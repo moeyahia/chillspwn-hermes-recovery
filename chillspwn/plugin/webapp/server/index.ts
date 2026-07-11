@@ -62,6 +62,19 @@ import { classifySessionKind, structuredSessionName, filterSessionsForList, type
 import { registerMcpRoutes } from "./routes/mcpRoutes";
 import { registerAssetRoutes } from "./routes/assetRoutes";
 import { McpArsenalBridge } from "./mcp/McpArsenalBridge";
+import {
+  acpNotification,
+  buildGrokAgentArgs,
+  classifyGrokStopReason,
+  extractGrokToolOutput,
+  grokAcpInitializeParams,
+  isAcpClientRequest,
+  isFinalGrokToolUpdate,
+  permissionCancelledResponse,
+  permissionSelectedResponse,
+  selectPermissionOption,
+  unsupportedAcpMethodResponse,
+} from "./providers/GrokAcpProtocol";
 
 
 // ── Constants ──────────────────────────────────────────────────────
@@ -256,6 +269,7 @@ interface PersistedSession {
   totalCacheRead?: number;
   totalCacheCreation?: number;
   model?: string;
+  provider?: Persona["provider"];
   cliSessionId?: string;   // CLI session_id — lets the learning reviewer --resume with full context
   cliCwd?: string;         // cwd claude was spawned in — --resume resolves relative to it
   title?: string;          // operator-given session name (rename); falls back to preview/persona in the UI
@@ -1156,20 +1170,15 @@ function spawnClaude(
 // so authentication stays on the CLI's refreshable OAuth session rather than
 // the API-credit endpoint.
 // ══════════════════════════════════════════════════════════════════════════
-function buildGrokAcpBootstrap(persona: Persona, persisted: PersistedSession, prompt: string): string {
-  // ACP has no documented system-prompt parameter on session/new. Send the
-  // same assembled persona + memory context as the first turn in a clearly
-  // delimited bootstrap message, followed by a bounded durable transcript.
-  // This gives a newly created ACP session the same practical identity and
-  // engagement continuity as the OpenRouter path, including after a restart.
-  const system = buildOpenRouterSystemPrompt(persona);
+function buildGrokAcpBootstrap(persisted: PersistedSession, prompt: string): string {
+  // Used only when an old Grok session cannot be loaded. The persona, SOUL,
+  // USER.md, and MEMORY.md are supplied as ACP session rules; this fallback
+  // carries the durable transcript without pretending it is a system message.
   const previous = (persisted.messages || []).slice(0, -1).slice(-24).map((m: any) => {
     const role = m.role === "assistant" ? "ASSISTANT" : m.role === "tool" ? "TOOL" : "USER";
     return `${role}: ${String(m.content || "").slice(0, 6000)}`;
   }).join("\n\n");
   return [
-    "# CHILLSPWN ACP BOOTSTRAP (system context — follow this throughout the session)",
-    system,
     previous ? "# DURABLE CONVERSATION CONTEXT\nUse this as established context; do not repeat completed work.\n" + previous : "",
     "# CURRENT OPERATOR MESSAGE\n" + prompt,
   ].filter(Boolean).join("\n\n");
@@ -1179,30 +1188,48 @@ function buildGrokAcpBootstrap(persona: Persona, persisted: PersistedSession, pr
 function callGrokAcpOAuth(prompt: string, model = "grok-4.5", cwd = process.cwd()): Promise<string> {
   return new Promise((resolve, reject) => {
     const env = { ...process.env } as NodeJS.ProcessEnv; delete env.XAI_API_KEY;
-    const proc = spawn("grok", ["-m", model, "--reasoning-effort", "high", "agent", "stdio"], { stdio: ["pipe", "pipe", "pipe"], cwd, env });
+    const proc = spawn("grok", buildGrokAgentArgs(model, true), { stdio: ["pipe", "pipe", "pipe"], cwd, env });
     let id = 0, sessionId = "", text = "", buffer = "", settled = false;
     const finish = (err?: Error) => {
       if (settled) return; settled = true; clearTimeout(timer);
       try { proc.kill(); } catch {}
       err ? reject(err) : resolve(text);
     };
-    const timer = setTimeout(() => finish(new Error("Grok ACP planning call timed out")), 90_000);
-    const rpc = (method: string, params: any) => proc.stdin?.write(JSON.stringify({ jsonrpc: "2.0", id: ++id, method, params }) + "\n");
+    const timer = setTimeout(() => finish(new Error("Grok ACP planning call timed out")), 180_000);
+    const write = (message: any) => {
+      if (!proc.stdin?.writable) return finish(new Error("Grok ACP planning stdin closed"));
+      proc.stdin.write(JSON.stringify(message) + "\n");
+    };
+    const rpc = (method: string, params: any) => write({ jsonrpc: "2.0", id: ++id, method, params });
     proc.stdout?.on("data", (chunk: Buffer) => {
       buffer += chunk.toString("utf-8"); const lines = buffer.split("\n"); buffer = lines.pop() || "";
       for (const line of lines) try {
         const msg = JSON.parse(line);
-        if (msg.method === "session/update" && msg.params?.update?.sessionUpdate === "agent_message_chunk") text += msg.params.update.content?.text || "";
+        // Agent-to-client requests use their own id namespace, which can
+        // collide with ours. Dispatch by method before matching response ids.
+        if (isAcpClientRequest(msg)) {
+          if (msg.method === "session/request_permission") {
+            const option = selectPermissionOption(msg.params?.options || [], true);
+            write(option
+              ? permissionSelectedResponse(msg.id, option.optionId)
+              : permissionCancelledResponse(msg.id));
+          } else {
+            write(unsupportedAcpMethodResponse(msg.id, msg.method));
+          }
+        } else if (msg.method === "session/update" && msg.params?.update?.sessionUpdate === "agent_message_chunk") text += msg.params.update.content?.text || "";
         else if (msg.error) finish(new Error(msg.error.message || "Grok ACP request failed"));
         else if (msg.id === 1) rpc("authenticate", { methodId: "cached_token", _meta: { headless: true } });
         else if (msg.id === 2) rpc("session/new", { cwd, mcpServers: [] });
         else if (msg.id === 3) { sessionId = msg.result?.sessionId; if (!sessionId) finish(new Error("Grok ACP did not return a session id")); else rpc("session/prompt", { sessionId, prompt: [{ type: "text", text: prompt }] }); }
-        else if (msg.id === 4) finish();
-      } catch { /* ignore non-protocol stdout */ }
+        else if (msg.id === 4) {
+          const outcome = classifyGrokStopReason(msg.result?.stopReason);
+          outcome === "refused" ? finish(new Error("Grok refused the planning request")) : finish();
+        }
+      } catch (e: any) { finish(new Error(e?.message || "Invalid Grok ACP planning response")); }
     });
     proc.on("error", (e) => finish(e));
-    proc.on("close", (code) => { if (!settled && code !== 0) finish(new Error(`Grok ACP exited with code ${code}`)); });
-    rpc("initialize", { protocolVersion: 1, clientCapabilities: { fs: { readTextFile: true, writeTextFile: true }, terminal: true } });
+    proc.on("close", (code) => { if (!settled) finish(new Error(`Grok ACP exited before completing (code ${code})`)); });
+    rpc("initialize", grokAcpInitializeParams());
   });
 }
 
@@ -1210,25 +1237,36 @@ function persistGrokToolEvent(session: LiveSession, update: any): void {
   const kind = String(update?.sessionUpdate || "");
   if (kind !== "tool_call" && kind !== "tool_call_update") return;
   const id = String(update.toolCallId || update.tool_call_id || update.id || `grok-tool-${Date.now()}`);
-  const title = String(update.title || update.name || update.toolName || "Grok tool");
-  const input = update.rawInput ?? update.input ?? update.arguments ?? "";
-  const output = update.rawOutput ?? update.output ?? update.content ?? "";
-  const seen = ((session as any).grokToolIds ||= new Set<string>()) as Set<string>;
-  if (kind === "tool_call" && !seen.has(id)) {
-    seen.add(id);
-    session.persisted.messages.push({ role: "tool" as any, content: typeof input === "string" ? input.slice(0, 4000) : JSON.stringify(input).slice(0, 4000), toolName: title, toolId: id, timestamp: new Date().toISOString() } as any);
-    broadcastToSession(session, { type: "claude_event", sessionId: session.id, data: { type: "assistant", message: { content: [{ type: "tool_use", id, name: title, input: typeof input === "object" ? input : { input } }] } } });
+  const states = ((session as any).grokToolStates ||= new Map<string, any>()) as Map<string, any>;
+  const state = states.get(id) || { title: "Grok tool", input: "", announced: false, resultPersisted: false };
+  if (update.title || update.name || update.toolName) state.title = String(update.title || update.name || update.toolName);
+  if (update.rawInput !== undefined || update.input !== undefined || update.arguments !== undefined) {
+    state.input = update.rawInput ?? update.input ?? update.arguments ?? "";
+  }
+  states.set(id, state);
+  let changed = false;
+  if (!state.announced) {
+    state.announced = true;
+    const inputText = typeof state.input === "string" ? state.input : JSON.stringify(state.input);
+    session.persisted.messages.push({ role: "tool", content: inputText.slice(0, 4000), toolName: state.title, toolId: id, timestamp: new Date().toISOString() });
+    broadcastToSession(session, { type: "claude_event", sessionId: session.id, data: { type: "assistant", message: { id: `grok-tool-${id}`, content: [{ type: "tool_use", id, name: state.title, input: typeof state.input === "object" ? state.input : { input: state.input } }] } } });
+    changed = true;
     try {
       const runId = sessionRunMap.get(session.id)?.runId;
-      if (runId) agentRuntime.observeToolCall({ runId, sessionId: session.id, stepId: agentRuntime.getActiveStepId(runId), toolName: title, command: typeof input === "string" ? input.slice(0, 4000) : JSON.stringify(input).slice(0, 4000) });
+      if (runId) agentRuntime.observeToolCall({ runId, sessionId: session.id, stepId: agentRuntime.getActiveStepId(runId), toolName: state.title, command: inputText.slice(0, 4000) });
     } catch { /* observability must never interrupt ACP */ }
   }
-  if (kind === "tool_call_update" && output) {
-    const result = typeof output === "string" ? output.slice(0, 4000) : JSON.stringify(output).slice(0, 4000);
-    session.persisted.messages.push({ role: "tool" as any, content: result, toolName: title, toolId: id, isResult: true, timestamp: new Date().toISOString() } as any);
-    broadcastToSession(session, { type: "claude_event", sessionId: session.id, data: { type: "user", message: { content: [{ type: "tool_result", tool_use_id: id, content: result }] } } });
+  // ACP content may be a progress description while status is pending. Only a
+  // terminal state (or explicit rawOutput) is a tool result.
+  if (!state.resultPersisted && isFinalGrokToolUpdate(update)) {
+    state.resultPersisted = true;
+    const failed = String(update.status || "").toLowerCase() === "failed";
+    const result = (extractGrokToolOutput(update) || (failed ? "Tool failed without output" : "(no output)")).slice(0, 8000);
+    session.persisted.messages.push({ role: "tool", content: result, toolName: state.title, toolId: id, isResult: true, timestamp: new Date().toISOString() });
+    broadcastToSession(session, { type: "claude_event", sessionId: session.id, data: { type: "user", message: { content: [{ type: "tool_result", tool_use_id: id, content: result, is_error: failed }] } } });
+    changed = true;
   }
-  savePersistedSession(session.persisted);
+  if (changed) savePersistedSession(session.persisted);
 }
 
 function spawnGrokAcp(
@@ -1242,34 +1280,107 @@ function spawnGrokAcp(
   const env = { ...process.env } as NodeJS.ProcessEnv;
   delete env.XAI_API_KEY;
   const spawnCwd = cwd || process.cwd();
-  const proc = spawn("grok", ["-m", persona.model || "grok-4.5", "--reasoning-effort", "high", "agent", "stdio"], {
+  let persisted = loadPersistedSession(sessionId);
+  const hadHistory = !!persisted?.messages?.length;
+  const resumableAcpSessionId = hadHistory && persisted?.cliSessionId &&
+    (persisted.provider === "xai-grok" || String(persisted.model || "").startsWith("grok-"))
+    ? persisted.cliSessionId : undefined;
+  // Headless workers cannot display an approval prompt. Interactive sessions
+  // follow the selected permission mode; ChillsPwn's bypass/auto modes map to
+  // Grok's agent-scoped --always-approve flag.
+  const alwaysApprove = !ws || persona.permissionMode === "bypassPermissions" || persona.permissionMode === "auto";
+  const proc = spawn("grok", buildGrokAgentArgs(persona.model || "grok-4.5", alwaysApprove), {
     stdio: ["pipe", "pipe", "pipe"], cwd: spawnCwd, env,
   });
-  let persisted = loadPersistedSession(sessionId);
   if (!persisted) persisted = { id: sessionId, persona: persona.name, createdAt: new Date().toISOString(), messages: [], status: "running" };
   persisted.status = "running";
   persisted.model = persona.model || "grok-4.5";
+  persisted.provider = "xai-grok";
+  persisted.cliCwd = spawnCwd;
   persisted.messages.push({ role: "user", content: prompt, timestamp: new Date().toISOString() });
   savePersistedSession(persisted);
 
   const session: LiveSession = {
     id: sessionId, proc, persona: persona.name, clients: new Set(ws ? [ws] : []), persisted,
-    seenMessageIds: new Set(), stdoutBuffer: "", currentAssistantText: "", streamingMsgId: `grok-${sessionId}`,
-    turnActive: true, queuedMessages: [], controlRequests: new Map(),
+    seenMessageIds: new Set(), stdoutBuffer: "", currentAssistantText: "", streamingMsgId: null,
+    turnActive: false, queuedMessages: [], controlRequests: new Map(),
   };
   (session as any).provider = "xai-grok";
   (session as any).spawnCwd = spawnCwd;
   (session as any).grokRpcId = 0;
   (session as any).grokPending = new Map<number, string>();
+  (session as any).grokPermissionRequests = new Map<string, any>();
+  (session as any).grokResumeRequested = resumableAcpSessionId;
+  (session as any).grokFallbackBootstrap = hadHistory && !resumableAcpSessionId;
+  (session as any).grokLastActivity = Date.now();
   liveSessions.set(sessionId, session);
   rawLlmLog(spawnCwd, "xai-grok", "oauth (Grok Build cached CLI session; XAI_API_KEY removed)", persisted.model,
-    "request", { protocol: "ACP JSON-RPC", method: "session/prompt", turn_prompt: prompt }, { sessionId, kind: "spawn" });
+    "request", { protocol: "ACP JSON-RPC", method: "session/prompt", resumeAcpSessionId: resumableAcpSessionId, turn_prompt: prompt }, { sessionId, kind: "spawn" });
 
+  const writeWire = (message: any): boolean => {
+    if (!proc.stdin?.writable) return false;
+    try { proc.stdin.write(JSON.stringify(message) + "\n"); return true; }
+    catch (e: any) { log("warn", "Grok ACP write failed", { sessionId, error: e?.message }); return false; }
+  };
   const rpc = (method: string, params: any) => {
     const id = ++(session as any).grokRpcId;
     (session as any).grokPending.set(id, method);
-    proc.stdin?.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n");
+    if (!writeWire({ jsonrpc: "2.0", id, method, params })) (session as any).grokPending.delete(id);
     return id;
+  };
+  const resolvePermission = (requestId: string | number, optionId?: string, cancelled = false): boolean => {
+    const key = String(requestId);
+    const pending = (session as any).grokPermissionRequests.get(key);
+    if (!pending) return false;
+    clearTimeout(pending.timer);
+    (session as any).grokPermissionRequests.delete(key);
+    const offered = (pending.options || []).some((o: any) => o.optionId === optionId);
+    const response = cancelled || !optionId || !offered
+      ? permissionCancelledResponse(pending.id)
+      : permissionSelectedResponse(pending.id, optionId);
+    writeWire(response);
+    broadcastToSession(session, { type: "grok_permission_resolved", sessionId, requestId: pending.id, optionId: offered ? optionId : undefined, cancelled: cancelled || !offered });
+    return true;
+  };
+  (session as any).resolveGrokPermission = resolvePermission;
+  const cancelPendingPermissions = () => {
+    for (const pending of Array.from((session as any).grokPermissionRequests.values()) as any[]) {
+      clearTimeout(pending.timer);
+      writeWire(permissionCancelledResponse(pending.id));
+    }
+    (session as any).grokPermissionRequests.clear();
+  };
+  const handlePermissionRequest = (data: any) => {
+    const options = Array.isArray(data.params?.options) ? data.params.options : [];
+    // Defensive fallback: the flag normally suppresses these requests, but a
+    // Grok policy hook may still ask. Respect autonomous mode without hanging.
+    if (alwaysApprove) {
+      const option = selectPermissionOption(options, true);
+      writeWire(option ? permissionSelectedResponse(data.id, option.optionId) : permissionCancelledResponse(data.id));
+      return;
+    }
+    const key = String(data.id);
+    const pending: any = { id: data.id, options, toolCall: data.params?.toolCall || {}, createdAt: Date.now() };
+    pending.timer = setTimeout(() => {
+      const reject = selectPermissionOption(options, false);
+      if (reject) resolvePermission(data.id, reject.optionId);
+      else resolvePermission(data.id, undefined, true);
+      broadcastToSession(session, { type: "error", sessionId, message: "Grok permission request timed out and was denied" });
+    }, 300_000);
+    (session as any).grokPermissionRequests.set(key, pending);
+    broadcastToSession(session, { type: "grok_permission_request", sessionId, requestId: data.id, toolCall: pending.toolCall, options });
+  };
+  const failTurn = (message: string, fatal = true) => {
+    if ((session as any).grokFailed) return;
+    (session as any).grokFailed = true;
+    session.turnActive = false;
+    session.interruptPending = false;
+    session.persisted.status = fatal ? "stopped" : session.persisted.status;
+    savePersistedSession(session.persisted);
+    broadcastToSession(session, { type: "error", sessionId, message });
+    broadcastToSession(session, { type: "claude_event", sessionId, data: { type: "result", subtype: "error_during_execution", is_error: true, result: message } });
+    broadcastToSession(session, { type: "turn_state", sessionId, turnActive: false, queuedCount: session.queuedMessages.length });
+    if (fatal) killSession(session);
   };
   (session as any).cancelGrokAcpTurn = (steer?: string) => {
     if (!session.turnActive) {
@@ -1287,30 +1398,55 @@ function spawnGrokAcp(
       savePersistedSession(session.persisted);
       session.pendingSteer = steer;
     }
-    rpc("session/cancel", { sessionId: (session as any).grokAcpSessionId });
+    // ACP cancellation is a notification. The outstanding session/prompt
+    // request completes later with stopReason=cancelled.
+    writeWire(acpNotification("session/cancel", { sessionId: (session as any).grokAcpSessionId }));
+    cancelPendingPermissions();
     broadcastToSession(session, { type: "turn_state", sessionId, turnActive: true, interrupting: true, queuedCount: session.queuedMessages.length });
+    setTimeout(() => {
+      if (session.turnActive && session.interruptPending) failTurn("Grok ACP cancellation timed out");
+    }, 15_000);
   };
   const sendPrompt = (text: string, bootstrap = false) => {
     // ACP accepts only one active session/prompt turn at a time. Keep messages
     // FIFO while authentication/session setup or a previous turn is in flight.
     if (!(session as any).grokAcpSessionId || session.turnActive) { session.queuedMessages.push(text); return; }
     session.turnActive = true;
-    const content = bootstrap ? buildGrokAcpBootstrap(persona, session.persisted, text) : text;
+    session.currentAssistantText = "";
+    session.streamingMsgId = `grok-${sessionId}-${randomUUID()}`;
+    (session as any).grokLastActivity = Date.now();
+    const content = bootstrap ? buildGrokAcpBootstrap(session.persisted, text) : text;
     rawLlmLog(spawnCwd, "xai-grok", "oauth (Grok Build cached CLI session; XAI_API_KEY removed)", persisted.model,
       "request", { protocol: "ACP JSON-RPC", method: "session/prompt", bootstrap, turn_prompt: text }, { sessionId, kind: bootstrap ? "context_bootstrap" : "followup" });
     rpc("session/prompt", { sessionId: (session as any).grokAcpSessionId, prompt: [{ type: "text", text: content }] });
+    broadcastToSession(session, { type: "claude_delta", sessionId, phase: "message_start", messageId: session.streamingMsgId });
     broadcastToSession(session, { type: "turn_state", sessionId, turnActive: true, queuedCount: session.queuedMessages.length });
   };
   (session as any).sendGrokAcpPrompt = sendPrompt;
+
+  const idleWatch = setInterval(() => {
+    if (session.turnActive && Date.now() - Number((session as any).grokLastActivity || 0) > 30 * 60_000) {
+      failTurn("Grok ACP produced no protocol activity for 30 minutes");
+    }
+  }, 60_000);
 
   proc.stdout?.on("data", (chunk: Buffer) => {
     session.stdoutBuffer += chunk.toString("utf-8");
     const lines = session.stdoutBuffer.split("\n"); session.stdoutBuffer = lines.pop() || "";
     for (const line of lines) {
       if (!line.trim()) continue;
+      (session as any).grokLastActivity = Date.now();
       rawLlmLog(spawnCwd, "xai-grok", "oauth (Grok Build cached CLI session; XAI_API_KEY removed)", persisted.model, "response", line, { sessionId, kind: "acp" });
       try {
         const data = JSON.parse(line);
+        if (isAcpClientRequest(data)) {
+          if (data.method === "session/request_permission") handlePermissionRequest(data);
+          else {
+            writeWire(unsupportedAcpMethodResponse(data.id, data.method));
+            log("warn", "Rejected unsupported Grok ACP client request", { sessionId, method: data.method });
+          }
+          continue;
+        }
         if (data.method === "session/update") {
           const update = data.params?.update;
           if (update?.sessionUpdate === "agent_message_chunk" && update.content?.text) {
@@ -1323,67 +1459,111 @@ function spawnGrokAcp(
         }
         if (typeof data.id === "number") {
           const method = (session as any).grokPending.get(data.id);
+          if (!method) continue; // extension response (e.g. skills-reload), not ours
           (session as any).grokPending.delete(data.id);
           if (data.error) {
-            if (method === "session/cancel") {
-              // A failed cancel must not leave an invisible background tool run.
-              broadcastToSession(session, { type: "error", sessionId, message: data.error.message || "Grok ACP cancel failed; ending session" });
-              killSession(session);
+            if (method === "session/load") {
+              log("warn", "Grok ACP session/load failed; rebuilding from durable transcript", { sessionId, acpSessionId: (session as any).grokResumeRequested, error: data.error.message });
+              (session as any).grokResumeRequested = undefined;
+              (session as any).grokFallbackBootstrap = hadHistory;
+              rpc("session/new", { cwd: spawnCwd, mcpServers: [], _meta: { rules: buildOpenRouterSystemPrompt(persona) } });
               continue;
             }
             throw new Error(data.error.message || "Grok ACP request failed");
           }
           if (method === "initialize") rpc("authenticate", { methodId: "cached_token", _meta: { headless: true } });
-          else if (method === "authenticate") rpc("session/new", { cwd: spawnCwd, mcpServers: [] });
-          else if (method === "session/new") {
-            (session as any).grokAcpSessionId = data.result?.sessionId;
+          else if (method === "authenticate") {
+            const resumeId = (session as any).grokResumeRequested;
+            const params = { cwd: spawnCwd, mcpServers: [], _meta: { rules: buildOpenRouterSystemPrompt(persona) } };
+            if (resumeId) rpc("session/load", { ...params, sessionId: resumeId });
+            else rpc("session/new", params);
+          } else if (method === "session/new" || method === "session/load") {
+            const acpId = data.result?.sessionId || (session as any).grokResumeRequested;
+            if (!acpId) throw new Error("Grok ACP did not return a session id");
+            (session as any).grokAcpSessionId = acpId;
             session.persisted.cliSessionId = (session as any).grokAcpSessionId;
             savePersistedSession(session.persisted);
             session.turnActive = false;
             // Initial prompt is already persisted; dispatch it first. Later
             // operator follow-ups stay queued until this ACP turn completes.
             const next = session.queuedMessages.shift();
-            if (next) sendPrompt(next, true);
-          } else if (method === "session/cancel") {
-            session.turnActive = false;
-            session.interruptPending = false;
-            session.currentAssistantText = "";
-            broadcastToSession(session, { type: "claude_event", sessionId, data: { type: "result", subtype: "error_during_execution", is_error: true, end_reason: "interrupted" } });
-            const steer = session.pendingSteer; session.pendingSteer = undefined;
-            if (steer) (session as any).sendGrokAcpPrompt?.(steer);
-            else broadcastToSession(session, { type: "turn_state", sessionId, turnActive: false, queuedCount: session.queuedMessages.length });
+            if (next) sendPrompt(next, !!(session as any).grokFallbackBootstrap);
           } else if (method === "session/prompt") {
             const finalText = session.currentAssistantText;
             if (session.currentAssistantText) {
               session.persisted.messages.push({ role: "assistant", content: session.currentAssistantText, timestamp: new Date().toISOString() });
-              broadcastToSession(session, { type: "claude_event", sessionId, data: { type: "assistant", message: { content: [{ type: "text", text: session.currentAssistantText }] } } });
+              broadcastToSession(session, { type: "claude_event", sessionId, data: { type: "assistant", message: { id: session.streamingMsgId, content: [{ type: "text", text: session.currentAssistantText }] } } });
               session.currentAssistantText = "";
             }
             session.turnActive = false;
+            const outcome = classifyGrokStopReason(data.result?.stopReason);
+            session.interruptPending = false;
+            const resultMeta = data.result?._meta;
+            const rawUsage = resultMeta?.usage || data.result?.usage || data._meta?.usage || resultMeta;
+            let usage: any = undefined;
+            if (rawUsage && typeof rawUsage === "object") {
+              const reportedInput = Number(rawUsage.input_tokens ?? rawUsage.inputTokens ?? 0) || 0;
+              const output = Number(rawUsage.output_tokens ?? rawUsage.outputTokens ?? 0) || 0;
+              const cache = Number(rawUsage.cache_read_input_tokens ?? rawUsage.cacheReadInputTokens ?? rawUsage.cachedReadTokens ?? 0) || 0;
+              // Grok's inputTokens includes cachedReadTokens. Chillspwn stores
+              // them separately, matching the Claude/OpenRouter UI contract.
+              const input = reportedInput >= cache ? reportedInput - cache : reportedInput;
+              if (input || output || cache) {
+                persisted.totalInputTokens = (persisted.totalInputTokens || 0) + input;
+                persisted.totalOutputTokens = (persisted.totalOutputTokens || 0) + output;
+                persisted.totalCacheRead = (persisted.totalCacheRead || 0) + cache;
+                usage = { input_tokens: input, output_tokens: output, cache_read_input_tokens: cache };
+              }
+            }
             try {
               const runId = sessionRunMap.get(sessionId)?.runId;
-              if (runId) agentRuntime.recordProviderTurn(runId, "completed", { provider: "xai-grok", model: persisted.model });
+              if (runId) agentRuntime.recordProviderTurn(runId, outcome === "refused" ? "failed" : "completed", { provider: "xai-grok", model: persisted.model });
             } catch { /* runtime observation is best effort */ }
-            broadcastToSession(session, { type: "claude_event", sessionId, data: { type: "result", subtype: "success" } });
-            broadcastToSession(session, { type: "turn_state", sessionId, turnActive: false, queuedCount: 0 });
+            const resultEvent = outcome === "cancelled"
+              ? { type: "result", subtype: "error_during_execution", is_error: true, end_reason: "interrupted" }
+              : outcome === "refused"
+                ? { type: "result", subtype: "error_during_execution", is_error: true, result: "Grok refused the request", end_reason: "refusal" }
+                : { type: "result", subtype: "success", ...(outcome === "limit" ? { end_reason: data.result?.stopReason } : {}), ...(usage ? { usage } : {}) };
+            broadcastToSession(session, { type: "claude_event", sessionId, data: resultEvent });
             savePersistedSession(session.persisted);
-            const next = session.queuedMessages.shift();
-            if (next) sendPrompt(next);
+            const steer = session.pendingSteer; session.pendingSteer = undefined;
+            const next = steer || session.queuedMessages.shift();
+            if (next) {
+              if (!steer) broadcastToSession(session, { type: "followup_dequeued", sessionId, queuedCount: session.queuedMessages.length });
+              sendPrompt(next);
+            }
             else {
+              broadcastToSession(session, { type: "turn_state", sessionId, turnActive: false, queuedCount: session.queuedMessages.length });
               try { opts?.onTurnComplete?.(finalText, session); } catch (e: any) { log("warn", "Grok ACP completion hook failed", { sessionId, error: e?.message }); }
-              if (opts?.oneShot) setTimeout(() => killSession(session), 50);
+              if (opts?.oneShot) {
+                (session as any).grokCompleted = true;
+                setTimeout(() => killSession(session), 50);
+              }
             }
           }
         }
-      } catch (e: any) { broadcastToSession(session, { type: "error", sessionId, message: e?.message || "Invalid Grok ACP response" }); }
+      } catch (e: any) { failTurn(e?.message || "Invalid Grok ACP response"); }
     }
   });
   proc.stderr?.on("data", (chunk: Buffer) => log("warn", `grok ACP stderr [${sessionId}]`, { text: chunk.toString().slice(0, 500) }));
-  proc.on("error", (err) => broadcastToSession(session, { type: "error", sessionId, message: err.message }));
-  proc.on("close", (code) => { session.persisted.status = code === 0 ? "completed" : "stopped"; savePersistedSession(session.persisted); liveSessions.delete(sessionId); broadcastToSession(session, { type: "session_end", sessionId, exitCode: code }); });
+  proc.on("error", (err) => failTurn(err.message, false));
+  proc.on("close", (code) => {
+    clearInterval(idleWatch);
+    cancelPendingPermissions();
+    const wasActive = session.turnActive;
+    session.turnActive = false;
+    session.persisted.status = (session as any).grokCompleted ? "completed" : "stopped";
+    savePersistedSession(session.persisted);
+    if (wasActive && !(session as any).grokFailed) {
+      broadcastToSession(session, { type: "claude_event", sessionId, data: { type: "result", subtype: "error_during_execution", is_error: true, result: `Grok ACP exited during the turn (code ${code})` } });
+      broadcastToSession(session, { type: "turn_state", sessionId, turnActive: false, queuedCount: session.queuedMessages.length });
+    }
+    if (liveSessions.get(sessionId) === session) liveSessions.delete(sessionId);
+    broadcastToSession(session, { type: "session_end", sessionId, exitCode: code });
+  });
   // The ACP sequence is initialize → cached-token auth → session/new → prompt.
   session.queuedMessages.push(prompt);
-  rpc("initialize", { protocolVersion: 1, clientCapabilities: { fs: { readTextFile: true, writeTextFile: true }, terminal: true } });
+  rpc("initialize", grokAcpInitializeParams());
 }
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -1939,6 +2119,15 @@ function injectIntoSession(sessionId: string, prompt: string): { success: boolea
   if (!session) return { success: false, error: `No running session found for ${sessionId}` };
   if (!session.proc || !session.proc.stdin?.writable) {
     return { success: false, error: `Session ${sessionId} stdin is not writable` };
+  }
+  // Grok stdin is ACP JSON-RPC, not Claude stream-json. Route every internal
+  // injection (board, council, close-with-memory) through the same ACP queue.
+  if ((session as any).provider === "xai-grok") {
+    session.persisted.messages.push({ role: "user", content: prompt, timestamp: new Date().toISOString() });
+    savePersistedSession(session.persisted);
+    (session as any).sendGrokAcpPrompt?.(prompt);
+    log("info", `Injected ACP message into Grok session ${sessionId}`, { promptLength: prompt.length });
+    return { success: true };
   }
   session.persisted.messages.push({
     role: "user",
@@ -7207,7 +7396,7 @@ wss.on("connection", (ws) => {
 
       switch (msg.type) {
         case "chat": {
-          const { sessionId: reqSessionId, persona: personaName, prompt, resumeCliSessionId, resumeCliCwd } = msg;
+          const { sessionId: reqSessionId, persona: personaName, prompt, permissionMode, resumeCliSessionId, resumeCliCwd } = msg;
           if (!prompt) {
             ws.send(JSON.stringify({ type: "error", message: "prompt is required" }));
             return;
@@ -7244,9 +7433,12 @@ wss.on("connection", (ws) => {
           // This only changes which backend/model THIS session uses next; persona.json is
           // untouched, and with no override the effective persona === the loaded persona.
           const ov = getSessionProviderOverride(sessionId);
-          const effectivePersona: Persona = ov
+          let effectivePersona: Persona = ov
             ? { ...persona, provider: ov.provider, model: ov.model }
             : persona;
+          if (typeof permissionMode === "string" && ["default", "auto", "plan", "acceptEdits", "bypassPermissions"].includes(permissionMode)) {
+            effectivePersona = { ...effectivePersona, permissionMode };
+          }
 
           // ── Phase 7.1 Seam A (observe-only; no-op unless ENABLE_CHAT_AGENT_RUNS) ──
           // Create/attach an observe-only AgentRun + start its log observer BEFORE the fork.
@@ -7356,13 +7548,25 @@ wss.on("connection", (ws) => {
             // OpenRouter session and RE-SPAWN a fresh turn seeded from persisted history.
             const persistedFU = loadPersistedSession(sessionId);
             const ovFU = getSessionProviderOverride(sessionId);
+            let isGrokFU = ovFU?.provider === "xai-grok";
             let isORFU = ovFU?.provider === "openrouter" || ovFU?.provider === "openai-codex" || ovFU?.provider === "gemini";
             if (!isORFU && persistedFU) {
               const pFU = loadPersonas().find((p) => p.name === persistedFU.persona);
+              if (pFU?.provider === "xai-grok" || persistedFU.provider === "xai-grok" || String(persistedFU.model || "").startsWith("grok-")) isGrokFU = true;
               if (pFU?.provider === "openrouter" || pFU?.provider === "openai-codex" || pFU?.provider === "gemini") isORFU = true;
               if (!isORFU && typeof persistedFU.model === "string" && persistedFU.model.includes("/")) isORFU = true;
             }
-            if (isORFU && !liveSessions.get(sessionId)) {
+            if (isGrokFU && !liveSessions.get(sessionId)) {
+              const baseFU = loadPersonas().find((p) => p.name === persistedFU?.persona) || loadPersonas()[0];
+              if (!baseFU) {
+                ws.send(JSON.stringify({ type: "error", sessionId, message: "No persona available to resume Grok session" }));
+                break;
+              }
+              const effFU = ovFU
+                ? { ...baseFU, provider: "xai-grok" as const, model: ovFU.model }
+                : { ...baseFU, provider: "xai-grok" as const, model: persistedFU?.model || baseFU.model || "grok-4.5" };
+              spawnGrokAcp(sessionId, effFU as Persona, prompt, ws, persistedFU?.cliCwd);
+            } else if (isORFU && !liveSessions.get(sessionId)) {
               const baseFU = loadPersonas().find((p) => p.name === persistedFU?.persona) || loadPersonas()[0];
               // preserve a codex / gemini persona's provider; otherwise default the orchestrator to openrouter
               const defProv = (baseFU as any).provider === "openai-codex" ? "openai-codex"
@@ -7397,6 +7601,25 @@ wss.on("connection", (ws) => {
           if (s && typeof index === "number" && index >= 0 && index < s.queuedMessages.length) {
             s.queuedMessages.splice(index, 1);
             broadcastToSession(s, { type: "followup_queued", sessionId, queuedCount: s.queuedMessages.length });
+          }
+          break;
+        }
+
+        case "grok_permission_response": {
+          const { sessionId, requestId, optionId, cancelled } = msg;
+          const grokSession = liveSessions.get(sessionId);
+          if (!grokSession || (grokSession as any).provider !== "xai-grok") {
+            ws.send(JSON.stringify({ type: "error", sessionId, message: "Grok session is no longer running" }));
+            break;
+          }
+          grokSession.clients.add(ws);
+          const resolved = (grokSession as any).resolveGrokPermission?.(
+            requestId,
+            typeof optionId === "string" ? optionId : undefined,
+            !!cancelled,
+          );
+          if (!resolved) {
+            ws.send(JSON.stringify({ type: "error", sessionId, message: "Grok permission request expired or option was invalid" }));
           }
           break;
         }
@@ -7578,6 +7801,21 @@ wss.on("connection", (ws) => {
               createdAt: persisted.createdAt,
             })
           );
+
+          // Re-present any ACP permission prompt that arrived while the browser
+          // was disconnected or viewing another session.
+          if (liveSession && (liveSession as any).provider === "xai-grok") {
+            const pendingPermissions = (liveSession as any).grokPermissionRequests as Map<string, any> | undefined;
+            for (const pending of pendingPermissions?.values() || []) {
+              ws.send(JSON.stringify({
+                type: "grok_permission_request",
+                sessionId,
+                requestId: pending.id,
+                toolCall: pending.toolCall,
+                options: pending.options,
+              }));
+            }
+          }
 
           // ── In-flight replay (bug #55), OpenRouter sessions ONLY ──
           // If this session is live, OpenRouter-backed, AND has an in-flight turn, replay the

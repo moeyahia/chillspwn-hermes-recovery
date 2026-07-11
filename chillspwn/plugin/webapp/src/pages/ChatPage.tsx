@@ -49,6 +49,13 @@ interface SessionInfo {
   title?: string;
 }
 
+interface GrokPermissionRequest {
+  sessionId: string;
+  requestId: string | number;
+  toolCall: Record<string, any>;
+  options: Array<{ optionId: string; name?: string; kind: string }>;
+}
+
 // ── Mobile detection ──────────────────────────────────────────────
 // Local copy of App.tsx's useIsMobile (importing from App.tsx would create a
 // circular import since App imports ChatPage). Returns true on the mobile
@@ -150,6 +157,47 @@ function ConfirmModal({
   );
 }
 
+function GrokPermissionModal({
+  request,
+  onSelect,
+  onCancel,
+}: {
+  request: GrokPermissionRequest;
+  onSelect: (optionId: string) => void;
+  onCancel: () => void;
+}) {
+  const tool = request.toolCall || {};
+  const title = String(tool.title || tool.name || tool.toolName || "Grok tool permission");
+  const detailValue = tool.rawInput ?? tool.input ?? tool.arguments ?? tool.content ?? "";
+  const detail = typeof detailValue === "string" ? detailValue : JSON.stringify(detailValue, null, 2);
+  return (
+    <div className="fixed inset-0 flex items-center justify-center z-[10000]" style={{ background: "rgba(0,0,0,0.76)", backdropFilter: "blur(4px)" }}>
+      <div className="rounded-lg p-5 max-w-lg w-[calc(100%-2rem)] mx-4" style={{ background: "var(--bg-surface)", border: "1px solid var(--neon-amber, #ffae42)", boxShadow: "0 0 35px rgba(255,174,66,0.14)" }}>
+        <div className="text-[10px] uppercase tracking-[0.16em] mb-2" style={{ color: "var(--neon-amber, #ffae42)" }}>Grok requests permission</div>
+        <h3 className="text-sm font-semibold mb-3" style={{ color: "var(--text-primary)" }}>{title}</h3>
+        {detail && (
+          <pre className="text-[11px] mb-4 p-3 rounded overflow-auto max-h-48 whitespace-pre-wrap" style={{ background: "rgba(0,0,0,0.35)", border: "1px solid var(--border-color)", color: "var(--text-dim)" }}>
+            {detail.slice(0, 5000)}
+          </pre>
+        )}
+        <div className="flex flex-wrap justify-end gap-2">
+          {request.options.map((option) => {
+            const allow = option.kind.startsWith("allow");
+            return (
+              <button key={option.optionId} onClick={() => onSelect(option.optionId)} className="px-3 py-1.5 text-xs rounded font-medium" style={{ border: `1px solid ${allow ? "rgba(43,212,127,0.55)" : "rgba(255,77,99,0.55)"}`, background: allow ? "rgba(43,212,127,0.12)" : "rgba(255,77,99,0.12)", color: allow ? "var(--neon-green, #2bd47f)" : "#ff6b7d" }}>
+                {option.name || option.kind.replaceAll("_", " ")}
+              </button>
+            );
+          })}
+          {!request.options.some((o) => o.kind.startsWith("reject")) && (
+            <button onClick={onCancel} className="px-3 py-1.5 text-xs rounded" style={{ border: "1px solid var(--border-color)", color: "var(--text-dim)" }}>Cancel</button>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export default function ChatPage({ persona, personaProvider, personaModel, permissionMode, onLiveSessionChange, resumeCliSession, onResumeConsumed, requestedSession, pendingNewSession, onNewSessionConsumed, onActiveSessionChange }: ChatProps) {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
@@ -162,6 +210,7 @@ export default function ChatPage({ persona, personaProvider, personaModel, permi
   const [sessions, setSessions] = useState<SessionInfo[]>([]);
   const [currentSession, setCurrentSession] = useState<string | null>(null);
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
+  const [grokPermission, setGrokPermission] = useState<GrokPermissionRequest | null>(null);
   const [turnCount, setTurnCount] = useState(0); // tracks how many user messages sent in this session
   // Messages the user submitted while a turn was still running — queued on the
   // server and injected after the current turn ends. Shown as chips above the composer.
@@ -700,6 +749,7 @@ export default function ChatPage({ persona, personaProvider, personaModel, permi
   // Drop any half-buffered stream tokens (and cancel a pending frame) whenever the
   // active session changes, so the old session's trailing tokens can't bleed in.
   useEffect(() => {
+    setGrokPermission(null);
     pendingDeltasRef.current.clear();
     if (deltaRafRef.current != null) {
       cancelAnimationFrame(deltaRafRef.current);
@@ -716,6 +766,23 @@ export default function ChatPage({ persona, personaProvider, personaModel, permi
 
   // ── Handle server events ──
   const handleServerEvent = useCallback((msg: any) => {
+    if (msg.type === "grok_permission_request") {
+      if (msg.sessionId && msg.sessionId !== currentSessionRef.current) {
+        setUnreadSessions((prev) => prev.has(msg.sessionId) ? prev : new Set(prev).add(msg.sessionId));
+        return;
+      }
+      setGrokPermission({
+        sessionId: msg.sessionId,
+        requestId: msg.requestId,
+        toolCall: msg.toolCall || {},
+        options: Array.isArray(msg.options) ? msg.options : [],
+      });
+      return;
+    }
+    if (msg.type === "grok_permission_resolved") {
+      setGrokPermission((current) => current && String(current.requestId) === String(msg.requestId) ? null : current);
+      return;
+    }
     // -- Live token streaming (partial deltas) --
     // Builds the in-progress assistant bubble token-by-token. The bubble id is
     // the model's message.id, so the later consolidated `assistant` event
@@ -1406,7 +1473,7 @@ export default function ChatPage({ persona, personaProvider, personaModel, permi
       // then stall ("Let me verify…:"). For OpenRouter we send the raw prompt and let the
       // orchestrator drive. The claude crash-respawn path is unchanged.
       let finalPrompt = prompt;
-      if (sessionIsDead && messages.length > 0 && activeProvider !== "openrouter") {
+      if (sessionIsDead && messages.length > 0 && activeProvider !== "openrouter" && activeProvider !== "xai-grok") {
         const recent = messages.slice(-12).filter((m) => m.role === "user" || m.role === "assistant");
         if (recent.length > 0) {
           const transcript = recent
@@ -1845,6 +1912,29 @@ export default function ChatPage({ persona, personaProvider, personaModel, permi
   // ── Render ──
   return (
     <div className="flex h-full">
+      {grokPermission && (
+        <GrokPermissionModal
+          request={grokPermission}
+          onSelect={(optionId) => {
+            wsRef.current?.send(JSON.stringify({
+              type: "grok_permission_response",
+              sessionId: grokPermission.sessionId,
+              requestId: grokPermission.requestId,
+              optionId,
+            }));
+            setGrokPermission(null);
+          }}
+          onCancel={() => {
+            wsRef.current?.send(JSON.stringify({
+              type: "grok_permission_response",
+              sessionId: grokPermission.sessionId,
+              requestId: grokPermission.requestId,
+              cancelled: true,
+            }));
+            setGrokPermission(null);
+          }}
+        />
+      )}
       {/* Session sidebar — toggle via header button */}
       {false && (/* sidebar removed — sessions live in the app nav */
       <div
