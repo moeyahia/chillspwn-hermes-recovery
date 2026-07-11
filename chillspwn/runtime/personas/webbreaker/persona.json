@@ -1,0 +1,35 @@
+{
+  "name": "WebBreaker",
+  "provider": "openai-codex",
+  "model": "gpt-5.6-sol",
+  "permissionMode": "default",
+  "systemPromptFile": "SOUL.md",
+  "tools": [
+    "terminal",
+    "execute_code",
+    "process",
+    "read_file",
+    "write_file",
+    "search_files",
+    "use_skill",
+    "recall_conversation",
+    "web_search",
+    "web_extract"
+  ],
+  "description": "web specialist (Phase 15) — commanded by ChillsPwn. agentId=WebBreaker",
+  "appendSystemPrompt": null,
+  "agentId": "WebBreaker",
+  "specialty": "web",
+  "allowedMcpServers": [
+    "sechub-web-security",
+    "sechub-exploitation",
+    "pentest-mcp-recon"
+  ],
+  "approvalRequiredTools": [
+    "ffuf_custom",
+    "sqlmap_assess",
+    "searchsploit_examine"
+  ],
+  "memoryNamespace": "agent:webbreaker",
+  "canApproveTrainingLessons": false
+}

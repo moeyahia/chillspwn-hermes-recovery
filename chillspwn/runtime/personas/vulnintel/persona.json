@@ -1,0 +1,27 @@
+{
+  "name": "VulnIntel",
+  "provider": "gemini",
+  "model": "gemini-3.5-flash",
+  "permissionMode": "default",
+  "systemPromptFile": "SOUL.md",
+  "tools": [
+    "read_file",
+    "search_files",
+    "use_skill",
+    "recall_conversation",
+    "web_search",
+    "web_extract"
+  ],
+  "description": "vulnerability_intelligence specialist (Phase 17) — read-only CVE intelligence, NOT exploitation. agentId=VulnIntel",
+  "appendSystemPrompt": null,
+  "agentId": "VulnIntel",
+  "specialty": "vulnerability_intelligence",
+  "allowedMcpServers": [
+    "vulnintel-cve-mcp",
+    "vulnintel-nvd",
+    "vulnintel-cve-search-local"
+  ],
+  "approvalRequiredTools": [],
+  "memoryNamespace": "agent:vulnintel",
+  "canApproveTrainingLessons": false
+}

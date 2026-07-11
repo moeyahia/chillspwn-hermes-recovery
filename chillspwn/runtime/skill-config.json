@@ -1,0 +1,14 @@
+{
+  "cve-researcher": {
+    "provider": "anthropic",
+    "model": "claude-opus-4-7"
+  },
+  "pineapple-operations": {
+    "provider": "openrouter",
+    "model": "deepseek/deepseek-v4-pro"
+  },
+  "kali-arsenal": {
+    "provider": "openai-codex",
+    "model": "gpt-5.5"
+  }
+}

@@ -1,0 +1,117 @@
+# Phase 18 — No-Hands Commander: chat-path enforcement for the OpenRouter/Codex orchestrator.
+# Target: ~/.hermes/skills/red-teaming/council-of-ais/scripts/orchestrator_openrouter.py
+# Apply:   patch -p1 < phase18-no-hands-orchestrator.patch   (from the scripts/ dir)
+# Reverse: patch -R -p1 < phase18-no-hands-orchestrator.patch
+# Purely additive (89 lines, 0 removed). Claude path untouched. See docs/PHASE-18-NO-HANDS-COMMANDER.md.
+--- a/orchestrator_openrouter.py
++++ b/orchestrator_openrouter.py
+@@ -785,6 +785,59 @@
+ # an autonomous run.
+ _GUIDED_EXEC_BLOCK = {"terminal", "execute_code", "process", "patch", "write_file"}
+ 
++# ── Phase 18: HARD "no-hands commander" — ChillsPwn (the Commander-in-Chief) may NOT directly run the
++# execution surface. This is the CHAT-path enforcement (managed runs are gated by the dashboard).
++# The PingPong session proved the gap: ChillsPwn ran 418 terminal + 367 execute_code actions (Kerberos
++# abuse, Certipy, DCSync, LDAP, SOCKS pivots) instead of delegating. We (a) remove these tools from the
++# commander's tool list for the turn and (b) hard-deny them in dispatch (belt-and-suspenders for text
++# tool-calls), returning the specialist to route to. Flag-gated: ENFORCE_CHILLSPWN_NO_HANDS (default on).
++_NO_HANDS = (os.environ.get("ENFORCE_CHILLSPWN_NO_HANDS", "true").strip().lower() in ("1", "true", "yes", "on"))
++_SELF_PERSONA = (os.environ.get("CHILLSPWN_OR_PERSONA", "") or "").strip().lower()
++_COMMANDER_PERSONAS = {"chillspwn", "commander", "commander-in-chief", "commander_in_chief", "orchestrator"}
++_IS_COMMANDER = _SELF_PERSONA in _COMMANDER_PERSONAS
++# The execution surface a commander may never touch directly (these are the only exec tools the OR
++# model is even given; specialist MCP tool names are never exposed here). file read/write/patch,
++# board_*, delegate_task, memory, skills, web_* stay available so it can still plan/route/synthesize.
++_COMMANDER_BLOCK = {"terminal", "execute_code", "process", "mcp_execute"}
++_NO_HANDS_ACTIVE = bool(_NO_HANDS and _IS_COMMANDER)
++
++# (toolName/command signal → specialist) — mirrors server/agents/ChillspwnCommanderPolicy.ts. Ordered:
++# domain-specific signals (AD/Kerberos/web/creds) are checked before generic recon so they win first.
++_SPECIALIST_SIGNALS = [
++    (re.compile(r"\b(certipy|impacket|secretsdump|getuserspns|getnpusers|getst|gettgt|ticketer|dcsync|nxc|netexec|crackmapexec|cme|kerbrute|kerberos|krb5|s4u|gmsa|bloodhound|sharphound|roadrecon|evil-?winrm|winrm|ldapsearch|ldap|rpcclient|smbclient|smbmap|adcs|esc[0-9]|pkinit|asreproast|kerberoast)\b", re.I), "ADAttackMapper", "active_directory"),
++    (re.compile(r"\b(hashcat|john|johntheripper|hydra|medusa|wordlist|rockyou|crack|brute-?force|bruteforce|password|passwords|mask-?attack)\b", re.I), "CredSmith", "credentials"),
++    (re.compile(r"\b(ffuf|gobuster|feroxbuster|dirb|dirbuster|wfuzz|nikto|nuclei|sqlmap|wpscan|whatweb|httpx|katana|gau|waybackurls|burp|dirsearch)\b", re.I), "WebBreaker", "web"),
++    (re.compile(r"\b(tmux|ssh|socks|proxychains|chisel|ligolo|sshuttle|pivot|meterpreter|reverse-?shell|ncat|socat|session|upload_file|download_file)\b", re.I), "SessionRunner", "persistent_execution"),
++    (re.compile(r"\b(binwalk|radare2|ghidra|capa|yara|objdump|readelf|gdb|pwndbg|decompile)\b", re.I), "ReverseSage", "reverse_engineering"),
++    (re.compile(r"\b(gitleaks|semgrep|trufflehog|secret-?scan)\b", re.I), "SecretHunter", "secrets_code"),
++    (re.compile(r"\b(prowler|trivy|awscli|kubectl|kubeconfig|gcloud|cloud-?posture)\b", re.I), "CloudSentinel", "cloud"),
++    (re.compile(r"\b(boofuzz|dharma|afl|libfuzzer|fuzz)\b", re.I), "FuzzSmith", "fuzzing"),
++    (re.compile(r"\b(theharvester|maigret|sherlock|shodan|censys|dnstwist|recon-?ng|osint|amass)\b", re.I), "OSINTSeeker", "osint"),
++    (re.compile(r"\b(searchsploit|cve-?\d|nvd|epss|kev|exploit-?db|vulners|cvss)\b", re.I), "VulnIntel", "vulnerability_intelligence"),
++    (re.compile(r"\b(nmap|masscan|rustscan|port_?scan|service-?discovery|dnsenum|dnsrecon|fierce|sslscan|traceroute)\b", re.I), "ReconScout", "reconnaissance"),
++]
++
++def _recommend_specialist(name, command=None):
++    hay = f"{name or ''} {command or ''}"
++    for rx, agent, domain in _SPECIALIST_SIGNALS:
++        if rx.search(hay):
++            return agent, domain
++    if name in ("terminal", "execute_code", "process"):
++        return "SessionRunner", "persistent_execution"
++    return "ReconScout", "reconnaissance"
++
++def _no_hands_denial(name, a):
++    """The denial string returned to the model when the commander tries a blocked exec tool."""
++    cmd = ""
++    if isinstance(a, dict):
++        cmd = a.get("command") or a.get("code") or a.get("cmd") or ""
++    agent, domain = _recommend_specialist(name, cmd if isinstance(cmd, str) else "")
++    return (f"⛔ DELEGATION REQUIRED — ChillsPwn is the Commander-in-Chief and cannot run '{name}' "
++            f"directly. This is {domain} work. Route it to {agent}: create a delegated specialist task "
++            f"with board_create_task(agent=\"{agent}\", title=..., body=<the exact objective + command>) "
++            f"or delegate_task(targetAgentId=\"{agent}\", ...). Plan, route, supervise, approve, "
++            f"synthesize — specialists execute.")
++
+ def _detect_engagement_mode(session_file: str) -> str:
+     try:
+         with open(session_file) as f:
+@@ -1696,6 +1749,30 @@
+     else:
+         _active_tools = _OPENAI_TOOLS
+ 
++    # Phase 18 — HARD no-hands commander: strip the execution surface from ChillsPwn's tool list this
++    # turn (the model never even sees terminal/execute_code/process/mcp_execute) and inject the
++    # commander directive. Specialists are unaffected; only the commander persona is hands-off.
++    if _NO_HANDS_ACTIVE:
++        _active_tools = [t for t in _active_tools
++                         if ((t.get("function") or {}).get("name")) not in _COMMANDER_BLOCK]
++        messages.insert(2, {"role": "system", "content":
++            "## COMMANDER-IN-CHIEF — NO HANDS (Phase 18). You are ChillsPwn, the Commander-in-Chief. "
++            "You DO NOT run attacks yourself. terminal, execute_code, process, and MCP execution are "
++            "DISABLED for you this session — they are SPECIALIST work. For ANY execution (scanning, "
++            "exploitation, credential attacks, AD/Kerberos, web fuzzing, cracking, reverse engineering, "
++            "shell/pivot/session ops) you MUST delegate: board_create_task(agent=\"<Specialist>\", "
++            "title, body=<exact objective + command>) for parallel fan-out, or delegate_task("
++            "targetAgentId=\"<Specialist>\", ...). Routing: nmap/masscan/discovery→ReconScout; "
++            "ffuf/gobuster/nikto/nuclei/sqlmap/web→WebBreaker; hashcat/john/hydra/wordlists→CredSmith; "
++            "certipy/impacket/nxc/kerberos/ldap/bloodhound/WinRM/ADCS/gMSA/DCSync→ADAttackMapper; "
++            "shell/tmux/ssh/socks/pivot/long-running→SessionRunner; gitleaks/semgrep/secrets→"
++            "SecretHunter; CVE/NVD/EPSS/KEV/version lookups→VulnIntel; final report/evidence→"
++            "ReportSmith. You MAY read_file/search_files/write_file (plans, synthesis, reports), "
++            "recall_conversation, remember, use_skill, web_search, and the board_*/delegate_task tools. "
++            "PLAN → ROUTE → SUPERVISE → APPROVE → SYNTHESIZE. Specialists execute."})
++        emit({"type": "status", "kind": "no_hands",
++              "text": "🎖️ No-Hands Commander — ChillsPwn delegates execution to specialists (terminal/execute_code disabled)"})
++
+     # Context chip: surface WHAT memory/context was injected into THIS turn — the passive
+     # "the model is referring to the MCP/memory" signal, distinct from an explicit recall_conversation.
+     # kind:"context" so the frontend renders it as a small persistent chip (not the transient label).
+@@ -1860,6 +1937,18 @@
+         return (head + "\n" + (final or "(sub-agent produced no text result)"))[:TOOL_RESULT_CAP]
+ 
+     def _run_tool(name, a):
++        # Phase 18 — HARD no-hands commander (belt-and-suspenders). The exec tools are already stripped
++        # from the commander's tool list, but a text-parsed tool-call (DSML/<invoke>) could still name
++        # one. Deny it here and tell the model which specialist to delegate to. Specialists/non-commander
++        # personas are unaffected.
++        if _NO_HANDS_ACTIVE and name in _COMMANDER_BLOCK:
++            try:
++                agent, _ = _recommend_specialist(name, (a or {}).get("command") if isinstance(a, dict) else None)
++                emit({"type": "status", "kind": "no_hands_deny",
++                      "text": f"⛔ Blocked ChillsPwn direct '{name}' — route to {agent}"})
++            except Exception:
++                pass
++            return _no_hands_denial(name, a)
+         # recall_conversation is a LOCAL tool. It now searches THREE sources and returns them
+         # as labeled, budget-split sections: the live findings-ledger (incl. commands already
+         # run), the persistent memory (USER.md + MEMORY.md, inlined in the system prompt), and

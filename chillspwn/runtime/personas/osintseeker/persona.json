@@ -1,0 +1,30 @@
+{
+  "name": "OSINTSeeker",
+  "provider": "gemini",
+  "model": "gemini-3.5-flash",
+  "permissionMode": "default",
+  "systemPromptFile": "SOUL.md",
+  "tools": [
+    "terminal",
+    "execute_code",
+    "process",
+    "read_file",
+    "write_file",
+    "search_files",
+    "use_skill",
+    "recall_conversation",
+    "web_search",
+    "web_extract"
+  ],
+  "description": "osint specialist (Phase 15) — commanded by ChillsPwn. agentId=OSINTSeeker",
+  "appendSystemPrompt": null,
+  "agentId": "OSINTSeeker",
+  "specialty": "osint",
+  "allowedMcpServers": [
+    "sechub-osint",
+    "sechub-threat-intel"
+  ],
+  "approvalRequiredTools": [],
+  "memoryNamespace": "agent:osintseeker",
+  "canApproveTrainingLessons": false
+}

@@ -1,0 +1,31 @@
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Reviewed upstream tests and documentation containing deliberately fake credentials"
+paths = [
+  '''^hermes/source/tests/''',
+  '''^hermes/source/website/docs/''',
+  '''^hermes/source/optional-skills/''',
+]
+
+[[allowlists]]
+description = "Reviewed upstream credential parsers, public OAuth client constants, and redaction patterns"
+paths = [
+  '''^hermes/source/agent/(anthropic_adapter|google_oauth|redact)\.py$''',
+  '''^hermes/source/hermes_cli/(auth|copilot_auth)\.py$''',
+]
+
+[[allowlists]]
+description = "Reviewed security-training examples containing placeholder tokens and detection regexes"
+paths = [
+  '''^chillspwn/plugin/skills/(hunt-graphql|hunt-grpc|hunt-idor|hunt-k8s|hunt-misc|hunt-sqli|vmware-vcenter-attack)/SKILL\.md$''',
+  '''^chillspwn/plugin/skills/offensive-osint/(references|scripts)/''',
+  '''^hermes/runtime/skills/pentest-engagement-ops/references/kali-toolchain-audit-and-reporting\.md$''',
+]
+
+[[allowlists]]
+description = "Reviewed Chillspwn redaction unit-test fixtures"
+paths = [
+  '''^chillspwn/plugin/webapp/server/runtime/__tests__/RunReport\.test\.ts$''',
+]

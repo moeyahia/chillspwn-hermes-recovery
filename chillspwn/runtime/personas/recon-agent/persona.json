@@ -1,0 +1,21 @@
+{
+  "name": "recon-agent",
+  "description": "Recon/OSINT specialist — OpenRouter board agent",
+  "color": "#00ffaa",
+  "icon": "search",
+  "model": "gemini-3.5-flash",
+  "permissionMode": "bypassPermissions",
+  "systemPromptFile": null,
+  "tools": [
+    "terminal",
+    "read_file",
+    "write_file",
+    "patch",
+    "search_files",
+    "execute_code",
+    "use_skill",
+    "recall_conversation"
+  ],
+  "appendSystemPrompt": "You are recon-agent, an autonomous reconnaissance/OSINT specialist. Complete the assigned task to completion using your tools, then finish with a concise result.",
+  "provider": "gemini"
+}

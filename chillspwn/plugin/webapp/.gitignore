@@ -1,0 +1,118 @@
+# ──────────────────────────────────────────────────────────────────────────
+# ChillsPwn webapp .gitignore
+# Goal: track ONLY source. Never commit secrets, CTF loot, auth material,
+# logs, build outputs, caches, backups, archives, or generated artifacts.
+# Added for the agent-runtime work (Phase 1). Conservative by design — when
+# in doubt, exclude.
+# ──────────────────────────────────────────────────────────────────────────
+
+# ── Dependencies / build outputs ──
+node_modules/
+dist/
+dist-revamp/
+dist-*/
+build/
+coverage/
+.vite/
+android/
+*.tsbuildinfo
+
+# ── Logs & runtime data ──
+logs/
+*.log
+*.out
+.runtime-phase*-bak/
+runtime-data/
+server/runtime/.data/
+
+# ── Backups / snapshots / archives ──
+# NB: *.bak* (not *.bak.*) so timestamped copies like `index.ts.bak-20260531` are caught too.
+*.bak
+*.bak*
+*.orig
+*.tmp
+*.tmp-*
+*~
+archives/
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+chillspwn-agent-runtime-phase-*.zip
+
+# ── Secrets / auth / tokens (NEVER COMMIT) ──
+.env
+.env.*
+!.env.example
+auth.json
+*auth*.json
+*.token
+*token*
+*secret*
+*.credentials.json
+.credentials.json
+
+# ── Cryptographic / engagement credential material ──
+*.ccache
+*.kirbi
+*.keytab
+*.pem
+*.key
+*.p12
+*.pfx
+*.pcap
+*.pcapng
+
+# ── CTF loot / engagement artifacts (this tree currently holds live loot) ──
+loot/
+flags/
+flag*.txt
+*flag*.txt
+C:\\*
+*.accdb
+*.mdb
+CVE-*.py
+[0-9][0-9][0-9][0-9][0-9].py
+[0-9][0-9][0-9][0-9][0-9].sh
+[0-9][0-9][0-9][0-9][0-9].txt
+dacledit-*.bak
+
+# ── Generated / local databases & conversation logs ──
+conversation.mcp
+*.mcp
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+*.sqlite-journal
+
+# ── Caches & runtime state ── (NB: bun.lock / package-lock.json are tracked source)
+.cache/
+*.cache
+.tmp/
+tmp/
+*.pid
+.last-*
+
+# ── More credential/engagement material ──
+*.ovpn
+*.rdp
+*.kdbx
+*.gpg
+
+# ── Capacitor / mobile build noise ──
+capacitor.config.json
+.gradle/
+*.apk
+*.aab
+*.keystore
+
+# ── OS / editor noise ──
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+__pycache__/
+*.pyc

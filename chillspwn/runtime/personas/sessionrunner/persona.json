@@ -1,0 +1,35 @@
+{
+  "name": "SessionRunner",
+  "provider": "openai-codex",
+  "model": "gpt-5.6-sol",
+  "permissionMode": "default",
+  "systemPromptFile": "SOUL.md",
+  "tools": [
+    "terminal",
+    "execute_code",
+    "process",
+    "read_file",
+    "write_file",
+    "search_files",
+    "use_skill",
+    "recall_conversation",
+    "web_search",
+    "web_extract"
+  ],
+  "description": "persistent_execution specialist (Phase 15) — commanded by ChillsPwn. agentId=SessionRunner",
+  "appendSystemPrompt": null,
+  "agentId": "SessionRunner",
+  "specialty": "persistent_execution",
+  "allowedMcpServers": [
+    "pentest-mcp-server-ssh"
+  ],
+  "approvalRequiredTools": [
+    "create_session",
+    "execute",
+    "send_input",
+    "upload_file",
+    "kill_session"
+  ],
+  "memoryNamespace": "agent:sessionrunner",
+  "canApproveTrainingLessons": false
+}

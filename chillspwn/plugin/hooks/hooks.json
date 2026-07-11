@@ -1,0 +1,28 @@
+{
+  "description": "ChillsPwn agent hooks — load identity/memory at session start, preserve memory on compaction, auto-save learnings on stop",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/session-start.sh\"",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/pre-compact-memory.sh\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "Stop": []
+  }
+}

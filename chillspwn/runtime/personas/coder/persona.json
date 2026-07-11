@@ -1,0 +1,12 @@
+{
+  "name": "Coder",
+  "description": "Software development specialist — coding, debugging, architecture",
+  "color": "#16a34a",
+  "icon": "terminal",
+  "model": "gpt-5.6-sol",
+  "permissionMode": "auto",
+  "systemPromptFile": "SOUL.md",
+  "tools": "default",
+  "appendSystemPrompt": null,
+  "provider": "openai-codex"
+}

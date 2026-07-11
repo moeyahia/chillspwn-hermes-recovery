@@ -1,0 +1,35 @@
+{
+  "name": "FuzzSmith",
+  "provider": "gemini",
+  "model": "gemini-3.5-flash",
+  "permissionMode": "default",
+  "systemPromptFile": "SOUL.md",
+  "tools": [
+    "terminal",
+    "execute_code",
+    "process",
+    "read_file",
+    "write_file",
+    "search_files",
+    "use_skill",
+    "recall_conversation",
+    "web_search",
+    "web_extract"
+  ],
+  "description": "fuzzing specialist (Phase 15) — commanded by ChillsPwn. agentId=FuzzSmith",
+  "appendSystemPrompt": null,
+  "agentId": "FuzzSmith",
+  "specialty": "fuzzing",
+  "allowedMcpServers": [
+    "sechub-fuzzing",
+    "sechub-code-security"
+  ],
+  "approvalRequiredTools": [
+    "boofuzz_run_fuzzer",
+    "ftp_fuzzer",
+    "run_dharma",
+    "go_fuzz_run"
+  ],
+  "memoryNamespace": "agent:fuzzsmith",
+  "canApproveTrainingLessons": false
+}

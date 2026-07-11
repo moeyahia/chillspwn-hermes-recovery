@@ -1,0 +1,2036 @@
+@import "tailwindcss";
+
+/* ============================================================
+   ChillsPwn — Dark Neon HUD Theme
+   Inspired by hustlearmyknife.com — dark navy backgrounds,
+   cyan/purple neon accents, frosted dark glass panels,
+   cyber grid overlay, neon glow hover states
+   ============================================================ */
+
+/* ============================================================
+   DARK TECHNICAL HUD — revamp 2026-06.  Futuristic via shape · type · precision.
+   Neutral hairline structure + ELECTRIC-LIME signature accent + SOLID surfaces
+   (solid panels make backdrop-filter pointless → it's killed globally below for speed).
+   Same token NAMES as before, remapped values → reskins the whole app at once.
+   ============================================================ */
+@theme {
+  --color-cyber-bg: #0a0e14;
+  --color-cyber-surface: #11161f;
+  --color-cyber-panel: #161c27;
+  --color-cyber-border: rgba(223,230,239,0.12);
+  --color-cyber-border-bright: rgba(182,242,58,0.40);
+  --color-cyber-green: #2bd47f;
+  --color-cyber-cyan: #b6f23a;
+  --color-cyber-red: #ff4d63;
+  --color-cyber-amber: #ffae42;
+  --color-cyber-text: #dfe6ef;
+  --color-cyber-text-dim: #9aa6b6;
+  --color-cyber-text-muted: #5e6b7d;
+}
+
+:root {
+  --bg-primary: #0a0e14;       /* canvas */
+  --bg-dark: #070a0f;          /* deepest */
+  --bg-surface: #11161f;       /* SOLID raised surface (was translucent → needed blur) */
+  --bg-panel: #161c27;         /* SOLID highest */
+  --border-color: rgba(223,230,239,0.12);     /* neutral hairline */
+  --border-bright: rgba(182,242,58,0.42);     /* lime-tint active/hover edge */
+  --neon-green: #2bd47f;       /* success / connected */
+  --neon-cyan: #4d8bff;        /* secondary = volt blue */
+  --neon-red: #ff4d63;
+  --neon-amber: #ffae42;
+  --neon-purple: #b07cff;
+  --text-primary: #dfe6ef;
+  --text-bright: #ffffff;
+  --text-dim: #9aa6b6;
+  --text-muted: #5e6b7d;
+  --jarvis-blue: #b6f23a;      /* PRIMARY accent = electric lime (the signature) */
+  --jarvis-blue-dim: rgba(182,242,58,0.15);
+  --jarvis-blue-faint: rgba(182,242,58,0.06);
+  --hud-gold: #ffae42;
+  --desktop-bg: #0a0e14;
+  --desktop-text: #dfe6ef;
+  /* display font for headings/HUD labels (body stays JetBrains Mono) */
+  --font-display: "Chakra Petch", "JetBrains Mono", monospace;
+}
+
+/* ============================================================
+   KEYFRAMES — Animation library
+   ============================================================ */
+
+/* Animated gradient background */
+@keyframes gradient-shift {
+  0% { background-position: 0% 50%; }
+  50% { background-position: 100% 50%; }
+  100% { background-position: 0% 50%; }
+}
+
+/* Floating bokeh orbs */
+@keyframes bokeh-drift {
+  0% { transform: translate(0, 0) scale(1); }
+  25% { transform: translate(15px, -20px) scale(1.03); }
+  50% { transform: translate(-10px, 10px) scale(0.97); }
+  75% { transform: translate(20px, 15px) scale(1.02); }
+  100% { transform: translate(-5px, -10px) scale(1); }
+}
+
+@keyframes border-breathe {
+  0%, 100% {
+    border-color: rgba(182,242,58,0.1);
+    box-shadow: 0 4px 16px rgba(182,242,58,0.04);
+  }
+  50% {
+    border-color: rgba(182,242,58,0.25);
+    box-shadow: 0 4px 24px rgba(182,242,58,0.1);
+  }
+}
+
+@keyframes flicker-in {
+  0% { opacity: 0; transform: translateY(8px); }
+  40% { opacity: 0.5; }
+  100% { opacity: 1; transform: translateY(0); }
+}
+
+/* Gentle monotonic fade+rise for chat bubbles (no opacity dip → reads as a smooth
+   reveal, not a flicker). Cheap one-shot; does not affect steady-state perf. */
+@keyframes chat-bubble-in {
+  from { opacity: 0; transform: translateY(8px) scale(0.992); }
+  to   { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+/* Soft TOP edge-fade so messages elegantly dissolve as they scroll up out of view.
+   Only the top is masked — the bottom (newest / streaming text) stays fully crisp
+   so you never read through a faded last line. Pure compositor mask, no repaint. */
+.chat-scroll {
+  -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 22px, #000 100%);
+  mask-image: linear-gradient(to bottom, transparent 0, #000 22px, #000 100%);
+}
+
+@keyframes jarvis-title-pulse {
+  0%, 100% { text-shadow: 0 0 12px rgba(182,242,58,0.4), 0 0 30px rgba(182,242,58,0.15); opacity: 1; }
+  50% { text-shadow: 0 0 20px rgba(182,242,58,0.6), 0 0 50px rgba(182,242,58,0.25); opacity: 0.95; }
+}
+
+@keyframes pulse-green {
+  0%, 100% { opacity: 1; box-shadow: 0 0 6px rgba(43,212,127,0.6); }
+  50% { opacity: 0.5; box-shadow: 0 0 12px rgba(43,212,127,0.3); }
+}
+
+@keyframes pulse-red-anim {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
+}
+
+@keyframes streaming-dots {
+  0% { content: "\25CA"; }
+  33% { content: "\25CA\25CA"; }
+  66% { content: "\25CA\25CA\25CA"; }
+}
+
+@keyframes corner-pulse {
+  0%, 100% { border-color: rgba(182,242,58,0.15); }
+  50% { border-color: rgba(182,242,58,0.45); }
+}
+
+@keyframes hud-pulse {
+  0%, 100% { opacity: 0.3; transform: translate(-50%, -50%) scale(1); }
+  50% { opacity: 0.5; transform: translate(-50%, -50%) scale(1.01); }
+}
+
+@keyframes data-scroll {
+  0% { transform: translateY(0); }
+  100% { transform: translateY(-50%); }
+}
+
+@keyframes bracket-reveal {
+  0% { opacity: 0; width: 0; height: 0; }
+  100% { opacity: 1; width: 16px; height: 16px; }
+}
+
+@keyframes glow-wave {
+  0%, 100% { box-shadow: 0 4px 16px rgba(182,242,58,0.06); }
+  50% { box-shadow: 0 8px 32px rgba(182,242,58,0.14); }
+}
+
+@keyframes icon-hologram {
+  0%, 100% {
+    filter: drop-shadow(0 0 4px rgba(182,242,58,0.3));
+  }
+  50% {
+    filter: drop-shadow(0 0 10px rgba(182,242,58,0.5));
+  }
+}
+
+@keyframes window-open {
+  0% {
+    opacity: 0;
+    transform: scale(0.92) translateY(12px);
+  }
+  100% {
+    opacity: 1;
+    transform: scale(1) translateY(0);
+  }
+}
+
+@keyframes taskbar-glow {
+  0%, 100% {
+    box-shadow: 0 -2px 12px rgba(182,242,58,0.06);
+  }
+  50% {
+    box-shadow: 0 -2px 20px rgba(182,242,58,0.12);
+  }
+}
+
+@keyframes tile-scan {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+
+@keyframes particle-drift {
+  0% { transform: translate(0, 0); }
+  25% { transform: translate(-3px, 5px); }
+  50% { transform: translate(2px, -3px); }
+  75% { transform: translate(-5px, -2px); }
+  100% { transform: translate(3px, 4px); }
+}
+
+@keyframes ring-spin {
+  0% { transform: translate(-50%, -50%) rotate(0deg); }
+  100% { transform: translate(-50%, -50%) rotate(360deg); }
+}
+
+@keyframes radar-sweep {
+  0% { transform: translate(-50%, -50%) rotate(0deg); }
+  100% { transform: translate(-50%, -50%) rotate(360deg); }
+}
+
+/* ============================================================
+   GLOBAL LAYOUT
+   ============================================================ */
+
+html {
+  height: 100%;
+  margin: 0;
+  background: #0a0e14;
+  font-size: 110%;
+}
+
+body {
+  height: 100%;
+  margin: 0;
+  background-color: #0a0e14;
+  /* Flat dark canvas + a faint STATIC technical grid (no glow blobs — neon stays on the logos only). */
+  background-image:
+    linear-gradient(rgba(223,230,239,0.02) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(223,230,239,0.02) 1px, transparent 1px);
+  background-size: 30px 30px;
+  background-attachment: fixed;
+  color: var(--desktop-text, oklch(0.96 0.01 280));
+  font-family: "JetBrains Mono", "Fira Code", "Cascadia Code", monospace;
+  overflow: hidden;
+  position: relative;
+}
+
+#root {
+  height: 100%;
+  position: relative;
+  z-index: 1;
+  background: transparent;
+}
+
+/* ============================================================
+   BACKGROUND — Animated layers
+   ============================================================ */
+
+/* LAYER 1: decorative neon bokeh orbs — REMOVED (revamp: neon glow stays on the logos only,
+   background is a flat dark canvas). */
+body::before { display: none !important; }
+
+/* LAYER 2: Cyber grid — cyan-tinted lines with radial mask fade */
+body::after {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 0;
+  background-image:
+    linear-gradient(rgba(182,242,58,0.07) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(182,242,58,0.07) 1px, transparent 1px);
+  background-size: 40px 40px;
+  -webkit-mask-image: radial-gradient(#000 25%, transparent 70%);
+  mask-image: radial-gradient(#000 25%, transparent 70%);
+  opacity: 0.6;
+}
+
+/* Subtle central cyan glow focus */
+#root::before {
+  content: "";
+  position: fixed;
+  width: 600px;
+  height: 600px;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  pointer-events: none;
+  z-index: 0;
+  border-radius: 50%;
+  background: radial-gradient(circle,
+    rgba(182,242,58,0.04) 0%,
+    rgba(182,242,58,0.02) 30%,
+    transparent 70%
+  );
+}
+
+#root::after {
+  content: "";
+  position: fixed;
+  width: 400px;
+  height: 400px;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  pointer-events: none;
+  z-index: 0;
+  border-radius: 50%;
+  background: radial-gradient(circle,
+    rgba(176,124,255,0.03) 0%,
+    transparent 60%
+  );
+}
+
+/* ============================================================
+   SCROLLBAR
+   ============================================================ */
+::-webkit-scrollbar { width: 5px; height: 5px; }
+::-webkit-scrollbar-track { background: rgba(0,0,0,0.3); }
+::-webkit-scrollbar-thumb {
+  background: rgba(182,242,58,0.25);
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover { background: rgba(182,242,58,0.45); }
+
+/* ============================================================
+   TYPOGRAPHY
+   ============================================================ */
+.font-cyber {
+  font-family: "JetBrains Mono", "Fira Code", "Cascadia Code", monospace;
+  letter-spacing: 0.03em;
+}
+
+h1, h2, h3 {
+  color: oklch(0.96 0.01 280);
+  text-shadow: none;
+}
+
+::selection {
+  background: rgba(182,242,58,0.3);
+  color: #ffffff;
+}
+
+/* ============================================================
+   GLOW UTILITIES (neon, dark-appropriate)
+   ============================================================ */
+.glow-green { box-shadow: 0 0 8px rgba(43,212,127,0.35), 0 0 20px rgba(43,212,127,0.12); }
+.glow-green-sm { box-shadow: 0 0 5px rgba(43,212,127,0.3); }
+.glow-cyan { box-shadow: 0 0 8px rgba(182,242,58,0.35), 0 0 20px rgba(182,242,58,0.12); }
+.glow-red { box-shadow: 0 0 8px rgba(255,77,99,0.4), 0 0 20px rgba(255,77,99,0.15); }
+.glow-input:focus {
+  box-shadow: 0 0 0 2px rgba(182,242,58,0.2), 0 0 16px rgba(182,242,58,0.15);
+  border-color: var(--jarvis-blue) !important;
+}
+
+.pulse-dot { animation: pulse-green 1.5s ease-in-out infinite; }
+.pulse-red { animation: pulse-red-anim 1.5s ease-in-out infinite; }
+
+/* ============================================================
+   TITLE — Cyan neon glow text
+   ============================================================ */
+.matrix-title {
+  animation: jarvis-title-pulse 3s ease-in-out infinite;
+  color: #b6f23a;
+  text-shadow: 0 0 12px rgba(182,242,58,0.4), 0 0 30px rgba(182,242,58,0.15);
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  font-weight: 700;
+}
+
+.streaming-indicator::after {
+  content: "\25CA";
+  animation: streaming-dots 0.8s steps(3) infinite;
+  color: var(--jarvis-blue);
+}
+
+/* ============================================================
+   NEON CARD — Dark frosted glass card
+   ============================================================ */
+.neon-card {
+  position: relative;
+  background: rgba(20,24,37,0.85);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border: 1px solid rgba(182,242,58,0.12);
+  border-radius: 0.5rem;
+  box-shadow: 0 4px 16px rgba(0,0,0,0.3);
+  animation: border-breathe 4s ease-in-out infinite;
+  overflow: visible;
+}
+
+.neon-card:hover {
+  border-color: rgba(182,242,58,0.35);
+  box-shadow: 0 8px 32px rgba(182,242,58,0.1), 0 4px 16px rgba(0,0,0,0.3);
+}
+
+/* HUD targeting corners — cyan neon accents */
+.neon-card::before,
+.neon-card::after {
+  content: "";
+  position: absolute;
+  width: 12px;
+  height: 12px;
+  border-color: rgba(182,242,58,0.25);
+  border-style: solid;
+  pointer-events: none;
+  transition: all 0.3s ease;
+  animation: corner-pulse 4s ease-in-out infinite;
+}
+.neon-card::before { top: -1px; left: -1px; border-width: 2px 0 0 2px; }
+.neon-card::after { bottom: -1px; right: -1px; border-width: 0 2px 2px 0; }
+.neon-card:hover::before, .neon-card:hover::after {
+  width: 20px;
+  height: 20px;
+  border-color: rgba(182,242,58,0.5);
+}
+
+/* ============================================================
+   SESSION LIST
+   ============================================================ */
+.session-item {
+  transition: all 0.2s ease;
+  border-left: 2px solid transparent;
+  position: relative;
+}
+.session-item:hover {
+  background: rgba(182,242,58,0.06);
+  border-left-color: rgba(182,242,58,0.3);
+}
+.session-item.active {
+  background: rgba(182,242,58,0.1);
+  border-left-color: #b6f23a;
+}
+.session-item.active::before {
+  content: "";
+  position: absolute;
+  left: 0; top: 0; bottom: 0;
+  width: 2px;
+  background: #b6f23a;
+  box-shadow: 0 0 8px rgba(182,242,58,0.5);
+}
+
+/* ============================================================
+   NAV ITEMS
+   ============================================================ */
+.nav-item {
+  transition: all 0.2s ease;
+  position: relative;
+}
+.nav-item:hover {
+  background: rgba(182,242,58,0.08);
+  color: #b6f23a;
+}
+.nav-active {
+  background: rgba(182,242,58,0.1);
+  color: #b6f23a !important;
+  box-shadow: inset 3px 0 0 #b6f23a;
+}
+.nav-active::after {
+  content: "";
+  position: absolute;
+  left: 0; top: 0; bottom: 0;
+  width: 3px;
+  background: #b6f23a;
+  box-shadow: 0 0 8px rgba(182,242,58,0.5);
+}
+
+/* ============================================================
+   MESSAGES — dark backgrounds with colored left borders
+   ============================================================ */
+/* Bubbles ease in with a soft decelerating "arrive-then-settle" rise on EVERY viewport.
+   The old desktop flicker-in had an opacity dip (0→0.5→1) that flashed; this monotonic
+   easeOutExpo reveal reads like a real chat bubble landing. Compositor-only, one-shot. */
+.msg-animate { animation: chat-bubble-in 0.34s cubic-bezier(0.16, 1, 0.3, 1) both; }
+
+.msg-assistant {
+  border-left: 2px solid #b6f23a;
+  background: rgba(182,242,58,0.06);
+  color: oklch(0.96 0.01 280);
+  position: relative;
+}
+.msg-assistant::before {
+  content: "";
+  position: absolute;
+  left: 0; top: 0; bottom: 0;
+  width: 2px;
+  background: #b6f23a;
+  box-shadow: 0 0 8px rgba(182,242,58,0.4);
+}
+
+.msg-user {
+  border-left: 2px solid #b07cff;
+  background: rgba(176,124,255,0.06);
+  color: oklch(0.96 0.01 280);
+}
+
+.msg-system {
+  border-left: 2px solid #556680;
+  background: rgba(255,255,255,0.03);
+  color: #8a9ab0;
+}
+
+.msg-tool {
+  border-left: 2px solid #ffae42;
+  background: rgba(255,174,66,0.06);
+}
+
+.msg-error {
+  border-left: 2px solid #ff4d63;
+  background: rgba(255,77,99,0.06);
+}
+
+/* ============================================================
+   TOOL PANEL — dark glass with amber accent
+   ============================================================ */
+.tool-panel {
+  background: rgba(20,24,37,0.8);
+  backdrop-filter: blur(12px);
+  border: 1px solid rgba(255,174,66,0.15);
+  border-radius: 0.375rem;
+  transition: all 0.2s ease;
+}
+.tool-panel:hover { border-color: rgba(255,174,66,0.3); box-shadow: 0 4px 16px rgba(255,174,66,0.08); }
+.tool-panel summary { cursor: pointer; user-select: none; list-style: none; }
+.tool-panel summary::-webkit-details-marker { display: none; }
+
+/* ============================================================
+   CHAT TEXT SIZE — override the 125% root scale for chat
+   ============================================================ */
+.chat-content {
+  font-size: 0.72rem;
+  line-height: 1.6;
+}
+
+/* ============================================================
+   CODE / MARKDOWN
+   ============================================================ */
+.chat-content pre {
+  background: rgba(8,10,18,0.8);
+  padding: 0.75rem 1rem;
+  border-radius: 0.5rem;
+  overflow-x: auto;
+  font-size: 0.8rem;
+  font-family: "JetBrains Mono", "Fira Code", monospace;
+  border: 1px solid rgba(182,242,58,0.1);
+  margin: 0.5rem 0;
+  color: oklch(0.90 0.01 280);
+}
+.chat-content code {
+  background: rgba(182,242,58,0.08);
+  color: #b6f23a;
+  padding: 0.15rem 0.4rem;
+  border-radius: 0.25rem;
+  font-size: 0.8rem;
+  font-family: "JetBrains Mono", "Fira Code", monospace;
+}
+.chat-content pre code {
+  background: transparent;
+  padding: 0;
+  color: oklch(0.90 0.01 280);
+}
+
+/* ============================================================
+   FORM CONTROLS
+   ============================================================ */
+select, input[type="text"], input[type="number"], textarea {
+  background: rgba(10,14,25,0.9) !important;
+  border: 1px solid rgba(182,242,58,0.15) !important;
+  color: oklch(0.96 0.01 280);
+  transition: all 0.2s ease;
+}
+select:focus, input:focus, textarea:focus {
+  border-color: var(--jarvis-blue) !important;
+  outline: none;
+  box-shadow: 0 0 0 2px rgba(182,242,58,0.15), 0 0 16px rgba(182,242,58,0.12);
+}
+
+/* ============================================================
+   SIDEBAR
+   ============================================================ */
+aside, nav, [class*="sidebar"], [class*="Sidebar"] {
+  position: relative;
+}
+
+/* ============================================================
+   BUTTONS
+   ============================================================ */
+button { transition: all 0.15s ease; }
+button:hover { filter: brightness(1.15); }
+button:active { filter: brightness(0.85); transform: scale(0.98); }
+
+/* ============================================================
+   LINKS
+   ============================================================ */
+a { color: var(--jarvis-blue); text-decoration: none; }
+a:hover { color: #44e0ff; text-shadow: 0 0 8px rgba(182,242,58,0.3); }
+
+/* ============================================================
+   TABLE DATA
+   ============================================================ */
+table { font-family: "JetBrains Mono", monospace; font-size: 0.82rem; }
+th { color: var(--jarvis-blue); text-transform: uppercase; font-size: 0.72rem; letter-spacing: 0.06em; }
+
+/* ============================================================
+   JARVIS WINDOWED DESKTOP ENVIRONMENT
+   ============================================================ */
+
+/* -- Desktop ------------------------------------------------- */
+
+.hud-desktop {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background: transparent;
+  display: flex;
+  flex-direction: column;
+}
+
+.hud-desktop-icons {
+  flex: 1;
+  display: grid;
+  grid-template-columns: repeat(4, 140px);
+  grid-template-rows: repeat(2, 150px);
+  gap: 18px;
+  align-content: center;
+  justify-content: center;
+  padding: 60px 20px 60px 20px;
+  pointer-events: all;
+  z-index: 5;
+  position: relative;
+}
+
+/* -- Icon Tile ----------------------------------------------- */
+
+.hud-icon-tile {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  width: 140px;
+  height: 140px;
+  border-radius: 12px;
+  border: 1px solid rgba(182,242,58,0.12);
+  background: rgba(20,24,37,0.75);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  cursor: pointer;
+  transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+  position: relative;
+  overflow: hidden;
+  user-select: none;
+  box-shadow: 0 4px 16px rgba(0,0,0,0.3);
+}
+
+.hud-icon-tile::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(
+    120deg,
+    transparent 30%,
+    rgba(182,242,58,0.06) 50%,
+    transparent 70%
+  );
+  background-size: 200% 100%;
+  animation: tile-scan 4s ease-in-out infinite;
+  pointer-events: none;
+}
+
+/* HUD corners on tiles */
+.hud-icon-tile::after {
+  content: "";
+  position: absolute;
+  inset: 3px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  pointer-events: none;
+  transition: border-color 0.25s ease;
+}
+
+.hud-icon-tile:hover {
+  background: rgba(20,24,37,0.9);
+  border-color: rgba(182,242,58,0.4);
+  transform: translateY(-4px) scale(1.04);
+  box-shadow: 0 8px 32px rgba(182,242,58,0.15), 0 4px 16px rgba(0,0,0,0.3);
+}
+
+.hud-icon-tile:hover::after {
+  border-color: rgba(182,242,58,0.15);
+}
+
+.hud-icon-tile:active {
+  transform: translateY(-1px) scale(0.98);
+  box-shadow: 0 2px 8px rgba(0,0,0,0.4);
+}
+
+.hud-icon-tile-icon {
+  font-size: 2rem;
+  color: var(--jarvis-blue);
+  animation: icon-hologram 3s ease-in-out infinite;
+  line-height: 1;
+}
+
+.hud-icon-tile:hover .hud-icon-tile-icon {
+  color: #44e0ff;
+  filter: drop-shadow(0 0 8px rgba(182,242,58,0.5));
+}
+
+.hud-icon-tile-label {
+  font-family: "JetBrains Mono", "Fira Code", monospace;
+  font-size: 0.6rem;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  transition: color 0.2s ease;
+  text-align: center;
+  line-height: 1.2;
+}
+
+.hud-icon-tile:hover .hud-icon-tile-label {
+  color: var(--jarvis-blue);
+}
+
+/* -- Window Container ---------------------------------------- */
+
+.hud-window {
+  display: flex;
+  flex-direction: column;
+  border-radius: 10px;
+  border: 1px solid rgba(182,242,58,0.12);
+  background: #0a0e14;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  box-shadow:
+    0 8px 32px rgba(0,0,0,0.4),
+    0 2px 8px rgba(182,242,58,0.05);
+  overflow: hidden;
+  animation: window-open 0.3s cubic-bezier(0.22, 0.61, 0.36, 1);
+  transition: box-shadow 0.2s ease;
+}
+
+/* HUD corner brackets on windows */
+.hud-window::before,
+.hud-window::after {
+  content: "";
+  position: absolute;
+  width: 16px;
+  height: 16px;
+  border-color: rgba(182,242,58,0.25);
+  border-style: solid;
+  pointer-events: none;
+  z-index: 10;
+  animation: corner-pulse 4s ease-in-out infinite;
+}
+.hud-window::before { top: -1px; left: -1px; border-width: 2px 0 0 2px; border-radius: 10px 0 0 0; }
+.hud-window::after { bottom: -1px; right: -1px; border-width: 0 2px 2px 0; border-radius: 0 0 10px 0; }
+
+/* -- Title Bar ----------------------------------------------- */
+
+.hud-titlebar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  height: 34px;
+  min-height: 34px;
+  padding: 0 10px;
+  background: linear-gradient(180deg, #1a1f30 0%, #151a28 100%);
+  border-bottom: 1px solid rgba(182,242,58,0.15);
+  cursor: grab;
+  user-select: none;
+  position: relative;
+  z-index: 2;
+}
+
+.hud-titlebar:active {
+  cursor: grabbing;
+}
+
+.hud-titlebar-left {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.hud-titlebar-icon {
+  font-size: 0.9rem;
+  color: var(--jarvis-blue);
+  flex-shrink: 0;
+}
+
+.hud-titlebar-title {
+  font-family: "JetBrains Mono", "Fira Code", monospace;
+  font-size: 0.7rem;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: oklch(0.90 0.01 280);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.hud-titlebar-controls {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex-shrink: 0;
+}
+
+/* -- Window Control Buttons ---------------------------------- */
+
+.hud-ctrl-btn {
+  width: 24px;
+  height: 22px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid transparent;
+  border-radius: 3px;
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 0.75rem;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  line-height: 1;
+  padding: 0;
+}
+
+.hud-ctrl-btn:hover {
+  background: rgba(182,242,58,0.1);
+  border-color: rgba(182,242,58,0.2);
+  color: var(--jarvis-blue);
+}
+
+.hud-ctrl-minimize:hover {
+  background: rgba(182,242,58,0.1);
+  color: var(--jarvis-blue);
+}
+
+.hud-ctrl-maximize:hover {
+  background: rgba(43,212,127,0.1);
+  border-color: rgba(43,212,127,0.25);
+  color: var(--neon-green);
+}
+
+.hud-ctrl-close:hover {
+  background: rgba(255,77,99,0.12);
+  border-color: rgba(255,77,99,0.3);
+  color: var(--neon-red);
+}
+
+.hud-ctrl-close:active {
+  background: rgba(255,77,99,0.2);
+}
+
+/* -- Window Body --------------------------------------------- */
+
+.hud-window-body {
+  flex: 1;
+  overflow: hidden;
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+/* Ensure pages inside windows fill the space */
+.hud-window-body > * {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+}
+
+/* -- Resize Handle ------------------------------------------- */
+
+.hud-resize-handle {
+  position: absolute;
+  bottom: 0;
+  right: 0;
+  width: 16px;
+  height: 16px;
+  cursor: nwse-resize;
+  z-index: 10;
+  background:
+    linear-gradient(135deg, transparent 50%, rgba(182,242,58,0.2) 50%);
+  border-radius: 0 0 9px 0;
+  transition: background 0.2s ease;
+}
+
+.hud-resize-handle:hover {
+  background:
+    linear-gradient(135deg, transparent 50%, rgba(182,242,58,0.4) 50%);
+}
+
+/* -- Taskbar ------------------------------------------------- */
+
+.hud-taskbar {
+  display: flex;
+  align-items: center;
+  height: 38px;
+  min-height: 38px;
+  padding: 0 12px;
+  background: #0e121e;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  border-top: 1px solid rgba(182,242,58,0.1);
+  box-shadow: 0 -4px 16px rgba(0,0,0,0.3);
+  z-index: 9000;
+  position: relative;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.hud-taskbar-left {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.hud-taskbar-logo {
+  font-size: 1rem;
+  color: var(--jarvis-blue);
+}
+
+.hud-taskbar-brand {
+  font-family: "JetBrains Mono", "Fira Code", monospace;
+  font-size: 0.7rem;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--jarvis-blue);
+}
+
+.hud-taskbar-status-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  animation: pulse-green 1.5s ease-in-out infinite;
+  flex-shrink: 0;
+  transition: background-color 0.3s ease;
+}
+
+.hud-taskbar-status-dot-offline {
+  animation: none;
+  box-shadow: 0 0 4px rgba(255,77,99, 0.5);
+}
+
+/* ============================================================
+   CHAT CONTENT WRAPPING — prevent sentences from overflowing
+   ============================================================ */
+.chat-content,
+.chat-content * {
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+.chat-content pre,
+.chat-content code {
+  white-space: pre-wrap !important;
+  overflow-wrap: anywhere !important;
+  word-break: break-word !important;
+  max-width: 100%;
+}
+/* Long URLs and tokens shouldn't push the bubble out of the chat column */
+.msg-assistant, .msg-user, .msg-system, .msg-tool {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+/* ============================================================
+   CYBER INPUT — chat textarea with terminal vibe
+   ============================================================ */
+.cyber-input {
+  transition: border-color 0.2s, box-shadow 0.2s;
+  outline: none;
+  caret-color: var(--neon-green, #2bd47f) !important;
+}
+.cyber-input:focus {
+  border-color: rgba(43,212,127, 0.6) !important;
+  box-shadow:
+    inset 0 0 0 1px rgba(43,212,127, 0.2),
+    0 0 16px rgba(43,212,127, 0.18),
+    0 0 32px rgba(182,242,58, 0.06) !important;
+}
+.cyber-input::placeholder {
+  color: var(--text-muted);
+  opacity: 0.45;
+  font-family: 'JetBrains Mono', 'Fira Code', monospace;
+  font-style: italic;
+  font-size: 12px;
+  letter-spacing: 0.02em;
+}
+.cyber-input::selection {
+  background: rgba(182,242,58, 0.3);
+  color: #fff;
+}
+
+/* ============================================================
+   KANBAN — trello-style draggable cards
+   ============================================================ */
+.kanban-card-draggable:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4), 0 0 0 1px rgba(182,242,58, 0.15);
+}
+.kanban-card-draggable:active {
+  cursor: grabbing !important;
+}
+.kanban-card-draggable {
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+/* xterm.js — enable touch/mobile scrolling */
+.xterm-viewport {
+  overflow-y: auto !important;
+  -webkit-overflow-scrolling: touch !important;
+  touch-action: pan-y !important;
+}
+.xterm-screen {
+  touch-action: pan-y !important;
+}
+
+.hud-taskbar-center {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  overflow-x: auto;
+  padding: 0 8px;
+  justify-content: center;
+}
+
+.hud-taskbar-center::-webkit-scrollbar { height: 0; }
+
+/* -- Taskbar Tabs -------------------------------------------- */
+
+.hud-taskbar-tab {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 10px;
+  border-radius: 4px;
+  border: 1px solid rgba(182,242,58,0.1);
+  background: rgba(182,242,58,0.04);
+  cursor: pointer;
+  transition: all 0.15s ease;
+  white-space: nowrap;
+  max-width: 160px;
+}
+
+.hud-taskbar-tab:hover {
+  background: rgba(182,242,58,0.1);
+  border-color: rgba(182,242,58,0.25);
+}
+
+.hud-taskbar-tab-active {
+  border-color: rgba(182,242,58,0.3);
+  background: rgba(182,242,58,0.1);
+  box-shadow: 0 2px 8px rgba(182,242,58,0.1);
+}
+
+.hud-taskbar-tab-minimized {
+  opacity: 0.5;
+  border-style: dashed;
+}
+
+.hud-taskbar-tab-minimized:hover {
+  opacity: 0.8;
+}
+
+.hud-taskbar-tab-icon {
+  font-size: 0.7rem;
+  color: var(--jarvis-blue);
+}
+
+.hud-taskbar-tab-label {
+  font-family: "JetBrains Mono", "Fira Code", monospace;
+  font-size: 0.6rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+
+.hud-taskbar-tab:hover .hud-taskbar-tab-label {
+  color: var(--jarvis-blue);
+}
+
+.hud-taskbar-tab-active .hud-taskbar-tab-label {
+  color: var(--text-primary);
+}
+
+/* -- Taskbar Right ------------------------------------------- */
+
+.hud-taskbar-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.hud-taskbar-persona {
+  font-family: "JetBrains Mono", "Fira Code", monospace;
+  font-size: 0.65rem;
+  letter-spacing: 0.06em;
+  color: var(--neon-green);
+}
+
+.hud-taskbar-model {
+  font-family: "JetBrains Mono", "Fira Code", monospace;
+  font-size: 0.6rem;
+  letter-spacing: 0.04em;
+  color: var(--text-dim);
+}
+
+.hud-taskbar-mode {
+  font-family: "JetBrains Mono", "Fira Code", monospace;
+  font-size: 0.6rem;
+  letter-spacing: 0.04em;
+  color: var(--hud-gold);
+}
+
+.hud-taskbar-divider {
+  color: var(--text-muted);
+  font-size: 0.6rem;
+}
+
+.hud-taskbar-time {
+  font-family: "JetBrains Mono", "Fira Code", monospace;
+  font-size: 0.7rem;
+  letter-spacing: 0.06em;
+  color: var(--jarvis-blue);
+}
+
+.hud-taskbar-date {
+  font-family: "JetBrains Mono", "Fira Code", monospace;
+  font-size: 0.55rem;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+  margin-left: -4px;
+}
+
+/* -- Persona Panel (top-right overlay) ----------------------- */
+
+.hud-persona-panel {
+  position: absolute;
+  top: 14px;
+  right: 14px;
+  width: 190px;
+  z-index: 50;
+  border-radius: 8px;
+  border: 1px solid rgba(182,242,58,0.12);
+  background: #0a0e14;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  box-shadow:
+    0 4px 20px rgba(0,0,0,0.4),
+    0 2px 8px rgba(182,242,58,0.05);
+  overflow: hidden;
+  animation: border-breathe 4s ease-in-out infinite;
+}
+
+.hud-persona-panel-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  border-bottom: 1px solid rgba(182,242,58,0.08);
+  font-family: "JetBrains Mono", "Fira Code", monospace;
+  font-size: 0.6rem;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--jarvis-blue);
+}
+
+.hud-persona-panel-icon {
+  font-size: 0.75rem;
+  color: var(--jarvis-blue);
+}
+
+.hud-persona-panel-body {
+  padding: 8px 10px;
+  display: flex;
+  flex-direction: column;
+}
+
+.hud-persona-label {
+  font-family: "JetBrains Mono", "Fira Code", monospace;
+  font-size: 0.5rem;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  margin-bottom: 3px;
+}
+
+.hud-persona-select {
+  width: 100%;
+  font-family: "JetBrains Mono", "Fira Code", monospace;
+  font-size: 0.65rem;
+  padding: 4px 6px;
+  border-radius: 4px;
+  background: rgba(10,14,25,0.9) !important;
+  border: 1px solid rgba(182,242,58,0.15) !important;
+  color: var(--neon-green);
+  outline: none;
+  transition: all 0.2s ease;
+}
+
+.hud-persona-select:focus {
+  border-color: var(--jarvis-blue) !important;
+  box-shadow: 0 0 12px rgba(182,242,58,0.15);
+}
+
+/* ============================================================
+   BACKGROUND LAYER 5 — Floating neon motes
+   ============================================================ */
+.hud-desktop::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 0;
+  background-image:
+    radial-gradient(2px 2px at 10% 15%, rgba(182,242,58,0.2) 50%, transparent 100%),
+    radial-gradient(2px 2px at 20% 70%, rgba(176,124,255,0.15) 50%, transparent 100%),
+    radial-gradient(3px 3px at 35% 25%, rgba(182,242,58,0.22) 50%, transparent 100%),
+    radial-gradient(2px 2px at 45% 85%, rgba(176,124,255,0.12) 50%, transparent 100%),
+    radial-gradient(2.5px 2.5px at 55% 10%, rgba(182,242,58,0.18) 50%, transparent 100%),
+    radial-gradient(2px 2px at 65% 55%, rgba(176,124,255,0.12) 50%, transparent 100%),
+    radial-gradient(3px 3px at 75% 35%, rgba(182,242,58,0.15) 50%, transparent 100%),
+    radial-gradient(2px 2px at 85% 75%, rgba(176,124,255,0.12) 50%, transparent 100%),
+    radial-gradient(2.5px 2.5px at 92% 20%, rgba(182,242,58,0.15) 50%, transparent 100%),
+    radial-gradient(2px 2px at 5% 45%, rgba(176,124,255,0.1) 50%, transparent 100%),
+    radial-gradient(2px 2px at 30% 55%, rgba(182,242,58,0.1) 50%, transparent 100%),
+    radial-gradient(3px 3px at 50% 45%, rgba(176,124,255,0.14) 50%, transparent 100%),
+    radial-gradient(2px 2px at 70% 80%, rgba(182,242,58,0.12) 50%, transparent 100%),
+    radial-gradient(2.5px 2.5px at 15% 90%, rgba(176,124,255,0.12) 50%, transparent 100%),
+    radial-gradient(2px 2px at 88% 50%, rgba(182,242,58,0.14) 50%, transparent 100%),
+    radial-gradient(2px 2px at 40% 5%, rgba(176,124,255,0.1) 50%, transparent 100%),
+    radial-gradient(3px 3px at 60% 65%, rgba(182,242,58,0.16) 50%, transparent 100%),
+    radial-gradient(2px 2px at 25% 40%, rgba(176,124,255,0.1) 50%, transparent 100%),
+    radial-gradient(2.5px 2.5px at 80% 15%, rgba(182,242,58,0.14) 50%, transparent 100%),
+    radial-gradient(2px 2px at 95% 85%, rgba(176,124,255,0.12) 50%, transparent 100%);
+  animation: particle-drift 40s linear infinite alternate;
+}
+
+/* ============================================================
+   BACKGROUND LAYER 6 — Subtle decorative ring indicators
+   ============================================================ */
+.hud-desktop::after {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 0;
+  background-image:
+    radial-gradient(circle at 8% 12%, transparent 14px, rgba(182,242,58,0.06) 15px, rgba(182,242,58,0.06) 16px, transparent 17px),
+    radial-gradient(circle at 8% 12%, transparent 8px, rgba(182,242,58,0.04) 9px, rgba(182,242,58,0.04) 10px, transparent 11px),
+    radial-gradient(circle at 92% 88%, transparent 18px, rgba(176,124,255,0.04) 19px, rgba(176,124,255,0.04) 20px, transparent 21px),
+    radial-gradient(circle at 92% 88%, transparent 10px, rgba(176,124,255,0.03) 11px, rgba(176,124,255,0.03) 12px, transparent 13px),
+    radial-gradient(circle at 15% 75%, transparent 12px, rgba(182,242,58,0.04) 13px, rgba(182,242,58,0.04) 14px, transparent 15px),
+    radial-gradient(circle at 85% 25%, transparent 16px, rgba(176,124,255,0.04) 17px, rgba(176,124,255,0.04) 18px, transparent 19px),
+    radial-gradient(circle at 85% 25%, transparent 22px, rgba(176,124,255,0.03) 23px, rgba(176,124,255,0.03) 24px, transparent 25px),
+    radial-gradient(circle at 50% 8%, transparent 10px, rgba(182,242,58,0.04) 11px, rgba(182,242,58,0.04) 12px, transparent 13px),
+    radial-gradient(circle at 35% 92%, transparent 14px, rgba(182,242,58,0.04) 15px, rgba(182,242,58,0.04) 16px, transparent 17px),
+    radial-gradient(circle at 8% 12%, rgba(182,242,58,0.08) 2px, transparent 3px),
+    radial-gradient(circle at 92% 88%, rgba(176,124,255,0.07) 2px, transparent 3px),
+    radial-gradient(circle at 85% 25%, rgba(176,124,255,0.06) 2px, transparent 3px),
+    radial-gradient(circle at 15% 75%, rgba(182,242,58,0.07) 2px, transparent 3px);
+}
+
+/* ============================================================
+   Circuit traces container
+   ============================================================ */
+.hud-desktop {
+  position: relative;
+}
+
+.hud-desktop > .circuit-traces {
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 0;
+  overflow: hidden;
+}
+
+/* ============================================================
+   Gear ring (dark neon version)
+   ============================================================ */
+.hud-gear-ring {
+  position: fixed;
+  width: 900px;
+  height: 900px;
+  top: 50%;
+  left: 55%;
+  pointer-events: none;
+  z-index: 0;
+  border-radius: 50%;
+  background:
+    radial-gradient(circle, transparent 38%, rgba(182,242,58,0.03) 39%, rgba(182,242,58,0.03) 40%, transparent 41%),
+    radial-gradient(circle, transparent 55%, rgba(176,124,255,0.02) 56%, rgba(176,124,255,0.02) 57%, transparent 58%),
+    radial-gradient(circle, transparent 72%, rgba(182,242,58,0.015) 73%, rgba(182,242,58,0.015) 74%, transparent 75%),
+    radial-gradient(circle, transparent 89%, rgba(176,124,255,0.01) 90%, rgba(176,124,255,0.01) 91%, transparent 92%);
+  transform: translate(-50%, -50%);
+  opacity: 0.5;
+}
+
+/* ============================================================
+   CYBER GRID — cyan-tinted grid lines with radial mask fade
+   ============================================================ */
+.cyber-grid {
+  background-image:
+    linear-gradient(
+      rgba(182,242,58,0.07) 1px,
+      transparent 1px
+    ),
+    linear-gradient(
+      90deg,
+      rgba(182,242,58,0.07) 1px,
+      transparent 1px
+    ),
+    url("/Background.svg");
+  background-size: 40px 40px, 40px 40px, cover;
+  background-position: top left, top left, center;
+  background-repeat: repeat, repeat, no-repeat;
+  -webkit-mask-image: radial-gradient(ellipse at center, black 30%, transparent 75%);
+  mask-image: radial-gradient(ellipse at center, black 30%, transparent 75%);
+}
+
+/* Scanlines overlay — subtle */
+.scanlines::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: repeating-linear-gradient(
+    0deg,
+    transparent 0 2px,
+    rgba(182,242,58,0.03) 2px 3px
+  );
+  pointer-events: none;
+  mix-blend-mode: overlay;
+}
+
+/* Glitch hover effect for interactive elements */
+@keyframes glitch {
+  0%, 100% { transform: translate(0, 0); }
+  20% { transform: translate(-1px, 1px); }
+  40% { transform: translate(1px, -1px); }
+  60% { transform: translate(-1px, -1px); }
+  80% { transform: translate(1px, 1px); }
+}
+.glitch:hover {
+  animation: glitch 0.3s infinite;
+}
+
+/* ============================================================
+   MOBILE RESPONSIVE — Galaxy Fold and other mobile devices
+   ============================================================ */
+@media (max-width: 899px) {
+  html { font-size: 100% !important; }
+
+  .hud-desktop-icons {
+    grid-template-columns: repeat(3, 90px) !important;
+    grid-template-rows: auto !important;
+    gap: 10px !important;
+    padding: 20px 10px !important;
+  }
+
+  .hud-icon-tile {
+    width: 90px !important;
+    height: 90px !important;
+  }
+
+  .hud-icon-tile-icon { font-size: 1.5rem !important; }
+  .hud-icon-tile-label { font-size: 0.5rem !important; }
+
+  .chat-content { font-size: 0.78rem !important; }
+
+  /* Make session sidebar narrower on mobile */
+  .session-item { padding: 4px 6px !important; }
+}
+
+/* ============================================================
+   NATIVE MOBILE APP SHELL — used at <900px in App.tsx
+   ============================================================ */
+.app-shell {
+  /* #63 (attempt 6 — the real fix). IN-FLOW full height, NOT position:fixed. On this iOS
+     standalone PWA, position:fixed boxes resolve against a containing block that EXCLUDES the
+     bottom safe area — proven: a fixed splash AND a fixed shell both left a ~30px strip of body
+     background (#0a0e14 = --bg-primary, the exact measured strip color) below the nav. An in-flow
+     element sized to the viewport reaches the TRUE screen bottom, exactly like <body> does. This
+     restores the original known-good in-flow shell that I regressed four attempts ago by switching
+     to position:fixed. The original's first-paint shrink (gap until you navigated) is now handled
+     by index.html: a splash held ~800ms covers the settle, then one reflow re-resolves the height.
+     100lvh (stable large viewport) preferred; 100dvh fallback. */
+  height: 100dvh;
+  height: 100lvh;
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-primary);
+  /* iOS safe areas — TOP only. The bottom inset is owned by .app-tab-bar (its last child),
+     which pads its own background into the home-indicator area. Adding padding-bottom here too
+     double-counted the inset and left a strip of page background between content and the nav. */
+  padding-top: env(safe-area-inset-top, 0);
+}
+
+.app-bar {
+  /* raised from 58px so the larger 60px brand logo fits with breathing room */
+  height: 72px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 14px;
+  background: rgba(14, 18, 30, 0.85);
+  backdrop-filter: blur(14px) saturate(180%);
+  -webkit-backdrop-filter: blur(14px) saturate(180%);
+  border-bottom: 1px solid rgba(182,242,58, 0.12);
+  flex-shrink: 0;
+  position: sticky;
+  top: 0;
+  z-index: 10;
+}
+
+.app-bar-title {
+  font-size: 17px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  color: var(--jarvis-blue);
+  text-transform: uppercase;
+}
+
+.app-bar-status-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 12px;
+  padding: 5px 11px;
+  border-radius: 999px;
+  background: rgba(182,242,58, 0.08);
+  border: 1px solid rgba(182,242,58, 0.2);
+  color: var(--text-muted);
+  font-weight: 600;
+  letter-spacing: 0.04em;
+}
+
+.app-content {
+  flex: 1;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  position: relative;
+}
+
+/* iOS momentum/touch scrolling for any overflow container in the standalone PWA.
+   Harmless on non-scrolling elements — only affects overflow:auto/scroll areas. */
+* {
+  -webkit-overflow-scrolling: touch;
+}
+
+.app-tab-bar {
+  display: flex;
+  flex-shrink: 0;
+  background: rgba(14, 18, 30, 0.92);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  border-top: 1px solid rgba(182,242,58, 0.12);
+  padding: 6px 4px calc(6px + env(safe-area-inset-bottom, 0)) 4px;
+}
+
+.app-tab {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 7px 4px;
+  background: transparent;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  gap: 4px;
+  position: relative;
+  min-height: 58px;
+  transition: color 0.2s, transform 0.1s;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.app-tab:active {
+  transform: scale(0.94);
+}
+
+.app-tab-active {
+  color: var(--jarvis-blue);
+}
+
+/* Active indicator: small dot above the icon */
+.app-tab-active::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 28px;
+  height: 3px;
+  border-radius: 0 0 3px 3px;
+  background: var(--jarvis-blue);
+  box-shadow: 0 0 8px rgba(182,242,58, 0.6);
+}
+
+.app-tab-icon {
+  font-size: 24px;
+  line-height: 1;
+  /* Cyber glyphs need a tighter font for that terminal feel */
+  font-family: 'JetBrains Mono', 'Fira Code', monospace;
+  text-shadow: 0 0 6px currentColor;
+  filter: drop-shadow(0 0 4px rgba(182,242,58, 0.25));
+}
+
+.app-tab-active .app-tab-icon {
+  filter: drop-shadow(0 0 8px rgba(182,242,58, 0.7));
+}
+
+.app-tab-label {
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+}
+
+.app-tab-badge {
+  position: absolute;
+  top: 6px;
+  right: 50%;
+  margin-right: -18px;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  border-radius: 999px;
+  background: var(--neon-red, #ff4d63);
+  color: #fff;
+  font-size: 9px;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 2px solid #0e121e;
+}
+
+/* FAB — Floating Action Button */
+.app-fab {
+  position: absolute;
+  right: 16px;
+  bottom: 16px;
+  width: 56px;
+  height: 56px;
+  border-radius: 50%;
+  background: linear-gradient(135deg, rgba(182,242,58,0.95), rgba(0,153,255,0.95));
+  border: none;
+  color: #001020;
+  font-size: 24px;
+  font-weight: 700;
+  cursor: pointer;
+  box-shadow: 0 4px 16px rgba(182,242,58,0.4), 0 0 32px rgba(182,242,58,0.2);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 20;
+  transition: transform 0.15s, box-shadow 0.15s;
+  -webkit-tap-highlight-color: transparent;
+}
+.app-fab:active {
+  transform: scale(0.92);
+  box-shadow: 0 2px 10px rgba(182,242,58,0.3);
+}
+
+/* Slide-up sheet (for More menu / modals) */
+.app-sheet-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.5);
+  backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
+  z-index: 30;
+  animation: fade-in 0.2s ease-out;
+}
+
+.app-sheet {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: #0a0e14;
+  border-top: 1px solid rgba(182,242,58, 0.2);
+  border-radius: 18px 18px 0 0;
+  padding: 12px 16px calc(16px + env(safe-area-inset-bottom, 0)) 16px;
+  z-index: 31;
+  max-height: 80vh;
+  overflow-y: auto;
+  animation: slide-up-sheet 0.28s cubic-bezier(0.22, 0.61, 0.36, 1);
+  box-shadow: 0 -8px 30px rgba(0, 0, 0, 0.6);
+}
+
+.app-sheet-handle {
+  width: 36px;
+  height: 4px;
+  background: rgba(255, 255, 255, 0.2);
+  border-radius: 2px;
+  margin: 0 auto 14px auto;
+}
+
+.app-sheet-title {
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--jarvis-blue);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  margin-bottom: 14px;
+}
+
+/* App grid in the More sheet — iOS-style square cards */
+.app-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 11px;
+}
+
+.app-grid-tile {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 16px 4px;
+  border-radius: 14px;
+  background: rgba(182,242,58, 0.04);
+  border: 1px solid rgba(182,242,58, 0.12);
+  color: var(--text-primary);
+  cursor: pointer;
+  gap: 7px;
+  transition: transform 0.15s, background 0.15s, border-color 0.15s;
+  -webkit-tap-highlight-color: transparent;
+}
+.app-grid-tile:active {
+  transform: scale(0.93);
+  background: rgba(182,242,58, 0.12);
+  border-color: rgba(182,242,58, 0.3);
+}
+.app-grid-tile-active {
+  background: rgba(182,242,58, 0.15) !important;
+  border-color: rgba(182,242,58, 0.5) !important;
+}
+.app-grid-tile-icon {
+  font-size: 26px;
+  font-family: 'JetBrains Mono', 'Fira Code', monospace;
+  color: var(--jarvis-blue);
+  text-shadow: 0 0 8px rgba(182,242,58, 0.3);
+  line-height: 1;
+}
+.app-grid-tile-label {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  text-align: center;
+  color: var(--text-dim);
+  line-height: 1.25;
+}
+
+@keyframes slide-up-sheet {
+  from { transform: translateY(100%); }
+  to { transform: translateY(0); }
+}
+@keyframes fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+/* Mobile chat tweaks — larger text and inputs for thumbs (~15% bigger than original) */
+@media (max-width: 899px) {
+  body, html { font-size: 17px; }
+  /* Chat-content gets a real readable size, not desktop 0.78rem */
+  .chat-content { font-size: 0.95rem !important; line-height: 1.55 !important; }
+  /* Bigger touch targets + bigger typing font */
+  .glow-input { min-height: 48px !important; font-size: 16px !important; padding: 12px 14px !important; }
+  /* Bigger send button */
+  button { -webkit-tap-highlight-color: transparent; }
+  /* Bigger code rendered in chat */
+  .chat-content pre, .chat-content code { font-size: 13px !important; }
+  /* Cards more spacious + rounded */
+  .msg-assistant, .msg-user, .msg-system, .msg-tool {
+    border-radius: 12px !important;
+    padding: 14px 16px !important;
+  }
+  /* Hide hover effects on touch */
+  *:hover { transition: none !important; }
+}
+
+/* ──────────────────────────────────────────────────────────────
+   MOBILE PERFORMANCE OVERRIDES (added for mobile/iPad smoothness)
+   Continuous (infinite) decorative animations and backdrop-filter
+   blur are the main cause of laggy touch / scroll jank on phones &
+   iPad: mobile GPUs repaint the whole layer every frame, even when
+   nothing is interacting. We drop the heavy decorative loops + blur
+   on small screens but KEEP the tiny functional indicators (status
+   pulse dots, streaming dots) which are cheap and meaningful.
+   ────────────────────────────────────────────────────────────── */
+@media (max-width: 899px) {
+  /* Full-screen continuous backgrounds — the single biggest offenders */
+  body::before,
+  .hud-desktop::before { animation: none !important; }
+
+  /* Decorative card / title glows that repaint on every visible card */
+  .matrix-title,
+  .neon-card,
+  .neon-card::after,
+  .hud-persona-panel { animation: none !important; }
+
+  /* backdrop-filter blur is very expensive on mobile Safari/Chrome.
+     Drop it on the mobile chrome + cards (a solid bg sits behind them). */
+  .app-bar,
+  .app-tab-bar,
+  .app-sheet-backdrop,
+  .neon-card,
+  .tool-panel {
+    backdrop-filter: none !important;
+    -webkit-backdrop-filter: none !important;
+  }
+
+  /* Chat bubbles: skip layout/paint of OFF-SCREEN messages while scrolling
+     ("poor-man's virtualization" — nodes stay in the DOM, the browser just
+     doesn't render them until near the viewport). contain-intrinsic-size gives
+     each skipped bubble a ~120px height estimate so the scrollbar stays stable.
+     Use the gentle monotonic fade (not the old flicker) so a bubble revealed by
+     scroll-into-view eases in smoothly instead of flashing. */
+  /* .msg-animate: animation comes from the unified base rule; content-visibility removed here
+     too (it caused scroll-up snapping with variable bubble heights — see note further below). */
+}
+
+/* Honour the OS "reduce motion" accessibility setting on every device:
+   collapse all animations/transitions to ~instant so nothing loops. */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
+}
+
+/* ══════════════════════════════════════════════════════════════
+   DARK-HUD REVAMP — GLOBAL LAG-KILL (all viewports: desktop · iPad · Fold · iPhone)
+   The two dominant causes of heaviness were backdrop-filter blur (133 sites) and
+   perpetual decorative animation loops. Surfaces are now SOLID, so backdrop-filter
+   reveals nothing → kill it everywhere (the * !important also beats inline styles).
+   Stop the full-screen + per-card/title decorative loops; KEEP the tiny functional
+   indicators (status pulse dots, streaming dots) — cheap and meaningful.
+   ══════════════════════════════════════════════════════════════ */
+*, *::before, *::after {
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+}
+body::before,
+.hud-desktop::before,
+.matrix-title,
+.neon-card,
+.neon-card::after,
+.neon-card::before,
+.hud-icon-tile::before,
+.hud-icon-tile-icon,
+.hud-window::after,
+.hud-persona-panel,
+.glitch:hover {
+  animation: none !important;
+}
+
+/* Display type — squared technical face for headings / HUD labels (body stays mono). */
+.matrix-title,
+.hud-title, .hud-window-title, .hud-persona-name,
+h1, h2, h3, .disp {
+  font-family: var(--font-display);
+  letter-spacing: 0.02em;
+}
+
+/* Brand logo — embedded-raster logo recolored to lime via hue-rotate + a gentle neon glow.
+   One small element, so the glow loop is kept (the global lag-kill targets the heavy decorative
+   loops, not this). */
+@keyframes logo-neon {
+  0%, 100% { filter: hue-rotate(150deg) saturate(1.5) brightness(1.1)  drop-shadow(0 0 5px rgba(182,242,58,0.45)); }
+  50%      { filter: hue-rotate(150deg) saturate(1.62) brightness(1.18) drop-shadow(0 0 12px rgba(182,242,58,0.78)); }
+}
+.brand-logo { animation: logo-neon 3.2s ease-in-out infinite; }
+
+/* ── Telegram-smooth chat (revamp) ──────────────────────────────
+   Off-screen message bubbles skip layout/paint via content-visibility on EVERY device (was
+   mobile-only) → the list scrolls smoothly no matter how long the history. Momentum scrolling +
+   contained overscroll kill the iOS rubber-band jank. Pairs with the global backdrop-filter kill. */
+/* content-visibility was REMOVED from chat bubbles: with wildly variable bubble heights
+   (a one-line reply vs a 50-line terminal dump) the fixed size-estimate made the scrollbar
+   JUMP/snap when you scrolled up past them. History is paginated ("Load older"), so the
+   rendered node count stays bounded and native scrolling is smooth without it. */
+/* Streaming caret — terminal-style blink at the end of the growing reply, so it reads as
+   "alive / typing" instead of a block silently resizing. Honours reduced-motion (below). */
+@keyframes caret-blink { 0%, 49% { opacity: 1; } 50%, 100% { opacity: 0; } }
+.stream-caret { display: inline-block; margin-left: 1px; transform: translateY(1px); color: var(--neon-green, #b6f23a); font-weight: 700; animation: caret-blink 1.05s step-end infinite; }
+/* Native scrolling only — NO global scroll-behavior:smooth (it animated the scroll-anchor
+   corrections during scroll-up and read as a "snap") and NO will-change (forced a compositor
+   layer that added repaint jank). Manual wheel/touch scroll is now buttery-native; the
+   "Jump to latest" pill does its own one-off smooth scrollTo(). */
+.chat-scroll { -webkit-overflow-scrolling: touch; overscroll-behavior: contain; }
+
+/* ══════════════════════════════════════════════════════════════
+   POC SKIN — make the real app look like the dark-HUD POC: notched panels,
+   corner ticks, command bar, clean cards/badges/buttons, Chakra Petch headers.
+   Targets the app's CLASSED surfaces (shell + cards). Notch only on non-scrolling
+   chrome (clip-path would clip a scroll container's content/scrollbar).
+   ══════════════════════════════════════════════════════════════ */
+:root{ --notch:10px; --acid:#b6f23a; --acid-ink:#0a1400; --panelc:#11161f; --panel2:#161c27;
+       --line:rgba(223,230,239,.13); --line2:rgba(223,230,239,.06); }
+
+/* ── command bar ── */
+.app-bar{ background:#0d121b !important; border-bottom:1px solid var(--line) !important;
+  backdrop-filter:none !important; box-shadow:none !important; }
+.app-bar-title{ font-family:var(--font-display) !important; letter-spacing:.05em !important;
+  text-transform:uppercase; font-weight:700 !important; }
+
+/* ── bottom nav ── */
+.app-tab-bar{ background:#0d121b !important; border-top:1px solid var(--line) !important;
+  backdrop-filter:none !important; box-shadow:none !important; }
+.app-tab{ position:relative; color:var(--text-muted) !important; transition:.14s ease; }
+.app-tab-label{ font-family:var(--font-display); letter-spacing:.09em; font-size:9px !important; }
+.app-tab-active{ color:var(--acid) !important; }
+.app-tab-active::before{ content:""; position:absolute; top:0; left:22%; right:22%; height:2px;
+  background:var(--acid); }
+
+/* ── More sheet + tiles ── */
+.app-sheet{ background:#0d121b !important; border:1px solid var(--line) !important;
+  border-bottom:0 !important; backdrop-filter:none !important;
+  clip-path:polygon(var(--notch) 0,100% 0,100% 100%,0 100%,0 var(--notch)); }
+.app-sheet-title{ font-family:var(--font-display) !important; text-transform:uppercase;
+  letter-spacing:.08em; }
+.app-grid-tile{ position:relative; background:var(--panel2) !important; border:1px solid var(--line) !important;
+  border-radius:0 !important;
+  clip-path:polygon(7px 0,100% 0,100% calc(100% - 7px),calc(100% - 7px) 100%,0 100%,0 7px); transition:.14s ease; }
+.app-grid-tile:hover{ border-color:rgba(182,242,58,.4) !important; transform:translateY(-1px); }
+.app-grid-tile-active{ border-color:var(--acid) !important; background:rgba(182,242,58,.08) !important; }
+.app-grid-tile-icon{ color:var(--acid) !important; }
+.app-grid-tile-label{ font-family:var(--font-display); letter-spacing:.04em; }
+
+/* ── notched HUD panels + corner ticks (the POC signature) ── */
+.neon-card, .hud-panel, .msg-assistant, .tool-panel{
+  position:relative !important; background:var(--panelc) !important;
+  border:1px solid var(--line) !important; border-radius:0 !important; box-shadow:none !important;
+  clip-path:polygon(var(--notch) 0,100% 0,100% calc(100% - var(--notch)),calc(100% - var(--notch)) 100%,0 100%,0 var(--notch)); }
+/* corner ticks via pseudo-elements (no component edits needed) */
+.neon-card::before, .hud-panel::before{ content:""; position:absolute; top:5px; left:5px; width:8px; height:8px;
+  border:1.5px solid var(--acid); border-right:0; border-bottom:0; opacity:.85; animation:none !important; }
+.neon-card::after, .hud-panel::after{ content:""; position:absolute; bottom:5px; right:5px; width:8px; height:8px;
+  border:1.5px solid var(--acid); border-left:0; border-top:0; opacity:.85; animation:none !important;
+  background:none !important; }
+/* assistant chat bubble = POC card with a lime left-accent */
+.msg-assistant{ border-left:2px solid var(--acid) !important;
+  clip-path:polygon(0 0,100% 0,100% calc(100% - 8px),calc(100% - 8px) 100%,0 100%) !important; }
+
+/* ── headings → Chakra Petch display ── */
+h1,h2,h3,.hud-title,.hud-window-title,.matrix-title{ font-family:var(--font-display) !important;
+  letter-spacing:.02em; }
+
+/* ── clipped buttons (the classed ones) ── */
+button.glow-button, .hud-btn, .cyber-btn{
+  clip-path:polygon(7px 0,100% 0,100% calc(100% - 7px),calc(100% - 7px) 100%,0 100%,0 7px) !important;
+  border-radius:0 !important; font-family:var(--font-display); }
+
+/* ── POC SKIN v2 — reach the INLINE-styled panels on data/log/settings pages ──
+   Most pages build panels with inline styles a stylesheet can't select by role; but an external
+   !important rule DOES override an inline property. Flatten big rounded corners to the POC's sharp
+   technical edges (keep pills/dots round), and quiet heavy inline borders to hairlines. */
+[style*="border-radius: 6"],[style*="border-radius: 7"],[style*="border-radius: 8"],
+[style*="border-radius: 9"],[style*="border-radius: 10"],[style*="border-radius: 11"],
+[style*="border-radius: 12"],[style*="border-radius: 14"],[style*="border-radius: 16"],
+[style*="borderRadius:6"],[style*="borderRadius:7"],[style*="borderRadius:8"],
+[style*="borderRadius:9"],[style*="borderRadius:10"],[style*="borderRadius:12"],[style*="borderRadius:16"]{
+  border-radius: 2px !important;
+}
+/* Page panels get the lime hairline-accent edge for the HUD feel */
+.app-content .hud-panel, .app-content section[style*="border"], .app-content .panel{
+  background:#11161f !important; border:1px solid rgba(223,230,239,.12) !important;
+}
+
+/* ── POC SKIN v3 — chat/comms density → clean HUD blocks + corner ticks on tool panels ── */
+.tool-panel{ position:relative; clip-path:polygon(8px 0,100% 0,100% calc(100% - 8px),calc(100% - 8px) 100%,0 100%,0 8px) !important;
+  border:1px solid rgba(223,230,239,.12) !important; background:#0d1219 !important; }
+.tool-panel::before{ content:""; position:absolute; top:4px; left:4px; width:7px; height:7px;
+  border:1.5px solid var(--acid); border-right:0; border-bottom:0; opacity:.8; }
+/* chat input bar → HUD */
+.glow-input, textarea.glow-input, input.glow-input{ border-radius:2px !important; background:#0d1219 !important;
+  border:1px solid rgba(223,230,239,.14) !important; }
+.glow-input:focus{ border-color:var(--acid) !important; box-shadow:none !important; }
+/* user message bubble → subtle volt-blue right-accent (POC) */
+.msg-user{ border-right:2px solid #4d8bff !important; border-radius:0 !important;
+  clip-path:polygon(0 0,100% 0,100% 100%,8px 100%,0 calc(100% - 8px)) !important; background:#141b26 !important; }
+/* status chips / pills stay rounded; small dots stay round */
+[style*="border-radius: 999"],[style*="borderRadius:999"],[style*="border-radius: 50%"],[style*="borderRadius:50"]{ border-radius:999px !important; }
+
+/* ══════════════════════════════════════════════════════════════
+   POC SHELL — the real app rebuilt INTO the dark-HUD POC layout.
+   Command bar + grouped left rail (tablet/iPad/Fold) → bottom bar (phone) + notched main.
+   ══════════════════════════════════════════════════════════════ */
+.poc-shell{ position:fixed; inset:0; display:grid; grid-template-columns:214px 1fr;
+  grid-template-rows:auto 1fr; background:#0a0e14; color:var(--text-primary); overflow:hidden;
+  font-family:"JetBrains Mono",monospace; }
+.poc-bar{ grid-column:1/-1; display:flex; align-items:center; gap:12px; padding:10px 16px;
+  border-bottom:1px solid var(--line); background:#0d121b; min-height:54px; padding-top:max(10px,env(safe-area-inset-top)); }
+.poc-brand{ font-family:var(--font-display); font-weight:700; font-size:15px; letter-spacing:.05em; white-space:nowrap; }
+.poc-brand b{ color:var(--acid-ink); background:var(--acid); padding:1px 6px; margin-left:1px;
+  clip-path:polygon(5px 0,100% 0,100% 70%,calc(100% - 5px) 100%,0 100%,0 30%); }
+.poc-bar .sp{ flex:1 }
+.poc-chip{ display:inline-flex; align-items:center; gap:6px; padding:4px 9px; border:1px solid var(--line);
+  background:#161c27; font-size:10px; letter-spacing:.06em; text-transform:uppercase; color:var(--text-dim);
+  border-radius:3px; cursor:pointer; white-space:nowrap; }
+.poc-dot{ width:6px; height:6px; border-radius:50%; background:var(--neon-green); box-shadow:0 0 0 3px rgba(43,212,127,.16); flex:none }
+.poc-dot.live{ background:var(--acid); box-shadow:0 0 0 3px rgba(182,242,58,.2) }
+.poc-menu{ display:none; font-size:20px; background:none; border:0; color:var(--acid); cursor:pointer; padding:2px 8px }
+
+.poc-rail{ border-right:1px solid var(--line); padding:14px 10px; overflow-y:auto; background:#0b1018; }
+/* nav-collapsed: hide the rail, main panel takes the full width (LLM LOGS focus mode) */
+.poc-shell.nav-collapsed{ grid-template-columns:1fr; }
+.poc-shell.nav-collapsed .poc-rail{ display:none; }
+.poc-railsec{ font-family:var(--font-display); font-size:9px; letter-spacing:.2em; text-transform:uppercase;
+  color:var(--text-muted); padding:12px 10px 6px; }
+.poc-nav{ display:flex; align-items:center; gap:10px; padding:8px 11px; color:var(--text-dim); cursor:pointer;
+  border-left:2px solid transparent; transition:.13s ease; font-size:12px; }
+.poc-nav:hover{ background:#161c27; color:var(--text-primary); }
+.poc-nav.on{ background:#161c27; color:var(--acid); border-left-color:var(--acid); font-weight:600; }
+.poc-nav .ic{ width:16px; text-align:center; opacity:.85; font-size:13px; }
+
+.poc-main{ position:relative; overflow:hidden; display:flex; flex-direction:column; min-width:0; min-height:0; }
+.poc-main > *{ flex:1; min-height:0; }
+
+/* phone (≤700px): hide rail, show bottom bar, single column */
+.poc-botbar{ display:none; }
+@media (max-width:700px){
+  .poc-shell{ grid-template-columns:1fr; grid-template-rows:auto 1fr auto; }
+  .poc-rail{ display:none; }
+  .poc-menu{ display:inline-block; }
+  .poc-botbar{ display:flex; grid-column:1/-1; border-top:1px solid var(--line); background:#0d121b;
+    padding-bottom:env(safe-area-inset-bottom); }
+  .poc-tab{ flex:1; display:flex; flex-direction:column; align-items:center; gap:3px; padding:8px 2px;
+    background:none; border:0; color:var(--text-muted); cursor:pointer; position:relative; }
+  .poc-tab .ic{ font-size:16px } .poc-tab .lb{ font-family:var(--font-display); font-size:8.5px; letter-spacing:.08em }
+  .poc-tab.on{ color:var(--acid) }
+  .poc-tab.on::before{ content:""; position:absolute; top:0; left:24%; right:24%; height:2px; background:var(--acid) }
+}
+/* mobile rail drawer (phone, when menu opened) */
+.poc-drawer{ position:fixed; inset:0; z-index:80; display:none; }
+.poc-drawer.open{ display:block }
+.poc-drawer .bg{ position:absolute; inset:0; background:rgba(0,0,0,.55) }
+.poc-drawer .panel{ position:absolute; top:0; left:0; bottom:0; width:240px; background:#0b1018;
+  border-right:1px solid var(--line); padding:14px 10px; overflow-y:auto; padding-top:max(14px,env(safe-area-inset-top)); }
+
+/* ══════════════════════════════════════════════════════════════
+   MESSENGER CHAT — Telegram/Messenger-style bubbles.
+   Overrides the POC blocky/notched skin on chat messages ONLY: rounded
+   bubbles with tails, grouped runs, dark incoming + volt-blue outgoing,
+   readable type. Everything else keeps the dark-HUD POC look.
+   ══════════════════════════════════════════════════════════════ */
+.msg-row{ align-items:flex-end; }
+
+/* assistant avatar (shown only on the last bubble of a run) */
+.msg-ava{ width:28px; height:28px; border-radius:50%; overflow:hidden; flex:none;
+  background:linear-gradient(135deg,#1c2433,#141b26); border:1px solid rgba(182,242,58,.32);
+  display:flex; align-items:center; justify-content:center; }
+.msg-ava img{ width:20px; height:20px; border-radius:50%; }
+
+/* sender name (first bubble of an assistant run) */
+.msg-name{ font-family:var(--font-display); font-size:10px; letter-spacing:.09em; text-transform:uppercase;
+  color:var(--acid); margin:0 0 3px 6px; opacity:.85; }
+
+/* THE BUBBLES — kill the POC notch/clip-path, go rounded */
+.msg-assistant.msg-bubble, .msg-user.msg-bubble{
+  clip-path:none !important; border:0 !important; box-shadow:none !important; border-left:0 !important;
+  border-right:0 !important; padding:9px 13px !important; border-radius:17px !important;
+  position:relative; font-size:14px; line-height:1.5; max-width:100%; }
+.msg-assistant.msg-bubble::before, .msg-assistant.msg-bubble::after,
+.msg-user.msg-bubble::before, .msg-user.msg-bubble::after{ display:none !important; content:none !important; }
+
+/* On-theme bubbles — both sit on the flat dark canvas; the brand lime is the ONLY accent.
+   Incoming (AI) = neutral HUD panel; outgoing (you) = a lime-tinted surface + lime hairline. */
+.msg-assistant.msg-bubble{ background:#161c27 !important; color:var(--text-primary) !important;
+  border:1px solid rgba(223,230,239,.08) !important; border-bottom-left-radius:5px !important; }
+.msg-user.msg-bubble{ background:rgba(182,242,58,.12) !important; color:var(--text-primary) !important;
+  border:1px solid rgba(182,242,58,.30) !important; border-bottom-right-radius:5px !important; }
+.msg-user.msg-bubble .chat-content{ color:var(--text-primary) !important; }
+.msg-user.msg-bubble .chat-content a{ color:var(--acid) !important; text-decoration:underline; }
+.msg-user.msg-bubble .chat-content code{ background:rgba(0,0,0,.30) !important; color:var(--acid) !important; }
+.msg-user.msg-bubble .chat-content pre{ background:rgba(0,0,0,.32) !important;
+  border-color:rgba(182,242,58,.18) !important; }
+.msg-user.msg-bubble .chat-content pre code{ color:var(--text-primary) !important; }
+
+/* meta row — short time + subtle copy */
+.msg-meta{ display:flex; align-items:center; gap:9px; margin:4px 6px 0;
+  font-size:10px; font-family:"JetBrains Mono",monospace; color:#7e8da0; opacity:.7; }
+.msg-copy{ background:none; border:0; color:inherit; cursor:pointer; opacity:.75; font-size:10px;
+  padding:0; letter-spacing:.04em; font-family:"JetBrains Mono",monospace; }
+.msg-copy:hover{ opacity:1; text-decoration:underline; }
+
+/* readable chat type (messenger feel): proportional sans for PROSE (wins over the older
+   0.72rem mono rules); code/pre keep their own JetBrains Mono rule below. */
+.chat-content{ font-size:14.5px !important; line-height:1.55 !important;
+  font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Inter","Helvetica Neue",system-ui,sans-serif !important;
+  letter-spacing:0 !important; }
+.chat-content pre, .chat-content code{ font-family:"JetBrains Mono","Fira Code",monospace !important; }
+.msg-bubble .chat-content > div:last-child{ margin-bottom:0; }
+
+/* the bare streaming/“processing” bubble (no .msg-bubble class) — match the incoming look */
+.msg-assistant:not(.msg-bubble){ clip-path:none !important; border:1px solid rgba(223,230,239,.08) !important; border-left:1px solid rgba(223,230,239,.08) !important;
+  background:#161c27 !important; border-radius:17px !important; border-bottom-left-radius:5px !important; }
+.msg-assistant:not(.msg-bubble)::before, .msg-assistant:not(.msg-bubble)::after{ display:none !important; }
+
+/* ══════════════════════════════════════════════════════════════
+   SESSIONS IN THE NAV — conversation list under the app navigation
+   (rail on tablet/Fold, drawer on phone). Each row opens in COMMS;
+   pencil renames inline, trash deletes with a tiny confirm.
+   ══════════════════════════════════════════════════════════════ */
+.poc-sess-new{ font-family:var(--font-display); font-size:9.5px; letter-spacing:.06em; color:var(--acid);
+  background:rgba(182,242,58,.08); border:1px solid rgba(182,242,58,.25); border-radius:4px;
+  padding:2px 8px; cursor:pointer; white-space:nowrap; }
+.poc-sess-new:hover{ background:rgba(182,242,58,.16); }
+.poc-sess-empty{ font-size:11px; color:var(--text-muted); padding:8px 12px; }
+.poc-sess{ display:flex; align-items:center; gap:4px; padding:6px 8px 6px 11px;
+  border-left:2px solid transparent; position:relative; }
+.poc-sess:hover{ background:#161c27; }
+.poc-sess.on{ background:#161c27; border-left-color:var(--acid); }
+.poc-sess-main{ display:flex; align-items:center; gap:8px; flex:1; min-width:0; cursor:pointer; }
+.poc-sess-dot{ width:6px; height:6px; border-radius:50%; background:var(--text-muted); flex:none; }
+.poc-sess-dot.live{ background:var(--neon-green); box-shadow:0 0 0 3px rgba(43,212,127,.16); }
+.poc-sess-label{ font-size:12px; color:var(--text-dim); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.poc-sess.on .poc-sess-label{ color:var(--acid); }
+.poc-sess-act{ background:none; border:0; color:var(--text-muted); cursor:pointer; font-size:12px;
+  padding:2px 4px; opacity:.55; border-radius:3px; flex:none; line-height:1; }
+.poc-sess:hover .poc-sess-act{ opacity:.85; }
+.poc-sess-act:hover{ opacity:1; background:rgba(255,255,255,.06); }
+.poc-sess-act.del:hover{ color:var(--neon-red); }
+.poc-sess.editing{ gap:6px; }
+.poc-sess-input{ flex:1; min-width:0; font-size:12px; font-family:"JetBrains Mono",monospace;
+  background:#0d1219 !important; border:1px solid var(--acid) !important; color:var(--text-primary) !important;
+  border-radius:4px; padding:3px 7px; outline:none; }
+.poc-sess-confirm{ display:flex; align-items:center; gap:3px; flex:none; }
+.poc-sess-confirm .poc-sess-act{ font-size:10px; font-family:var(--font-display); letter-spacing:.04em;
+  border:1px solid var(--line); opacity:.95; padding:2px 7px; }
+.poc-sess-confirm .poc-sess-act.del{ color:var(--neon-red); border-color:rgba(255,77,99,.4); }

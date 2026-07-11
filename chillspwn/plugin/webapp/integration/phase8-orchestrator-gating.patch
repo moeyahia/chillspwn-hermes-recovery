@@ -1,0 +1,114 @@
+--- a/scripts/orchestrator_openrouter.py	2026-06-06 01:35:51.817007930 +0000
++++ b/scripts/orchestrator_openrouter.py	2026-06-06 01:35:51.839529558 +0000
+@@ -597,6 +597,82 @@
+         return {"error": f"{type(e).__name__}: {e}"}
+ 
+ 
++# ── Phase 8: OpenRouter/Codex runtime tool gating (flag-gated; DEFAULT OFF) ─────────────────────
++# When enabled, consult the dashboard's runtime tool-gate BEFORE executing a tool. The TypeScript
++# runtime owns the policy (allow / deny / approval); this only asks and acts on the answer. With
++# gating off (the default) tools execute EXACTLY as before — zero behavior change. Claude is never
++# gated here (it runs in a different, frozen process).
++_GATE_ENABLED = os.environ.get("ENABLE_OPENROUTER_RUNTIME_GATING", "").lower() in ("1", "true", "yes", "on")
++_GATE_MODE = os.environ.get("OPENROUTER_GATE_MODE", "off")              # off | dry-run | enforce
++_GATE_FAIL_MODE = os.environ.get("OPENROUTER_GATE_FAIL_MODE", "deny")   # only "deny" — fail CLOSED
++_GATE_RUN_ID = os.environ.get("CHILLSPWN_AGENT_RUN_ID", "")
++try: _GATE_TIMEOUT = int(os.environ.get("OPENROUTER_GATE_TIMEOUT_SECONDS", "300") or 300)
++except Exception: _GATE_TIMEOUT = 300
++try: _GATE_POLL = max(1, int(os.environ.get("OPENROUTER_GATE_POLL_SECONDS", "2") or 2))
++except Exception: _GATE_POLL = 2
++# Meta/delegation/memory tools are NOT gated (they don't act on the target system). Every other
++# tool — the actual execution tools + any UNKNOWN tool — IS gated (fail-closed on the unknown).
++# 8.2: state-changing / delegating tools are GATED (delegate_task, board_create_task,
++# board_update, skill_manage, remember REMOVED — a spawned worker would otherwise run tools
++# outside the gate). Pass-through = read-only / introspection only (no mutation, no agent spawn).
++_GATE_PASSTHROUGH = {"board_await", "board_list", "use_skill", "recall_conversation",
++                     "index_skills", "web_search", "web_extract"}
++
++def _gate_active():
++    return _GATE_ENABLED and _GATE_MODE in ("dry-run", "enforce") and bool(_GATE_RUN_ID)
++
++def _gate_tool(name, args):
++    """Consult the runtime gate before executing `name`. Returns (decision, denial_msg, tool_call_id)
++    where decision is 'allow' or 'deny'. Pass-through + gating-off ⇒ always ('allow', None, None)."""
++    if not _gate_active() or name in _GATE_PASSTHROUGH:
++        return ("allow", None, None)
++    cmd = args.get("command") if isinstance(args, dict) else None
++    resp = _board_http("POST", f"/api/runs/{_GATE_RUN_ID}/tool-gate",
++                       {"toolName": name, "arguments": args if isinstance(args, dict) else {}, "command": cmd}, timeout=15)
++    if not isinstance(resp, dict) or resp.get("error"):
++        if _GATE_MODE == "dry-run":
++            return ("allow", None, None)                       # dry-run NEVER blocks
++        return ("deny", f"[runtime gate unreachable — fail-closed deny for '{name}']", None)
++    decision = resp.get("decision"); tcid = resp.get("toolCallId")
++    if _GATE_MODE == "dry-run":
++        return ("allow", None, tcid)                           # record what WOULD happen; never block
++    if decision == "allow":
++        return ("allow", None, tcid)
++    if decision == "deny":
++        return ("deny", f"[runtime gate DENIED '{name}': {resp.get('reason', 'policy')}]", tcid)
++    if decision == "awaiting_approval":
++        waited = 0
++        while waited < _GATE_TIMEOUT:
++            time.sleep(_GATE_POLL); waited += _GATE_POLL
++            st = _board_http("GET", f"/api/runs/{_GATE_RUN_ID}/tool-calls/{tcid}", timeout=10)
++            s = st.get("status") if isinstance(st, dict) else None
++            if s == "approved": return ("allow", None, tcid)
++            if s == "rejected": return ("deny", f"[runtime gate: operator REJECTED '{name}']", tcid)
++        # 8.3: timed out — expire the approval + reject the tool call server-side so it stops
++        # showing as action-required, then deny to the model.
++        _board_http("POST", f"/api/runs/{_GATE_RUN_ID}/tool-calls/{tcid}/timeout",
++                    {"reason": f"gate approval timed out after {_GATE_TIMEOUT}s"}, timeout=15)
++        return ("deny", f"[runtime gate: approval TIMED OUT for '{name}']", tcid)
++    return ("deny", f"[runtime gate: unrecognized decision for '{name}']", tcid)
++
++def _infer_success(output):
++    """8.2: treat obvious runtime-error output as a FAILED tool result (conservative)."""
++    o = output or ""
++    if o.startswith("[runtime gate") or o.startswith("ERROR:"):
++        return False
++    for marker in ("Traceback (most recent call last)", "Permission denied", "command not found"):
++        if marker in o:
++            return False
++    return True
++
++def _gate_result(tcid, success, output):
++    """Record a gated tool's result back to the runtime (best-effort; +evidence)."""
++    if not (_gate_active() and tcid):
++        return
++    _board_http("POST", f"/api/runs/{_GATE_RUN_ID}/tool-calls/{tcid}/result",
++                {"success": bool(success), "output": (output or "")[:20000]}, timeout=15)
++
++
+ # When a fresh self-plan is created, retire the SAME persona's OLDER orchestrator Backlog plans
+ # (status -> archived) so cross-session re-planning doesn't pile up duplicate plan cards. Touches
+ # ONLY that persona's own orchestrator-created Backlog cards older than the TTL — never agent cards,
+@@ -1704,8 +1780,12 @@
+         emit({"type": "assistant", "message": {
+             "id": f"msg_{session_id}_{it}_{tag}_{tcid}", "model": model_used,
+             "content": [{"type": "tool_use", "id": tcid, "name": name, "input": a}]}})
+-        res = _run_tool(name, a)
+-        res = res[:TOOL_RESULT_CAP]
++        _gdec, _gden, _gtcid = _gate_tool(name, a)            # Phase 8 gate (no-op unless enabled)
++        if _gdec == "deny":
++            res = _gden[:TOOL_RESULT_CAP]
++        else:
++            res = _run_tool(name, a)[:TOOL_RESULT_CAP]
++            _gate_result(_gtcid, _infer_success(res), res)
+         _turn_tools[0] += 1
+         emit({"type": "user", "message": {
+             "content": [{"type": "tool_result", "tool_use_id": tcid, "content": res}]}})
+@@ -2128,7 +2208,12 @@
+                     emit({"type": "assistant", "message": {
+                         "id": f"msg_{session_id}_{it}_tu_{tcid}", "model": model_used,
+                         "content": [{"type": "tool_use", "id": tcid, "name": name, "input": a}]}})
+-                    res = _run_tool(name, a)[:TOOL_RESULT_CAP]
++                    _gdec, _gden, _gtcid = _gate_tool(name, a)   # Phase 8 gate (no-op unless enabled)
++                    if _gdec == "deny":
++                        res = _gden[:TOOL_RESULT_CAP]
++                    else:
++                        res = _run_tool(name, a)[:TOOL_RESULT_CAP]
++                        _gate_result(_gtcid, _infer_success(res), res)
+                     emit({"type": "user", "message": {
+                         "content": [{"type": "tool_result", "tool_use_id": tcid, "content": res}]}})
+                     messages.append({"role": "tool", "tool_call_id": tcid, "name": name, "content": res})

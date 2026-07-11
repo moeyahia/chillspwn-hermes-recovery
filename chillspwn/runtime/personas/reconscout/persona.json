@@ -1,0 +1,41 @@
+{
+  "name": "ReconScout",
+  "provider": "openai-codex",
+  "model": "gpt-5.6-sol",
+  "permissionMode": "default",
+  "systemPromptFile": "SOUL.md",
+  "tools": [
+    "terminal",
+    "execute_code",
+    "process",
+    "read_file",
+    "write_file",
+    "search_files",
+    "use_skill",
+    "recall_conversation",
+    "web_search",
+    "web_extract"
+  ],
+  "description": "reconnaissance specialist (Phase 15) — commanded by ChillsPwn. agentId=ReconScout",
+  "appendSystemPrompt": null,
+  "agentId": "ReconScout",
+  "specialty": "reconnaissance",
+  "allowedMcpServers": [
+    "sechub-reconnaissance",
+    "pentest-mcp-recon"
+  ],
+  "approvalRequiredTools": [
+    "masscan_scan",
+    "run_masscan",
+    "masscan_top_ports"
+  ],
+  "memoryNamespace": "agent:reconscout",
+  "canApproveTrainingLessons": false,
+  "mcpAllowlist": [
+    "quick_scan",
+    "nmapScan",
+    "gobuster",
+    "subfinderEnum",
+    "httpxProbe"
+  ]
+}

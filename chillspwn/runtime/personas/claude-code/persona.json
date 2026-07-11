@@ -1,0 +1,12 @@
+{
+  "name": "Claude Code",
+  "description": "Vanilla Claude Code — no custom persona, default behavior",
+  "color": "#6366f1",
+  "icon": "code",
+  "model": "gpt-5.6-sol",
+  "permissionMode": "default",
+  "systemPromptFile": null,
+  "tools": "default",
+  "appendSystemPrompt": "\n\n[ULTRACODING MODE] You are operating in ULTRACODING mode. ultrathink before every non-trivial decision. Prefer precise, working code over plans. Verify behavior (run it, read the output) before claiming completion. Read entire files when context matters; do not skim past relevant lines. When changing code, state exactly what changed and why in one sentence.",
+  "provider": "openai-codex"
+}

@@ -1,0 +1,944 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{BOX_NAME}} Penetration Test Report — ChillsPwn Security</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;500;600;700;800;900&family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@300;400;500;600&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg-primary: #ffffff;
+            --bg-secondary: #f5f5f8;
+            --bg-card: rgba(245, 245, 250, 0.9);
+            --bg-card-hover: rgba(240, 240, 248, 0.95);
+            --neon-magenta: #4e8a00;       /* primary accent — readable deep lime on white (was pink) */
+            --neon-magenta-dim: #356000;
+            --neon-lime: #b6f23a;          /* ChillsPwn brand electric lime — badges / underlines / glows */
+            --neon-cyan: #0099aa;
+            --neon-cyan-dim: #007788;
+            --neon-green: #00884a;
+            --neon-red: #cc0033;
+            --neon-orange: #cc5500;
+            --neon-yellow: #aa8800;
+            --text-primary: #1a1a2e;
+            --text-secondary: #3a3a50;
+            --text-muted: #8888a0;
+            --border-subtle: rgba(182, 242, 58, 0.18);
+            --border-accent: rgba(182, 242, 58, 0.40);
+            --glass-bg: rgba(240, 240, 250, 0.6);
+            --glass-border: rgba(0, 0, 0, 0.08);
+            --severity-critical: #cc0033;
+            --severity-high: #cc3300;
+            --severity-medium: #cc7700;
+            --severity-low: #aa8800;
+            --severity-info: #0088cc;
+        }
+
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            line-height: 1.7;
+            min-height: 100vh;
+            position: relative;
+            overflow-x: hidden;
+        }
+
+        /* Scan line effect — subtle on light */
+        body::before {
+            content: '';
+            position: fixed;
+            top: 0; left: 0; right: 0; bottom: 0;
+            background: repeating-linear-gradient(
+                0deg,
+                transparent,
+                transparent 2px,
+                rgba(182, 242, 58, 0.008) 2px,
+                rgba(182, 242, 58, 0.008) 4px
+            );
+            pointer-events: none;
+            z-index: 9999;
+        }
+
+        /* Animated grid background — subtle on light */
+        body::after {
+            content: '';
+            position: fixed;
+            top: 0; left: 0; right: 0; bottom: 0;
+            background:
+                linear-gradient(rgba(182, 242, 58, 0.025) 1px, transparent 1px),
+                linear-gradient(90deg, rgba(182, 242, 58, 0.025) 1px, transparent 1px);
+            background-size: 60px 60px;
+            pointer-events: none;
+            z-index: -1;
+        }
+
+        .report-container {
+            max-width: 1100px;
+            margin: 0 auto;
+            padding: 40px 50px;
+            position: relative;
+        }
+
+        /* ===== COVER PAGE ===== */
+        .cover-page {
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            position: relative;
+            padding: 60px 0;
+            border-bottom: 1px solid var(--border-subtle);
+            margin-bottom: 60px;
+        }
+
+        .cover-logo-top-left {
+            position: absolute;
+            top: 40px;
+            left: 0;
+            width: 80px;
+            height: 80px;
+            filter: drop-shadow(0 0 12px rgba(182, 242, 58, 0.35));
+        }
+
+        .cover-logo-top-left img {
+            width: 100%;
+            height: 100%;
+            object-fit: contain;
+            /* recolor the pink raster brand mark to ChillsPwn lime (matches dashboard logo) */
+            filter: hue-rotate(150deg) saturate(1.5) brightness(1.1);
+        }
+
+        .cover-center-logo {
+            max-width: 900px;
+            width: 100%;
+            margin-bottom: 50px;
+            filter: drop-shadow(0 0 20px rgba(182, 242, 58, 0.2));
+        }
+
+        .cover-center-logo img {
+            width: 100%;
+            height: auto;
+            /* recolor the pink raster brand mark to ChillsPwn lime (matches dashboard logo) */
+            filter: hue-rotate(150deg) saturate(1.5) brightness(1.1);
+        }
+
+        .cover-title {
+            font-family: 'Orbitron', sans-serif;
+            font-size: 2.8rem;
+            font-weight: 800;
+            text-transform: uppercase;
+            letter-spacing: 6px;
+            background: linear-gradient(135deg, var(--neon-magenta), var(--neon-cyan));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+            margin-bottom: 15px;
+            text-align: center;
+            /* text-shadow removed for light theme clarity */
+        }
+
+        .cover-subtitle {
+            font-family: 'Orbitron', sans-serif;
+            font-size: 1.1rem;
+            font-weight: 400;
+            color: var(--text-secondary);
+            letter-spacing: 8px;
+            text-transform: uppercase;
+            margin-bottom: 60px;
+        }
+
+        .cover-meta {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px 60px;
+            padding: 30px 40px;
+            background: var(--glass-bg);
+            border: 1px solid var(--glass-border);
+            border-radius: 8px;
+            backdrop-filter: blur(10px);
+            width: 100%;
+            max-width: 600px;
+        }
+
+        .cover-meta-item {
+            display: flex;
+            flex-direction: column;
+        }
+
+        .cover-meta-label {
+            font-family: 'Orbitron', sans-serif;
+            font-size: 0.65rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 3px;
+            color: var(--neon-magenta);
+            margin-bottom: 5px;
+        }
+
+        .cover-meta-value {
+            font-size: 0.95rem;
+            color: var(--text-primary);
+            font-weight: 500;
+        }
+
+        .cover-classification {
+            margin-top: 40px;
+            padding: 10px 30px;
+            border: 2px solid var(--neon-red);
+            border-radius: 4px;
+            font-family: 'Orbitron', sans-serif;
+            font-size: 0.75rem;
+            letter-spacing: 5px;
+            text-transform: uppercase;
+            color: var(--neon-red);
+            /* text-shadow removed for light theme */
+        }
+
+        /* ===== SECTION HEADERS ===== */
+        .section {
+            margin-bottom: 50px;
+            page-break-inside: avoid;
+        }
+
+        .section-header {
+            display: flex;
+            align-items: center;
+            gap: 16px;
+            margin-bottom: 30px;
+            padding-bottom: 15px;
+            border-bottom: 1px solid var(--border-subtle);
+            position: relative;
+        }
+
+        .section-header::after {
+            content: '';
+            position: absolute;
+            bottom: -1px;
+            left: 0;
+            width: 120px;
+            height: 2px;
+            background: linear-gradient(90deg, var(--neon-lime), transparent);
+        }
+
+        .section-number {
+            font-family: 'Orbitron', sans-serif;
+            font-size: 0.7rem;
+            font-weight: 700;
+            color: #0a0e14;
+            background: var(--neon-lime);
+            padding: 4px 10px;
+            border-radius: 3px;
+            letter-spacing: 2px;
+            min-width: 40px;
+            text-align: center;
+        }
+
+        .section-title {
+            font-family: 'Orbitron', sans-serif;
+            font-size: 1.4rem;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 3px;
+            color: var(--text-primary);
+        }
+
+        /* ===== CONTENT PANELS ===== */
+        .panel {
+            background: var(--bg-card);
+            border: 1px solid var(--glass-border);
+            border-radius: 8px;
+            padding: 30px;
+            margin-bottom: 20px;
+            backdrop-filter: blur(10px);
+            transition: border-color 0.3s ease;
+        }
+
+        .panel:hover {
+            border-color: var(--border-accent);
+        }
+
+        .panel p {
+            color: var(--text-secondary);
+            font-size: 0.95rem;
+            margin-bottom: 12px;
+        }
+
+        .panel p:last-child { margin-bottom: 0; }
+
+        /* ===== RISK OVERVIEW ===== */
+        .risk-grid {
+            display: grid;
+            grid-template-columns: repeat(5, 1fr);
+            gap: 12px;
+            margin-bottom: 30px;
+        }
+
+        .risk-card {
+            text-align: center;
+            padding: 20px 10px;
+            border-radius: 8px;
+            background: var(--bg-card);
+            border: 1px solid var(--glass-border);
+            transition: transform 0.2s ease, box-shadow 0.2s ease;
+        }
+
+        .risk-card:hover {
+            transform: translateY(-2px);
+        }
+
+        .risk-card.critical { border-color: rgba(255, 0, 68, 0.4); }
+        .risk-card.critical:hover { box-shadow: 0 4px 20px rgba(255, 0, 68, 0.2); }
+        .risk-card.high { border-color: rgba(255, 68, 0, 0.4); }
+        .risk-card.high:hover { box-shadow: 0 4px 20px rgba(255, 68, 0, 0.2); }
+        .risk-card.medium { border-color: rgba(255, 136, 0, 0.4); }
+        .risk-card.medium:hover { box-shadow: 0 4px 20px rgba(255, 136, 0, 0.2); }
+        .risk-card.low { border-color: rgba(255, 204, 0, 0.4); }
+        .risk-card.low:hover { box-shadow: 0 4px 20px rgba(255, 204, 0, 0.2); }
+        .risk-card.info { border-color: rgba(0, 184, 255, 0.4); }
+        .risk-card.info:hover { box-shadow: 0 4px 20px rgba(0, 184, 255, 0.2); }
+
+        .risk-count {
+            font-family: 'Orbitron', sans-serif;
+            font-size: 2.2rem;
+            font-weight: 800;
+            margin-bottom: 6px;
+        }
+
+        .risk-card.critical .risk-count { color: var(--severity-critical); }
+        .risk-card.high .risk-count { color: var(--severity-high); }
+        .risk-card.medium .risk-count { color: var(--severity-medium); }
+        .risk-card.low .risk-count { color: var(--severity-low); }
+        .risk-card.info .risk-count { color: var(--severity-info); }
+
+        .risk-label {
+            font-family: 'Orbitron', sans-serif;
+            font-size: 0.65rem;
+            font-weight: 600;
+            letter-spacing: 2px;
+            text-transform: uppercase;
+            color: var(--text-muted);
+        }
+
+        /* ===== FINDINGS ===== */
+        .finding {
+            background: var(--bg-card);
+            border: 1px solid var(--glass-border);
+            border-radius: 8px;
+            margin-bottom: 30px;
+            overflow: hidden;
+        }
+
+        .finding-header {
+            display: flex;
+            align-items: center;
+            gap: 16px;
+            padding: 20px 30px;
+            border-bottom: 1px solid var(--glass-border);
+            background: rgba(182, 242, 58, 0.03);
+        }
+
+        .severity-badge {
+            font-family: 'Orbitron', sans-serif;
+            font-size: 0.6rem;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 2px;
+            padding: 5px 14px;
+            border-radius: 3px;
+            color: #ffffff;
+            white-space: nowrap;
+        }
+
+        .severity-badge.critical { background: var(--severity-critical); }
+        .severity-badge.high { background: var(--severity-high); }
+        .severity-badge.medium { background: var(--severity-medium); }
+        .severity-badge.low { background: var(--severity-low); }
+        .severity-badge.info { background: var(--severity-info); }
+
+        .finding-title {
+            font-family: 'Orbitron', sans-serif;
+            font-size: 1rem;
+            font-weight: 600;
+            letter-spacing: 1px;
+            color: var(--text-primary);
+        }
+
+        .finding-cvss {
+            margin-left: auto;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.85rem;
+            font-weight: 600;
+            color: var(--neon-cyan);
+            white-space: nowrap;
+        }
+
+        .finding-body {
+            padding: 25px 30px;
+        }
+
+        .finding-subsection {
+            margin-bottom: 25px;
+        }
+
+        .finding-subsection:last-child { margin-bottom: 0; }
+
+        .finding-subsection-title {
+            font-family: 'Orbitron', sans-serif;
+            font-size: 0.7rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 3px;
+            color: var(--neon-magenta);
+            margin-bottom: 10px;
+            padding-bottom: 6px;
+            border-bottom: 1px solid rgba(182, 242, 58, 0.12);
+        }
+
+        .finding-subsection p {
+            color: var(--text-secondary);
+            font-size: 0.9rem;
+            margin-bottom: 8px;
+        }
+
+        /* ===== CODE BLOCKS ===== */
+        .code-block {
+            position: relative;
+            margin: 15px 0;
+            border-radius: 6px;
+            overflow: hidden;
+        }
+
+        .code-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 10px 16px;
+            background: rgba(182, 242, 58, 0.06);
+            border-bottom: 1px solid rgba(182, 242, 58, 0.12);
+        }
+
+        .code-language {
+            font-family: 'Orbitron', sans-serif;
+            font-size: 0.6rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 2px;
+            color: var(--neon-magenta);
+        }
+
+        .code-filename {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.75rem;
+            color: var(--text-muted);
+        }
+
+        pre {
+            background: #f0f0f5;
+            padding: 20px;
+            /* Allow long tokens (URLs, hashes, base64) to wrap rather than scroll horizontally — the previous overflow-x:auto caused horizontal scroll inside iframe report views */
+            overflow-x: auto;
+            white-space: pre-wrap;       /* preserve linebreaks BUT wrap long lines */
+            word-break: break-word;       /* break overly long words at any char */
+            overflow-wrap: anywhere;      /* aggressive wrap for unbroken tokens (b64, jwt, urls) */
+            border: 1px solid rgba(182, 242, 58, 0.1);
+            border-top: none;
+            border-radius: 0 0 6px 6px;
+            max-width: 100%;              /* prevent expanding beyond parent */
+        }
+
+        code {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.82rem;
+            line-height: 1.8;
+            color: var(--text-secondary);
+            /* Inline code wrap so long inline tokens (paths, commands) don't blow past the container */
+            white-space: pre-wrap;
+            word-break: break-word;
+            overflow-wrap: anywhere;
+        }
+
+        /* Tables — make long URLs/hashes inside cells wrap instead of pushing the table wide */
+        td, th {
+            word-break: break-word;
+            overflow-wrap: anywhere;
+        }
+
+        .code-comment { color: #8888a0; font-style: italic; }
+        .code-keyword { color: #4e8a00; }
+        .code-string { color: #006644; }
+        .code-function { color: #007788; }
+        .code-number { color: #cc5500; }
+
+        /* ===== TABLES ===== */
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 15px 0;
+            font-size: 0.88rem;
+        }
+
+        thead th {
+            font-family: 'Orbitron', sans-serif;
+            font-size: 0.65rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 2px;
+            color: var(--neon-magenta);
+            text-align: left;
+            padding: 12px 16px;
+            border-bottom: 2px solid var(--border-accent);
+            background: rgba(182, 242, 58, 0.04);
+        }
+
+        tbody td {
+            padding: 12px 16px;
+            border-bottom: 1px solid var(--glass-border);
+            color: var(--text-secondary);
+        }
+
+        tbody tr:hover {
+            background: rgba(182, 242, 58, 0.03);
+        }
+
+        /* ===== ATTACK CHAIN ===== */
+        .attack-chain {
+            display: flex;
+            align-items: center;
+            gap: 0;
+            padding: 20px 0;
+            overflow-x: auto;
+            margin: 20px 0;
+        }
+
+        .chain-node {
+            flex-shrink: 0;
+            text-align: center;
+            padding: 16px 20px;
+            background: var(--bg-card);
+            border: 1px solid var(--border-accent);
+            border-radius: 6px;
+            min-width: 140px;
+        }
+
+        .chain-node-label {
+            font-family: 'Orbitron', sans-serif;
+            font-size: 0.6rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            color: var(--neon-cyan);
+            margin-bottom: 4px;
+        }
+
+        .chain-node-desc {
+            font-size: 0.78rem;
+            color: var(--text-secondary);
+        }
+
+        .chain-arrow {
+            flex-shrink: 0;
+            font-size: 1.2rem;
+            color: var(--neon-magenta);
+            padding: 0 8px;
+            font-family: 'JetBrains Mono', monospace;
+        }
+
+        /* ===== REMEDIATION ===== */
+        .remediation-item {
+            display: flex;
+            gap: 14px;
+            padding: 14px 0;
+            border-bottom: 1px solid var(--glass-border);
+        }
+
+        .remediation-item:last-child { border-bottom: none; }
+
+        .remediation-icon {
+            font-size: 1rem;
+            flex-shrink: 0;
+            margin-top: 2px;
+        }
+
+        .remediation-text {
+            color: var(--text-secondary);
+            font-size: 0.9rem;
+        }
+
+        /* ===== FOOTER ===== */
+        .report-footer {
+            margin-top: 80px;
+            padding-top: 30px;
+            border-top: 1px solid var(--border-subtle);
+            text-align: center;
+        }
+
+        .footer-logo {
+            width: 50px;
+            height: 50px;
+            margin-bottom: 15px;
+            /* recolor the pink raster brand mark to ChillsPwn lime (matches dashboard logo) */
+            filter: hue-rotate(150deg) saturate(1.5) brightness(1.1) drop-shadow(0 0 8px rgba(182, 242, 58, 0.3));
+        }
+
+        .footer-text {
+            font-family: 'Orbitron', sans-serif;
+            font-size: 0.6rem;
+            letter-spacing: 4px;
+            text-transform: uppercase;
+            color: var(--text-muted);
+        }
+
+        .footer-disclaimer {
+            font-size: 0.78rem;
+            color: var(--text-muted);
+            margin-top: 10px;
+            max-width: 600px;
+            margin-left: auto;
+            margin-right: auto;
+        }
+
+        /* ===== PRINT ===== */
+        @media print {
+            body::before, body::after { display: none; }
+            body { background: #ffffff; }
+
+            /* Cover must fit ONE page. min-height:100vh + a tall logo + big margins pushed the
+               CONFIDENTIAL stamp (the last cover element) onto a second page. Size the cover to its
+               content AND shrink that content so the whole cover comfortably fits one printed page. */
+            .cover-page {
+                min-height: auto;
+                height: auto;
+                padding: 16px 0 24px;
+                margin-bottom: 0;
+                border-bottom: none;
+                page-break-after: always;
+                break-after: page;
+            }
+            .cover-center-logo { max-width: 340px; margin-bottom: 22px; }
+            .cover-title { font-size: 2.1rem; margin-bottom: 8px; }
+            .cover-subtitle { margin-bottom: 26px; }
+            .cover-meta { padding: 20px 30px; gap: 14px 50px; }
+            .cover-classification { margin-top: 24px; break-inside: avoid; }
+
+            /* Let sections AND findings FLOW across page boundaries so pages pack densely.
+               page-break-inside:avoid on a whole section/finding shoved it onto a fresh page,
+               leaving short/near-empty pages (the risk-overview numbers alone, etc.). */
+            .section { page-break-inside: auto; }
+            /* The Table of Contents stands alone on its own page. */
+            .toc-section { page-break-after: always; break-after: page; }
+            .toc-section + hr { display: none; }
+            .finding { page-break-inside: auto; break-inside: auto; }
+
+            /* Keep only SMALL atomic units from splitting mid-block. */
+            .risk-grid, .finding-header, .code-block, .remediation-item, .chain-node,
+            table, tr { break-inside: avoid; page-break-inside: avoid; }
+
+            /* Never strand a heading at the bottom of a page, separated from its content
+               (fixes "Detailed Findings" header alone, finding titles orphaned, etc.). */
+            .section-header, .finding-header { break-after: avoid; page-break-after: avoid; }
+            .finding-subsection-title, h2, h3, h4 { break-after: avoid; page-break-after: avoid; }
+        }
+
+        /* ===== GLOW EFFECTS ===== */
+        .glow-magenta { text-shadow: 0 0 10px rgba(182, 242, 58, 0.6); }
+        .glow-cyan { text-shadow: 0 0 10px rgba(0, 240, 255, 0.6); }
+
+        /* TOC */
+        .toc-list {
+            list-style: none;
+            padding: 0;
+        }
+
+        .toc-item {
+            display: flex;
+            align-items: baseline;
+            gap: 12px;
+            padding: 10px 0;
+            border-bottom: 1px solid var(--glass-border);
+        }
+
+        .toc-num {
+            font-family: 'Orbitron', sans-serif;
+            font-size: 0.7rem;
+            font-weight: 700;
+            color: var(--neon-magenta);
+            min-width: 30px;
+        }
+
+        .toc-text {
+            font-size: 0.95rem;
+            color: var(--text-secondary);
+        }
+
+        .toc-dots {
+            flex: 1;
+            border-bottom: 1px dotted var(--text-muted);
+            margin: 0 8px;
+            align-self: center;
+        }
+
+        .toc-page {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.8rem;
+            color: var(--text-muted);
+        }
+
+        /* Horizontal rule style */
+        hr {
+            border: none;
+            height: 1px;
+            background: linear-gradient(90deg, transparent, var(--neon-magenta), transparent);
+            margin: 40px 0;
+        }
+    </style>
+</head>
+<body>
+    <div class="report-container">
+
+        <!-- ===== COVER PAGE ===== -->
+        <div class="cover-page">
+            <div class="cover-logo-top-left">
+                <img src="assets/smallLogo.png" alt="K Logo">
+            </div>
+
+            <div class="cover-center-logo">
+                <img src="assets/Logo.svg" alt="ChillsPwn Security">
+            </div>
+
+            <h1 class="cover-title">Penetration Test Report</h1>
+            <p class="cover-subtitle">Security Assessment</p>
+
+            <div class="cover-meta">
+                <div class="cover-meta-item">
+                    <span class="cover-meta-label">Client</span>
+                    <span class="cover-meta-value">{{CLIENT_NAME}}</span>
+                </div>
+                <div class="cover-meta-item">
+                    <span class="cover-meta-label">Date</span>
+                    <span class="cover-meta-value">{{DATE}}</span>
+                </div>
+                <div class="cover-meta-item">
+                    <span class="cover-meta-label">Target</span>
+                    <span class="cover-meta-value">{{TARGET}}</span>
+                </div>
+                <div class="cover-meta-item">
+                    <span class="cover-meta-label">Engagement Type</span>
+                    <span class="cover-meta-value">{{ENGAGEMENT_TYPE}}</span>
+                </div>
+                <div class="cover-meta-item">
+                    <span class="cover-meta-label">Assessor</span>
+                    <span class="cover-meta-value">{{ASSESSOR}}</span>
+                </div>
+                <div class="cover-meta-item">
+                    <span class="cover-meta-label">Report Version</span>
+                    <span class="cover-meta-value">{{VERSION}}</span>
+                </div>
+            </div>
+
+            <div class="cover-classification">Confidential</div>
+        </div>
+
+        <!-- ===== TABLE OF CONTENTS ===== -->
+        <div class="section toc-section">
+            <div class="section-header">
+                <span class="section-number">00</span>
+                <h2 class="section-title">Table of Contents</h2>
+            </div>
+            <ul class="toc-list">
+                <li class="toc-item">
+                    <span class="toc-num">01</span>
+                    <span class="toc-text">Executive Summary</span>
+                    <span class="toc-dots"></span>
+                </li>
+                <li class="toc-item">
+                    <span class="toc-num">02</span>
+                    <span class="toc-text">Scope & Methodology</span>
+                    <span class="toc-dots"></span>
+                </li>
+                <li class="toc-item">
+                    <span class="toc-num">03</span>
+                    <span class="toc-text">Risk Overview</span>
+                    <span class="toc-dots"></span>
+                </li>
+                <li class="toc-item">
+                    <span class="toc-num">04</span>
+                    <span class="toc-text">Detailed Findings</span>
+                    <span class="toc-dots"></span>
+                </li>
+                <li class="toc-item">
+                    <span class="toc-num">05</span>
+                    <span class="toc-text">Attack Chain</span>
+                    <span class="toc-dots"></span>
+                </li>
+                <li class="toc-item">
+                    <span class="toc-num">06</span>
+                    <span class="toc-text">Tools & Environment</span>
+                    <span class="toc-dots"></span>
+                </li>
+                <li class="toc-item">
+                    <span class="toc-num">07</span>
+                    <span class="toc-text">Appendix</span>
+                    <span class="toc-dots"></span>
+                </li>
+            </ul>
+        </div>
+
+        <hr>
+
+        <!-- ===== 01 — EXECUTIVE SUMMARY ===== -->
+        <div class="section">
+            <div class="section-header">
+                <span class="section-number">01</span>
+                <h2 class="section-title">Executive Summary</h2>
+            </div>
+            <div class="panel">
+                <p>
+                    A comprehensive penetration test was conducted against <strong>{{TARGET}}</strong> during the period
+                    of <strong>{{DATE_RANGE}}</strong>. The assessment was performed using a black-box methodology,
+                    simulating a real-world attacker with no prior knowledge of the target infrastructure.
+                </p>
+                <p>
+                    The overall security posture of the target is assessed as <strong style="color: var(--severity-critical);">CRITICAL</strong>.
+                    Multiple high-severity vulnerabilities were identified that could allow an attacker to achieve
+                    full system compromise, including remote code execution, privilege escalation, and sensitive data exfiltration.
+                </p>
+                <p>
+                    Immediate remediation is recommended for all critical and high-severity findings.
+                    A complete attack chain demonstrating full compromise is documented in Section 05.
+                </p>
+            </div>
+        </div>
+
+        <!-- ===== 02 — SCOPE & METHODOLOGY ===== -->
+        <div class="section">
+            <div class="section-header">
+                <span class="section-number">02</span>
+                <h2 class="section-title">Scope & Methodology</h2>
+            </div>
+            <div class="panel">
+                <p><strong style="color: var(--neon-cyan);">Target Scope:</strong></p>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Asset</th>
+                            <th>Type</th>
+                            <th>IP / Domain</th>
+                            <th>Status</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <!-- SCOPE_PLACEHOLDER -->
+                    </tbody>
+                </table>
+            </div>
+            <div class="panel">
+                <p><strong style="color: var(--neon-cyan);">Methodology:</strong></p>
+                <p>The assessment followed a structured approach:</p>
+                <p>① <strong>Reconnaissance</strong> — Passive and active information gathering</p>
+                <p>② <strong>Enumeration</strong> — Service and application fingerprinting</p>
+                <p>③ <strong>Vulnerability Analysis</strong> — Automated and manual vulnerability identification</p>
+                <p>④ <strong>Exploitation</strong> — Proof-of-concept exploitation of discovered vulnerabilities</p>
+                <p>⑤ <strong>Post-Exploitation</strong> — Privilege escalation and lateral movement</p>
+                <p>⑥ <strong>Reporting</strong> — Documentation of findings with reproducible exploit code</p>
+            </div>
+        </div>
+
+        <!-- ===== 03 — RISK OVERVIEW ===== -->
+        <div class="section">
+            <div class="section-header">
+                <span class="section-number">03</span>
+                <h2 class="section-title">Risk Overview</h2>
+            </div>
+            <!-- RISK_GRID_PLACEHOLDER -->
+        </div>
+
+        <!-- ===== 04 — DETAILED FINDINGS ===== -->
+        <div class="section">
+            <div class="section-header">
+                <span class="section-number">04</span>
+                <h2 class="section-title">Detailed Findings</h2>
+            </div>
+
+            <!-- FINDINGS_PLACEHOLDER -->
+        </div>
+
+        <!-- ===== 05 — ATTACK CHAIN ===== -->
+        <div class="section">
+            <div class="section-header">
+                <span class="section-number">05</span>
+                <h2 class="section-title">Attack Chain</h2>
+            </div>
+            <div class="panel">
+                <p>The following attack chain demonstrates the path from initial access to full compromise:</p>
+                <!-- ATTACK_CHAIN_PLACEHOLDER -->
+            </div>
+        </div>
+
+        <!-- ===== 06 — TOOLS ===== -->
+        <div class="section">
+            <div class="section-header">
+                <span class="section-number">06</span>
+                <h2 class="section-title">Tools & Environment</h2>
+            </div>
+            <div class="panel">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Tool</th>
+                            <th>Version</th>
+                            <th>Purpose</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <!-- TOOLS_PLACEHOLDER -->
+                    </tbody>
+                </table>
+                <p style="margin-top: 15px;">
+                    <strong style="color: var(--neon-cyan);">Environment:</strong>
+                    Kali Linux (Rolling) — All assessments conducted from a dedicated penetration testing VM.
+                </p>
+            </div>
+        </div>
+
+        <!-- ===== 07 — APPENDIX ===== -->
+        <div class="section">
+            <div class="section-header">
+                <span class="section-number">07</span>
+                <h2 class="section-title">Appendix</h2>
+            </div>
+            <div class="panel">
+                <p><strong style="color: var(--neon-cyan);">Raw Tool Output</strong></p>
+                <p>Full outputs from all tools used during the assessment are available in the engagement directory:</p>
+                <div class="code-block">
+                    <div class="code-header">
+                        <span class="code-language">Directory Structure</span>
+                    </div>
+                    <pre><code>/root/htb/boxes/{{BOX_NAME}}/
+├── scans/              <span class="code-comment"># nmap, nikto, ffuf, nuclei output</span>
+├── loot/               <span class="code-comment"># Captured credentials, tokens, files</span>
+├── exploits/           <span class="code-comment"># Custom scripts, payloads, PoCs</span>
+├── notes/              <span class="code-comment"># Methodology notes, phase summaries</span>
+└── report/             <span class="code-comment"># This report + diagrams</span></code></pre>
+                </div>
+            </div>
+        </div>
+
+        <!-- ===== FOOTER ===== -->
+        <div class="report-footer">
+            <img src="assets/smallLogo.png" alt="K" class="footer-logo">
+            <div class="footer-text">ChillsPwn Security — Security Division</div>
+            <p class="footer-disclaimer">
+                This document contains confidential information intended solely for the authorized recipient.
+                Unauthorized disclosure, reproduction, or distribution is strictly prohibited.
+            </p>
+        </div>
+
+    </div>
+</body>
+</html>

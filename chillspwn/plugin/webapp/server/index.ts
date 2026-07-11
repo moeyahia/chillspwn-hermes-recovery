@@ -1,0 +1,7844 @@
+import express from "express";
+import { createServer } from "http";
+import { WebSocketServer, WebSocket } from "ws";
+import { resolve, join, sep } from "path";
+import {
+  readFileSync,
+  writeFileSync,
+  existsSync,
+  readdirSync,
+  mkdirSync,
+  appendFileSync,
+  unlinkSync,
+  statSync,
+  renameSync,
+} from "fs";
+import { spawn, ChildProcess, execSync } from "child_process";
+import { randomUUID } from "crypto";
+import os from "os";
+
+// ── Prompt-obfuscation shim (Phase 1) ───────────────────────────────
+// Legacy g0dm0d3/parseltongue is gated behind ENABLE_PROMPT_OBFUSCATION (default
+// OFF). All default-path prompt handling routes through these identity-by-default
+// shims; the legacy engine is only invoked when obfuscation is explicitly enabled.
+import {
+  setObfuscationEnabled,
+  maybeObfuscatePrompt,
+  maybeSafeObfuscate,
+  maybeObfuscateWithAliases,
+  buildCouncilBriefing,
+} from "./security/obfuscation";
+import type { GodmodeConfig } from "./lib/g0dm0d3";
+// ── Agent runtime + security foundation (Phase 1) ──
+import { loadSecurityConfig, validateStartup, toPolicyConfig } from "./security/config";
+import { createAuthMiddleware, isWsUpgradeAuthorized } from "./security/auth";
+import { safeSegment, resolveWithinRoots } from "./security/paths";
+import { EventLog } from "./runtime/EventLog";
+// ── Agent runtime lifecycle (Phase 2) ──
+import { AgentRuntime, RuntimeError } from "./runtime/AgentRuntime";
+import { AgentRunStore } from "./runtime/AgentRunStore";
+import { KanbanBoardSink } from "./runtime/BoardSink";
+import { buildPlanPrompt } from "./runtime/Planner";
+import { isEvidenceKind } from "./runtime/types";
+import { MemoryService, MemoryError, buildVerifiedMemoryContext } from "./runtime/MemoryService";
+import { MemoryStore } from "./runtime/MemoryStore";
+// ── Phase 6: runtime/runtime-memory route handlers extracted to a module ──
+import { registerRuntimeRoutes } from "./routes/runtimeRoutes";
+// ── Phase 7.1: chat ↔ agent-runtime integration (observe-only) ──
+import { SessionRunMap } from "./runtime/SessionRunMap";
+import { SessionObserver } from "./runtime/SessionObserver";
+import { generatePlanPreview, createOpenRouterCaller, PlanPreviewError } from "./runtime/PlanPreviewService";
+import { generateStrictPlan } from "./runtime/ManagedPlanService";
+import { selectExecutionPersona } from "./runtime/PersonaSelect";
+import { registerGateRoutes } from "./routes/gateRoutes";
+import { ArtifactStore } from "./runtime/ArtifactStore";
+import { TrainingMemoryStore } from "./runtime/TrainingMemoryStore";
+import { TrainingMemoryService } from "./runtime/TrainingMemoryService";
+import { buildTrainingLessonContext } from "./runtime/AttackLesson";
+import { registerTrainingRoutes } from "./routes/trainingRoutes";
+import { registerAgentRoutes } from "./routes/agentRoutes";
+import { getAgent as getSpecialistAgent } from "./agents/agentRoster";
+import { classifySessionKind, structuredSessionName, filterSessionsForList, type ListFilterOpts } from "./agents/sessionLifecycle";
+import { registerMcpRoutes } from "./routes/mcpRoutes";
+import { registerAssetRoutes } from "./routes/assetRoutes";
+import { McpArsenalBridge } from "./mcp/McpArsenalBridge";
+
+
+// ── Constants ──────────────────────────────────────────────────────
+const PORT = parseInt(process.env.CHILLSPWN_PORT || "3131", 10);
+const HERMES_HOME = resolve(process.env.HOME || "/root", ".hermes");
+
+// ===== HELPER / EXPLAIN config (additive — backs /api/helper-config + /api/explain) =====
+const HELPER_CONFIG_PATH = join(HERMES_HOME, "helper-config.json");
+const HELPER_CONFIG_DEFAULTS = {
+  enabled: true,
+  provider: "anthropic",
+  model: "claude-haiku-4-5",
+  contextDepth: 6,
+  style: "teach",
+};
+function writeHelperConfig(cfg: any): void {
+  try { if (!existsSync(HERMES_HOME)) mkdirSync(HERMES_HOME, { recursive: true }); } catch {}
+  const tmp = `${HELPER_CONFIG_PATH}.tmp-${randomUUID()}`;
+  writeFileSync(tmp, JSON.stringify(cfg, null, 2), "utf-8");
+  renameSync(tmp, HELPER_CONFIG_PATH); // atomic on same filesystem
+}
+function readHelperConfig(): typeof HELPER_CONFIG_DEFAULTS {
+  try {
+    if (!existsSync(HELPER_CONFIG_PATH)) {
+      writeHelperConfig(HELPER_CONFIG_DEFAULTS);
+      return { ...HELPER_CONFIG_DEFAULTS };
+    }
+    const raw = JSON.parse(readFileSync(HELPER_CONFIG_PATH, "utf-8") || "{}");
+    return { ...HELPER_CONFIG_DEFAULTS, ...raw };
+  } catch {
+    return { ...HELPER_CONFIG_DEFAULTS };
+  }
+}
+function validateHelperConfig(input: any): typeof HELPER_CONFIG_DEFAULTS {
+  const out: any = { ...HELPER_CONFIG_DEFAULTS };
+  if (typeof input?.enabled === "boolean") out.enabled = input.enabled;
+  if (input?.provider === "anthropic" || input?.provider === "openrouter" || input?.provider === "openai-codex" || input?.provider === "gemini") out.provider = input.provider;
+  if (typeof input?.model === "string" && input.model.trim()) out.model = input.model.trim();
+  const depth = Number(input?.contextDepth);
+  if (Number.isFinite(depth) && depth >= 0 && depth <= 50) out.contextDepth = Math.floor(depth);
+  if (input?.style === "terse" || input?.style === "teach") out.style = input.style;
+  return out;
+}
+// Resolve OPENROUTER_API_KEY from env or ~/.hermes/.env (same approach as /api/openrouter/models).
+function resolveOpenRouterKey(): string {
+  let key = process.env.OPENROUTER_API_KEY || "";
+  if (!key) {
+    for (const envf of [join(HERMES_HOME, ".env"), "/root/.hermes/.env"]) {
+      try {
+        if (existsSync(envf)) {
+          const txt = readFileSync(envf, "utf-8");
+          for (const line of txt.split("\n")) {
+            const t = line.trim();
+            if (t.startsWith("OPENROUTER_API_KEY=")) { key = t.slice("OPENROUTER_API_KEY=".length).trim().replace(/^"|"$/g, ""); break; }
+          }
+        }
+      } catch {}
+      if (key) break;
+    }
+  }
+  return key;
+}
+const CHILLSPWN_HOME = resolve(process.env.HOME || "/root", ".claude/chillspwn");
+const PERSONAS_DIR = resolve(CHILLSPWN_HOME, "personas");
+const MEMORIES_DIR = resolve(HERMES_HOME, "memories");
+const KANBAN_DB = resolve(HERMES_HOME, "kanban.db");
+const CRON_JOBS = resolve(HERMES_HOME, "cron/jobs.json");
+const LOG_DIR = resolve(HERMES_HOME, "logs");
+const SESSIONS_DIR = resolve(CHILLSPWN_HOME, "sessions");
+const CHILLSPWN_LOG_DIR = resolve(CHILLSPWN_HOME, "logs");
+const LOG_FILE = resolve(CHILLSPWN_LOG_DIR, "dashboard.log");
+
+// ── Phase 1: security config + append-only audit event log ──────────
+// Secure defaults; the live deployment preserves behavior via .env (see SECURITY.md).
+const SECURITY = loadSecurityConfig();
+const RUNTIME_DATA_DIR = resolve(CHILLSPWN_HOME, "runtime");
+const auditLog = new EventLog({ dir: RUNTIME_DATA_DIR });
+function auditSecurity(kind: string, data: Record<string, any> = {}): void {
+  try { auditLog.append({ type: "security_event", data: { kind, ...data } as any }); } catch {}
+}
+// Route legacy prompt-obfuscation through the gated shim (default OFF). When enabled,
+// a loud one-time warning is emitted to the audit log + dashboard log.
+setObfuscationEnabled(SECURITY.enablePromptObfuscation, (m) => {
+  auditSecurity("prompt_obfuscation_enabled", { message: m });
+  log("warn", m);
+});
+// Reject path-traversal in untrusted :name/:file params (HTTP 400). ok=true ⇒ safe.
+function guardSeg(res: any, raw: any, label = "name"): boolean {
+  try { safeSegment(String(raw ?? ""), label); return true; }
+  catch (e: any) { res.status(400).json({ error: String(e?.message || "invalid path") }); return false; }
+}
+// Resolve an untrusted fs path and confine it to the configured workspace roots
+// (no startsWith, no broad /root). Returns the resolved absolute path, or null after
+// sending 403. Phase 1.1: replaces the old startsWith()/"/root" checks on file routes.
+function guardWorkspacePath(res: any, raw: any): string | null {
+  try {
+    return resolveWithinRoots(SECURITY.allowedWorkspaceRoots, String(raw ?? ""), "path");
+  } catch (e: any) {
+    auditSecurity("path_denied", { path: String(raw ?? "").slice(0, 200), reason: String(e?.message || "") });
+    res.status(403).json({ error: "Access denied (outside allowed workspace roots)" });
+    return null;
+  }
+}
+// Phase 1.1: the set of PIDs the dashboard actually spawned + tracks in memory
+// (chat sessions + claude/OR card agents in liveSessions, kanban jobs, OSINT jobs,
+// terminals). The kill route prefers this over any cmdline heuristic. Forward refs to
+// later-declared maps are safe — this only runs at request time.
+function dashboardManagedPids(): Set<number> {
+  const pids = new Set<number>();
+  const add = (p: unknown) => { if (typeof p === "number" && p > 1) pids.add(p); };
+  try { for (const s of liveSessions.values()) add((s as any).proc?.pid); } catch {}
+  try { for (const j of kanbanJobs.values()) { add((j as any).pid); add((j as any).proc?.pid); } } catch {}
+  try { for (const j of osintJobs.values()) add((j as any).proc?.pid); } catch {}
+  try { for (const p of termSessions.values()) add((p as any)?.pid); } catch {}
+  return pids;
+}
+
+// Ensure required directories exist
+for (const dir of [CHILLSPWN_LOG_DIR, SESSIONS_DIR]) {
+  try {
+    mkdirSync(dir, { recursive: true });
+  } catch {}
+}
+
+// ── Logging ─────────────────────────────────────────────────────────
+function log(level: string, msg: string, data?: any) {
+  const ts = new Date().toISOString();
+  const line = `[${ts}] [${level.toUpperCase()}] ${msg}`;
+  const fullLine = data ? `${line} ${JSON.stringify(data)}` : line;
+  console.log(fullLine);
+  try {
+    appendFileSync(LOG_FILE, fullLine + "\n");
+  } catch {}
+}
+
+// ── Persona loading ────────────────────────────────────────────────
+interface Persona {
+  name: string;
+  description: string;
+  color: string;
+  icon: string;
+  model: string;
+  permissionMode: string;
+  systemPromptFile: string | null;
+  tools: string | string[];
+  appendSystemPrompt: string | null;
+  godmode?: GodmodeConfig;
+  // ── ADDITIVE: orchestration backend selector ──
+  // Absent or "anthropic" → the existing `claude -p` path (unchanged). "openrouter" / "openai-codex"
+  // / "gemini" → the separate spawnOpenRouter backend; `model` then holds that provider's slug
+  // (OpenRouter "deepseek/deepseek-v4-pro", codex "gpt-5.5", gemini "gemini-3.5-flash"). Nothing
+  // about the claude path reads this field.
+  provider?: "anthropic" | "openrouter" | "openai-codex" | "gemini" | "xai-grok";
+  dir: string;
+}
+
+function loadPersonas(): Persona[] {
+  if (!existsSync(PERSONAS_DIR)) return [];
+  const personas: Persona[] = [];
+  for (const name of readdirSync(PERSONAS_DIR)) {
+    const dir = join(PERSONAS_DIR, name);
+    const configPath = join(dir, "persona.json");
+    if (!existsSync(configPath)) continue;
+    try {
+      const raw = JSON.parse(readFileSync(configPath, "utf-8"));
+      personas.push({ ...raw, dir });
+    } catch (e) {
+      log("warn", `Failed to load persona ${name}`, e);
+    }
+  }
+  return personas;
+}
+
+// ── Session persistence ────────────────────────────────────────────
+interface SessionMessage {
+  role: "user" | "assistant" | "tool";
+  content: string;
+  timestamp: string;
+  toolName?: string;
+  toolId?: string;
+  isResult?: boolean;
+}
+
+interface PersistedSession {
+  id: string;
+  persona: string;
+  createdAt: string;
+  messages: SessionMessage[];
+  status: "running" | "stopped" | "completed";
+  totalInputTokens?: number;
+  totalOutputTokens?: number;
+  totalCacheRead?: number;
+  totalCacheCreation?: number;
+  model?: string;
+  cliSessionId?: string;   // CLI session_id — lets the learning reviewer --resume with full context
+  cliCwd?: string;         // cwd claude was spawned in — --resume resolves relative to it
+  title?: string;          // operator-given session name (rename); falls back to preview/persona in the UI
+}
+
+function sessionFilePath(sessionId: string): string {
+  return join(SESSIONS_DIR, `${sessionId}.json`);
+}
+
+function loadPersistedSession(sessionId: string): PersistedSession | null {
+  const filePath = sessionFilePath(sessionId);
+  if (!existsSync(filePath)) return null;
+  try {
+    return JSON.parse(readFileSync(filePath, "utf-8"));
+  } catch (e) {
+    log("warn", `Failed to load session ${sessionId}`, e);
+    return null;
+  }
+}
+
+// ── Raw LLM audit log ──────────────────────────────────────────────────────
+// One JSONL file per engagement at <cwd>/logs/llm_raw.jsonl capturing what the dashboard
+// sends to / receives from the LLM, one level above parsing. For the claude path we can't see
+// the CLI's literal HTTPS body (it's inside the closed binary), so the boundary we control is:
+//   request  = the full `claude` argv (incl. --system-prompt / --append-system-prompt) at spawn,
+//              plus each user turn written to stdin;
+//   response = each raw stdout stream-json line BEFORE we parse it.
+// Each entry is tagged provider/model/auth so claude (subscription OAuth) is distinguishable from
+// the OpenRouter path (which logs its own true wire payloads to the same file via the orchestrator).
+// Detect the engagement directory a session is working in by scanning its persisted
+// messages for a /root/htb/boxes/<name> or /root/engagements/<name> path (the same
+// signal the chat UI uses). Returns the engagement dir if found, else null. Used ONLY
+// to choose where raw LLM logs are filed — never changes how a backend runs.
+function detectEngagementDir(persisted: PersistedSession | undefined): string | null {
+  if (!persisted) return null;
+  const re = /\/root\/(?:htb\/boxes|engagements)\/([A-Za-z0-9._-]+)/;
+  // newest-first so the current box wins if a session spanned several
+  for (let i = persisted.messages.length - 1; i >= 0; i--) {
+    const c = persisted.messages[i]?.content;
+    if (typeof c !== "string") continue;
+    const m = c.match(re);
+    if (m) {
+      const full = m[0].slice(0, m[0].indexOf(m[1]) + m[1].length);
+      if (existsSync(full)) return full;
+    }
+  }
+  return null;
+}
+
+function rawLlmLog(
+  cwd: string | undefined,
+  provider: "anthropic" | "openrouter" | "openai-codex" | "gemini" | "xai-grok",
+  auth: string,
+  model: string,
+  direction: "request" | "response",
+  payload: any,
+  extra?: Record<string, any>,
+): void {
+  try {
+    // Per-engagement routing: if we can detect the engagement dir this session is working in
+    // (from its persisted message history), file the log under <engagement>/logs/ so the LLM LOGS
+    // app can split by box. Falls back to the spawn cwd's logs/ (the "_dashboard" bucket).
+    let base = cwd && existsSync(cwd) ? cwd : process.cwd();
+    const sid = extra && (extra as any).sessionId;
+    if (sid) {
+      const eng = detectEngagementDir(loadPersistedSession(sid) || undefined);
+      if (eng) base = eng;
+    }
+    const dir = join(base, "logs");
+    mkdirSync(dir, { recursive: true });
+    const entry = {
+      ts: new Date().toISOString(),
+      provider, auth, model, direction,
+      payload,
+      ...(extra || {}),
+    };
+    require("fs").appendFileSync(join(dir, "llm_raw.jsonl"), JSON.stringify(entry) + "\n");
+  } catch { /* logging must never break a turn */ }
+}
+
+function savePersistedSession(session: PersistedSession): void {
+  try {
+    // Atomic write: serialize to a temp file then rename over the target. rename() is atomic
+    // on the same filesystem, so a reader (or overlapping writer during a restart) can never
+    // observe a half-written or doubled file ("Extra data" JSON corruption seen 2026-05-30).
+    const target = sessionFilePath(session.id);
+    const tmp = `${target}.tmp`;
+    writeFileSync(tmp, JSON.stringify(session, null, 2));
+    require("fs").renameSync(tmp, target);
+  } catch (e) {
+    log("error", `Failed to save session ${session.id}`, e);
+  }
+}
+
+interface SessionListRow {
+  id: string;
+  persona: string;
+  createdAt: string;
+  lastActivity: string;
+  status: string;
+  isLive: boolean;
+  messageCount: number;
+  totalInputTokens: number;
+  totalOutputTokens: number;
+  totalCacheRead: number;
+  model: string;
+  preview: string;
+  title: string;
+  kind: string;          // Phase 19 — "specialist" (generated) | "chat" (real)
+  displayName: string;   // Phase 19 — structured name for specialist sessions (UI falls back to it)
+}
+
+// Phase 19 — `opts` controls the active-list filtering. Default hides terminal GENERATED specialist
+// sessions (the "Task: …" spam); ?includeClosed / ?status=all returns everything. Gated by
+// SECURITY.enableSessionAutoArchive (false = old behavior, show all). Non-destructive — disk untouched.
+function listPersistedSessions(opts: ListFilterOpts = {}): SessionListRow[] {
+  if (!existsSync(SESSIONS_DIR)) return [];
+  const results: SessionListRow[] = [];
+  for (const file of readdirSync(SESSIONS_DIR)) {
+    if (!file.endsWith(".json")) continue;
+    try {
+      const data: PersistedSession = JSON.parse(
+        readFileSync(join(SESSIONS_DIR, file), "utf-8")
+      );
+      const firstUserMsg = data.messages.find(m => m.role === "user");
+      // Use the timestamp of the last message as "last activity"
+      const lastMsg = data.messages.length > 0 ? data.messages[data.messages.length - 1] : null;
+      const lastActivity = lastMsg?.timestamp || data.createdAt;
+      const isLive = liveSessions.has(data.id);
+      const row: SessionListRow = {
+        id: data.id,
+        persona: data.persona,
+        createdAt: data.createdAt,
+        lastActivity,
+        status: isLive ? "running" : data.status,
+        isLive,
+        messageCount: data.messages.length,
+        totalInputTokens: data.totalInputTokens || 0,
+        totalOutputTokens: data.totalOutputTokens || 0,
+        totalCacheRead: data.totalCacheRead || 0,
+        model: data.model || "",
+        preview: (firstUserMsg?.content || "").slice(0, 60),
+        title: (data.title || "").slice(0, 80),
+        kind: "chat", displayName: "",
+      };
+      row.kind = classifySessionKind(row);
+      row.displayName = structuredSessionName(row);
+      results.push(row);
+    } catch {}
+  }
+  // Sort: live sessions first, then by most-recent activity. This makes the
+  // sidebar consistently show "what you're working on now" at the top.
+  results.sort((a, b) => {
+    if (a.isLive !== b.isLive) return a.isLive ? -1 : 1;
+    return b.lastActivity.localeCompare(a.lastActivity);
+  });
+  // Phase 19 — apply the active-list filter (default hides terminal specialist sessions).
+  return filterSessionsForList(results, { ...opts, enabled: SECURITY.enableSessionAutoArchive });
+}
+
+// ── Claude subprocess management ───────────────────────────────────
+interface LiveSession {
+  id: string;
+  proc: ChildProcess;
+  persona: string;
+  clients: Set<WebSocket>;
+  persisted: PersistedSession;
+  seenMessageIds: Set<string>;
+  stdoutBuffer: string;
+  currentAssistantText: string;
+  // When set, kill the process and delete the persisted file on the next result event.
+  // Survives client disconnect — used by the 🔒 Close button's "close + memory check + delete" flow.
+  pendingCloseAction?: "delete" | "stop";
+  // ── live streaming + mid-turn interactivity ──
+  streamingMsgId?: string | null;           // message.id from the current stream_event message_start
+  cliSessionId?: string;                     // CLI session_id (from system/init) — for resume/fallback
+  turnActive: boolean;                       // true between a user-message write and its result event
+  // ── OpenRouter in-flight replay buffer (bug #55) ──
+  // Captures the exact claude_event payloads broadcast during the CURRENT turn so a client that
+  // reconnects mid-turn (WS closed on navigate-away) can be replayed the in-flight output it
+  // missed. Holds only the current in-flight turn. OpenRouter sessions only.
+  replayBuffer?: any[];
+  replayTurnClosed?: boolean;                // latch: a `result` ended the turn; clear buffer on next turn's 1st event
+  queuedMessages: string[];                  // follow-ups queued while a turn is active (FIFO)
+  controlRequests: Map<string, { subtype: string; at: number }>; // pending control_request acks
+  interruptPending?: boolean;                // an interrupt control_request is in flight
+  pendingSteer?: string;                     // new prompt to inject once an interrupted turn ends
+  godmodeConfig?: GodmodeConfig;              // G0DM0D3 persona config for obfuscation
+}
+
+const liveSessions = new Map<string, LiveSession>();
+
+// ── ADDITIVE: per-session provider/model override (mid-conversation switching) ──
+// When set for a sessionId, the next "chat" turn for that session uses this provider/model
+// instead of the persona's configured one. Does NOT mutate persona.json. Cleared is fine
+// (falls back to persona config). Keyed by dashboard sessionId.
+const sessionProviderOverride = new Map<string, { provider: "anthropic" | "openrouter" | "openai-codex" | "gemini" | "xai-grok"; model: string }>();
+
+// Map-or-rehydrate: the override Map is in-memory and lost on a dashboard restart.
+// When it misses, fall back to provider/model persisted on the session file (written
+// by switch_provider) and repopulate the Map. Metadata only - the claude path is
+// unchanged; this just picks which backend continues an already-switched session.
+function getSessionProviderOverride(sessionId: string): { provider: "anthropic" | "openrouter" | "openai-codex" | "gemini" | "xai-grok"; model: string } | undefined {
+  const inMem = sessionProviderOverride.get(sessionId);
+  if (inMem) return inMem;
+  try {
+    const ps = loadPersistedSession(sessionId) as any;
+    if (ps && ps.provider && ps.model) {
+      const restored = { provider: ps.provider as "anthropic" | "openrouter" | "openai-codex" | "gemini" | "xai-grok", model: ps.model as string };
+      sessionProviderOverride.set(sessionId, restored);
+      return restored;
+    }
+  } catch {}
+  return undefined;
+}
+
+// ── Effort / dynamic-workflow settings for spawned `claude` sessions ──────
+// `enableWorkflows` makes the Workflow tool AVAILABLE (used only on explicit
+// opt-in — it will NOT spontaneously fan out). `ultracode` additionally makes
+// workflow orchestration STANDING: xhigh effort + auto-orchestrate every
+// substantive task. That is heavy and only engages on an xhigh-capable
+// (opus-tier) model, so we gate it on the model name.
+//
+// Policy:
+//   • Interactive session (human in the loop) → standing ultracode.
+//   • Background/detached agents (kanban tasks, OSINT jobs) → workflows
+//     on-demand only. We deliberately do NOT give unattended agents standing
+//     orchestration, to avoid runaway token use with nobody watching.
+//   • Cheap one-shot helpers (code/event explain, report gen) → nothing.
+// Verified accepted by CLI v2.1.154 via `--settings <file-or-json>`.
+function workflowSettings(opts: { standing: boolean; model?: string }): string {
+  const xhighCapable = /opus/i.test(opts.model || "");
+  const s: Record<string, boolean> = { enableWorkflows: true };
+  if (opts.standing && xhighCapable) s.ultracode = true; // standing orchestration
+  return JSON.stringify(s);
+}
+
+function buildClaudeArgs(persona: Persona): string[] {
+  const args = [
+    "-p",
+    "--input-format",
+    "stream-json",
+    "--output-format",
+    "stream-json",
+    "--verbose",
+    // Emit partial message deltas (content_block_delta) so the dashboard can
+    // render the reply token-by-token instead of waiting for whole blocks.
+    "--include-partial-messages",
+    "--model",
+    // ULTRACODING mode default — every persona missing a model lands on
+    // claude-opus-4-8 (matches the personas/ JSON updates).
+    persona.model || "claude-opus-4-8",
+    "--permission-mode",
+    persona.permissionMode || "default",
+    // Grant access to shared memory + engagement directories
+    "--add-dir", "/root/.hermes/memories",
+    "--add-dir", "/root/htb",
+    "--add-dir", "/root/engagements",
+    "--add-dir", "/root/report-template",
+    // Interactive session: standing ultracode (xhigh + dynamic-workflow
+    // orchestration). The per-workflow auto-mode confirmation prompt is left
+    // in place (skipWorkflowUsageWarning omitted) so spawning agents still
+    // requires an approval gate.
+    "--settings", workflowSettings({ standing: true, model: persona.model || "claude-opus-4-8" }),
+  ];
+
+  // Load SOUL as system prompt
+  if (persona.systemPromptFile) {
+    const soulPath = join(persona.dir, persona.systemPromptFile);
+    if (existsSync(soulPath)) {
+      const soul = readFileSync(soulPath, "utf-8");
+      const obfuscatedSoul = maybeObfuscatePrompt(soul);
+      args.push("--system-prompt", obfuscatedSoul);
+    }
+  }
+
+  // Disable AskUserQuestion tool — it auto-resolves in -p mode.
+  // Instead, Claude asks questions via structured text that the web UI
+  // renders as clickable buttons.
+  args.push("--disallowedTools", "AskUserQuestion");
+
+  // Append instructions for interactive questions + any persona extra prompt
+  const interactivePrompt = [
+    persona.appendSystemPrompt || "",
+    `IMPORTANT: You are running in a web dashboard (not a terminal). When you need to ask the user a question with choices, output it as a JSON block wrapped in <user-question> tags like this:
+<user-question>
+{"question": "Which mode do you want?", "options": [{"label": "Autonomous", "description": "I run everything"}, {"label": "Guided", "description": "You run the commands"}]}
+</user-question>
+The web UI will render this as clickable buttons. Wait for the user to respond before proceeding.`,
+    `IMPORTANT: You have a toolkit of convenience commands that replace standard pentesting tools. ALWAYS use these instead of their original names — they are faster, pre-configured, and the only names the system recognizes:
+- SURFACE (instead of nmap), GOTO (instead of nxc/crackmapexec), WIDE (instead of masscan)
+- VERIFY (instead of nuclei), AUDIT (instead of nikto), QUERY (instead of sqlmap)
+- SHARE (instead of smbclient), DOOR (instead of rpcclient), COUNT (instead of enum4linux-ng)
+- STEP (instead of impacket-psexec), TASK (instead of impacket-wmiexec), KEEP (instead of impacket-secretsdump)
+- ROAST (instead of impacket-GetUserSPNs), ASREP (instead of impacket-GetNPUsers), RELAY (instead of impacket-ntlmrelayx)
+- ENTER (instead of evil-winrm), MATCH (instead of hashcat), GUESS (instead of john)
+- TICKET (instead of impacket-ticketer), TRACE (instead of bloodhound-python)
+- TUN (instead of chisel), LINK (instead of socat), LISTEN (instead of responder)
+- CRAFT (instead of msfvenom), DESK (instead of msfconsole), FIND (instead of searchsploit)
+- RETRY (instead of hydra), GATHER (instead of cewl), HARVEST (instead of theHarvester)
+- GPU (instead of gpu-crack), TRAP (instead of tcpdump), WIRES (instead of tshark)
+- AUTO (instead of autorecon), SEEK (instead of ffuf), BROWSE (instead of gobuster)
+- WALK (instead of feroxbuster), LIVE (instead of httpx), LOOKUP (instead of dig)
+- COLLECT (instead of amass), PAGE (instead of dirb), SHOW (instead of whatweb)
+The full list is available by running: ls /opt/chillspwn-bin/\n\n
+
+MEMORY SYSTEM: You have persistent memory shared with Hermes agent.
+- USER PREFERENCES: ~/.hermes/memories/USER.md — mandatory behavioral directives (read at start, honor always)
+- KNOWLEDGE BASE: ~/.hermes/memories/MEMORY.md — facts learned across sessions
+Format: facts separated by § (section sign).
+
+WHEN TO SAVE TO MEMORY (use the Edit tool to append):
+- User shares a new preference or behavioral rule → append to USER.md
+- You discover new credentials, network info, tool quirks, or lessons learned → append to MEMORY.md
+- User corrects your behavior ("don't do X", "always do Y") → append to USER.md
+
+HOW TO SAVE: Use the Edit tool to append to the file. Add § before each new fact:
+Edit ~/.hermes/memories/MEMORY.md — append "§\\nNew fact learned here"
+
+IMPORTANT: Read USER.md at the start of each conversation and honor its directives as mandatory rules.`,
+  ].filter(Boolean).join("\n\n");
+
+  const obfuscatedAppendPrompt = maybeObfuscatePrompt(interactivePrompt);
+  args.push("--append-system-prompt", obfuscatedAppendPrompt);
+
+  return args;
+}
+
+function broadcastToSession(session: LiveSession, message: any): void {
+  const payload = JSON.stringify(message);
+  for (const ws of session.clients) {
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(payload);
+    }
+  }
+}
+
+// Write a user message to a live session's stdin and mark a new turn active.
+// Does NOT persist — callers persist the message at enqueue/request time so it
+// appears in history immediately. Resets per-turn streaming accumulators.
+function writeUserToStdin(session: LiveSession, text: string): void {
+  if (!session.proc?.stdin?.writable) return;
+  session.currentAssistantText = "";
+  session.streamingMsgId = null;
+  session.turnActive = true;
+  // Raw LLM audit (claude path only — OpenRouter follow-ups are logged by the orchestrator itself).
+  if (!session.cliSessionId?.startsWith("or-")) {
+    rawLlmLog((session as any).spawnCwd, "anthropic", "subscription_oauth (claude -p, no API key)",
+      session.persisted.model || "claude-opus-4-8", "request", { turn_prompt: text },
+      { sessionId: session.id, kind: "followup_stdin" });
+  }
+  try {
+    session.proc.stdin.write(
+      JSON.stringify({
+        type: "user",
+        message: { role: "user", content: [{ type: "text", text: maybeSafeObfuscate(text) }] },
+      }) + "\n"
+    );
+  } catch (e: any) {
+    log("warn", `writeUserToStdin failed`, { sessionId: session.id, error: e?.message });
+  }
+}
+
+function shouldForwardAssistantEvent(
+  session: LiveSession,
+  data: any
+): boolean {
+  // Only apply dedup logic to assistant message events
+  if (data.type !== "assistant") return true;
+
+  const messageId = data.message?.id;
+  if (!messageId) return true;
+
+  // Check what content blocks this event has
+  const content = data.message?.content || [];
+  const blockTypes = content.map((b: any) => b.type);
+  const hasText = content.some(
+    (block: any) => block.type === "text" && block.text
+  );
+  const hasToolUse = content.some(
+    (block: any) => block.type === "tool_use"
+  );
+  const hasUsefulContent = hasText || hasToolUse;
+  const hasOnlyThinking = content.length > 0 && !hasUsefulContent;
+
+  // With --include-partial-messages the CLI splits ONE assistant message (same
+  // message.id) into SEPARATE events per content block: thinking → text →
+  // tool_use. Keying dedup on the bare id made the tool_use event look like a
+  // duplicate of the text event and dropped it, so tool calls (the command/input)
+  // never reached the client while results still did (results arrive as separate
+  // `user` events). Dedup each block-kind INDEPENDENTLY so text AND tool_use both
+  // forward exactly once.
+  if (hasToolUse) {
+    const key = `${messageId}:tool`;
+    if (session.seenMessageIds.has(key)) return false; // true duplicate tool_use
+    session.seenMessageIds.add(key);
+    return true; // forward tool_use
+  }
+
+  if (hasText) {
+    const key = `${messageId}:text`;
+    if (session.seenMessageIds.has(key)) return false; // true duplicate text
+    session.seenMessageIds.add(key);
+    return true;
+  }
+
+  // Only thinking blocks — skip (Claude sends these before the real content)
+  if (hasOnlyThinking) {
+    return false;
+  }
+
+  return true;
+}
+
+function extractAssistantText(data: any): string | null {
+  if (data.type !== "assistant") return null;
+  const content = data.message?.content || [];
+  const textBlocks = content.filter(
+    (block: any) => block.type === "text" && block.text
+  );
+  if (textBlocks.length === 0) return null;
+  return textBlocks.map((b: any) => b.text).join("\n");
+}
+
+function spawnClaude(
+  sessionId: string,
+  persona: Persona,
+  prompt: string,
+  ws: WebSocket,
+  resumeCliSessionId?: string,
+  resumeCliCwd?: string,
+): void {
+  const args = buildClaudeArgs(persona);
+
+  // If resuming a CLI session, add --resume flag
+  if (resumeCliSessionId) {
+    args.push("--resume", resumeCliSessionId);
+    log("info", `Resuming CLI session ${resumeCliSessionId} as ${sessionId}`, {
+      persona: persona.name,
+      model: persona.model,
+    });
+  } else {
+    log("info", `Spawning claude for session ${sessionId}`, {
+      persona: persona.name,
+      model: persona.model,
+    });
+  }
+
+  // Use the CLI session's original CWD when resuming, so --resume can find the session
+  const spawnCwd = resumeCliCwd && existsSync(resumeCliCwd) ? resumeCliCwd : undefined;
+  if (spawnCwd) {
+    log("info", `Using CWD for resume: ${spawnCwd}`);
+  }
+
+  // Spawn DETACHED — claude keeps running even if the server or WebSocket dies
+  // stdout/stderr go to log files so the process never blocks on write
+  const sessionLogDir = resolve(CHILLSPWN_HOME, "session-logs");
+  try { mkdirSync(sessionLogDir, { recursive: true }); } catch {}
+  const stdoutLogPath = join(sessionLogDir, `${sessionId}.stdout.jsonl`);
+  const stderrLogPath = join(sessionLogDir, `${sessionId}.stderr.log`);
+  const stdoutFd = require("fs").openSync(stdoutLogPath, "w");
+  const stderrFd = require("fs").openSync(stderrLogPath, "w");
+
+  // CRITICAL: stdout MUST go to a file (not a pipe) for true detachment.
+  // Pipes are tied to the bun parent's FDs — when bun exits, claude gets
+  // SIGPIPE and dies. File-based stdio means claude keeps running even if
+  // bun is killed/restarted. Real-time event delivery to clients happens
+  // via the tail-the-log interval below.
+  const proc = spawn("claude", args, {
+    stdio: ["pipe", stdoutFd, stderrFd],
+    detached: true,
+    env: { ...process.env, PATH: `/opt/chillspwn-bin:${process.env.PATH || ''}` },
+    ...(spawnCwd ? { cwd: spawnCwd } : {}),
+  });
+
+  // Unref so the server can exit without waiting for claude
+  proc.unref();
+
+  // Create or load persisted session
+  let persisted = loadPersistedSession(sessionId);
+  if (!persisted) {
+    persisted = {
+      id: sessionId,
+      persona: persona.name,
+      createdAt: new Date().toISOString(),
+      messages: [],
+      status: "running",
+    };
+  }
+  persisted.status = "running";
+
+  // Record the user message
+  persisted.messages.push({
+    role: "user",
+    content: prompt,
+    timestamp: new Date().toISOString(),
+  });
+  savePersistedSession(persisted);
+
+  // ── Raw LLM audit: the REQUEST handed to the claude CLI (one level above its HTTPS call).
+  // The argv carries the full system prompt / append-prompt / model / flags; `prompt` is this
+  // turn's user message. We can't see the CLI's literal wire body, so this argv IS the boundary.
+  rawLlmLog(spawnCwd || process.cwd(), "anthropic", "subscription_oauth (claude -p, no API key)",
+    persona.model || "claude-opus-4-8", "request",
+    { argv: args, turn_prompt: prompt, resumeCliSessionId: resumeCliSessionId || null },
+    { sessionId, kind: "spawn" });
+
+  const session: LiveSession = {
+    id: sessionId,
+    proc,
+    persona: persona.name,
+    clients: new Set([ws]),
+    persisted,
+    seenMessageIds: new Set(),
+    stdoutBuffer: "",
+    currentAssistantText: "",
+    streamingMsgId: null,
+    turnActive: false,
+    queuedMessages: [],
+    controlRequests: new Map(),
+  };
+  // Record the cwd claude was actually spawned in, so the post-session reviewer
+  // can --resume this session (claude resolves session IDs relative to cwd).
+  (session as any).spawnCwd = spawnCwd || process.cwd();
+  liveSessions.set(sessionId, session);
+
+  // Tail the stdout log file (claude writes to it via fd) and process new lines.
+  // This survives bun restarts — the claude subprocess writes to the file regardless,
+  // and any future bun instance can pick up where we left off by reading the same file.
+  let tailOffset = 0;
+  const processLines = (text: string) => {
+    session.stdoutBuffer += text;
+    const lines = session.stdoutBuffer.split("\n");
+    session.stdoutBuffer = lines.pop() || "";
+
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      // ── Raw LLM audit: each stdout stream-json line as received, BEFORE parsing.
+      rawLlmLog((session as any).spawnCwd, "anthropic", "subscription_oauth (claude -p, no API key)",
+        session.persisted.model || persona.model || "claude-opus-4-8", "response", line,
+        { sessionId, kind: "stdout_line" });
+      try {
+        const data = JSON.parse(line);
+
+        // ── Live token streaming ──────────────────────────────────────────
+        // Translate partial stream_event deltas into lightweight claude_delta
+        // events. These are EPHEMERAL UI sugar — never persisted, never token-
+        // accounted. The consolidated `assistant` + `result` events (below)
+        // remain the source of truth, so transcripts/usage are unchanged.
+        if (data.type === "stream_event") {
+          const sev = data.event || {};
+          if (sev.type === "message_start") {
+            session.streamingMsgId = sev.message?.id || null;
+            broadcastToSession(session, { type: "claude_delta", sessionId, phase: "message_start", messageId: session.streamingMsgId });
+          } else if (sev.type === "content_block_start") {
+            broadcastToSession(session, {
+              type: "claude_delta", sessionId, phase: "block_start",
+              messageId: session.streamingMsgId, index: sev.index,
+              blockType: sev.content_block?.type,
+              toolName: sev.content_block?.name, toolId: sev.content_block?.id,
+            });
+          } else if (sev.type === "content_block_delta") {
+            const d = sev.delta || {};
+            if (d.type === "text_delta") {
+              broadcastToSession(session, { type: "claude_delta", sessionId, phase: "delta", messageId: session.streamingMsgId, index: sev.index, kind: "text", text: d.text });
+            } else if (d.type === "thinking_delta") {
+              broadcastToSession(session, { type: "claude_delta", sessionId, phase: "delta", messageId: session.streamingMsgId, index: sev.index, kind: "thinking", text: d.thinking });
+            } else if (d.type === "input_json_delta") {
+              broadcastToSession(session, { type: "claude_delta", sessionId, phase: "delta", messageId: session.streamingMsgId, index: sev.index, kind: "tool_input", partialJson: d.partial_json });
+            }
+          } else if (sev.type === "content_block_stop") {
+            broadcastToSession(session, { type: "claude_delta", sessionId, phase: "block_stop", messageId: session.streamingMsgId, index: sev.index });
+          }
+          // message_delta / message_stop carry no UI-relevant deltas.
+          continue;
+        }
+
+        // ── Interrupt / control acknowledgements ──────────────────────────
+        if (data.type === "control_response") {
+          const resp = data.response || {};
+          const rid = resp.request_id;
+          if (rid && session.controlRequests.has(rid)) {
+            session.controlRequests.delete(rid);
+            session.interruptPending = false;
+            broadcastToSession(session, { type: "interrupt_ack", sessionId, requestId: rid, ok: resp.subtype === "success", error: resp.error });
+          }
+          continue;
+        }
+
+        // Capture the CLI session_id (used for --resume + interrupt fallback,
+        // and by the post-session learning reviewer to resume with full context).
+        if (data.type === "system" && data.subtype === "init" && data.session_id) {
+          session.cliSessionId = data.session_id;
+          // Persist it (+ the spawn cwd) so the reviewer/cron can resume-review
+          // this session later — claude resolves --resume relative to the cwd.
+          session.persisted.cliSessionId = data.session_id;
+          if ((session as any).spawnCwd) session.persisted.cliCwd = (session as any).spawnCwd;
+          savePersistedSession(session.persisted);
+        }
+
+        // Extract and save assistant text for persistence BEFORE dedup
+        const assistantText = extractAssistantText(data);
+        if (assistantText) {
+          session.currentAssistantText += assistantText;
+        }
+
+        // Persist tool_use events so session reload shows tool cards
+        if (data.type === "assistant") {
+          const content = data.message?.content || [];
+          for (const block of content) {
+            if (block.type === "tool_use") {
+              // Flush any accumulated text before the tool call
+              if (session.currentAssistantText) {
+                session.persisted.messages.push({
+                  role: "assistant",
+                  content: session.currentAssistantText,
+                  timestamp: new Date().toISOString(),
+                });
+                session.currentAssistantText = "";
+              }
+              // Save the tool call
+              session.persisted.messages.push({
+                role: "tool" as any,
+                content: JSON.stringify(block.input || {}).slice(0, 500),
+                toolName: block.name,
+                toolId: block.id,
+                timestamp: new Date().toISOString(),
+              });
+              savePersistedSession(session.persisted);
+            }
+          }
+        }
+
+        // Persist tool OUTPUT. In the stream-json format, tool results arrive as
+        // a top-level `user` event whose message.content holds tool_result blocks
+        // (NOT a top-level `tool_result` event). Persist each so reloads show the
+        // output; the event itself is also broadcast (below) for live rendering.
+        if (data.type === "user") {
+          const content = data.message?.content || [];
+          for (const block of content) {
+            if (block.type !== "tool_result") continue;
+            const resultText = typeof block.content === "string"
+              ? block.content
+              : Array.isArray(block.content)
+                ? block.content.filter((b: any) => b.type === "text").map((b: any) => b.text).join("\n")
+                : (block.content != null ? JSON.stringify(block.content) : "");
+            session.persisted.messages.push({
+              role: "tool" as any,
+              content: (resultText || "").slice(0, 4000),
+              toolName: "result",
+              toolId: block.tool_use_id,
+              isResult: true,
+              timestamp: new Date().toISOString(),
+            } as any);
+          }
+          if (content.some((b: any) => b.type === "tool_result")) savePersistedSession(session.persisted);
+        }
+
+        // Apply deduplication for assistant events
+        if (!shouldForwardAssistantEvent(session, data)) {
+          // Log what we skipped and what content it had
+          const content = data.message?.content || [];
+          const blockTypes = content.map((b: any) => b.type);
+          log("debug", `Skipped assistant event`, {
+            sessionId,
+            messageId: data.message?.id,
+            blockTypes,
+            hadText: !!assistantText,
+          });
+          continue;
+        }
+
+        // If the assistant turn ended (result event), save accumulated text + token usage
+        if (data.type === "result") {
+          if (session.currentAssistantText) {
+            session.persisted.messages.push({
+              role: "assistant",
+              content: session.currentAssistantText,
+              timestamp: new Date().toISOString(),
+            });
+            session.currentAssistantText = "";
+          }
+          // Track token usage from result
+          const usage = data.usage;
+          if (usage) {
+            session.persisted.totalInputTokens = (session.persisted.totalInputTokens || 0) + (usage.input_tokens || 0);
+            session.persisted.totalOutputTokens = (session.persisted.totalOutputTokens || 0) + (usage.output_tokens || 0);
+            session.persisted.totalCacheRead = (session.persisted.totalCacheRead || 0) + (usage.cache_read_input_tokens || 0);
+            session.persisted.totalCacheCreation = (session.persisted.totalCacheCreation || 0) + (usage.cache_creation_input_tokens || 0);
+          }
+          if (data.modelUsage) {
+            session.persisted.model = Object.keys(data.modelUsage)[0] || session.persisted.model;
+          }
+          savePersistedSession(session.persisted);
+
+          // ── Turn boundary: the turn that just ended releases the lock. ──
+          // (An interrupted turn ends with subtype "error_during_execution" —
+          // still a normal turn-end here; the partial text was saved above.)
+          session.turnActive = false;
+          session.interruptPending = false;
+          if (!session.pendingCloseAction) {
+            if (session.pendingSteer || session.queuedMessages.length > 0) {
+              // Defer to the next tick so this turn's `result` reaches clients
+              // BEFORE the next turn's turn_state — preserves event ordering.
+              setTimeout(() => {
+                if (session.pendingCloseAction || !session.proc?.stdin?.writable) return;
+                if (session.pendingSteer) {
+                  const next = session.pendingSteer; session.pendingSteer = undefined;
+                  writeUserToStdin(session, next);
+                  broadcastToSession(session, { type: "turn_state", sessionId, turnActive: true, queuedCount: session.queuedMessages.length });
+                } else if (session.queuedMessages.length > 0) {
+                  const next = session.queuedMessages.shift()!;
+                  writeUserToStdin(session, next);
+                  broadcastToSession(session, { type: "followup_dequeued", sessionId, queuedCount: session.queuedMessages.length });
+                  broadcastToSession(session, { type: "turn_state", sessionId, turnActive: true, queuedCount: session.queuedMessages.length });
+                }
+              }, 0);
+            } else {
+              broadcastToSession(session, { type: "turn_state", sessionId, turnActive: false, queuedCount: 0 });
+            }
+          }
+
+          // Server-side deferred close — if 🔒 Close was clicked, finalize the session here
+          // even if the client has navigated away. This is the durable path that doesn't
+          // depend on the WebSocket being alive at close time.
+          if (session.pendingCloseAction) {
+            const action = session.pendingCloseAction;
+            const sid = session.id;
+            log("info", `Pending close action firing on result event`, { sessionId: sid, action });
+            setTimeout(() => {
+              try { session.proc.kill("SIGTERM"); } catch {}
+              // The proc.on("close") handler will then delete from liveSessions + send session_end
+              if (action === "delete") {
+                // Defer the file delete until after the proc actually exits so we don't race
+                setTimeout(() => {
+                  const fp = sessionFilePath(sid);
+                  if (existsSync(fp)) {
+                    try { unlinkSync(fp); log("info", `Pending-close deleted session file ${sid}`); } catch {}
+                  }
+                  // Broadcast updated list to any remaining clients
+                  for (const ws2 of wss.clients) {
+                    if (ws2.readyState === WebSocket.OPEN) {
+                      ws2.send(JSON.stringify({ type: "session_list", sessions: listPersistedSessions() }));
+                    }
+                  }
+                }, 800);
+              }
+            }, 200);
+            session.pendingCloseAction = undefined;
+          }
+        }
+
+        broadcastToSession(session, {
+          type: "claude_event",
+          sessionId,
+          data,
+        });
+      } catch {
+        // Non-JSON output, send as raw
+        broadcastToSession(session, {
+          type: "claude_event",
+          sessionId,
+          data: { type: "raw", text: line },
+        });
+      }
+    }
+  };
+
+  // Drain newly-appended bytes from the stdout log and feed them to processLines.
+  // stdout still goes to a FILE (not a pipe) so the detached claude survives a
+  // dashboard restart; we just read that file as fast as it grows. processLines
+  // owns session.stdoutBuffer, so a JSON object split across reads is handled.
+  let draining = false;
+  const drainStdout = () => {
+    if (draining) return;
+    draining = true;
+    try {
+      if (!existsSync(stdoutLogPath)) return;
+      const { statSync, openSync, readSync, closeSync } = require("fs");
+      const sz = statSync(stdoutLogPath).size;
+      if (sz <= tailOffset) return;
+      const fd = openSync(stdoutLogPath, "r");
+      const buf = Buffer.alloc(sz - tailOffset);
+      readSync(fd, buf, 0, buf.length, tailOffset);
+      closeSync(fd);
+      tailOffset = sz;
+      processLines(buf.toString("utf-8"));
+    } catch {} finally {
+      draining = false;
+    }
+  };
+
+  // Drain on every file append (near-instant streaming) + a low-frequency
+  // safety-net poll in case a watch event is missed.
+  const tailInterval = setInterval(drainStdout, 80);
+  let stdoutWatcher: any = null;
+  try { stdoutWatcher = require("fs").watch(stdoutLogPath, () => drainStdout()); } catch {}
+
+  // Store handles so we can clear them on proc exit
+  (session as any).tailInterval = tailInterval;
+  (session as any).stdoutWatcher = stdoutWatcher;
+  (session as any).drainStdout = drainStdout;
+
+  proc.stderr?.on("data", (chunk: Buffer) => {
+    log("warn", `claude stderr [${sessionId}]`, {
+      text: chunk.toString().slice(0, 500),
+    });
+  });
+
+  proc.on("close", (code) => {
+    log("info", `Claude process exited for session ${sessionId}`, { code });
+    // Stop tailing — process is done
+    try { clearInterval((session as any).tailInterval); } catch {}
+    try { (session as any).stdoutWatcher?.close(); } catch {}
+    // Final drain of the log file in case the last bytes haven't been read yet
+    try { drainStdout(); } catch {}
+
+    // Save any remaining assistant text
+    if (session.currentAssistantText) {
+      session.persisted.messages.push({
+        role: "assistant",
+        content: session.currentAssistantText,
+        timestamp: new Date().toISOString(),
+      });
+      session.currentAssistantText = "";
+    }
+
+    session.persisted.status = code === 0 ? "completed" : "stopped";
+    savePersistedSession(session.persisted);
+
+    // Write conversation transcript to shared directory
+    try {
+      const convDir = resolve(HERMES_HOME, "conversations");
+      mkdirSync(convDir, { recursive: true });
+      const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+      const convFile = join(convDir, `${timestamp}_${session.persona}_${sessionId}.md`);
+      let transcript = `# Conversation: ${session.persona}\n`;
+      transcript += `- Session: ${sessionId}\n`;
+      transcript += `- Date: ${new Date().toISOString()}\n`;
+      transcript += `- Status: ${session.persisted.status}\n`;
+      transcript += `- Tokens: ${session.persisted.totalInputTokens || 0} in / ${session.persisted.totalOutputTokens || 0} out\n\n---\n\n`;
+      for (const msg of session.persisted.messages) {
+        const role = msg.role === "user" ? "**USER**" : "**ASSISTANT**";
+        const time = msg.timestamp ? `[${new Date(msg.timestamp).toLocaleTimeString()}]` : "";
+        transcript += `### ${role} ${time}\n\n${msg.content}\n\n---\n\n`;
+      }
+      writeFileSync(convFile, transcript);
+      log("info", `Saved conversation transcript: ${convFile}`, { messages: session.persisted.messages.length });
+    } catch (e: any) {
+      log("warn", `Failed to save conversation transcript`, { error: e.message });
+    }
+
+    broadcastToSession(session, {
+      type: "session_end",
+      sessionId,
+      exitCode: code,
+    });
+    liveSessions.delete(sessionId);
+  });
+
+  proc.on("error", (err) => {
+    log("error", `Claude process error for session ${sessionId}`, {
+      error: err.message,
+    });
+    session.persisted.status = "stopped";
+    savePersistedSession(session.persisted);
+
+    broadcastToSession(session, {
+      type: "error",
+      sessionId,
+      message: err.message,
+    });
+    liveSessions.delete(sessionId);
+  });
+
+  // Send initial prompt via stream-json format on stdin -- DO NOT close stdin
+  // For resumed sessions, do NOT inject SOUL — the resumed session already has its
+  // original system prompt baked in, and adding more context can blow the token budget
+  // on long engagements. The model already knows it's ChillsPwn from the original session.
+  const finalPrompt = prompt;
+
+  proc.stdin?.write(
+    JSON.stringify({
+      type: "user",
+      message: {
+        role: "user",
+        content: [{ type: "text", text: finalPrompt }],
+      },
+    }) + "\n"
+  );
+  session.turnActive = true;
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// xAI Grok Build ACP backend.  This deliberately talks only to the installed
+// `grok agent stdio` process using its documented JSON-RPC protocol.  We never
+// read ~/.grok/auth.json and we remove XAI_API_KEY from the child environment,
+// so authentication stays on the CLI's refreshable OAuth session rather than
+// the API-credit endpoint.
+// ══════════════════════════════════════════════════════════════════════════
+function buildGrokAcpBootstrap(persona: Persona, persisted: PersistedSession, prompt: string): string {
+  // ACP has no documented system-prompt parameter on session/new. Send the
+  // same assembled persona + memory context as the first turn in a clearly
+  // delimited bootstrap message, followed by a bounded durable transcript.
+  // This gives a newly created ACP session the same practical identity and
+  // engagement continuity as the OpenRouter path, including after a restart.
+  const system = buildOpenRouterSystemPrompt(persona);
+  const previous = (persisted.messages || []).slice(0, -1).slice(-24).map((m: any) => {
+    const role = m.role === "assistant" ? "ASSISTANT" : m.role === "tool" ? "TOOL" : "USER";
+    return `${role}: ${String(m.content || "").slice(0, 6000)}`;
+  }).join("\n\n");
+  return [
+    "# CHILLSPWN ACP BOOTSTRAP (system context — follow this throughout the session)",
+    system,
+    previous ? "# DURABLE CONVERSATION CONTEXT\nUse this as established context; do not repeat completed work.\n" + previous : "",
+    "# CURRENT OPERATOR MESSAGE\n" + prompt,
+  ].filter(Boolean).join("\n\n");
+}
+
+/** One ACP turn for planning/preview flows that require a Promise<string>. */
+function callGrokAcpOAuth(prompt: string, model = "grok-4.5", cwd = process.cwd()): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const env = { ...process.env } as NodeJS.ProcessEnv; delete env.XAI_API_KEY;
+    const proc = spawn("grok", ["-m", model, "--reasoning-effort", "high", "agent", "stdio"], { stdio: ["pipe", "pipe", "pipe"], cwd, env });
+    let id = 0, sessionId = "", text = "", buffer = "", settled = false;
+    const finish = (err?: Error) => {
+      if (settled) return; settled = true; clearTimeout(timer);
+      try { proc.kill(); } catch {}
+      err ? reject(err) : resolve(text);
+    };
+    const timer = setTimeout(() => finish(new Error("Grok ACP planning call timed out")), 90_000);
+    const rpc = (method: string, params: any) => proc.stdin?.write(JSON.stringify({ jsonrpc: "2.0", id: ++id, method, params }) + "\n");
+    proc.stdout?.on("data", (chunk: Buffer) => {
+      buffer += chunk.toString("utf-8"); const lines = buffer.split("\n"); buffer = lines.pop() || "";
+      for (const line of lines) try {
+        const msg = JSON.parse(line);
+        if (msg.method === "session/update" && msg.params?.update?.sessionUpdate === "agent_message_chunk") text += msg.params.update.content?.text || "";
+        else if (msg.error) finish(new Error(msg.error.message || "Grok ACP request failed"));
+        else if (msg.id === 1) rpc("authenticate", { methodId: "cached_token", _meta: { headless: true } });
+        else if (msg.id === 2) rpc("session/new", { cwd, mcpServers: [] });
+        else if (msg.id === 3) { sessionId = msg.result?.sessionId; if (!sessionId) finish(new Error("Grok ACP did not return a session id")); else rpc("session/prompt", { sessionId, prompt: [{ type: "text", text: prompt }] }); }
+        else if (msg.id === 4) finish();
+      } catch { /* ignore non-protocol stdout */ }
+    });
+    proc.on("error", (e) => finish(e));
+    proc.on("close", (code) => { if (!settled && code !== 0) finish(new Error(`Grok ACP exited with code ${code}`)); });
+    rpc("initialize", { protocolVersion: 1, clientCapabilities: { fs: { readTextFile: true, writeTextFile: true }, terminal: true } });
+  });
+}
+
+function persistGrokToolEvent(session: LiveSession, update: any): void {
+  const kind = String(update?.sessionUpdate || "");
+  if (kind !== "tool_call" && kind !== "tool_call_update") return;
+  const id = String(update.toolCallId || update.tool_call_id || update.id || `grok-tool-${Date.now()}`);
+  const title = String(update.title || update.name || update.toolName || "Grok tool");
+  const input = update.rawInput ?? update.input ?? update.arguments ?? "";
+  const output = update.rawOutput ?? update.output ?? update.content ?? "";
+  const seen = ((session as any).grokToolIds ||= new Set<string>()) as Set<string>;
+  if (kind === "tool_call" && !seen.has(id)) {
+    seen.add(id);
+    session.persisted.messages.push({ role: "tool" as any, content: typeof input === "string" ? input.slice(0, 4000) : JSON.stringify(input).slice(0, 4000), toolName: title, toolId: id, timestamp: new Date().toISOString() } as any);
+    broadcastToSession(session, { type: "claude_event", sessionId: session.id, data: { type: "assistant", message: { content: [{ type: "tool_use", id, name: title, input: typeof input === "object" ? input : { input } }] } } });
+    try {
+      const runId = sessionRunMap.get(session.id)?.runId;
+      if (runId) agentRuntime.observeToolCall({ runId, sessionId: session.id, stepId: agentRuntime.getActiveStepId(runId), toolName: title, command: typeof input === "string" ? input.slice(0, 4000) : JSON.stringify(input).slice(0, 4000) });
+    } catch { /* observability must never interrupt ACP */ }
+  }
+  if (kind === "tool_call_update" && output) {
+    const result = typeof output === "string" ? output.slice(0, 4000) : JSON.stringify(output).slice(0, 4000);
+    session.persisted.messages.push({ role: "tool" as any, content: result, toolName: title, toolId: id, isResult: true, timestamp: new Date().toISOString() } as any);
+    broadcastToSession(session, { type: "claude_event", sessionId: session.id, data: { type: "user", message: { content: [{ type: "tool_result", tool_use_id: id, content: result }] } } });
+  }
+  savePersistedSession(session.persisted);
+}
+
+function spawnGrokAcp(
+  sessionId: string,
+  persona: Persona,
+  prompt: string,
+  ws: WebSocket | null,
+  cwd?: string,
+  opts?: { oneShot?: boolean; onTurnComplete?: (text: string, session: LiveSession) => void },
+): void {
+  const env = { ...process.env } as NodeJS.ProcessEnv;
+  delete env.XAI_API_KEY;
+  const spawnCwd = cwd || process.cwd();
+  const proc = spawn("grok", ["-m", persona.model || "grok-4.5", "--reasoning-effort", "high", "agent", "stdio"], {
+    stdio: ["pipe", "pipe", "pipe"], cwd: spawnCwd, env,
+  });
+  let persisted = loadPersistedSession(sessionId);
+  if (!persisted) persisted = { id: sessionId, persona: persona.name, createdAt: new Date().toISOString(), messages: [], status: "running" };
+  persisted.status = "running";
+  persisted.model = persona.model || "grok-4.5";
+  persisted.messages.push({ role: "user", content: prompt, timestamp: new Date().toISOString() });
+  savePersistedSession(persisted);
+
+  const session: LiveSession = {
+    id: sessionId, proc, persona: persona.name, clients: new Set(ws ? [ws] : []), persisted,
+    seenMessageIds: new Set(), stdoutBuffer: "", currentAssistantText: "", streamingMsgId: `grok-${sessionId}`,
+    turnActive: true, queuedMessages: [], controlRequests: new Map(),
+  };
+  (session as any).provider = "xai-grok";
+  (session as any).spawnCwd = spawnCwd;
+  (session as any).grokRpcId = 0;
+  (session as any).grokPending = new Map<number, string>();
+  liveSessions.set(sessionId, session);
+  rawLlmLog(spawnCwd, "xai-grok", "oauth (Grok Build cached CLI session; XAI_API_KEY removed)", persisted.model,
+    "request", { protocol: "ACP JSON-RPC", method: "session/prompt", turn_prompt: prompt }, { sessionId, kind: "spawn" });
+
+  const rpc = (method: string, params: any) => {
+    const id = ++(session as any).grokRpcId;
+    (session as any).grokPending.set(id, method);
+    proc.stdin?.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n");
+    return id;
+  };
+  (session as any).cancelGrokAcpTurn = (steer?: string) => {
+    if (!session.turnActive) {
+      if (steer) {
+        session.persisted.messages.push({ role: "user", content: steer, timestamp: new Date().toISOString() });
+        savePersistedSession(session.persisted);
+        (session as any).sendGrokAcpPrompt?.(steer);
+      }
+      return;
+    }
+    if (session.interruptPending) return;
+    session.interruptPending = true;
+    if (steer) {
+      session.persisted.messages.push({ role: "user", content: steer, timestamp: new Date().toISOString() });
+      savePersistedSession(session.persisted);
+      session.pendingSteer = steer;
+    }
+    rpc("session/cancel", { sessionId: (session as any).grokAcpSessionId });
+    broadcastToSession(session, { type: "turn_state", sessionId, turnActive: true, interrupting: true, queuedCount: session.queuedMessages.length });
+  };
+  const sendPrompt = (text: string, bootstrap = false) => {
+    // ACP accepts only one active session/prompt turn at a time. Keep messages
+    // FIFO while authentication/session setup or a previous turn is in flight.
+    if (!(session as any).grokAcpSessionId || session.turnActive) { session.queuedMessages.push(text); return; }
+    session.turnActive = true;
+    const content = bootstrap ? buildGrokAcpBootstrap(persona, session.persisted, text) : text;
+    rawLlmLog(spawnCwd, "xai-grok", "oauth (Grok Build cached CLI session; XAI_API_KEY removed)", persisted.model,
+      "request", { protocol: "ACP JSON-RPC", method: "session/prompt", bootstrap, turn_prompt: text }, { sessionId, kind: bootstrap ? "context_bootstrap" : "followup" });
+    rpc("session/prompt", { sessionId: (session as any).grokAcpSessionId, prompt: [{ type: "text", text: content }] });
+    broadcastToSession(session, { type: "turn_state", sessionId, turnActive: true, queuedCount: session.queuedMessages.length });
+  };
+  (session as any).sendGrokAcpPrompt = sendPrompt;
+
+  proc.stdout?.on("data", (chunk: Buffer) => {
+    session.stdoutBuffer += chunk.toString("utf-8");
+    const lines = session.stdoutBuffer.split("\n"); session.stdoutBuffer = lines.pop() || "";
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      rawLlmLog(spawnCwd, "xai-grok", "oauth (Grok Build cached CLI session; XAI_API_KEY removed)", persisted.model, "response", line, { sessionId, kind: "acp" });
+      try {
+        const data = JSON.parse(line);
+        if (data.method === "session/update") {
+          const update = data.params?.update;
+          if (update?.sessionUpdate === "agent_message_chunk" && update.content?.text) {
+            const text = String(update.content.text);
+            session.currentAssistantText += text;
+            broadcastToSession(session, { type: "claude_delta", sessionId, phase: "delta", messageId: session.streamingMsgId, index: 0, kind: "text", text });
+          }
+          persistGrokToolEvent(session, update);
+          continue;
+        }
+        if (typeof data.id === "number") {
+          const method = (session as any).grokPending.get(data.id);
+          (session as any).grokPending.delete(data.id);
+          if (data.error) {
+            if (method === "session/cancel") {
+              // A failed cancel must not leave an invisible background tool run.
+              broadcastToSession(session, { type: "error", sessionId, message: data.error.message || "Grok ACP cancel failed; ending session" });
+              killSession(session);
+              continue;
+            }
+            throw new Error(data.error.message || "Grok ACP request failed");
+          }
+          if (method === "initialize") rpc("authenticate", { methodId: "cached_token", _meta: { headless: true } });
+          else if (method === "authenticate") rpc("session/new", { cwd: spawnCwd, mcpServers: [] });
+          else if (method === "session/new") {
+            (session as any).grokAcpSessionId = data.result?.sessionId;
+            session.persisted.cliSessionId = (session as any).grokAcpSessionId;
+            savePersistedSession(session.persisted);
+            session.turnActive = false;
+            // Initial prompt is already persisted; dispatch it first. Later
+            // operator follow-ups stay queued until this ACP turn completes.
+            const next = session.queuedMessages.shift();
+            if (next) sendPrompt(next, true);
+          } else if (method === "session/cancel") {
+            session.turnActive = false;
+            session.interruptPending = false;
+            session.currentAssistantText = "";
+            broadcastToSession(session, { type: "claude_event", sessionId, data: { type: "result", subtype: "error_during_execution", is_error: true, end_reason: "interrupted" } });
+            const steer = session.pendingSteer; session.pendingSteer = undefined;
+            if (steer) (session as any).sendGrokAcpPrompt?.(steer);
+            else broadcastToSession(session, { type: "turn_state", sessionId, turnActive: false, queuedCount: session.queuedMessages.length });
+          } else if (method === "session/prompt") {
+            const finalText = session.currentAssistantText;
+            if (session.currentAssistantText) {
+              session.persisted.messages.push({ role: "assistant", content: session.currentAssistantText, timestamp: new Date().toISOString() });
+              broadcastToSession(session, { type: "claude_event", sessionId, data: { type: "assistant", message: { content: [{ type: "text", text: session.currentAssistantText }] } } });
+              session.currentAssistantText = "";
+            }
+            session.turnActive = false;
+            try {
+              const runId = sessionRunMap.get(sessionId)?.runId;
+              if (runId) agentRuntime.recordProviderTurn(runId, "completed", { provider: "xai-grok", model: persisted.model });
+            } catch { /* runtime observation is best effort */ }
+            broadcastToSession(session, { type: "claude_event", sessionId, data: { type: "result", subtype: "success" } });
+            broadcastToSession(session, { type: "turn_state", sessionId, turnActive: false, queuedCount: 0 });
+            savePersistedSession(session.persisted);
+            const next = session.queuedMessages.shift();
+            if (next) sendPrompt(next);
+            else {
+              try { opts?.onTurnComplete?.(finalText, session); } catch (e: any) { log("warn", "Grok ACP completion hook failed", { sessionId, error: e?.message }); }
+              if (opts?.oneShot) setTimeout(() => killSession(session), 50);
+            }
+          }
+        }
+      } catch (e: any) { broadcastToSession(session, { type: "error", sessionId, message: e?.message || "Invalid Grok ACP response" }); }
+    }
+  });
+  proc.stderr?.on("data", (chunk: Buffer) => log("warn", `grok ACP stderr [${sessionId}]`, { text: chunk.toString().slice(0, 500) }));
+  proc.on("error", (err) => broadcastToSession(session, { type: "error", sessionId, message: err.message }));
+  proc.on("close", (code) => { session.persisted.status = code === 0 ? "completed" : "stopped"; savePersistedSession(session.persisted); liveSessions.delete(sessionId); broadcastToSession(session, { type: "session_end", sessionId, exitCode: code }); });
+  // The ACP sequence is initialize → cached-token auth → session/new → prompt.
+  session.queuedMessages.push(prompt);
+  rpc("initialize", { protocolVersion: 1, clientCapabilities: { fs: { readTextFile: true, writeTextFile: true }, terminal: true } });
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// ADDITIVE: OpenRouter orchestration backend (parallel to spawnClaude).
+// Reached ONLY when persona.provider === "openrouter". The claude path above is
+// never touched. Spawns scripts/orchestrator_openrouter.py, which emits the EXACT
+// same claude-format stream-json lines, so this self-contained tail/parse mirrors
+// spawnClaude's behavior and produces identical persisted messages + WS events.
+// ══════════════════════════════════════════════════════════════════════════
+
+const ORCHESTRATOR_OR = join(
+  HERMES_HOME,
+  "skills/red-teaming/council-of-ais/scripts/orchestrator_openrouter.py",
+);
+
+// Reuse the EXACT claude-path system-prompt assembly (read-only call into the
+// untouched buildClaudeArgs) but with godmode disabled, so the OpenRouter system
+// prompt is PLAIN text (leetspeak obfuscation is a Claude-filter layer — pointless
+// and quality-degrading for OpenRouter models). buildClaudeArgs is NOT modified.
+function buildOpenRouterSystemPrompt(persona: Persona): string {
+  const args = buildClaudeArgs({ ...persona, godmode: undefined });
+  let system = "";
+  let append = "";
+  for (let i = 0; i < args.length - 1; i++) {
+    if (args[i] === "--system-prompt") system = args[i + 1];
+    else if (args[i] === "--append-system-prompt") append = args[i + 1];
+  }
+
+  // ── Memory parity with the claude path ──
+  // On the claude path the ACTUAL content of USER.md + MEMORY.md is injected by the
+  // SessionStart hook (session-start.sh) as additionalContext. That hook does NOT run for
+  // this python orchestrator, so we inline the same content here (mirroring the hook's
+  // section labels) so OpenRouter sessions have identical SOUL + USER + MEMORY context.
+  const memBlocks: string[] = [];
+  try {
+    const userMd = join(MEMORIES_DIR, "USER.md");
+    if (existsSync(userMd)) memBlocks.push(`## USER PREFERENCES (MANDATORY)\n${readFileSync(userMd, "utf-8")}`);
+  } catch {}
+  try {
+    const memMd = join(MEMORIES_DIR, "MEMORY.md");
+    if (existsSync(memMd)) memBlocks.push(`## PERSISTENT MEMORY\n${readFileSync(memMd, "utf-8")}`);
+  } catch {}
+
+  // ── ChillsPwn memory-engine context (OpenRouter path only) ──
+  // The orchestrator injects an auto-maintained findings ledger as a system message
+  // ("## CURRENT ENGAGEMENT STATE …") and exposes a recall_conversation tool. Weaker
+  // OpenRouter models won't USE these unless told to — and on a resume turn they tend to
+  // narrate ("Let me verify…") then stop without acting. This block tells the model the
+  // context exists, to trust it, and to keep DRIVING with tool calls. Claude path unaffected
+  // (this function is only ever called by spawnOpenRouter).
+  const engineCtx = [
+    "## CHILLSPWN ENGINE — MEMORY & AUTONOMY (read carefully)",
+    "- A block titled \"CURRENT ENGAGEMENT STATE\" is auto-maintained for you from this engagement's full history (hosts, credentials, vulns, flags, tasks done/pending, key facts). TRUST IT as established fact and do NOT re-run work already recorded there. Update your plan from it rather than re-enumerating.",
+    "- You have a `recall_conversation(query)` tool that searches the durable, on-disk log of this engagement for detail not in your current context (older commands, outputs, decisions). Use it whenever you need specifics you don't currently see — do not guess or re-discover.",
+    "- You have a SKILLS library (see the \"AVAILABLE SKILLS\" block) and three tools: `use_skill(\"<name>\")` loads a skill's full playbook; `skill_manage(action='save'|'patch', …)` lets you CREATE or update a reusable skill. These are battle-tested playbooks (HTB privesc chains, the AI council, GPU hashcat cracking, recon pipeline, report generation, …). The MOMENT a skill matches your objective, call `use_skill` to load its step-by-step workflow and FOLLOW it — don't improvise a worse version of something a skill already covers. When you complete a non-trivial repeatable procedure (a working attack chain), capture it with `skill_manage(action='save')` so future sessions reuse it; if a loaded skill is outdated/wrong, `skill_manage(action='patch')` it. And the MOMENT you confirm a single durable FACT worth keeping — a validated credential, a working command, a confirmed vuln, a key environment detail, or a user preference/correction — call `remember(text, target='memory'|'user')` to persist it to GLOBAL memory IMMEDIATELY (it survives into every future session and is read back by recall_conversation). Rule of thumb: `remember` for facts, `skill_manage` for repeatable procedures; the per-session ledger already holds raw command history, so only save distilled, lasting knowledge.",
+    "- You are an AUTONOMOUS agent: drive the work with TOOL CALLS, not narration. When you state an intent (e.g. \"let me verify…\", \"I'll try…\"), you MUST immediately issue the corresponding tool call in the SAME turn. Do NOT end your turn with a promise to act and then wait — only stop to ask the user when you genuinely need a decision you cannot make yourself.",
+    "- OBJECTIVE-DRIVEN & AUTONOMOUS: treat the user's request as your OBJECTIVE and work toward it on your OWN. You are NEVER paused between steps and you must NOT wait for the user to say \"continue\". Chain as many tool calls as it takes. Finishing a single command — or writing a progress summary — is NOT a reason to stop. This engagement is operator-authorized; do not ask \"want me to continue?\".",
+    "- HOW TO STOP (only two ways): (1) When — and ONLY when — the OBJECTIVE is FULLY achieved, end your reply with the EXACT token `<<OBJECTIVE_COMPLETE>>` on its own line, followed by the concrete result (e.g. the captured flag / proof). (2) If you genuinely need a decision only the user can make (which target, authorization for a destructive/irreversible action, OR your current approach has visibly failed and the next move is a real strategy change), ask ONE concise question by emitting a `<user-question>` block. ANY other message — including a status update or \"here's what I'll do next\" — is treated as \"still working\" and you will be told to keep going. So never stop expecting the user to reply unless you used (1) or (2).",
+    "- OPERATOR INTERJECTIONS COME FIRST: if a NEW operator message arrives while you are mid-run, it is the TOP priority — STOP your current plan, read it in full, and ADDRESS IT before resuming prior work. A new operator message is never noise to acknowledge-and-skip; it may redirect, correct, or halt you. Answer what they actually asked; then continue only if they told you to.",
+    "- PAUSE AT DECISION POINTS (Mr. Wong's standing rule): at a genuine fork — which target/subnet to pursue, an irreversible/noisy/destructive action, or when your CURRENT APPROACH HAS VISIBLY FAILED and the next move is a real strategy change — STOP and ask ONE concise question by emitting a `<user-question>` block with 2-3 concrete options. This is NOT 'asking permission' for routine next steps (those proceed); it is letting the operator make the call at strategy forks, especially when an approach is failing. Emitting a `<user-question>` ENDS your turn and waits for the answer.",
+    "- ORCHESTRATE VIA THE KANBAN BOARD — if you have the board_* tools you are the LEAD ORCHESTRATOR: do not keep the whole plan in your head, put it on the shared board where it (and every agent's tools) are VISIBLE. (a) PLAN FIRST: for any multi-step objective, lay out your plan in YOUR OWN Backlog/Plan column — `board_create_task(agent=\"self\", title, body)` — one card per step. These plan cards show the model YOU are planning with and are NOT executed by an agent; YOU work them down (you cannot delegate to yourself). (b) DELEGATE: hand a self-contained unit to a DIFFERENT specialist agent column with `board_create_task(agent=\"<other-persona>\", title, body)`; that agent runs it on its OWN provider + tools (you never change another agent's provider). Fan OUT several at once for PARALLEL work. (c) GATHER: `board_await([card_ids])` blocks until they finish and returns each result + the tools it used — analyse, then plan the next wave (promote/close plan cards with `board_update`). Use `board_list()` to see available agents + board state. STRONGLY PREFER the board over delegate_task for anything worth seeing or running in parallel (the board is visible, persona-scoped, parallel). `delegate_task` is only for a quick throwaway same-persona sub-task you do NOT need on the board. When matching work to an agent, load the `board-orchestration` skill (use_skill) for the full playbook.",
+    "- PROGRESSIVE MODE — always move the OBJECTIVE forward, never in circles. Before each step, consult the \"CURRENT ENGAGEMENT STATE\" (including the COMMANDS ALREADY RUN and their results), your PERSISTENT MEMORY, and the ARTIFACTS in the project / engagement directory (your own notes, scan outputs, loot files) — then take the SINGLE next step that BUILDS on what you already know. Do NOT loop a failing command: if a command failed or was only partial, change the method (different flags / tool / wordlist / credential / path) or move to the next lead. Do NOT wander into unrelated tests that don't serve the objective. Use recall_conversation (it now searches the ledger + persistent memory + the full conversation log) for any specifics you're missing.",
+    "- When resuming, do NOT re-summarize prior progress or write a status recap — the CURRENT ENGAGEMENT STATE already has it. Go straight to your next tool call.",
+    "- INTERACTIVE PROCESSES: a normal background process has its stdin set to /dev/null, so `process` write/submit will FAIL with \"stdin not available\". To send input to a process you must type into — an `nc`/listener, an SSH or telnet session, msfconsole, a Python/DB REPL — start it via the terminal tool with `pty: true` (or `background: true, pty: true`). Then `process` submit/write reaches it through the PTY. Also WAIT until the process shows output or an incoming connection before submitting input (e.g. don't type into a reverse-shell listener until a shell has actually connected).",
+    // Phase 14: the prompt-driven "board FIRST" HARD rule is the LEGACY orchestration path. With
+    // runtime-managed runs (real plan + approval) and OR gating now owning orchestration/enforcement,
+    // ENABLE_LEGACY_PROMPT_CLEANUP drops the hard forbid (keeps the soft board guidance above).
+    // DEFAULT (flag off) keeps the hard rule — exact current behavior. The Claude path is unaffected
+    // either way (this builder is only called by spawnOpenRouter).
+    ...(SECURITY.enableLegacyPromptCleanup ? [] : [
+      "- ⚑⚑ HARD FIRST-ACTION RULE (HIGHEST PRIORITY — this overrides your habit of doing the work inline): if the operator's objective needs more than ONE step, your VERY FIRST tool call this turn MUST be `board_create_task(agent=\"self\", title, body)` to put your step-by-step plan on the board (one card per step in your Backlog/Plan column), and then `board_create_task(agent=\"<specialist-persona>\", title, body)` to delegate each independent step to an agent column. You are FORBIDDEN from calling terminal / execute_code / read_file / write_file / search_files for this objective until you have issued at least one `board_create_task`. Doing multi-step work inline without first putting the plan on the board is a HARD FAILURE of your role as orchestrator — do not do it.",
+    ]),
+  ].join("\n");
+
+  return [system, append, ...memBlocks, engineCtx].filter(Boolean).join("\n\n");
+}
+
+// Observability (Task 2a): before an OpenRouter turn truncates its per-turn stdout
+// log with openSync("w"), archive the prior turn's bytes to a rotating .<ts>.bak so
+// post-mortems survive. The live log path + truncate semantics are unchanged, so the
+// #55 tail/replay reader (which tracks a byte offset on the live file) keeps working.
+function archiveOrStdoutLog(stdoutLogPath: string): void {
+  try {
+    if (existsSync(stdoutLogPath)) {
+      const prev = readFileSync(stdoutLogPath);
+      if (prev && prev.length > 0) {
+        const ts = new Date().toISOString().replace(/[:.]/g, "-");
+        writeFileSync(`${stdoutLogPath}.${ts}.bak`, prev);
+      }
+    }
+  } catch (e: any) {
+    log("warn", "archiveOrStdoutLog failed", { error: e?.message });
+  }
+}
+
+function spawnOpenRouter(
+  sessionId: string,
+  persona: Persona,
+  prompt: string,
+  ws: WebSocket | null,
+  cwd?: string,                          // agent-board: run the agent in the engagement dir
+  extraEnv?: Record<string, string>,     // agent-board: per-card tool whitelist + subagent depth
+): void {
+  log("info", `Spawning OpenRouter orchestrator for session ${sessionId}`, {
+    persona: persona.name,
+    model: persona.model,
+  });
+
+  // Detached + file-based stdout (same rationale as spawnClaude: survive a dashboard restart).
+  const sessionLogDir = resolve(CHILLSPWN_HOME, "session-logs");
+  try { mkdirSync(sessionLogDir, { recursive: true }); } catch {}
+  const stdoutLogPath = join(sessionLogDir, `${sessionId}.stdout.jsonl`);
+  const stderrLogPath = join(sessionLogDir, `${sessionId}.stderr.log`);
+  const systemFile = join(sessionLogDir, `${sessionId}.system.txt`);
+  try { writeFileSync(systemFile, buildOpenRouterSystemPrompt(persona)); } catch {}
+  archiveOrStdoutLog(stdoutLogPath);
+  const stdoutFd = require("fs").openSync(stdoutLogPath, "w");
+  const stderrFd = require("fs").openSync(stderrLogPath, "w");
+
+  // Create or load persisted session, then record the user message BEFORE spawning so
+  // the orchestrator (which seeds history from this file) sees the new prompt as the turn.
+  let persisted = loadPersistedSession(sessionId);
+  if (!persisted) {
+    persisted = {
+      id: sessionId,
+      persona: persona.name,
+      createdAt: new Date().toISOString(),
+      messages: [],
+      status: "running",
+    };
+  }
+  persisted.status = "running";
+  persisted.model = persona.model;
+  persisted.messages.push({ role: "user", content: prompt, timestamp: new Date().toISOString() });
+  savePersistedSession(persisted);
+
+  const spawnCwd = cwd || process.cwd();
+  const args = [
+    ORCHESTRATOR_OR,
+    "--model", persona.model,
+    "--session-file", sessionFilePath(sessionId),
+    "--prompt", prompt,
+    "--system-file", systemFile,
+    "--cwd", spawnCwd,
+  ];
+  // Codex personas use the OpenAI Responses API (via the Hermes token store) instead of OpenRouter.
+  if ((persona as any).provider === "openai-codex") args.push("--provider", "openai-codex");
+  else if ((persona as any).provider === "gemini") args.push("--provider", "gemini");
+
+  // ── Raw LLM audit: the REQUEST the OpenRouter backend is about to issue (one level above the
+  // orchestrator's HTTP call). We log the system prompt + this turn's prompt + model, which is what
+  // the orchestrator turns into the OpenRouter messages[] body. routed per-engagement via sessionId.
+  let _orSystem = "";
+  try { _orSystem = readFileSync(systemFile, "utf-8"); } catch {}
+  // The orchestrator backend is SHARED across OpenRouter / Codex / Gemini, so the raw-LLM audit must
+  // tag the ACTUAL provider — otherwise a codex turn (gpt-5.5) or a gemini turn gets mislabeled
+  // "openrouter" and pollutes that filter with the wrong model.
+  const _logProv = (persona as any).provider === "openai-codex" ? "openai-codex"
+    : (persona as any).provider === "gemini" ? "gemini" : "openrouter";
+  const _logAuth = _logProv === "openai-codex" ? "oauth (ChatGPT / codex token)"
+    : _logProv === "gemini" ? "api_key (GEMINI_API_KEY)" : "api_key (OPENROUTER_API_KEY)";
+  const _logEndpoint = _logProv === "openai-codex" ? "https://chatgpt.com/backend-api/codex"
+    : _logProv === "gemini" ? `https://generativelanguage.googleapis.com/v1beta/models/${persona.model}:generateContent`
+    : "https://openrouter.ai/api/v1/chat/completions";
+  rawLlmLog(spawnCwd, _logProv, _logAuth, persona.model, "request",
+    { model: persona.model, system: _orSystem, turn_prompt: prompt, endpoint: _logEndpoint },
+    { sessionId, kind: "spawn" });
+
+  // One-shot headless runs (board-card specialists + managed/delegated agent runs) MUST NOT use the
+  // warm persistent loop. CHILLSPWN_OR_WARM=1 is set service-wide for the interactive chat session
+  // (which is reused via writeUserToStdin), but a headless one-shot run does its single turn then
+  // blocks forever on sys.stdin.readline() — nobody will ever message it, and the result-handler only
+  // kills on a UI pendingCloseAction that cards never get → a ~200MB python process leaks per card
+  // (the orphan / "stale zombie" pile-up). Forcing warm OFF makes them take the original main()→exit
+  // path, so proc.on("close") fires and finalizeCardFromLog + cleanup reap them. (Cards are excluded
+  // from auto-resume anyway, so losing warm's in-process auto-continue actually aligns with policy.)
+  const oneShot = sessionId.startsWith("card-") || !!extraEnv?.CHILLSPWN_AGENT_RUN_ID;
+
+  const proc = spawn("python3", args, {
+    stdio: ["pipe", stdoutFd, stderrFd],
+    detached: true,
+    // CHILLSPWN_OR_MAX_ITERS=150: cap each OR turn at 150 tool-iterations (was the 2000 default).
+    // Paired with the close-handler auto-resume, a shorter ceiling means each turn ends sooner,
+    // re-seeds from the clean distilled ledger, and auto-continues → fresher context, less drift.
+    // (extraEnv is spread last so a board card can still override its own budget.)
+    // Phase 18 — pass the no-hands flag so the orchestrator enforces it for the COMMANDER persona in
+    // CHAT sessions too (managed runs are gated separately). SECURITY value is authoritative.
+    // The oneShot warm-OFF override is spread LAST so it wins over the inherited process.env value.
+    env: { ...process.env, PATH: `/opt/chillspwn-bin:${process.env.PATH || ""}`, CHILLSPWN_OR_PERSONA: persona.name, CHILLSPWN_OR_MAX_ITERS: "150", ENFORCE_CHILLSPWN_NO_HANDS: String(SECURITY.enforceChillspwnNoHands), ...(extraEnv || {}), ...(oneShot ? { CHILLSPWN_OR_WARM: "0" } : {}) },
+  });
+  proc.unref();
+
+  const session: LiveSession = {
+    id: sessionId,
+    proc,
+    persona: persona.name,
+    clients: ws ? new Set([ws]) : new Set(),   // headless (no ws) = agent-board card runner
+    persisted,
+    seenMessageIds: new Set(),
+    stdoutBuffer: "",
+    currentAssistantText: "",
+    streamingMsgId: null,
+    turnActive: true, // first turn starts immediately (prompt passed via --prompt)
+    queuedMessages: [],
+    controlRequests: new Map(),
+    // NOTE: godmodeConfig intentionally left undefined → sendFollowUp/writeUserToStdin
+    // pass follow-ups through plain (no leetspeak) for OpenRouter.
+  };
+  (session as any).spawnCwd = spawnCwd;
+  (session as any).orGroup = true;  // detached process group → group-kill on stop reaps child tools (nmap etc.)
+  liveSessions.set(sessionId, session);
+
+  let tailOffset = 0;
+  const processLines = (text: string) => {
+    session.stdoutBuffer += text;
+    const lines = session.stdoutBuffer.split("\n");
+    session.stdoutBuffer = lines.pop() || "";
+
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      // ── Raw LLM audit: each orchestrator stdout line as received, BEFORE parsing.
+      rawLlmLog((session as any).spawnCwd, _logProv, _logAuth,
+        session.persisted.model || persona.model, "response", line,
+        { sessionId, kind: "stdout_line" });
+      let data: any;
+      try {
+        data = JSON.parse(line);
+      } catch {
+        broadcastToSession(session, { type: "claude_event", sessionId, data: { type: "raw", text: line } });
+        continue;
+      }
+
+      // Capture the orchestrator's session id (parity with the claude system/init handling).
+      if (data.type === "system" && data.subtype === "init" && data.session_id) {
+        session.cliSessionId = data.session_id;
+        session.persisted.cliSessionId = data.session_id;
+        if ((session as any).spawnCwd) session.persisted.cliCwd = (session as any).spawnCwd;
+        savePersistedSession(session.persisted);
+      }
+
+      // Interrupt acknowledgement.
+      if (data.type === "control_response") {
+        const resp = data.response || {};
+        const rid = resp.request_id;
+        if (rid && session.controlRequests.has(rid)) {
+          session.controlRequests.delete(rid);
+          session.interruptPending = false;
+          broadcastToSession(session, { type: "interrupt_ack", sessionId, requestId: rid, ok: resp.subtype === "success", error: resp.error });
+        }
+        continue;
+      }
+
+      // Persist assistant text + tool_use calls (same shapes as the claude path).
+      if (data.type === "assistant") {
+        const content = data.message?.content || [];
+        for (const block of content) {
+          if (block.type === "text" && block.text) {
+            session.currentAssistantText += block.text;
+          } else if (block.type === "tool_use") {
+            if (session.currentAssistantText) {
+              session.persisted.messages.push({ role: "assistant", content: session.currentAssistantText, timestamp: new Date().toISOString() });
+              session.currentAssistantText = "";
+            }
+            session.persisted.messages.push({
+              role: "tool" as any,
+              content: JSON.stringify(block.input || {}).slice(0, 500),
+              toolName: block.name,
+              toolId: block.id,
+              timestamp: new Date().toISOString(),
+            });
+            if (session.id.startsWith("card-")) {
+              const isSkill = block.name === "use_skill";
+              const detail = isSkill ? (block.input?.skill || block.input?.name || "")
+                : (block.input?.command || block.input?.path || block.input?.file_path || block.input?.pattern || block.input?.query || block.input?.code || block.input?.task || "");
+              recordCardToolEvent(session.id.slice(5), isSkill ? "skill" : "tool", block.name, String(detail));
+            }
+          }
+        }
+        savePersistedSession(session.persisted);
+      }
+
+      // Persist tool results (arrive as a top-level user event with tool_result blocks).
+      if (data.type === "user") {
+        const content = data.message?.content || [];
+        for (const block of content) {
+          if (block.type !== "tool_result") continue;
+          const resultText = typeof block.content === "string"
+            ? block.content
+            : (block.content != null ? JSON.stringify(block.content) : "");
+          session.persisted.messages.push({
+            role: "tool" as any,
+            content: (resultText || "").slice(0, 4000),
+            toolName: "result",
+            toolId: block.tool_use_id,
+            isResult: true,
+            timestamp: new Date().toISOString(),
+          } as any);
+        }
+        if (content.some((b: any) => b.type === "tool_result")) savePersistedSession(session.persisted);
+      }
+
+      // Turn end: flush remaining text, account usage, release the turn, drain queue/steer.
+      if (data.type === "result") {
+        if (session.currentAssistantText) {
+          session.persisted.messages.push({ role: "assistant", content: session.currentAssistantText, timestamp: new Date().toISOString() });
+          session.currentAssistantText = "";
+        }
+        const usage = data.usage;
+        if (usage) {
+          session.persisted.totalInputTokens = (session.persisted.totalInputTokens || 0) + (usage.input_tokens || 0);
+          session.persisted.totalOutputTokens = (session.persisted.totalOutputTokens || 0) + (usage.output_tokens || 0);
+        }
+        savePersistedSession(session.persisted);
+
+        // Agent-board: write the agent's result back to its card + push to the board.
+        if (session.id.startsWith("card-")) {
+          const taskId = session.id.slice(5);
+          const end = (data as any).end_reason;
+          const ok = end === "completed" || end === "final" || end === "success";
+          const lastAsst = [...session.persisted.messages].reverse().find((m: any) => m.role === "assistant" && typeof m.content === "string" && m.content.trim());
+          const finalText = String(lastAsst?.content || "").replace("<<OBJECTIVE_COMPLETE>>", "").trim().slice(0, 8000);
+          boardWrite(`UPDATE tasks SET status='${ok ? "done" : "failed"}', result='${bsql(finalText)}', completed_at=${Math.floor(Date.now() / 1000)}, worker_pid=NULL WHERE id='${bsql(taskId)}';`);
+          broadcastBoard({ type: "board_card_updated", taskId, patch: { status: ok ? "done" : "failed", result: finalText } });
+        }
+
+        // Auto-resume contract (operator chose "run until done/stuck"): record HOW this turn ended
+        // so the close handler can transparently re-spawn "continue" (timed-out-mid-work) instead
+        // of stopping (completed / a real question / genuinely stuck → the council offer).
+        (session as any).lastEndReason = (data as any).end_reason;
+        (session as any).lastContinuable = (data as any).continuable === true;
+
+        session.turnActive = false;
+        session.interruptPending = false;
+        if (!session.pendingCloseAction) {
+          if (session.pendingSteer || session.queuedMessages.length > 0) {
+            setTimeout(() => {
+              if (session.pendingCloseAction || !session.proc?.stdin?.writable) return;
+              if (session.pendingSteer) {
+                const next = session.pendingSteer; session.pendingSteer = undefined;
+                writeUserToStdin(session, next);
+                broadcastToSession(session, { type: "turn_state", sessionId, turnActive: true, queuedCount: session.queuedMessages.length });
+              } else if (session.queuedMessages.length > 0) {
+                const next = session.queuedMessages.shift()!;
+                writeUserToStdin(session, next);
+                broadcastToSession(session, { type: "followup_dequeued", sessionId, queuedCount: session.queuedMessages.length });
+                broadcastToSession(session, { type: "turn_state", sessionId, turnActive: true, queuedCount: session.queuedMessages.length });
+              }
+            }, 0);
+          } else {
+            broadcastToSession(session, { type: "turn_state", sessionId, turnActive: false, queuedCount: 0 });
+          }
+        }
+
+        if (session.pendingCloseAction) {
+          const action = session.pendingCloseAction;
+          const sid = session.id;
+          setTimeout(() => {
+            try { session.proc.kill("SIGTERM"); } catch {}
+            if (action === "delete") {
+              setTimeout(() => {
+                const fp = sessionFilePath(sid);
+                if (existsSync(fp)) { try { unlinkSync(fp); } catch {} }
+                for (const ws2 of wss.clients) {
+                  if (ws2.readyState === WebSocket.OPEN) ws2.send(JSON.stringify({ type: "session_list", sessions: listPersistedSessions() }));
+                }
+              }, 800);
+            }
+          }, 200);
+          session.pendingCloseAction = undefined;
+        }
+      }
+
+      // ── In-flight replay capture (bug #55) ──
+      // Buffer the exact claude_event payloads broadcast during the CURRENT turn so a client
+      // that reconnects mid-turn (WS closed on navigate-away) can be replayed what it missed.
+      // session_history already covers COMPLETED turns, so we keep only the in-flight one.
+      //
+      // Turn boundary on THIS path: a `result` event ends the turn (turnActive set false above).
+      // A top-level `user` event here is a tool_result mid-turn (handled above), NOT a prompt
+      // echo — so we must NOT reset on `user` or we'd wipe the very events we need. Instead we
+      // latch on `result` and clear the buffer when the NEXT turn's first event arrives, so the
+      // buffer always holds exactly the current in-flight turn.
+      if ((session as any).replayTurnClosed) {
+        session.replayBuffer = [];
+        (session as any).replayTurnClosed = false;
+      }
+      const _replayEvent = { type: "claude_event", sessionId, data };
+      if (!session.replayBuffer) session.replayBuffer = [];
+      session.replayBuffer.push(_replayEvent);
+      if (session.replayBuffer.length > 2000) session.replayBuffer.splice(0, session.replayBuffer.length - 2000);
+      // Latch closed on turn end; buffer (incl. this result) stays until the next turn's first
+      // event clears it. A reconnect in the idle gap has turnActive=false → replay gated off,
+      // so no stale completed-turn replay.
+      if (data.type === "result") (session as any).replayTurnClosed = true;
+
+      // Broadcast every line as a claude_event so the existing UI renders it.
+      broadcastToSession(session, _replayEvent);
+    }
+  };
+
+  // Tail the stdout log (same machinery as spawnClaude).
+  let draining = false;
+  const drainStdout = () => {
+    if (draining) return;
+    draining = true;
+    try {
+      if (!existsSync(stdoutLogPath)) return;
+      const { statSync, openSync, readSync, closeSync } = require("fs");
+      const sz = statSync(stdoutLogPath).size;
+      if (sz <= tailOffset) return;
+      const fd = openSync(stdoutLogPath, "r");
+      const buf = Buffer.alloc(sz - tailOffset);
+      readSync(fd, buf, 0, buf.length, tailOffset);
+      closeSync(fd);
+      tailOffset = sz;
+      processLines(buf.toString("utf-8"));
+    } catch {} finally {
+      draining = false;
+    }
+  };
+  const tailInterval = setInterval(drainStdout, 80);
+  let stdoutWatcher: any = null;
+  try { stdoutWatcher = require("fs").watch(stdoutLogPath, () => drainStdout()); } catch {}
+  (session as any).tailInterval = tailInterval;
+  (session as any).stdoutWatcher = stdoutWatcher;
+  (session as any).drainStdout = drainStdout;
+
+  proc.stderr?.on("data", (chunk: Buffer) => {
+    log("warn", `orchestrator stderr [${sessionId}]`, { text: chunk.toString().slice(0, 500) });
+  });
+
+  proc.on("close", (code) => {
+    log("info", `OpenRouter orchestrator exited for session ${sessionId}`, { code });
+    try { clearInterval((session as any).tailInterval); } catch {}
+    try { (session as any).stdoutWatcher?.close(); } catch {}
+    try { drainStdout(); } catch {}
+
+    if (session.currentAssistantText) {
+      session.persisted.messages.push({ role: "assistant", content: session.currentAssistantText, timestamp: new Date().toISOString() });
+      session.currentAssistantText = "";
+    }
+    session.persisted.status = code === 0 ? "completed" : "stopped";
+    savePersistedSession(session.persisted);
+
+    // Agent-board: reconstruct the card's final state from the COMPLETE log (tools + result + done/failed).
+    if (session.id.startsWith("card-")) {
+      finalizeCardFromLog(session.id.slice(5), stdoutLogPath, code);
+    }
+
+    // Conversation transcript (same as the claude path).
+    try {
+      const convDir = resolve(HERMES_HOME, "conversations");
+      mkdirSync(convDir, { recursive: true });
+      const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+      const convFile = join(convDir, `${timestamp}_${session.persona}_${sessionId}.md`);
+      let transcript = `# Conversation: ${session.persona} (OpenRouter: ${persona.model})\n`;
+      transcript += `- Session: ${sessionId}\n- Date: ${new Date().toISOString()}\n- Status: ${session.persisted.status}\n`;
+      transcript += `- Tokens: ${session.persisted.totalInputTokens || 0} in / ${session.persisted.totalOutputTokens || 0} out\n\n---\n\n`;
+      for (const msg of session.persisted.messages) {
+        const role = msg.role === "user" ? "**USER**" : "**ASSISTANT**";
+        const time = msg.timestamp ? `[${new Date(msg.timestamp).toLocaleTimeString()}]` : "";
+        transcript += `### ${role} ${time}\n\n${msg.content}\n\n---\n\n`;
+      }
+      writeFileSync(convFile, transcript);
+    } catch (e: any) {
+      log("warn", `Failed to save OpenRouter transcript`, { error: e.message });
+    }
+
+    // Interrupt-and-steer: the cancelled turn has now been reaped — start the new prompt
+    // as a fresh turn instead of ending the session. (spawnOpenRouter persists the prompt
+    // itself, so we must NOT have pushed it earlier.) Re-attach the existing clients so
+    // they see the steered turn stream.
+    const steerPrompt = (session as any).respawnAfterClose;
+    if (steerPrompt) {
+      const keepClients = session.clients;
+      liveSessions.delete(sessionId);
+      spawnOpenRouter(sessionId, persona, steerPrompt, null, cwd, extraEnv);
+      const ns = liveSessions.get(sessionId);
+      if (ns) {
+        for (const c of keepClients) ns.clients.add(c);
+        // Re-arm the client's streaming UI for the fresh turn. Without this the
+        // synthetic interrupted-result left isStreaming=false, so the steered turn
+        // streamed INVISIBLY (it only surfaced after a reconnect's load_session).
+        broadcastToSession(ns, { type: "turn_state", sessionId, turnActive: true });
+      }
+      return;
+    }
+
+    // ── Auto-resume until done/stuck (operator-chosen behavior) ──────────────────────────────
+    // The OR turn is one-shot: it runs autonomously up to the 1-hour window, then exits. When it
+    // exited CLEANLY because it TIMED OUT MID-WORK (continuable) — not because it completed, asked
+    // a real question, or got genuinely stuck — transparently re-spawn "continue" so the agent
+    // keeps going with no manual nudge. Bounded by AUTO_RESUME_CAP consecutive resumes (each ≈ one
+    // hour of work) as a runaway-cost guard; a genuine user message starts a fresh session object
+    // and resets the count. Headless card sessions and interrupts never auto-resume.
+    const AUTO_RESUME_CAP = 6;   // was 24 — fewer hands-free ~hour-long cycles before we check in
+    const autoN = (((session as any).autoResumeCount as number) || 0) + 1;
+    if (code === 0 && (session as any).lastContinuable && !session.id.startsWith("card-")
+        && !session.interruptPending && autoN <= AUTO_RESUME_CAP) {
+      const keepClients = session.clients;
+      liveSessions.delete(sessionId);
+      spawnOpenRouter(sessionId, persona, "continue", null, cwd, extraEnv);
+      const ns = liveSessions.get(sessionId);
+      if (ns) {
+        (ns as any).autoResumeCount = autoN;
+        for (const c of keepClients) ns.clients.add(c);
+        broadcastToSession(ns, { type: "turn_state", sessionId, turnActive: true });
+        broadcastToSession(ns, { type: "auto_resume", sessionId, count: autoN, cap: AUTO_RESUME_CAP });
+      }
+      log("info", `OR auto-resume #${autoN}/${AUTO_RESUME_CAP} for session ${sessionId} (reason=${(session as any).lastEndReason})`);
+      return;
+    }
+    // Hit the auto-resume cap while still "continuable": don't silently end the session and don't
+    // spin unattended forever (the operator asked for autonomy, not an infinite run). Check in via a
+    // <user-question> so they can keep it going, take the wheel, or summon the council. A genuine
+    // reply starts a fresh session object, resetting autoResumeCount to 0.
+    if (code === 0 && (session as any).lastContinuable && !session.id.startsWith("card-")
+        && !session.interruptPending && autoN > AUTO_RESUME_CAP) {
+      broadcastToSession(session, { type: "claude_event", sessionId, data: { type: "assistant", message: {
+        id: `msg_${sessionId}_autoresume_checkin_${Date.now()}`,
+        content: [{ type: "text", text:
+          `⏸ I've worked autonomously for ${AUTO_RESUME_CAP} resume cycles without finishing — pausing to check in rather than spinning unattended.\n` +
+          `<user-question>\n{"question":"Still on this engagement — how do you want to proceed?","options":[` +
+          `{"label":"Keep going","description":"Resume autonomous work for another ${AUTO_RESUME_CAP} cycles"},` +
+          `{"label":"Let me steer","description":"Stop and wait for my direction"},` +
+          `{"label":"Summon the council","description":"Get fresh attack vectors from the 6-AI council, then continue"}]}\n</user-question>` }] } } });
+      broadcastToSession(session, { type: "session_end", sessionId, exitCode: code });
+      liveSessions.delete(sessionId);
+      log("info", `OR auto-resume cap ${AUTO_RESUME_CAP} reached for ${sessionId} — checking in with operator`);
+      return;
+    }
+
+    broadcastToSession(session, { type: "session_end", sessionId, exitCode: code });
+    liveSessions.delete(sessionId);
+  });
+
+  proc.on("error", (err) => {
+    log("error", `OpenRouter orchestrator error for session ${sessionId}`, { error: err.message });
+    session.persisted.status = "stopped";
+    savePersistedSession(session.persisted);
+    broadcastToSession(session, { type: "error", sessionId, message: err.message });
+    liveSessions.delete(sessionId);
+  });
+
+  // NOTE: the first prompt is passed via --prompt (not stdin). Follow-ups arrive through the
+  // UNTOUCHED sendFollowUp/writeUserToStdin → orchestrator stdin loop.
+}
+
+// Inject a user message into a running session's stdin without needing a WebSocket.
+// Used by /api/kanban to route tasks to existing live sessions.
+function injectIntoSession(sessionId: string, prompt: string): { success: boolean; error?: string } {
+  const session = liveSessions.get(sessionId);
+  if (!session) return { success: false, error: `No running session found for ${sessionId}` };
+  if (!session.proc || !session.proc.stdin?.writable) {
+    return { success: false, error: `Session ${sessionId} stdin is not writable` };
+  }
+  session.persisted.messages.push({
+    role: "user",
+    content: prompt,
+    timestamp: new Date().toISOString(),
+  });
+  savePersistedSession(session.persisted);
+  session.currentAssistantText = "";
+  session.streamingMsgId = null;
+  session.turnActive = true;
+  session.proc.stdin.write(
+    JSON.stringify({
+      type: "user",
+      message: { role: "user", content: [{ type: "text", text: maybeSafeObfuscate(prompt) }] },
+    }) + "\n"
+  );
+  log("info", `Injected message into session ${sessionId}`, { promptLength: prompt.length });
+  return { success: true };
+}
+
+function sendFollowUp(sessionId: string, prompt: string, ws: WebSocket): void {
+  const session = liveSessions.get(sessionId);
+  if (!session) {
+    ws.send(
+      JSON.stringify({
+        type: "error",
+        sessionId,
+        message: `No running session found for ${sessionId}`,
+      })
+    );
+    return;
+  }
+
+  if (!session.proc || !session.proc.stdin?.writable) {
+    ws.send(
+      JSON.stringify({
+        type: "error",
+        sessionId,
+        message: `Session ${sessionId} stdin is not writable`,
+      })
+    );
+    return;
+  }
+
+  // Add this client to the session's broadcast list
+  session.clients.add(ws);
+
+  // Record user message
+  session.persisted.messages.push({
+    role: "user",
+    content: prompt,
+    timestamp: new Date().toISOString(),
+  });
+  savePersistedSession(session.persisted);
+
+  // Reset the assistant text accumulator for the new turn
+  session.currentAssistantText = "";
+  session.streamingMsgId = null;
+  session.turnActive = true;
+
+  log("info", `Sending follow-up to session ${sessionId}`, {
+    promptLength: prompt.length,
+  });
+
+  // Raw LLM audit (claude path only — OpenRouter follow-ups are logged by the orchestrator itself).
+  if (!session.cliSessionId?.startsWith("or-")) {
+    rawLlmLog((session as any).spawnCwd, "anthropic", "subscription_oauth (claude -p, no API key)",
+      session.persisted.model || "claude-opus-4-8", "request", { turn_prompt: prompt },
+      { sessionId, kind: "followup_stdin" });
+  }
+
+  // Write follow-up to the subprocess stdin in stream-json format
+  session.proc.stdin.write(
+    JSON.stringify({
+      type: "user",
+      message: {
+        role: "user",
+        content: [{ type: "text", text: maybeSafeObfuscate(prompt) }],
+      },
+    }) + "\n"
+  );
+}
+
+// Gracefully interrupt the in-flight turn WITHOUT killing the process, then
+// optionally inject a new prompt ("steer"). Validated against CLI v2.1.156:
+// the interrupt control_request returns control_response{success}, the turn
+// ends with result{subtype:"error_during_execution"}, and the process stays
+// alive to accept the next message.
+// ── Stop a session's process. For OpenRouter (detached process group), signal the
+// whole GROUP so the in-flight tool subprocess (shell/nmap/etc.) dies too — no orphans.
+// The claude path keeps the exact prior behavior (single-process SIGTERM).
+function killSession(session: LiveSession, signal: NodeJS.Signals = "SIGTERM"): void {
+  const pid = session.proc?.pid;
+  if ((session as any).orGroup && pid) {
+    try { process.kill(-pid, signal); return; } catch {}
+    // fall through to single-process kill if the group is already gone
+  }
+  try { session.proc.kill(signal); } catch {}
+}
+
+function interruptSession(sessionId: string, newPrompt: string | undefined, ws: WebSocket): void {
+  const session = liveSessions.get(sessionId);
+  if (!session) {
+    ws.send(JSON.stringify({ type: "error", sessionId, message: `No running session for ${sessionId}` }));
+    return;
+  }
+  session.clients.add(ws);
+
+  // ── Grok ACP path ─────────────────────────────────────────────────────────
+  // ACP exposes structured cancellation; unlike the Claude control protocol it
+  // is a JSON-RPC method, so never write a Claude control_request to this stdin.
+  if ((session as any).provider === "xai-grok") {
+    (session as any).cancelGrokAcpTurn?.(newPrompt);
+    return;
+  }
+
+  // ── OpenRouter path ──────────────────────────────────────────────────────────
+  // The OR orchestrator is a ONE-SHOT process spawned with --prompt; it has NO stdin
+  // control-protocol reader, so the Claude-style control_request below can never reach
+  // it (writing it was a silent no-op → "interrupt did nothing"). The only way to cancel
+  // an in-flight OR turn is to kill its process GROUP (orGroup also reaps child tools
+  // like nmap). The kill fires the normal close handler — it saves the partial reply and
+  // emits session_end — so the UI un-streams and the user can immediately continue
+  // (a new message re-spawns). For "Interrupt & Send", the new prompt is re-spawned as a
+  // fresh turn by the close handler (see respawnAfterClose).
+  if ((session as any).orGroup) {
+    if (!session.turnActive || !session.proc?.pid) return; // nothing in flight to cancel
+    if (session.interruptPending) return;                  // dedupe rapid taps
+    session.interruptPending = true;
+    if (newPrompt) (session as any).respawnAfterClose = newPrompt;
+    // Finalize the partial bubble + un-stream immediately (a killed turn emits no result).
+    broadcastToSession(session, { type: "claude_event", sessionId, data: { type: "result", subtype: "error_during_execution", is_error: true, end_reason: "interrupted" } });
+    killSession(session, "SIGTERM");
+    log("info", `Interrupt (group-kill) OR session ${sessionId}`, { steer: !!newPrompt });
+    return;
+  }
+
+  if (!session.proc?.stdin?.writable) {
+    ws.send(JSON.stringify({ type: "error", sessionId, message: `Session ${sessionId} stdin is not writable` }));
+    return;
+  }
+  // Nothing running → just start the new prompt as a normal turn.
+  if (!session.turnActive) {
+    if (newPrompt) {
+      session.persisted.messages.push({ role: "user", content: newPrompt, timestamp: new Date().toISOString() });
+      savePersistedSession(session.persisted);
+      writeUserToStdin(session, newPrompt);
+      broadcastToSession(session, { type: "turn_state", sessionId, turnActive: true, queuedCount: session.queuedMessages.length });
+    }
+    return;
+  }
+  if (session.interruptPending) return; // dedupe rapid interrupts
+  session.interruptPending = true;
+  // Steer: persist the new prompt now; it is injected when the interrupted turn ends.
+  if (newPrompt) {
+    session.persisted.messages.push({ role: "user", content: newPrompt, timestamp: new Date().toISOString() });
+    savePersistedSession(session.persisted);
+    session.pendingSteer = newPrompt;
+  }
+  const rid = "int-" + randomUUID().slice(0, 8);
+  session.controlRequests.set(rid, { subtype: "interrupt", at: Date.now() });
+  try {
+    session.proc.stdin.write(JSON.stringify({ type: "control_request", request_id: rid, request: { subtype: "interrupt" } }) + "\n");
+  } catch (e: any) {
+    log("warn", `interrupt write failed`, { sessionId, error: e?.message });
+  }
+  broadcastToSession(session, { type: "turn_state", sessionId, turnActive: true, interrupting: true, queuedCount: session.queuedMessages.length });
+  log("info", `Interrupt sent to session ${sessionId}`, { rid, steer: !!newPrompt });
+  // Safety: clear the pending flag if no ack in 10s (the result event may still arrive).
+  setTimeout(() => {
+    if (session.controlRequests.has(rid)) {
+      session.controlRequests.delete(rid);
+      session.interruptPending = false;
+      log("warn", `interrupt ack timeout`, { sessionId, rid });
+    }
+  }, 10000);
+}
+
+// ── Express app ────────────────────────────────────────────────────
+const app = express();
+// IMPORTANT: raw body parser for /proxy must register BEFORE the json
+// middleware below — otherwise express.json() consumes the body before
+// our proxy handler sees the original bytes.
+// ── Phase 1.1: dashboard authentication FIRST — reject unauthorized remote requests
+// BEFORE the raw 50MB proxy parser and the 10MB JSON parser ever touch the body. The
+// auth check only reads headers/cookies/query (no parsed body needed). Loopback is
+// always trusted; /api/health stays open; a valid ?token= sets a cookie so the built
+// PWA keeps working without a rebuild. WS upgrades are gated separately (verifyClient).
+app.use(createAuthMiddleware(SECURITY, (e) =>
+  auditSecurity(e.kind, { path: e.path || "", addr: e.addr || "", reason: e.reason })));
+
+// Body parsers (run only for requests that passed auth above).
+app.use("/proxy", express.raw({ type: "*/*", limit: "50mb" }));
+app.use(express.json({ limit: "10mb" }));
+
+// ── Client-side log beacon (diagnostics) ──────────────────────────────────────
+// The iPad PWA's Safari console isn't reachable from the server, so the frontend
+// ships its own errors + lifecycle events here (window.onerror, unhandledrejection,
+// pageshow/visibilitychange, WS connect/close, resume reconnect, message count,
+// memory). Appended to client-logs.jsonl for post-mortem of the "blank screen on
+// resume" report. Best-effort; never throws.
+app.post("/api/client-log", (req, res) => {
+  try {
+    const entries = Array.isArray(req.body) ? req.body : [req.body];
+    const ip = (req.headers["x-forwarded-for"] as string) || req.socket.remoteAddress || "";
+    const ua = (req.headers["user-agent"] as string) || "";
+    const line = entries
+      .map((e) => JSON.stringify({ at: new Date().toISOString(), ip, ua, ...e }))
+      .join("\n") + "\n";
+    require("fs").appendFileSync("/root/.claude/chillspwn/client-logs.jsonl", line);
+  } catch {}
+  res.status(204).end();
+});
+
+// Serve built frontend in production.
+// index.html: no-store so an iOS PWA can never launch a STALE index that references a
+//   since-rebuilt (deleted) bundle hash → blank screen (#42). Hashed /assets are
+//   immutable so they cache hard.
+const distDir = resolve(import.meta.dirname || __dirname, "../dist");
+
+// Dynamic PWA manifest: stamp the current build id into start_url ("/?b=<id>") so every (re)install
+// lands on a fresh URL that iOS has never snapshotted — belt-and-suspenders with the in-app
+// auto-updater for the stale-bundle problem. Served no-store and BEFORE express.static so it wins
+// over the static dist/manifest.webmanifest.
+function currentBuildId(): string {
+  try { return JSON.parse(readFileSync(join(distDir, "build-id.json"), "utf-8")).id || ""; } catch {}
+  try {
+    const m = readFileSync(join(distDir, "index.html"), "utf-8").match(/assets\/index-([A-Za-z0-9_-]+)\.js/);
+    return m ? m[1] : "";
+  } catch { return ""; }
+}
+app.get("/manifest.webmanifest", (_req, res) => {
+  try {
+    const man = JSON.parse(readFileSync(join(distDir, "manifest.webmanifest"), "utf-8"));
+    const bid = currentBuildId();
+    man.start_url = bid ? `/?b=${bid}` : "/";
+    res.setHeader("Cache-Control", "no-store, must-revalidate");
+    res.type("application/manifest+json").send(JSON.stringify(man));
+  } catch {
+    res.status(404).end();
+  }
+});
+
+if (existsSync(distDir)) {
+  app.use(express.static(distDir, {
+    setHeaders: (res, filePath) => {
+      if (filePath.endsWith("index.html")) {
+        res.setHeader("Cache-Control", "no-store, must-revalidate");
+      } else if (filePath.includes(`${sep}assets${sep}`)) {
+        res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
+      }
+    },
+  }));
+}
+
+// ── REST API ───────────────────────────────────────────────────────
+
+// Health check
+app.get("/api/health", (_, res) => {
+  res.json({ status: "ok", uptime: process.uptime(), sessions: liveSessions.size });
+});
+
+// Personas
+app.get("/api/personas", (_, res) => {
+  res.json(loadPersonas().map(p => ({
+    name: p.name,
+    description: p.description,
+    color: p.color,
+    icon: p.icon,
+    model: p.model,
+    permissionMode: p.permissionMode,
+    provider: p.provider || "anthropic",
+  })));
+});
+
+app.post("/api/personas", (req, res) => {
+  if (req.body && req.body.name != null && !guardSeg(res, req.body.name)) return;
+  const { name, description, color, icon, model, permissionMode, soul } = req.body;
+  if (!name) return res.status(400).json({ error: "name required" });
+  const slug = name.toLowerCase().replace(/[^a-z0-9-]/g, "-");
+  const dir = join(PERSONAS_DIR, slug);
+  try {
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "persona.json"), JSON.stringify({
+      name, description: description || "", color: color || "#6366f1",
+      // New personas created via the API default to ULTRACODING (opus-4-8).
+      icon: icon || "user", model: model || "claude-opus-4-8",
+      permissionMode: permissionMode || "default",
+      systemPromptFile: soul ? "SOUL.md" : null,
+      tools: "default", appendSystemPrompt: null,
+    }, null, 2));
+    if (soul) writeFileSync(join(dir, "SOUL.md"), soul);
+    log("info", `Created persona: ${name}`);
+    res.json({ success: true, slug });
+  } catch (e: any) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Persona detail (includes SOUL content)
+app.get("/api/personas/:name", (req, res) => {
+  if (!guardSeg(res, req.params.name)) return;
+  const personas = loadPersonas();
+  const persona = personas.find(p => p.name.toLowerCase() === req.params.name.toLowerCase());
+  if (!persona) return res.status(404).json({ error: "Persona not found" });
+
+  let soul = "";
+  if (persona.systemPromptFile) {
+    const soulPath = join(persona.dir, persona.systemPromptFile);
+    if (existsSync(soulPath)) {
+      // Resolve symlink to show the real path
+      const realPath = require("fs").realpathSync(soulPath);
+      soul = readFileSync(soulPath, "utf-8");
+      return res.json({
+        ...persona,
+        soul,
+        soulPath: realPath,
+        isSymlink: require("fs").lstatSync(soulPath).isSymbolicLink(),
+      });
+    }
+  }
+  res.json({ ...persona, soul: "", soulPath: null, isSymlink: false });
+});
+
+// Update persona SOUL
+app.put("/api/personas/:name/soul", (req, res) => {
+  if (!guardSeg(res, req.params.name)) return;
+  const personas = loadPersonas();
+  const persona = personas.find(p => p.name.toLowerCase() === req.params.name.toLowerCase());
+  if (!persona) return res.status(404).json({ error: "Persona not found" });
+  if (!persona.systemPromptFile) return res.status(400).json({ error: "Persona has no SOUL file configured" });
+
+  const soulPath = join(persona.dir, persona.systemPromptFile);
+  // Resolve symlink — write to the real file so Hermes also sees the change
+  const realPath = require("fs").realpathSync(soulPath);
+  try {
+    writeFileSync(realPath, req.body.content || "");
+    log("info", `Updated SOUL for persona ${persona.name}`, { path: realPath });
+    res.json({ success: true, path: realPath });
+  } catch (e: any) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── ADDITIVE: OpenRouter model catalog (all models, cached ~1h) ──
+// Powers the terminal-style model picker. Read-only proxy to OpenRouter's /models.
+let _orModelsCache: { at: number; data: any[] } | null = null;
+app.get("/api/openrouter/models", async (_req, res) => {
+  try {
+    if (_orModelsCache && Date.now() - _orModelsCache.at < 3600_000) {
+      return res.json({ models: _orModelsCache.data, cached: true });
+    }
+    let key = process.env.OPENROUTER_API_KEY || "";
+    if (!key) {
+      for (const envf of [join(HERMES_HOME, ".env"), "/root/.hermes/.env"]) {
+        if (existsSync(envf)) {
+          for (const ln of readFileSync(envf, "utf-8").split("\n")) {
+            const t = ln.trim();
+            if (t.startsWith("OPENROUTER_API_KEY=")) { key = t.slice("OPENROUTER_API_KEY=".length).trim().replace(/^"|"$/g, ""); break; }
+          }
+        }
+        if (key) break;
+      }
+    }
+    const r = await fetch("https://openrouter.ai/api/v1/models", {
+      headers: key ? { Authorization: `Bearer ${key}` } : {},
+    });
+    const j: any = await r.json();
+    const models = (j.data || []).map((m: any) => ({
+      id: m.id,
+      name: m.name,
+      context_length: m.context_length,
+      pricing: m.pricing ? { prompt: m.pricing.prompt, completion: m.pricing.completion } : undefined,
+    }));
+    _orModelsCache = { at: Date.now(), data: models };
+    res.json({ models, cached: false });
+  } catch (e: any) {
+    res.status(500).json({ error: e.message, models: [] });
+  }
+});
+
+// ── Build id — lets the running app detect a newer deployed build and auto-reload (iOS PWA
+// stale-bundle fix). Reads dist/build-id.json (written by the vite build); falls back to the
+// hashed main-bundle name from index.html so it still changes per build even without the json.
+app.get("/api/build-id", (_req, res) => {
+  res.setHeader("Cache-Control", "no-store");
+  try {
+    const p = join(distDir, "build-id.json");
+    if (existsSync(p)) return res.json(JSON.parse(readFileSync(p, "utf-8")));
+  } catch {}
+  try {
+    const idx = readFileSync(join(distDir, "index.html"), "utf-8");
+    const m = idx.match(/assets\/index-([A-Za-z0-9_-]+)\.js/);
+    return res.json({ id: m ? m[1] : "unknown" });
+  } catch {
+    return res.json({ id: "unknown" });
+  }
+});
+
+// ── Codex (OpenAI ChatGPT-backend) live model catalog ──
+// The codex backend (chatgpt.com/backend-api/codex) has no usable /models endpoint, so — like
+// Hermes — we source the list dynamically from models.dev (the community model registry) and keep
+// only the gpt-5.x line the codex backend accepts (codex-tuned variants first). Cached 1h.
+let _codexModelsCache: { at: number; data: any[] } | null = null;
+// The ChatGPT codex backend only runs the codex-tuned line (the Codex CLI models) + gpt-5.5 (the
+// verified default). The general gpt-5.x API models on models.dev are NOT accepted there, so we
+// intersect the live registry with this codex-tuned set rather than listing every gpt-5.
+const isCodexTuned = (id: string) => /codex/i.test(id) || id === "gpt-5.5" || /^gpt-5\.6-(sol|terra|luna)$/.test(id);
+app.get("/api/codex/models", async (_req, res) => {
+  const FALLBACK = ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5", "gpt-5.3-codex", "gpt-5.3-codex-spark", "gpt-5.2-codex",
+    "gpt-5.1-codex-max", "gpt-5.1-codex-mini", "gpt-5.1-codex", "gpt-5-codex"].map((id) => ({ id, name: id }));
+  try {
+    if (_codexModelsCache && Date.now() - _codexModelsCache.at < 3600_000) {
+      return res.json({ models: _codexModelsCache.data, cached: true });
+    }
+    const r = await fetch("https://models.dev/api.json", { headers: { "User-Agent": "chillspwn" } });
+    const j: any = await r.json();
+    const openai = j?.openai?.models || {};
+    // intersect the live registry with the codex-tuned set (codex variants + gpt-5.5)
+    const ids = Object.keys(openai).filter((id) => isCodexTuned(id) && !/image|audio|tts|realtime|transcribe/i.test(id));
+    // gpt-5.6-sol (default) first, then gpt-5.5, then codex variants newest-first
+    const rank = (id: string) => (id === "gpt-5.6-sol" ? 0 : id === "gpt-5.5" ? 1 : 2);
+    ids.sort((a, b) => rank(a) - rank(b) || b.localeCompare(a));
+    const models = ids.map((id) => ({
+      id,
+      name: openai[id]?.name || id,
+      context_length: openai[id]?.limit?.context || openai[id]?.context_length,
+    }));
+    const data = models.length ? models : FALLBACK;
+    _codexModelsCache = { at: Date.now(), data };
+    res.json({ models: data, cached: false });
+  } catch (e: any) {
+    res.json({ models: FALLBACK, cached: false, error: e.message });
+  }
+});
+
+// ── ADDITIVE: persist a persona's orchestration provider + model to persona.json ──
+// Personas are hot-loaded per session, so this takes effect on the NEXT chat (no restart).
+app.put("/api/personas/:name/config", (req, res) => {
+  if (!guardSeg(res, req.params.name)) return;
+  const body: any = req.body || {};
+  const provider = body.provider;
+  const model = body.model;
+  if (provider !== undefined && provider !== "anthropic" && provider !== "openrouter" && provider !== "openai-codex" && provider !== "gemini" && provider !== "xai-grok") {
+    return res.status(400).json({ error: 'provider must be "anthropic", "openrouter", "openai-codex", "gemini", or "xai-grok"' });
+  }
+  if (model !== undefined && typeof model !== "string") {
+    return res.status(400).json({ error: "model must be a string" });
+  }
+  const personas = loadPersonas();
+  const persona = personas.find((p) => p.name.toLowerCase() === req.params.name.toLowerCase());
+  if (!persona) return res.status(404).json({ error: "Persona not found" });
+  const configPath = join(persona.dir, "persona.json");
+  try {
+    const raw = JSON.parse(readFileSync(configPath, "utf-8"));
+    if (provider !== undefined) raw.provider = provider;
+    if (model !== undefined) raw.model = model;
+    writeFileSync(configPath, JSON.stringify(raw, null, 2));
+    res.json({ success: true, provider: raw.provider || "anthropic", model: raw.model });
+  } catch (e: any) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// List currently-live ChillsPwn sessions (target choices for kanban task assignment)
+app.get("/api/live-sessions", (_, res) => {
+  const sessions: any[] = [];
+  for (const [id, s] of liveSessions) {
+    const lastUserMsg = [...s.persisted.messages].reverse().find(m => m.role === "user");
+    sessions.push({
+      id,
+      persona: s.persona,
+      pid: s.proc.pid,
+      messageCount: s.persisted.messages.length,
+      preview: (lastUserMsg?.content || "").slice(0, 60),
+      createdAt: s.persisted.createdAt,
+      stdinWritable: !!s.proc.stdin?.writable,
+    });
+  }
+  res.json(sessions);
+});
+
+// Memory
+app.get("/api/memory", (_, res) => {
+  const result: Record<string, string> = {};
+  for (const file of ["USER.md", "MEMORY.md"]) {
+    const path = join(MEMORIES_DIR, file);
+    result[file] = existsSync(path) ? readFileSync(path, "utf-8") : "";
+  }
+  res.json(result);
+});
+
+app.put("/api/memory/:file", (req, res) => {
+  const file = req.params.file;
+  if (!["USER.md", "MEMORY.md"].includes(file)) return res.status(400).json({ error: "invalid file" });
+  const path = join(MEMORIES_DIR, file);
+  writeFileSync(path, req.body.content || "");
+  log("info", `Updated memory file: ${file}`);
+  res.json({ success: true });
+});
+
+// Kanban (via sqlite3 CLI — avoids native module build issues)
+// Kanban — live agent/process manager
+app.get("/api/kanban", (_, res) => {
+  const agents: any[] = [];
+  const { execSync } = require("child_process");
+
+  // 1. ChillsPwn live sessions (claude -p subprocesses)
+  for (const [id, session] of liveSessions) {
+    agents.push({
+      id: `chillspwn-${id}`,
+      type: "chillspwn-chat",
+      name: `COMMS: ${session.persona}`,
+      status: "running",
+      provider: "anthropic",
+      // Display label for the COMMS row — reflects the new default
+      model: "claude-opus-4-8",
+      pid: session.proc.pid,
+      startedAt: session.persisted.createdAt,
+      messages: session.persisted.messages.length,
+      tokens: (session.persisted.totalInputTokens || 0) + (session.persisted.totalOutputTokens || 0),
+      sessionId: id,
+    });
+  }
+
+  // 2. Report generation jobs
+  for (const [jobId, job] of reportJobs) {
+    agents.push({
+      id: `report-${jobId}`,
+      type: "report-gen",
+      name: `Report: ${jobId.replace("report-", "").split("-")[0]}`,
+      status: job.status,
+      provider: "anthropic",
+      model: "sonnet",
+      stage: (job as any).stage || "",
+      progress: (job as any).progress || 0,
+      startedAt: job.startedAt,
+      completedAt: job.completedAt,
+    });
+  }
+
+  // 3. Active Claude processes + their child shells (from OS)
+  try {
+    const ps = execSync("ps aux | grep 'claude' | grep -v grep | grep -v 'bun\\|node\\|server'", { encoding: "utf-8", timeout: 3000 });
+    for (const line of ps.trim().split("\n")) {
+      if (!line.trim()) continue;
+      const parts = line.trim().split(/\s+/);
+      const pid = parseInt(parts[1]);
+      const cpu = parts[2];
+      const mem = parts[3];
+      const startTime = parts[8];
+      const cmd = parts.slice(10).join(" ").slice(0, 120);
+
+      // Skip if already tracked as a ChillsPwn session
+      if ([...liveSessions.values()].some(s => s.proc.pid === pid)) continue;
+      // Skip if already tracked as a dispatched kanban job (it'll be added below
+      // with its proper title/model/status instead of the generic OS-scan label)
+      if ([...kanbanJobs.values()].some(j => j.pid === pid)) continue;
+
+      let agentType = "claude-cli";
+      let name = "Claude CLI";
+      if (cmd.includes("--resume")) name = "Claude CLI (resumed)";
+      if (cmd.includes("-p") && cmd.includes("sonnet")) { agentType = "claude-task"; name = "Claude Task (Sonnet)"; }
+      if (cmd.includes("-p") && cmd.includes("haiku")) { agentType = "claude-task"; name = "Claude Task (Haiku)"; }
+
+      // Count child shell processes
+      let childShells: any[] = [];
+      try {
+        const children = execSync(`pgrep -P ${pid} 2>/dev/null || true`, { encoding: "utf-8", timeout: 2000 }).trim();
+        if (children) {
+          for (const cpidStr of children.split("\n")) {
+            const cpid = parseInt(cpidStr.trim());
+            if (isNaN(cpid)) continue;
+            try {
+              const childInfo = execSync(`ps -o pid=,etime=,stat=,args= -p ${cpid} 2>/dev/null`, { encoding: "utf-8", timeout: 1000 }).trim();
+              if (!childInfo) continue;
+              const childParts = childInfo.trim().split(/\s+/);
+              const childPid = parseInt(childParts[0]);
+              const childElapsed = childParts[1];
+              const childStat = childParts[2];
+              // Extract the eval command from the zsh -c ... eval '...' command
+              let childCmd = childParts.slice(3).join(" ");
+              const evalMatch = childCmd.match(/eval '(.*?)'/s);
+              if (evalMatch) childCmd = evalMatch[1];
+              // Clean up and truncate
+              childCmd = childCmd.replace(/^#.*?\n/gm, "").replace(/\s+/g, " ").trim().slice(0, 150);
+
+              childShells.push({
+                pid: childPid,
+                elapsed: childElapsed,
+                stat: childStat,
+                cmd: childCmd,
+              });
+            } catch {}
+          }
+        }
+      } catch {}
+
+      agents.push({
+        id: `os-${pid}`,
+        type: agentType,
+        name: childShells.length > 0 ? `${name} (${childShells.length} shells)` : name,
+        status: "running",
+        pid,
+        cpu: `${cpu}%`,
+        mem: `${mem}%`,
+        startTime,
+        cmd: cmd.slice(0, 200),
+        children: childShells,
+      });
+
+      // Also add each child shell as its own card
+      for (const child of childShells) {
+        agents.push({
+          id: `shell-${child.pid}`,
+          type: "shell",
+          name: child.cmd.slice(0, 60) || "Shell",
+          status: child.stat.includes("S") ? "running" : child.stat.includes("R") ? "running" : "stopped",
+          pid: child.pid,
+          parentPid: pid,
+          startTime: child.elapsed,
+          cmd: child.cmd,
+        });
+      }
+    }
+  } catch {}
+
+  // Track which PIDs are currently alive so we can detect completions
+  const currentPids = new Set<number>();
+  for (const a of agents) {
+    if (a.pid) currentPids.add(a.pid);
+  }
+
+  // Record processes that disappeared since last tick (moved to completed)
+  // But enrich them with the cmd/name from when they were alive
+  for (const pid of previousPids) {
+    if (!currentPids.has(pid)) {
+      // Find if we already have this in history
+      if (!processHistory.find(p => p.pid === pid)) {
+        // Try to find it in the previous agents snapshot
+        const prev = (global as any).__lastAgentsSnapshot?.find((a: any) => a.pid === pid);
+        processHistory.push({
+          id: `done-${pid}-${Date.now()}`,
+          type: prev?.type || "shell",
+          name: prev?.name || `Process ${pid}`,
+          status: "completed",
+          pid,
+          parentPid: prev?.parentPid,
+          cmd: prev?.cmd,
+          startedAt: prev?.startedAt || prev?.startTime || new Date().toISOString(),
+          completedAt: new Date().toISOString(),
+          provider: prev?.provider,
+          model: prev?.model,
+        });
+        if (processHistory.length > MAX_HISTORY) processHistory.shift();
+      }
+    }
+  }
+  previousPids = currentPids;
+  // Save current snapshot for next tick's enrichment
+  (global as any).__lastAgentsSnapshot = agents.map(a => ({ ...a }));
+
+  // 3b. Add completed/failed processes from history
+  for (const rec of processHistory) {
+    agents.push(rec);
+  }
+
+  // 4. Hermes gateway + cron status
+  try {
+    const hermes = execSync("pgrep -af 'hermes_cli.main gateway' | head -1", { encoding: "utf-8", timeout: 2000 }).trim();
+    if (hermes) {
+      const pid = parseInt(hermes.split(/\s+/)[0]);
+      agents.push({
+        id: `hermes-gateway`,
+        type: "hermes",
+        name: "Hermes Gateway",
+        status: "running",
+        pid,
+        provider: "openai-codex",
+        model: "gpt-5.6-sol",
+      });
+    }
+  } catch {}
+
+  // 5. Auto-dispatched kanban jobs (live tracked)
+  for (const [id, job] of kanbanJobs) {
+    // Skip if already in agents list from process scan
+    if (agents.some(a => a.pid === job.pid)) continue;
+    agents.push({
+      id: `task-${id}`,
+      type: "kanban-task",
+      name: `Task: ${job.title}`,
+      status: job.status,
+      pid: job.pid,
+      model: job.model,
+      provider: "anthropic",
+      startedAt: job.startedAt,
+      completedAt: job.completedAt,
+      cmd: job.output.slice(-100) || "(running...)",
+      sessionId: (job as any).sessionId || undefined,
+    });
+  }
+
+  // 6. Kanban tasks from SQLite that aren't already tracked by kanbanJobs
+  try {
+    const tasks = execSync(
+      `sqlite3 -json "${KANBAN_DB}" "SELECT id, title, status, assignee, model_override, created_at, worker_pid, consecutive_failures, last_failure_error, session_id FROM tasks WHERE status NOT IN ('archived','done','running') ORDER BY created_at DESC LIMIT 50;" 2>/dev/null || echo "[]"`,
+      { encoding: "utf-8", timeout: 3000 }
+    );
+    const parsed = JSON.parse(tasks || "[]");
+    for (const t of parsed) {
+      if (kanbanJobs.has(t.id)) continue;
+      agents.push({
+        id: `kanban-${t.id}`,
+        type: "kanban-task",
+        name: t.title,
+        status: t.status === "ready" ? "queued" : t.status === "triage" ? "queued" : t.status,
+        assignee: t.assignee,
+        model: t.model_override || "",
+        pid: t.worker_pid,
+        failures: t.consecutive_failures,
+        lastError: t.last_failure_error,
+        createdAt: t.created_at,
+        sessionId: t.session_id || undefined,
+      });
+    }
+  } catch {}
+
+  // 7. Workflow subagents — Claude Code's Workflow() API spawns subagents as
+  // internal threads (NOT separate OS processes), so they're invisible to ps.
+  // They live as JSONL files under ~/.claude/projects/<proj>/<session>/subagents/workflows/wf_*/agent-*.jsonl.
+  // Scan recently-active ones and show them as kanban cards so the user can see
+  // what's happening inside a multi-agent workflow.
+  try {
+    const { execSync } = require("child_process");
+    const { statSync } = require("fs");
+    const projectsDir = resolve(process.env.HOME || "/root", ".claude/projects");
+    // Find workflow agent files modified in the last 30 minutes
+    const findCmd = `find "${projectsDir}" -path '*/subagents/workflows/wf_*/agent-*.jsonl' -mmin -30 -type f 2>/dev/null | head -80`;
+    const found = execSync(findCmd, { encoding: "utf-8", timeout: 4000 }).trim();
+    if (found) {
+      const now = Date.now();
+      const workflowGroups = new Map<string, { wfId: string; sessionId: string; agents: any[] }>();
+      for (const filePath of found.split("\n")) {
+        if (!filePath) continue;
+        try {
+          const st = statSync(filePath);
+          const ageSec = Math.floor((now - st.mtime.getTime()) / 1000);
+          // Active = mtime within last 60 seconds. Otherwise the workflow likely finished.
+          const active = ageSec < 60;
+          // Path looks like: .../projects/<proj>/<sessionId>/subagents/workflows/<wfId>/agent-<id>.jsonl
+          const parts = filePath.split("/");
+          const agentFile = parts[parts.length - 1].replace(".jsonl", "");
+          const wfId = parts[parts.length - 2];
+          const sessionId = parts[parts.length - 5];
+          // Extract label from first line of the jsonl (the user-message preamble)
+          let label = agentFile.replace(/^agent-/, "").slice(0, 8);
+          try {
+            const firstLine = execSync(`head -1 "${filePath}" 2>/dev/null`, { encoding: "utf-8", timeout: 1000 }).trim();
+            if (firstLine) {
+              const parsed = JSON.parse(firstLine);
+              const content = parsed?.message?.content || "";
+              if (typeof content === "string") {
+                // Look for "## Title" markdown header
+                const headerMatch = content.match(/^##\s+([^\n]+)/);
+                if (headerMatch) label = headerMatch[1].slice(0, 60);
+                else label = content.slice(0, 60);
+              }
+            }
+          } catch {}
+
+          if (!workflowGroups.has(wfId)) {
+            workflowGroups.set(wfId, { wfId, sessionId, agents: [] });
+          }
+          workflowGroups.get(wfId)!.agents.push({
+            agentFile, label, ageSec, active, size: st.size, filePath,
+          });
+        } catch {}
+      }
+
+      for (const [wfId, group] of workflowGroups) {
+        const activeCount = group.agents.filter(a => a.active).length;
+        // Aggregate workflow summary card
+        agents.push({
+          id: `wf-${wfId}`,
+          type: "workflow",
+          name: `Workflow ${wfId.replace(/^wf_/, "").slice(0, 12)}`,
+          status: activeCount > 0 ? "running" : "completed",
+          cmd: `${group.agents.length} subagents · ${activeCount} active`,
+          sessionId: group.sessionId,
+          provider: "claude-code",
+          model: "internal",
+        });
+        // Individual subagent cards (cap at 20 per workflow to avoid flooding the board)
+        for (const a of group.agents.slice(0, 20)) {
+          agents.push({
+            id: `wfsub-${wfId}-${a.agentFile}`,
+            type: "workflow-subagent",
+            name: a.label,
+            status: a.active ? "running" : "completed",
+            sessionId: group.sessionId,
+            cmd: `${(a.size / 1024).toFixed(1)}K · last write ${a.ageSec}s ago · wf ${wfId.slice(-6)}`,
+          });
+        }
+      }
+    }
+  } catch {}
+
+  res.json(agents);
+});
+
+// Kanban — create task
+// Track auto-dispatched kanban tasks
+// ════════════════════════════════════════════════════════════════════════════════════════════
+// AGENT BOARD (Phase 1) — the kanban becomes an agent-orchestration control plane.
+// Columns = agents (personas). A card created in an agent column triggers a persona-scoped agent
+// (spawnOpenRouter, headless) whose tool/skill use is tracked on the card; its result returns to
+// the orchestrator via the board_* tools. ADDITIVE + OpenRouter-only; the claude path is untouched.
+// DB safety: every write here is one execSync — Node is single-threaded so writes never overlap,
+// and orchestrator writes arrive via the HTTP API so they ride the same thread. busy_timeout guards
+// against any external reader. The card-<id> session-id prefix isolates all new capture code.
+// ════════════════════════════════════════════════════════════════════════════════════════════
+const MAX_BOARD_AGENTS = 8;
+const BOARD_BACKLOG = "__plan__";   // legacy generic backlog pseudo-column (retired → migrated to ORCH_PERSONA)
+const ORCH_PERSONA = "ChillsPwn";   // the orchestrator/planner — its column IS the Backlog/Plan (NOT an executor agent)
+let _boardSeq = 0;
+
+function bsql(s: any): string { return String(s == null ? "" : s).replace(/'/g, "''"); }
+
+// execFileSync (NOT execSync) — the SQL is passed as a single literal argv, so JSON double-quotes
+// inside string values can't collide with shell quoting (which silently corrupted tools_used as a
+// shell-double-quoted command would). .timeout sets busy-timeout without polluting -json output.
+function boardWrite(sql: string): void {
+  try {
+    require("child_process").execFileSync("sqlite3", ["-cmd", ".timeout 5000", KANBAN_DB, sql],
+      { encoding: "utf-8", timeout: 6000 });
+  } catch (e: any) {
+    log("warn", "board write failed", { error: e?.message, sql: sql.slice(0, 100) });
+  }
+}
+function boardQuery(sql: string): any[] {
+  try {
+    const out = require("child_process").execFileSync("sqlite3", ["-cmd", ".timeout 5000", "-json", KANBAN_DB, sql],
+      { encoding: "utf-8", timeout: 6000, maxBuffer: 20 * 1024 * 1024, stdio: ["pipe", "pipe", "ignore"] });
+    return out && out.trim() ? JSON.parse(out) : [];
+  } catch { return []; }
+}
+
+// One-time additive schema: new board_columns table + ADD COLUMNs on tasks (ALTER warns harmlessly
+// if the column already exists). Seeds the backlog pseudo-column + one column per OpenRouter persona.
+function ensureBoardSchema(): void {
+  boardWrite(
+    "CREATE TABLE IF NOT EXISTS board_columns (persona TEXT PRIMARY KEY, position INTEGER NOT NULL DEFAULT 0, " +
+    "wip_limit INTEGER NOT NULL DEFAULT 2, enabled INTEGER NOT NULL DEFAULT 1, is_backlog INTEGER NOT NULL DEFAULT 0, " +
+    "created_at INTEGER NOT NULL DEFAULT 0);");
+  for (const col of ["agent_session_id TEXT", "engagement TEXT", "tools_used TEXT", "dispatched_at INTEGER", "agent_provider TEXT"]) {
+    boardWrite(`ALTER TABLE tasks ADD COLUMN ${col};`);
+  }
+  const now = Math.floor(Date.now() / 1000);
+  // The ORCHESTRATOR persona (ChillsPwn) is the planner — its column IS the Backlog/Plan column. It is
+  // NOT an executor agent: cards there are the orchestrator's plan and are never auto-dispatched. Every
+  // OTHER persona is an executor agent column that runs cards on its OWN provider config.
+  let pos = 1;
+  for (const p of loadPersonas()) {
+    if (p.name === ORCH_PERSONA) {
+      boardWrite(`INSERT INTO board_columns (persona, position, wip_limit, enabled, is_backlog, created_at) VALUES ('${bsql(p.name)}', 0, 0, 1, 1, ${now}) ON CONFLICT(persona) DO UPDATE SET position=0, is_backlog=1, wip_limit=0;`);
+    } else {
+      boardWrite(`INSERT INTO board_columns (persona, position, wip_limit, enabled, is_backlog, created_at) VALUES ('${bsql(p.name)}', ${pos}, 2, 1, 0, ${now}) ON CONFLICT(persona) DO UPDATE SET position=${pos}, is_backlog=0;`);
+      pos++;
+    }
+  }
+  // Retire the old generic backlog pseudo-column; migrate any of its cards to the orchestrator's column.
+  boardWrite(`UPDATE tasks SET assignee='${bsql(ORCH_PERSONA)}' WHERE assignee='${BOARD_BACKLOG}';`);
+  boardWrite(`DELETE FROM board_columns WHERE persona='${BOARD_BACKLOG}';`);
+  log("info", `Board schema ready — columns: ${listBoardColumns().map((c) => c.persona).join(", ") || "(none)"}`);
+}
+
+function listBoardColumns(): any[] {
+  return boardQuery("SELECT persona, position, wip_limit, enabled, is_backlog FROM board_columns ORDER BY position;");
+}
+function getBoardColumn(persona: string): any | null {
+  return boardQuery(`SELECT persona, position, wip_limit, enabled, is_backlog FROM board_columns WHERE persona='${bsql(persona)}';`)[0] || null;
+}
+
+// Map a tasks row → the Card shape the UI + board_* tools consume.
+function cardRow(id: string): any | null {
+  const t = boardQuery(`SELECT id, title, body, assignee, status, created_by, created_at, completed_at, model_override, agent_provider, worker_pid, tools_used, result, last_failure_error, engagement FROM tasks WHERE id='${bsql(id)}';`)[0];
+  if (!t) return null;
+  let tools: any[] = [];
+  try { tools = t.tools_used ? JSON.parse(t.tools_used) : []; } catch {}
+  return {
+    id: t.id, title: t.title, task: t.body || "", assignee: t.assignee || null,
+    status: t.status, createdBy: t.created_by || "human", createdAt: (t.created_at || 0) * 1000,
+    provider: t.agent_provider || undefined, model: t.model_override || undefined, pid: t.worker_pid || undefined, tools,
+    result: t.result || undefined, error: t.last_failure_error || undefined, engagement: t.engagement || undefined,
+  };
+}
+
+// Broadcast a board event to ALL connected dashboard clients (board events aren't session-scoped).
+function broadcastBoard(msg: any): void {
+  try {
+    const payload = JSON.stringify(msg);
+    for (const client of wss.clients) {
+      if (client.readyState === WebSocket.OPEN) client.send(payload);
+    }
+  } catch {}
+}
+
+// Record one tool/skill use on a card: a task_events row + the denormalized tasks.tools_used JSON,
+// then push it live to the board. Coarse (one row per tool — never per token).
+function recordCardToolEvent(taskId: string, kind: string, name: string, detail: string): void {
+  const ev = { id: `${taskId}:${++_boardSeq}`, ts: Date.now(), kind, name, detail: (detail || "").slice(0, 160) };
+  boardWrite(`INSERT INTO task_events (task_id, kind, payload, created_at) VALUES ('${bsql(taskId)}', '${bsql(kind)}', '${bsql(JSON.stringify(ev))}', ${Math.floor(Date.now() / 1000)});`);
+  let arr: any[] = [];
+  const cur = boardQuery(`SELECT tools_used FROM tasks WHERE id='${bsql(taskId)}';`)[0];
+  try { arr = cur && cur.tools_used ? JSON.parse(cur.tools_used) : []; } catch {}
+  arr.push(ev);
+  if (arr.length > 100) arr = arr.slice(-100);
+  boardWrite(`UPDATE tasks SET tools_used='${bsql(JSON.stringify(arr))}' WHERE id='${bsql(taskId)}';`);
+  broadcastBoard({ type: "board_tool", taskId, event: ev });
+}
+
+// On agent exit, reconstruct the card's FINAL state from the COMPLETE stdout log (authoritative —
+// robust against the live-drain missing the last events due to a flush race). Rebuilds the full
+// tool/skill list + final result + done/failed from the whole log.
+function finalizeCardFromLog(taskId: string, stdoutLogPath: string, code: number | null): void {
+  try {
+    const raw = readFileSync(stdoutLogPath, "utf-8");
+    const tools: any[] = [];
+    let finalText = ""; let endReason: string | null = null;
+    for (const line of raw.split("\n")) {
+      const s = line.trim(); if (!s.startsWith("{")) continue;
+      let e: any; try { e = JSON.parse(s); } catch { continue; }
+      if (e.type === "assistant") {
+        for (const b of (e.message?.content || [])) {
+          if (b.type === "tool_use") {
+            const isSkill = b.name === "use_skill";
+            const detail = isSkill ? (b.input?.skill || b.input?.name || "")
+              : (b.input?.command || b.input?.path || b.input?.file_path || b.input?.pattern || b.input?.query || b.input?.code || b.input?.task || "");
+            tools.push({ id: `${taskId}:f${tools.length + 1}`, ts: Date.now(), kind: isSkill ? "skill" : "tool", name: b.name, detail: String(detail).slice(0, 160) });
+          } else if (b.type === "text" && b.text && b.text.trim()) {
+            finalText = b.text;
+          }
+        }
+      } else if (e.type === "result") {
+        endReason = e.end_reason;
+        if (e.result && String(e.result).trim()) finalText = String(e.result); // claude -p final result
+      }
+    }
+    finalText = finalText.replace("<<OBJECTIVE_COMPLETE>>", "").trim().slice(0, 8000);
+    const cur = boardQuery(`SELECT status FROM tasks WHERE id='${bsql(taskId)}';`)[0];
+    const ok = code === 0 && (endReason === "completed" || endReason === "final" || endReason === "success" || !!finalText);
+    if (cur && (cur.status === "running" || cur.status === "queued")) {
+      boardWrite(`UPDATE tasks SET status='${ok ? "done" : "failed"}', result='${bsql(finalText || `agent exited code ${code}`)}', tools_used='${bsql(JSON.stringify(tools))}', completed_at=${Math.floor(Date.now() / 1000)}, worker_pid=NULL WHERE id='${bsql(taskId)}';`);
+      broadcastBoard({ type: "board_card_updated", taskId, patch: { status: ok ? "done" : "failed", result: finalText, tools } });
+    } else if (tools.length) {
+      boardWrite(`UPDATE tasks SET tools_used='${bsql(JSON.stringify(tools))}' WHERE id='${bsql(taskId)}';`);
+      broadcastBoard({ type: "board_card_updated", taskId, patch: { tools } });
+    }
+  } catch (e: any) {
+    log("warn", "finalizeCardFromLog failed", { taskId, error: e?.message });
+  }
+}
+
+// Resolve an engagement name → cwd (mirrors POST /api/kanban's convention).
+function engagementCwd(engagement?: string): string | undefined {
+  if (!engagement) return undefined;
+  for (const base of [`/root/htb/boxes/${engagement}`, `/root/engagements/${engagement}`]) {
+    try { if (existsSync(base)) return base; } catch {}
+  }
+  return undefined;
+}
+
+// Anthropic board agent: a headless `claude -p` (SUBSCRIPTION, not API; and NOT the frozen interactive
+// spawnClaude — this is the legacy kanban task-runner pattern). File-based stdout so finalizeCardFromLog
+// reconstructs the full tool list + result; a live tail surfaces tools as they happen.
+function spawnClaudeAgentForCard(task: any, persona: Persona, cwd?: string): void {
+  const sessionId = `card-${task.id}`;
+  if (liveSessions.has(sessionId)) return;
+  const sessionLogDir = resolve(CHILLSPWN_HOME, "session-logs");
+  try { mkdirSync(sessionLogDir, { recursive: true }); } catch {}
+  const stdoutLogPath = join(sessionLogDir, `${sessionId}.stdout.jsonl`);
+  const stdoutFd = require("fs").openSync(stdoutLogPath, "w");
+  const runCwd = cwd || process.cwd();
+  const append = persona.appendSystemPrompt || `You are the ${persona.name} agent.`;
+  const prompt = `Task: ${task.title}${task.body ? `\n\nDetails:\n${task.body}` : ""}\n\nYou are the "${persona.name}" agent. Complete this task autonomously with your tools, then report a concise result.`;
+  let proc: ChildProcess;
+  try {
+    proc = spawn("claude", [
+      "-p", "--model", persona.model || "sonnet",
+      "--permission-mode", persona.permissionMode || "bypassPermissions",
+      "--no-session-persistence", "--output-format", "stream-json", "--verbose",
+      "--allowedTools", "Bash,Read,Write,Edit,Glob,Grep,WebSearch,WebFetch",
+      "--append-system-prompt", append,
+    ], { stdio: ["pipe", stdoutFd, "ignore"], detached: true, cwd: runCwd, env: { ...process.env, PATH: `/opt/chillspwn-bin:${process.env.PATH || ""}` } });
+  } catch (e: any) {
+    boardWrite(`UPDATE tasks SET status='failed', last_failure_error='${bsql(e?.message || "claude spawn failed")}', worker_pid=NULL WHERE id='${bsql(task.id)}';`);
+    broadcastBoard({ type: "board_card_updated", taskId: task.id, patch: { status: "failed", error: String(e?.message || "spawn failed") } });
+    return;
+  }
+  proc.unref();
+  if (proc.pid) boardWrite(`UPDATE tasks SET worker_pid=${proc.pid} WHERE id='${bsql(task.id)}';`);
+  try { proc.stdin?.write(prompt); proc.stdin?.end(); } catch {}
+  liveSessions.set(sessionId, { id: sessionId, proc, persona: persona.name, clients: new Set(), persisted: { id: sessionId, persona: persona.name, createdAt: new Date().toISOString(), messages: [], status: "running" } } as any);
+  log("info", `Board agent dispatched (claude): ${persona.name} → card ${task.id}`, { sessionId, pid: proc.pid });
+  let off = 0;
+  const drain = () => {
+    try {
+      const buf = readFileSync(stdoutLogPath, "utf-8");
+      if (buf.length <= off) return;
+      const fresh = buf.slice(off); off = buf.length;
+      for (const line of fresh.split("\n")) {
+        const s = line.trim(); if (!s.startsWith("{")) continue;
+        let e: any; try { e = JSON.parse(s); } catch { continue; }
+        if (e.type === "assistant") for (const b of (e.message?.content || [])) {
+          if (b.type === "tool_use") {
+            const d = b.input?.command || b.input?.file_path || b.input?.path || b.input?.pattern || b.input?.query || "";
+            recordCardToolEvent(task.id, "tool", b.name, String(d).slice(0, 160));
+          }
+        }
+      }
+    } catch {}
+  };
+  const iv = setInterval(drain, 400);
+  proc.on("close", (code) => {
+    clearInterval(iv); try { drain(); } catch {}
+    liveSessions.delete(sessionId);
+    finalizeCardFromLog(task.id, stdoutLogPath, code);
+  });
+  proc.on("error", (err: any) => {
+    clearInterval(iv); liveSessions.delete(sessionId);
+    boardWrite(`UPDATE tasks SET status='failed', last_failure_error='${bsql(err?.message || "claude error")}', worker_pid=NULL WHERE id='${bsql(task.id)}';`);
+    broadcastBoard({ type: "board_card_updated", taskId: task.id, patch: { status: "failed", error: String(err?.message || "claude error") } });
+  });
+}
+
+// Spawn the persona's agent for a card — headless (no ws), persona-scoped tools, in the engagement dir.
+function spawnAgentForCard(task: any, persona: Persona): void {
+  const sessionId = `card-${task.id}`;
+  if (liveSessions.has(sessionId)) return;
+  const cwd = engagementCwd(task.engagement);
+  const whitelist = Array.isArray(persona.tools) ? persona.tools.join(",") : "";
+  const extraEnv: Record<string, string> = { CHILLSPWN_OR_SUBAGENT_DEPTH: "1" };  // board agents don't recurse
+  if (whitelist) extraEnv.CHILLSPWN_OR_TOOL_WHITELIST = whitelist;
+  const now = Math.floor(Date.now() / 1000);
+  // A card carries an inherited provider/model ONLY when the orchestrator created it for ITSELF (a
+  // self-planning card → run on the orchestrator's CURRENT model, e.g. ChillsPwn-on-DeepSeek). For
+  // everything else (delegated to a DIFFERENT agent, or human-created) the agent runs on its OWN
+  // persona config — the orchestrator never overrides another agent's provider.
+  const effProvider = (task.agent_provider || persona.provider || "anthropic");
+  const effModel = (task.model_override || persona.model);
+  const effPersona: Persona = { ...persona, provider: effProvider as any, model: effModel };
+  const prompt = `Task: ${task.title}${task.body ? `\n\nDetails:\n${task.body}` : ""}\n\nYou are the "${persona.name}" agent. Complete this task autonomously with your tools, then end your reply with <<OBJECTIVE_COMPLETE>> on its own line followed by a concise result.`;
+  // Record the EFFECTIVE provider/model on the card so the UI shows what it ACTUALLY ran on.
+  boardWrite(`UPDATE tasks SET status='running', agent_session_id='${bsql(sessionId)}', agent_provider='${bsql(effProvider)}', model_override='${bsql(effModel || "")}', started_at=${now}, dispatched_at=${now} WHERE id='${bsql(task.id)}';`);
+  broadcastBoard({ type: "board_card_updated", taskId: task.id, patch: { status: "running", provider: effProvider, model: effModel } });
+  try {
+    if (effProvider === "xai-grok") {
+      // ACP is persistent by default for chat. Board workers are deliberately
+      // one-shot: persist their final result to the board, then terminate the
+      // ACP child so a completed card cannot leave an idle agent behind.
+      spawnGrokAcp(sessionId, effPersona, prompt, null, cwd, {
+        oneShot: true,
+        onTurnComplete: (text, grokSession) => {
+          const tools = (grokSession.persisted.messages || []).filter((m: any) => m.role === "tool" && !m.isResult)
+            .map((m: any, i: number) => ({ id: `${task.id}:g${i + 1}`, ts: Date.now(), kind: "tool", name: m.toolName || "Grok tool", detail: String(m.content || "").slice(0, 160) }));
+          const result = String(text || "Grok ACP completed without a text result.").replace("<<OBJECTIVE_COMPLETE>>", "").trim().slice(0, 8000);
+          boardWrite(`UPDATE tasks SET status='done', result='${bsql(result)}', tools_used='${bsql(JSON.stringify(tools))}', completed_at=${Math.floor(Date.now() / 1000)}, worker_pid=NULL WHERE id='${bsql(task.id)}';`);
+          broadcastBoard({ type: "board_card_updated", taskId: task.id, patch: { status: "done", result, tools } });
+        },
+      });
+      const pid = liveSessions.get(sessionId)?.proc?.pid;
+      if (pid) boardWrite(`UPDATE tasks SET worker_pid=${pid} WHERE id='${bsql(task.id)}';`);
+      log("info", `Board agent dispatched: ${persona.name} on Grok ACP/${effModel} → card ${task.id}`, { sessionId, pid });
+    } else if (effProvider === "openrouter" || effProvider === "openai-codex" || effProvider === "gemini") {
+      // The OpenRouter, Codex, and Gemini backends all run through the same orchestrator process
+      // (spawnOpenRouter); effPersona.provider drives the --provider flag (openai-codex emits the
+      // codex backend, gemini emits the native Gemini backend, line ~1204). Without the case here,
+      // a non-Claude card fell through to the Claude path below and silently ran as anthropic.
+      spawnOpenRouter(sessionId, effPersona, prompt, null, cwd, extraEnv);
+      const live = liveSessions.get(sessionId);
+      const pid = (live?.proc as any)?.pid;
+      if (pid) boardWrite(`UPDATE tasks SET worker_pid=${pid} WHERE id='${bsql(task.id)}';`);
+      log("info", `Board agent dispatched: ${persona.name} on ${effProvider}/${effModel} → card ${task.id}`, { sessionId, pid });
+    } else {
+      spawnClaudeAgentForCard(task, effPersona, cwd);  // anthropic agent via headless claude -p (subscription)
+    }
+  } catch (e: any) {
+    boardWrite(`UPDATE tasks SET status='failed', last_failure_error='${bsql(e?.message || "spawn failed")}' WHERE id='${bsql(task.id)}';`);
+    broadcastBoard({ type: "board_card_updated", taskId: task.id, patch: { status: "failed", error: String(e?.message || "spawn failed") } });
+  }
+}
+
+// Dispatch a queued card if its column has a free WIP slot + we're under the global cap. Idempotent.
+function maybeDispatchCard(id: string): void {
+  const card = boardQuery(`SELECT id, title, body, assignee, status, engagement, agent_session_id, agent_provider, model_override FROM tasks WHERE id='${bsql(id)}';`)[0];
+  if (!card || card.status !== "queued" || card.agent_session_id) return;
+  const col = getBoardColumn(card.assignee);
+  if (!col || !col.enabled || col.is_backlog) return;
+  const persona = loadPersonas().find((p) => p.name.toLowerCase() === String(card.assignee).toLowerCase());
+  if (!persona) return;
+  const running = boardQuery("SELECT COUNT(*) AS n FROM tasks WHERE status='running';")[0];
+  if ((running?.n || 0) >= MAX_BOARD_AGENTS) return;
+  const colRunning = boardQuery(`SELECT COUNT(*) AS n FROM tasks WHERE assignee='${bsql(card.assignee)}' AND status='running';`)[0];
+  if ((colRunning?.n || 0) >= (col.wip_limit || 2)) return;
+  spawnAgentForCard(card, persona);
+}
+
+// Sweeper: pick up queued cards (created out-of-band, or WIP-deferred) and dispatch into free slots.
+function dispatchPendingCards(): void {
+  try {
+    for (const c of boardQuery("SELECT id FROM tasks WHERE status='queued' AND (agent_session_id IS NULL OR agent_session_id='') ORDER BY created_at LIMIT 20;")) {
+      maybeDispatchCard(c.id);
+    }
+  } catch {}
+}
+
+const kanbanJobs = new Map<string, { id: string; title: string; status: string; pid?: number; proc?: ChildProcess; output: string; startedAt: string; completedAt?: string; model: string }>();
+
+app.post("/api/kanban", (req, res) => {
+  const { title, body, assignee, provider, model, engagement, sessionId: contextSessionId, targetSessionId } = req.body;
+  if (!title) return res.status(400).json({ error: "title required" });
+  const { execSync } = require("child_process");
+  const id = randomUUID().slice(0, 12);
+  const now = Math.floor(Date.now() / 1000);
+
+  // ── AGENT-BOARD FORK (additive): if `assignee` is a board column, this is an agent card.
+  // Backlog (__plan__) cards are stored but NOT dispatched; agent-column cards trip the dispatcher.
+  // Anything else falls through to the legacy claude -p task runner below, byte-for-byte unchanged.
+  if (!targetSessionId && assignee) {
+    const col = getBoardColumn(assignee);
+    if (col) {
+      const createdBy = req.body.createdBy === "orchestrator" ? "orchestrator" : (req.body.createdBy || "human");
+      const status = col.is_backlog ? "backlog" : "queued";
+      boardWrite(
+        `INSERT INTO tasks (id, title, body, status, assignee, model_override, agent_provider, engagement, created_by, session_id, created_at) ` +
+        `VALUES ('${id}','${bsql(title)}','${bsql(body || "")}','${status}','${bsql(assignee)}','${bsql(model || "")}','${bsql(provider || "")}','${bsql(engagement || "")}','${bsql(createdBy)}','${bsql(contextSessionId || "")}',${now});`
+      );
+      broadcastBoard({ type: "board_card_created", card: cardRow(id) });
+      if (!col.is_backlog && col.enabled) maybeDispatchCard(id);
+      return res.json({ success: true, id, dispatched: col.is_backlog ? "backlog" : "to-agent", agent: assignee });
+    }
+  }
+
+  const taskModel = model || "sonnet";
+
+  // Save to SQLite — store either the dispatch target session or the context session
+  const linkSessionId = targetSessionId || contextSessionId || "";
+  try {
+    execSync(
+      `sqlite3 "${KANBAN_DB}" "INSERT INTO tasks (id, title, body, status, assignee, model_override, session_id, created_at) VALUES ('${id}', '${title.replace(/'/g, "''")}', '${(body || "").replace(/'/g, "''")}', 'running', '${assignee || "chillspwn"}', '${taskModel}', '${linkSessionId}', ${now});"`,
+      { encoding: "utf-8", timeout: 3000 }
+    );
+  } catch {}
+
+  // Build context-aware prompt
+  let engagementContext = "";
+  if (engagement) {
+    engagementContext = `\n\nENGAGEMENT CONTEXT: You are working on engagement "${engagement}". Save ALL output files to the engagement directory at /root/htb/boxes/${engagement}/ (or /root/engagements/${engagement}/). Use the standard subdirectories: scans/, loot/, exploits/, notes/, report/.`;
+  }
+
+  const taskPrompt = `Task: ${title}${body ? `\n\nDetails:\n${body}` : ""}${engagementContext}\n\nExecute this task thoroughly. Use the Bash tool for commands, Read/Write for files. Save results to appropriate locations. Report your findings when complete.`;
+
+  // If targetSessionId is set, route the task to an existing live session instead of spawning a new claude
+  if (targetSessionId) {
+    log("info", `Routing kanban task to existing session: ${targetSessionId}`, { id, title });
+    const result = injectIntoSession(targetSessionId, taskPrompt);
+    if (!result.success) {
+      // Mark task failed
+      try {
+        execSync(`sqlite3 "${KANBAN_DB}" "UPDATE tasks SET status='failed', last_failure_error='${(result.error || "").replace(/'/g, "''")}' WHERE id='${id}';"`, { timeout: 2000 });
+      } catch {}
+      return res.status(400).json({ error: result.error });
+    }
+    // Mark as done since it was handed off
+    try {
+      execSync(`sqlite3 "${KANBAN_DB}" "UPDATE tasks SET status='done' WHERE id='${id}';"`, { timeout: 2000 });
+    } catch {}
+    processHistory.push({
+      id: `task-${id}`,
+      type: "kanban-task",
+      name: title,
+      status: "completed",
+      cmd: `→ session ${targetSessionId}`,
+      startedAt: new Date().toISOString(),
+      completedAt: new Date().toISOString(),
+      model: "(routed-to-session)",
+    });
+    if (processHistory.length > MAX_HISTORY) processHistory.shift();
+    return res.json({ success: true, id, dispatched: "to-session", sessionId: targetSessionId });
+  }
+
+  log("info", `Auto-dispatching kanban task: ${title}`, { id, model: taskModel, engagement, contextSessionId });
+
+  const proc = spawn("claude", [
+    "-p",
+    "--model", taskModel,
+    "--permission-mode", "auto",
+    "--no-session-persistence",
+    "--output-format", "stream-json",
+    "--verbose",
+    "--allowedTools", "Bash,Read,Write,Edit,Glob,Grep,WebSearch,WebFetch",
+    // Background auto-dispatched task: Workflow tool available on-demand, but
+    // NOT standing ultracode. These run detached with --permission-mode auto +
+    // Bash; standing orchestration here = unattended autonomous command loops
+    // with no approval gate. Keep workflows opt-in only for unattended agents.
+    "--settings", workflowSettings({ standing: false, model: taskModel }),
+  ], {
+    stdio: ["pipe", "pipe", "pipe"],
+    env: { ...process.env, PATH: `/opt/chillspwn-bin:${process.env.PATH || ''}` },
+  });
+
+  proc.stdin?.write(taskPrompt);
+  proc.stdin?.end();
+
+  const job = {
+    id,
+    title,
+    status: "running",
+    pid: proc.pid,
+    proc,
+    output: "",
+    startedAt: new Date().toISOString(),
+    model: taskModel,
+    sessionId: contextSessionId || undefined,
+  };
+  kanbanJobs.set(id, job);
+
+  let stdoutBuf = "";
+  proc.stdout?.on("data", (chunk: Buffer) => {
+    stdoutBuf += chunk.toString();
+    // Parse stream-json for result text
+    for (const line of stdoutBuf.split("\n")) {
+      if (!line.trim()) continue;
+      try {
+        const d = JSON.parse(line);
+        if (d.type === "assistant") {
+          const texts = (d.message?.content || []).filter((b: any) => b.type === "text").map((b: any) => b.text);
+          if (texts.length) job.output += texts.join("\n") + "\n";
+        }
+        if (d.type === "result" && d.result) {
+          job.output += d.result;
+        }
+      } catch {}
+    }
+    stdoutBuf = stdoutBuf.includes("\n") ? stdoutBuf.split("\n").pop() || "" : stdoutBuf;
+  });
+
+  proc.stderr?.on("data", (chunk: Buffer) => {
+    job.output += `[stderr] ${chunk.toString()}`;
+  });
+
+  proc.on("close", (code) => {
+    job.status = code === 0 ? "completed" : "failed";
+    job.completedAt = new Date().toISOString();
+    delete (job as any).proc;
+    log("info", `Kanban task ${code === 0 ? "completed" : "failed"}: ${title}`, { id, exitCode: code });
+
+    // Update SQLite status
+    try {
+      execSync(`sqlite3 "${KANBAN_DB}" "UPDATE tasks SET status='${code === 0 ? "done" : "failed"}' WHERE id='${id}';"`, { encoding: "utf-8", timeout: 2000 });
+    } catch {}
+
+    // Also add to process history so it shows on the board
+    processHistory.push({
+      id: `task-${id}`,
+      type: "kanban-task",
+      name: title,
+      status: code === 0 ? "completed" : "failed",
+      pid: proc.pid,
+      cmd: taskPrompt.slice(0, 150),
+      startedAt: job.startedAt,
+      completedAt: job.completedAt,
+      model: taskModel,
+    });
+    if (processHistory.length > MAX_HISTORY) processHistory.shift();
+  });
+
+  proc.on("error", (err) => {
+    job.status = "failed";
+    job.output += `Error: ${err.message}`;
+    job.completedAt = new Date().toISOString();
+  });
+
+  res.json({ success: true, id, pid: proc.pid });
+});
+
+// ── AGENT BOARD endpoints ──
+// The board's columns (agents) + the backlog pseudo-column, with persona display meta merged in.
+app.get("/api/board/columns", (_req, res) => {
+  const personas = loadPersonas();
+  const cols = listBoardColumns().map((c: any) => {
+    const p = personas.find((x) => x.name.toLowerCase() === String(c.persona).toLowerCase());
+    return {
+      persona: c.persona, position: c.position, wipLimit: c.wip_limit,
+      enabled: !!c.enabled, isBacklog: !!c.is_backlog,
+      color: p?.color || "#00d4ff", icon: p?.icon || "user",
+      model: p?.model, provider: p?.provider || "anthropic",
+      allowedTools: Array.isArray(p?.tools) ? p?.tools : undefined,
+    };
+  });
+  res.json({ columns: cols });
+});
+
+// The whole board: columns + their active/recent cards (one query, lean — for the board UI + board_list).
+app.get("/api/board", (_req, res) => {
+  const cards = boardQuery(
+    "SELECT id, title, body, assignee, status, created_by, created_at, completed_at, model_override, agent_provider, worker_pid, tools_used, result, last_failure_error, engagement " +
+    "FROM tasks WHERE assignee IN (SELECT persona FROM board_columns) AND status != 'archived' ORDER BY created_at DESC LIMIT 200;"
+  ).map((t: any) => {
+    let tools: any[] = [];
+    try { tools = t.tools_used ? JSON.parse(t.tools_used) : []; } catch {}
+    return {
+      id: t.id, title: t.title, task: t.body || "", assignee: t.assignee || null, status: t.status,
+      createdBy: t.created_by || "human", createdAt: (t.created_at || 0) * 1000,
+      provider: t.agent_provider || undefined, model: t.model_override || undefined, pid: t.worker_pid || undefined, tools,
+      result: t.result || undefined, error: t.last_failure_error || undefined, engagement: t.engagement || undefined,
+    };
+  });
+  res.json({ cards });
+});
+
+// A single card (row + tools_used + recent task_events) — for board_await polling + the card expand view.
+app.get("/api/kanban/card/:id", (req, res) => {
+  const card = cardRow(req.params.id);
+  if (!card) return res.status(404).json({ error: "card not found" });
+  const events = boardQuery(`SELECT kind, payload, created_at FROM task_events WHERE task_id='${bsql(req.params.id)}' ORDER BY created_at DESC, id DESC LIMIT 100;`)
+    .map((e: any) => { try { return JSON.parse(e.payload); } catch { return { kind: e.kind, ts: (e.created_at || 0) * 1000 }; } }).reverse();
+  res.json({ ...card, events });
+});
+
+// Update a card: close a plan step (status), or PROMOTE a Backlog card to an agent (assignee → queue + dispatch).
+app.put("/api/board/card/:id", (req, res) => {
+  const id = req.params.id;
+  const cur = boardQuery(`SELECT status, assignee FROM tasks WHERE id='${bsql(id)}';`)[0];
+  if (!cur) return res.status(404).json({ error: "card not found" });
+  let { status, assignee } = req.body || {};
+  let willDispatch = false;
+  if (typeof assignee === "string" && assignee) {
+    const col = getBoardColumn(assignee);
+    if (col && col.enabled && !col.is_backlog && (!status || status === "queued")) { status = "queued"; willDispatch = true; }
+  }
+  const sets: string[] = [];
+  if (typeof assignee === "string" && assignee) sets.push(`assignee='${bsql(assignee)}'`);
+  if (typeof status === "string" && status) sets.push(`status='${bsql(status)}'`);
+  if (willDispatch) sets.push("agent_session_id=NULL");
+  if (!sets.length) return res.json({ ok: true });
+  boardWrite(`UPDATE tasks SET ${sets.join(", ")} WHERE id='${bsql(id)}';`);
+  broadcastBoard({ type: "board_card_updated", taskId: id, patch: { ...(assignee ? { assignee } : {}), ...(status ? { status } : {}) } });
+  if (willDispatch) maybeDispatchCard(id);
+  res.json({ ok: true, dispatched: willDispatch });
+});
+
+// Kanban — get task output
+app.get("/api/kanban/output/:id", (req, res) => {
+  const job = kanbanJobs.get(req.params.id);
+  if (!job) return res.status(404).json({ error: "Task not found" });
+  res.json({ id: job.id, title: job.title, status: job.status, output: job.output, startedAt: job.startedAt, completedAt: job.completedAt, model: job.model });
+});
+
+// Kanban — update task status
+app.put("/api/kanban/:id", (req, res) => {
+  const { status, model, assignee } = req.body;
+  const { execSync } = require("child_process");
+  const updates: string[] = [];
+  if (status) updates.push(`status='${status}'`);
+  if (model !== undefined) updates.push(`model_override='${model}'`);
+  if (assignee !== undefined) updates.push(`assignee='${assignee}'`);
+  if (updates.length === 0) return res.status(400).json({ error: "Nothing to update" });
+  try {
+    execSync(
+      `sqlite3 "${KANBAN_DB}" "UPDATE tasks SET ${updates.join(", ")} WHERE id='${req.params.id}';"`,
+      { encoding: "utf-8", timeout: 3000 }
+    );
+    res.json({ success: true });
+  } catch (e: any) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Kanban — kill a running process
+app.post("/api/kanban/kill/:pid", (req, res) => {
+  const pid = parseInt(req.params.pid);
+  if (isNaN(pid) || pid < 2) return res.status(400).json({ error: "Invalid PID" });
+  // Never kill PID 1 or the dashboard itself.
+  if (pid === 1 || pid === process.pid) {
+    auditSecurity("kill_refused", { pid, reason: "protected pid" });
+    return res.status(403).json({ error: "refusing to kill a protected process" });
+  }
+
+  // Phase 1.1: prefer PIDs the dashboard actually tracks (chat/card agents, jobs, terminals).
+  let basis = "";
+  if (dashboardManagedPids().has(pid)) {
+    basis = "tracked";
+  } else {
+    // Fallback: NARROW, EXACT command match for the two detached python runners we spawn
+    // (their PIDs aren't held in an in-memory map). No generic python3 / /script /
+    // server/index / bare 'claude'. Refuse outright if the cmdline can't be read.
+    let cmd = "";
+    let readable = true;
+    try { cmd = readFileSync(`/proc/${pid}/cmdline`, "utf-8").replace(/\0/g, " ").trim(); }
+    catch { readable = false; }
+    if (!readable || !cmd) {
+      auditSecurity("kill_refused", { pid, reason: "cmdline unreadable" });
+      return res.status(403).json({ error: "cannot verify process; refusing to kill" });
+    }
+    if (cmd.includes("orchestrator_openrouter.py") || cmd.includes("council_summon.py")) {
+      basis = "exact-cmd";
+    } else {
+      auditSecurity("kill_refused", { pid, reason: "not a dashboard-managed agent", cmd: cmd.slice(0, 160) });
+      return res.status(403).json({ error: "process is not a dashboard-managed agent" });
+    }
+  }
+
+  // DOCUMENTED GAP: a dashboard child whose PID is neither tracked in memory nor matches
+  // the two python runner scripts (e.g. a detached helper we don't register) cannot be
+  // killed via this endpoint. That is intentional — it self-terminates, and the operator
+  // can use the (gated) terminal. Full per-PID registration is a later-phase improvement.
+  try {
+    process.kill(pid, "SIGTERM");
+    auditSecurity("process_killed", { pid, basis });
+    log("info", `Killed process ${pid}`, { basis });
+    res.json({ success: true });
+  } catch (e: any) {
+    auditSecurity("kill_failed", { pid, error: String(e?.message || e) });
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// AGENT RUNTIME (Phase 2) — additive REST surface over the runtime lifecycle.
+// The runtime owns AgentRun state, structured planning, PlanSteps, board cards, and
+// step-bound tool gating. This block is self-contained: it does NOT touch the claude
+// path, the existing chat/board routes, or spawnClaude. Board cards are created via the
+// existing boardWrite/bsql (in a non-'queued' status, so the auto-dispatcher ignores
+// them — the runtime owns execution, not the sweeper).
+// ════════════════════════════════════════════════════════════════════════════
+// Phase 16.2 — runtime-mutable approval mode (operator-controlled; persisted so it survives restart).
+const APPROVAL_MODE_FILE = join(RUNTIME_DATA_DIR, "approval-mode.json");
+let _approvalModeRuntime: "human" | "auto" | "hybrid" = SECURITY.approvalMode;
+try { const s = JSON.parse(readFileSync(APPROVAL_MODE_FILE, "utf-8")); if (["human", "auto", "hybrid"].includes(s.mode)) _approvalModeRuntime = s.mode; } catch { /* env default */ }
+function getApprovalPolicyConfig() {
+  return {
+    mode: _approvalModeRuntime,
+    autoApproveRiskClasses: SECURITY.autoApproveRiskClasses,
+    autoApproveToolNames: SECURITY.autoApproveToolNames,
+    autoApproveAgentIds: SECURITY.autoApproveAgentIds,
+    autoApproveMaxRisk: SECURITY.autoApproveMaxRisk,
+  };
+}
+function setApprovalModeRuntime(mode: "human" | "auto" | "hybrid") {
+  _approvalModeRuntime = mode;
+  try { writeFileSync(APPROVAL_MODE_FILE, JSON.stringify({ mode, updatedAt: new Date().toISOString() })); } catch { /* best-effort persist */ }
+}
+
+const agentRuntime = new AgentRuntime({
+  store: new AgentRunStore(RUNTIME_DATA_DIR),
+  events: auditLog,
+  // Phase 16.2 — approval-mode policy + actor mapping for agent-scoped auto-approval.
+  getApprovalPolicy: getApprovalPolicyConfig,
+  agentForRun: (run) => { const a = getSpecialistAgent((run as any).persona || ""); return a ? a.agentId : null; },
+  board: new KanbanBoardSink({
+    write: (sql) => boardWrite(sql),
+    esc: (s) => bsql(s),
+    now: () => Date.now(),
+    genId: () => `rtcard_${randomUUID()}`,
+    // Phase 2.1: broadcast runtime card create/update so the live Kanban reflects them
+    // (best-effort; never affects the board write or the run).
+    onChange: (evt) => { try { broadcastBoard(evt); } catch {} },
+  }),
+  policy: toPolicyConfig(SECURITY),
+  // Phase 12: large evidence content → side-file artifacts (gated; off ⇒ inline as before).
+  artifactStore: SECURITY.enableArtifactStorage ? new ArtifactStore(RUNTIME_DATA_DIR) : undefined,
+});
+
+// Phase 16.2 — approval-mode API (operator-controlled; runtime-toggleable, persisted).
+app.get("/api/runtime/approval-mode", (_req, res) => {
+  res.json({ ...getApprovalPolicyConfig(), envDefault: SECURITY.approvalMode, persisted: true });
+});
+app.post("/api/runtime/approval-mode", (req, res) => {
+  const mode = (req.body?.mode || "").toString();
+  if (!["human", "auto", "hybrid"].includes(mode)) return res.status(400).json({ error: "mode must be human|auto|hybrid" });
+  setApprovalModeRuntime(mode as "human" | "auto" | "hybrid");
+  log("info", "approval mode changed", { mode, by: "operator" });
+  res.json({ ok: true, ...getApprovalPolicyConfig() });
+});
+
+// Phase 12: auth-gated artifact retrieval (path-traversal-guarded by id shape + size header).
+const _artifactStore = new ArtifactStore(RUNTIME_DATA_DIR);
+app.get("/api/artifacts/:id", (req, res) => {
+  if (!guardSeg(res, req.params.id, "artifactId")) return;
+  if (!SECURITY.enableArtifactStorage) return res.status(403).json({ error: "artifact storage is disabled" });
+  const art = _artifactStore.read(req.params.id); // returns null for unsafe id or missing file
+  if (!art) return res.status(404).json({ error: "artifact not found" });
+  res.setHeader("Content-Type", art.meta.mimeType);
+  res.setHeader("Content-Length", String(art.meta.size));
+  res.setHeader("Content-Disposition", `inline; filename="${art.meta.filename}"`);
+  res.setHeader("X-Artifact-Sha256", art.meta.sha256);
+  res.send(art.content);
+});
+app.get("/api/runs/:id/artifacts", (req, res) => {
+  if (!guardSeg(res, req.params.id, "runId")) return;
+  res.json({ artifacts: _artifactStore.list(req.params.id) });
+});
+
+// ── Phase 6: the runtime + runtime-memory route HANDLERS were extracted to
+// ./routes/runtimeRoutes.ts (behavior-identical). The singletons stay here because they
+// depend on index.ts internals (boardWrite/bsql/broadcastBoard/RUNTIME_DATA_DIR/auditLog/
+// SECURITY); only the handlers moved. Registration order/position is preserved.
+const memoryService = new MemoryService(new MemoryStore(RUNTIME_DATA_DIR), auditLog);
+registerRuntimeRoutes(app, { agentRuntime, auditLog, memoryService, guardSeg, log,
+  workerContractEnabled: () => SECURITY.enableDelegatedWorkerContract,
+  liveMemoryEnabled: () => SECURITY.enableLiveMemoryProposals,
+  reportsEnabled: () => SECURITY.enableFinalRunReports });
+// Phase 8: OpenRouter/Codex runtime tool-gate endpoints (real enforcement; gated by flag).
+registerGateRoutes(app, { agentRuntime, guardSeg, log, gatingEnabled: () => SECURITY.enableOpenrouterRuntimeGating,
+  routing: { // Phase 15.1: live specialist-routing enforcement in the gate
+    enabled: () => SECURITY.enableSpecialistAgentRouting,
+    config: () => ({ enableSpecialistRouting: SECURITY.enableSpecialistAgentRouting, enforceChillspwnDelegation: SECURITY.enforceChillspwnDelegation, allowChillspwnDirectTools: SECURITY.allowChillspwnDirectTools, requireSpecialistAssignment: SECURITY.requireSpecialistAssignment, enforceChillspwnNoHands: SECURITY.enforceChillspwnNoHands }),
+  } });
+// 8.2: HTB Training Memory — verified attack lessons (the reusable training unit).
+const trainingMemory = new TrainingMemoryService(new TrainingMemoryStore(RUNTIME_DATA_DIR), auditLog);
+registerTrainingRoutes(app, { trainingMemory, guardSeg, enabled: () => SECURITY.enableTrainingMemory });
+// Phase 15: specialist army read-only API (roster, mission board, routing preview, enforcement posture).
+registerAgentRoutes(app, {
+  guardSeg,
+  enabled: () => SECURITY.enableSpecialistAgentRouting,
+  policyConfig: () => ({
+    enableSpecialistRouting: SECURITY.enableSpecialistAgentRouting,
+    enforceChillspwnDelegation: SECURITY.enforceChillspwnDelegation,
+    allowChillspwnDirectTools: SECURITY.allowChillspwnDirectTools,
+    requireSpecialistAssignment: SECURITY.requireSpecialistAssignment,
+    enforceChillspwnNoHands: SECURITY.enforceChillspwnNoHands,
+  }),
+  // Phase 16.1 — specialist-lane Mission Board inputs (run docs + MCP status + memory counts).
+  board: {
+    listRunDocs: (_missionId: string | null) =>
+      agentRuntime.listRuns()
+        .map((r) => agentRuntime.getDoc(r.id))
+        .filter((d): d is NonNullable<typeof d> => !!d)
+        .map((d) => ({
+          run: { id: d.run.id, persona: (d.run as any).persona, objective: (d.run as any).objective, status: d.run.status, updatedAt: (d.run as any).updatedAt, missionId: (d.run as any).missionId ?? null },
+          steps: d.steps.map((s) => ({ id: s.id, title: s.title, purpose: s.purpose, successCriteria: s.successCriteria, status: s.status, assignedAgent: (s as any).assignedAgent, allowedTools: s.allowedTools, riskLevel: s.riskLevel, evidenceRefs: s.evidenceRefs, dependencies: s.dependencies, createdAt: s.createdAt, updatedAt: s.updatedAt })),
+          approvals: d.approvals.map((a) => ({ id: a.id, stepId: (a as any).stepId, status: a.status })),
+          evidence: d.evidence.map((e) => ({ id: e.id, stepId: (e as any).stepId, artifactId: (e as any).artifactId })),
+        })),
+    mcpStatusForAgent: (agentId: string) => {
+      const b = getMcpBridge();
+      return (b ? b.agentMcpStatus(agentId) : { bridgeMode: "bridge_disabled", profile: "bridge_disabled", enabledServers: 0, disabledServers: 0, missingDependency: 0, missingSecret: 0, dockerRequired: 0, servers: [] }) as any;
+    },
+    memoryCountsForAgent: (agentId: string) => {
+      try {
+        const ls = trainingMemory.listAgentLessons(agentId);
+        return { proposed: ls.filter((l) => l.status === "proposed").length, verified: ls.filter((l) => l.status === "verified" && l.kind !== "failed_attempt").length, failedAttempts: ls.filter((l) => l.kind === "failed_attempt").length, verifiedUsed: 0 };
+      } catch { return { proposed: 0, verified: 0, failedAttempts: 0, verifiedUsed: 0 }; }
+    },
+    handoffs: (_missionId: string | null) => [],
+    // Phase: merge kanban board_create_task cards into the Mission Board lanes (by assignee).
+    kanbanCards: (_missionId: string | null) => {
+      try {
+        return boardQuery("SELECT id, title, status, assignee, created_by, created_at FROM tasks ORDER BY created_at DESC LIMIT 200")
+          .map((t: any) => ({ id: String(t.id), title: String(t.title ?? ""), status: String(t.status ?? ""), assignee: t.assignee ? String(t.assignee) : undefined, createdBy: t.created_by ? String(t.created_by) : undefined, createdAt: t.created_at ? String(t.created_at) : undefined }));
+      } catch { return []; }
+    },
+  },
+});
+
+// ── Phase 16: MCP Arsenal Bridge (default OFF). Lazily built so the config can be reloaded; only
+// constructed when ENABLE_MCP_ARSENAL=true. Tools exposed ONLY via specialist allowlists + the gate.
+let _mcpBridge: McpArsenalBridge | null = null;
+function getMcpBridge(): McpArsenalBridge | null {
+  if (!SECURITY.enableMcpArsenal) return null;
+  if (!_mcpBridge) {
+    _mcpBridge = new McpArsenalBridge({
+      configPath: SECURITY.mcpArsenalConfig,
+      manifestPath: join(import.meta.dir, "agents", "mcpArsenal.manifest.json"),
+      mode: SECURITY.mcpArsenalMode,
+      allowDocker: SECURITY.mcpArsenalAllowDocker,
+      startServers: SECURITY.mcpArsenalStartServers,
+      defaultTimeoutMs: SECURITY.mcpArsenalDefaultTimeoutSeconds * 1000,
+      maxOutputBytes: SECURITY.mcpArsenalMaxOutputBytes,
+    });
+  }
+  return _mcpBridge;
+}
+registerMcpRoutes(app, {
+  bridge: getMcpBridge,
+  agentRuntime,
+  guardSeg,
+  enabled: () => SECURITY.enableMcpArsenal,
+  routingConfig: () => ({ enableSpecialistRouting: SECURITY.enableSpecialistAgentRouting, enforceChillspwnDelegation: SECURITY.enforceChillspwnDelegation, allowChillspwnDirectTools: SECURITY.allowChillspwnDirectTools, requireSpecialistAssignment: SECURITY.requireSpecialistAssignment, enforceChillspwnNoHands: SECURITY.enforceChillspwnNoHands }),
+  nowMs: () => Date.now(),
+  log,
+});
+
+// Phase 17 — wordlist / hashcat / missing-keys asset APIs (metadata + paths only).
+registerAssetRoutes(app, {
+  wordlistManifest: join(import.meta.dir, "assets", "wordlistAssets.manifest.json"),
+  hashcatManifest: join(import.meta.dir, "assets", "hashcatAssets.manifest.json"),
+  mcpManifest: join(import.meta.dir, "agents", "mcpArsenal.manifest.json"),
+  vulnIntelManifest: join(import.meta.dir, "assets", "vulnIntelMcp.manifest.json"),
+  activeMcpConfig: SECURITY.mcpArsenalConfig,
+  enabled: () => SECURITY.enableSpecialistAgentRouting,
+  env: () => process.env,
+});
+
+// ── Phase 7.1: chat ↔ agent-runtime integration (observe-only) ────────────────────────
+// Seam A creates/attaches an OBSERVE-ONLY AgentRun per chat session; the SessionObserver
+// (Seam B) tails the stdout JSONL the chat path already writes and records provider turns +
+// observe-only tool classifications. ALL of this is gated by ENABLE_CHAT_AGENT_RUNS and
+// wrapped so any failure is non-fatal — chat behaves exactly as today when off or on error.
+// NOTHING here touches spawnClaude / claude -p / the provider fork / orchestrator.
+const sessionRunMap = new SessionRunMap();
+const sessionObservers = new Map<string, SessionObserver>();
+try {
+  const n = sessionRunMap.rebuildFrom(agentRuntime as any);
+  if (n) log("info", `Phase 7: re-attached ${n} chat AgentRun(s) from store after restart`);
+} catch { /* best-effort */ }
+
+function ensureChatObserver(
+  sessionId: string,
+  runId: string,
+  opts?: { activeStepId?: () => string | null; finalize?: boolean },
+): void {
+  if (sessionObservers.has(sessionId)) return;
+  try {
+    const logPath = join(resolve(CHILLSPWN_HOME, "session-logs"), `${sessionId}.stdout.jsonl`);
+    const obs = new SessionObserver({
+      sessionId,
+      runId,
+      logPath,
+      runtime: agentRuntime,
+      isSessionLive: () => liveSessions.has(sessionId),
+      activeStepId: opts?.activeStepId,
+      finalize: opts?.finalize,
+      onEnd: (rid, finalized) => {
+        sessionObservers.delete(sessionId);
+        if (finalized) sessionRunMap.delete(sessionId);
+        log("info", `Phase 7: chat observer ended`, { sessionId, runId: rid, finalized });
+      },
+      log,
+    });
+    sessionObservers.set(sessionId, obs);
+    obs.start();
+  } catch (e: any) {
+    log("warn", "Phase 7: ensureChatObserver failed (non-fatal)", { sessionId, error: e?.message });
+  }
+}
+
+// Phase 7.5: a no-op CLOSED WebSocket stub for OBSERVE-ONLY provider launches from REST.
+// spawnClaude uses `ws` ONLY in `new Set([ws])`; broadcastToSession is readyState-guarded
+// (`=== WebSocket.OPEN`), so this stub is added to the client set and then SKIPPED on every
+// broadcast — it is never `.send()`-ed. This launches the real process (which writes its log
+// for the observer to tail) WITHOUT modifying spawnClaude. (spawnOpenRouter already supports
+// a null ws — the headless agent-board card runner — so OR needs no stub.)
+const OBSERVE_ONLY_WS = { readyState: 3 /* WebSocket.CLOSED */, send() {} } as unknown as WebSocket;
+
+// Seam A — called from the chat handler BEFORE the provider fork. Fully guarded.
+function attachChatRun(sessionId: string, persona: Persona, objective: string): void {
+  if (!SECURITY.enableChatAgentRuns) return; // flag OFF ⇒ no run, no observer, chat unchanged
+  try {
+    const providerKind =
+      persona.provider === "openrouter" ? "openrouter"
+      : persona.provider === "openai-codex" ? "openai-codex"
+      : persona.provider === "gemini" ? "gemini"
+      : persona.provider === "xai-grok" ? "xai-grok"
+      : "claude";
+    const obj = String(objective || "(chat session)").slice(0, 2000);
+    const existing = sessionRunMap.get(sessionId);
+    const run = existing ? agentRuntime.getRun(existing.runId) : null;
+    if (!run || run.status !== "executing") {
+      const created = agentRuntime.createChatRun({
+        sessionId, objective: obj, persona: persona.name, providerKind: providerKind as any,
+      });
+      sessionRunMap.set(sessionId, {
+        runId: created.id, provider: providerKind as any, persona: persona.name, objective: obj,
+      });
+      ensureChatObserver(sessionId, created.id);
+    } else {
+      sessionRunMap.touch(sessionId);
+      ensureChatObserver(sessionId, run.id);
+    }
+  } catch (e: any) {
+    // NEVER let runtime attachment break chat.
+    log("warn", "Phase 7: attachChatRun failed (non-fatal) — chat continues normally", { sessionId, error: e?.message });
+  }
+}
+
+// Report the AgentRun attached to a chat session (drives the minimal ChatPage banner).
+app.get("/api/sessions/:sessionId/run", (req, res) => {
+  if (!guardSeg(res, req.params.sessionId, "sessionId")) return;
+  const entry = sessionRunMap.get(req.params.sessionId);
+  if (!entry) return res.status(404).json({ error: "no agent run attached" });
+  res.json({
+    runId: entry.runId, provider: entry.provider, persona: entry.persona,
+    objective: entry.objective, source: "chat", mode: "observe", enforced: false,
+  });
+});
+
+// ── Phase 7.2: ADVISORY plan preview for observe-only chat runs ───────────────────────
+// Manual, button-triggered. Generates a NON-ENFORCED preview via the existing planning
+// prompt + parser and an isolated OpenRouter call. Refuses managed runs and non-chat runs.
+// Never converts the run to managed, never creates PlanSteps/ToolCalls/approvals.
+app.post("/api/runs/:id/plan-preview", async (req, res) => {
+  if (!guardSeg(res, req.params.id, "id")) return;
+  if (SECURITY.chatAgentPlanning === "off") {
+    return res.status(403).json({ error: "plan preview is disabled — set CHAT_AGENT_PLANNING=preview to enable" });
+  }
+  const run = agentRuntime.getRun(req.params.id);
+  if (!run) return res.status(404).json({ error: "run not found" });
+  if (run.source !== "chat" || run.mode !== "observe") {
+    return res.status(400).json({ error: "plan preview is only available for observe-only chat runs" });
+  }
+  try {
+    const caller = run.providerKind === "xai-grok"
+      ? (p: string) => callGrokAcpOAuth(p, loadPersonas().find((x) => x.name === run.persona)?.model || "grok-4.5", run.cwd || process.cwd())
+      : createOpenRouterCaller({ apiKey: process.env.OPENROUTER_API_KEY || "", model: SECURITY.chatAgentPlanningModel });
+    const preview = await generatePlanPreview(run.objective, caller, { generatedBy: SECURITY.chatAgentPlanningModel });
+    const updated = agentRuntime.setPlanPreview(run.id, preview);
+    res.json({ ok: true, planPreview: updated.planPreview });
+  } catch (e: any) {
+    const status = e instanceof PlanPreviewError ? 502 : 500;
+    log("warn", "Phase 7.2: plan-preview generation failed", { runId: run.id, error: e?.message });
+    res.status(status).json({ error: e?.message || "plan preview generation failed", details: e?.errors });
+  }
+});
+
+app.get("/api/runs/:id/plan-preview", (req, res) => {
+  if (!guardSeg(res, req.params.id, "id")) return;
+  const preview = agentRuntime.getPlanPreview(req.params.id);
+  if (!preview) return res.status(404).json({ error: "no plan preview attached" });
+  res.json({ planPreview: preview });
+});
+
+app.delete("/api/runs/:id/plan-preview", (req, res) => {
+  if (!guardSeg(res, req.params.id, "id")) return;
+  try {
+    agentRuntime.clearPlanPreview(req.params.id);
+    res.json({ ok: true });
+  } catch (e: any) {
+    res.status(404).json({ error: e?.message || "run not found" });
+  }
+});
+
+// ── Phase 7.4: runtime-managed chat launcher (NO execution) ───────────────────────────
+// Creates a mode=managed AgentRun, generates a STRICT plan (no coercion), and holds it at
+// awaiting_plan_approval. Nothing is executed: no claude -p, no orchestrator, no tool calls.
+// Gated by ENABLE_RUNTIME_MANAGED_CHAT (default off → 403 + launcher hidden client-side).
+app.post("/api/runs/managed-chat", async (req, res) => {
+  if (!SECURITY.enableRuntimeManagedChat) {
+    return res.status(403).json({ error: "runtime-managed chat is disabled — set ENABLE_RUNTIME_MANAGED_CHAT=true" });
+  }
+  const objective = typeof req.body?.objective === "string" ? req.body.objective.trim() : "";
+  if (!objective) return res.status(400).json({ error: "objective is required" });
+  const persona = typeof req.body?.persona === "string" && req.body.persona.trim() ? req.body.persona.trim() : "managed";
+  const providerKind =
+    req.body?.provider === "openrouter" ? "openrouter"
+    : req.body?.provider === "openai-codex" ? "openai-codex"
+    : req.body?.provider === "gemini" ? "gemini"
+    : req.body?.provider === "xai-grok" ? "xai-grok"
+    : "claude";
+  const sessionId = `managed-${randomUUID()}`;
+  let run: { id: string } | undefined;
+  try {
+    run = agentRuntime.createManagedChatRun({ sessionId, objective: objective.slice(0, 4000), persona, providerKind: providerKind as any });
+    agentRuntime.beginPlanning(run.id); // created → planning
+    const grokPersona = providerKind === "xai-grok" ? loadPersonas().find((x) => x.name === persona) : undefined;
+    const caller = providerKind === "xai-grok"
+      ? (p: string) => callGrokAcpOAuth(p, grokPersona?.model || "grok-4.5")
+      : createOpenRouterCaller({ apiKey: process.env.OPENROUTER_API_KEY || "", model: SECURITY.chatAgentPlanningModel });
+    // Phase 8.1/8.2 + 15.11: ground managed planning in the LAYERED lesson hierarchy (VERIFIED
+    // GLOBAL → PROJECT/LAB → SPECIALIST FOR <persona> → RELEVANT FAILED ATTEMPTS) then (b) operator-
+    // VERIFIED memory facts. ALL exclude unverified / rejected / stale / hypotheses and any target-
+    // specific secret. Visible/auditable in the prompt. Off (flags) ⇒ no injection.
+    const lessonBlock = SECURITY.enableTrainingMemory
+      ? trainingMemory.buildSpecialistPlanningContext(persona)
+      : "";
+    const memBlock = SECURITY.enableLiveMemoryProposals
+      ? buildVerifiedMemoryContext(memoryService.getRelevantVerifiedMemory({}))
+      : "";
+    const memoryContext = [lessonBlock, memBlock].filter(Boolean).join("\n\n");
+    const plan = await generateStrictPlan(objective, caller, { memoryContext }); // STRICT, retries, no coercion
+    const result = agentRuntime.submitPlan(run.id, plan); // → awaiting_plan_approval (real PlanSteps + board cards)
+    res.json({ ok: true, run: result.run, steps: result.steps });
+  } catch (e: any) {
+    // Fail the half-created run cleanly so there is no orphan stuck in planning.
+    if (run) { try { agentRuntime.failRun(run.id, `managed plan generation failed: ${e?.message ?? "error"}`); } catch { /* best-effort */ } }
+    const status = e?.name === "ManagedPlanError" ? 502 : 500;
+    log("warn", "Phase 7.4: managed-chat run failed", { error: e?.message, details: e?.errors });
+    res.status(status).json({ error: e?.message || "managed run failed", details: e?.errors });
+  }
+});
+
+// ── Phase 7.5: start OBSERVE-ONLY execution for an approved managed run ────────────────
+// Launches the real provider via the isolated wrapper (stub-ws for claude / headless for OR)
+// and attaches a SessionObserver that maps observed activity to the active PlanStep. For
+// Claude this is OBSERVE-ONLY: tools are classified, NEVER blocked. spawnClaude internals,
+// CLI args, stream-json, resume, and the orchestrator are all untouched.
+app.post("/api/runs/:id/start-observed-execution", (req, res) => {
+  if (!guardSeg(res, req.params.id, "id")) return;
+  if (!SECURITY.enableRuntimeManagedChat) return res.status(403).json({ error: "runtime-managed chat is disabled" });
+  const run = agentRuntime.getRun(req.params.id);
+  if (!run) return res.status(404).json({ error: "run not found" });
+  if (run.mode !== "managed") return res.status(400).json({ error: "observed execution is only for managed runs" });
+  if (run.status !== "executing") return res.status(400).json({ error: `plan not approved — run status is '${run.status}'` });
+  if (!run.stepIds || run.stepIds.length === 0) return res.status(400).json({ error: "managed run has no PlanSteps" });
+  const sessionId = run.sessionId;
+  if (sessionObservers.has(sessionId) || run.metadata?.observedExecutionStartedAt) {
+    return res.status(409).json({ error: "observed execution already started for this run" });
+  }
+  try {
+    // Phase 7.5.1: select a persona that matches the run's providerKind — never drift providers.
+    const sel = selectExecutionPersona(loadPersonas(), String(run.persona), run.providerKind as any);
+    if (!sel.ok) return res.status(400).json({ error: sel.error });
+    const persona = sel.persona;
+    // Phase 7.5.1: auto-start the first pending step (if none running) so observed activity
+    // attaches to a step rather than at run level. Audited startStep; never auto-completes.
+    const activeStepId = agentRuntime.startFirstPendingStep(run.id);
+    // Attach the MANAGED observer FIRST (active-step mapping + observe-only evidence; never
+    // auto-finalizes a managed run).
+    ensureChatObserver(sessionId, run.id, { activeStepId: () => agentRuntime.getActiveStepId(run.id), finalize: false });
+    // Launch the provider via the isolated wrapper — no spawnClaude change.
+    if ((persona.provider as any) === "xai-grok") {
+      spawnGrokAcp(sessionId, persona, run.objective, null);
+    } else if (persona.provider === "openrouter" || (persona.provider as any) === "openai-codex" || (persona.provider as any) === "gemini") {
+      // Phase 8: when OR/Codex gating is enabled, pass the gate config so the orchestrator
+      // consults the runtime tool-gate before executing tools (REAL enforcement). Otherwise
+      // the OR run is observe-only exactly as in Phase 7.5.
+      let gateEnv: Record<string, string> | undefined;
+      if (SECURITY.enableOpenrouterRuntimeGating && SECURITY.openrouterGateMode !== "off") {
+        gateEnv = {
+          ENABLE_OPENROUTER_RUNTIME_GATING: "true",
+          OPENROUTER_GATE_MODE: SECURITY.openrouterGateMode,
+          OPENROUTER_GATE_FAIL_MODE: SECURITY.openrouterGateFailMode,
+          OPENROUTER_GATE_TIMEOUT_SECONDS: String(SECURITY.openrouterGateTimeoutSeconds),
+          OPENROUTER_GATE_POLL_SECONDS: String(SECURITY.openrouterGatePollSeconds),
+          CHILLSPWN_AGENT_RUN_ID: run.id,
+          CHILLSPWN_DASHBOARD_URL: `http://127.0.0.1:${SECURITY.port}`,
+        };
+        agentRuntime.markGateMode(run.id, SECURITY.openrouterGateMode as "dry-run" | "enforce");
+      }
+      spawnOpenRouter(sessionId, persona, run.objective, null, undefined, gateEnv); // headless
+    } else {
+      spawnClaude(sessionId, persona, run.objective, OBSERVE_ONLY_WS); // closed-stub ws (broadcast-skipped)
+    }
+    agentRuntime.markObservedExecution(run.id);
+    log("info", "Phase 7.5: started observed execution", { runId: run.id, sessionId, persona: persona.name, provider: persona.provider, activeStepId });
+    res.json({
+      ok: true, runId: run.id, sessionId,
+      persona: persona.name, provider: persona.provider ?? "anthropic", providerKind: run.providerKind,
+      activeStepId, mode: "observe", enforced: false,
+    });
+  } catch (e: any) {
+    log("warn", "Phase 7.5: start-observed-execution failed", { runId: run.id, error: e?.message });
+    res.status(500).json({ error: e?.message || "failed to start observed execution" });
+  }
+});
+
+// Feature flags for the client (drives launcher visibility). Auth-gated (non-sensitive booleans).
+app.get("/api/runtime/flags", (_req, res) => {
+  res.json({
+    managedChatEnabled: SECURITY.enableRuntimeManagedChat,
+    planningEnabled: SECURITY.chatAgentPlanning !== "off",
+    requirePlanApproval: SECURITY.requirePlanApproval,
+    chatAgentRunsEnabled: SECURITY.enableChatAgentRuns,
+    cockpitLiveRefresh: SECURITY.enableCockpitLiveRefresh,
+    openrouterGating: SECURITY.enableOpenrouterRuntimeGating ? SECURITY.openrouterGateMode : "off",
+  });
+});
+
+// Cron jobs
+app.get("/api/cron", (_, res) => {
+  try {
+    const data = JSON.parse(readFileSync(CRON_JOBS, "utf-8"));
+    res.json(data.jobs || []);
+  } catch {
+    res.json([]);
+  }
+});
+
+app.put("/api/cron/:index", (req, res) => {
+  try {
+    const idx = parseInt(req.params.index);
+    const data = JSON.parse(readFileSync(CRON_JOBS, "utf-8"));
+    const jobs = data.jobs || [];
+    if (idx < 0 || idx >= jobs.length) return res.status(404).json({ error: "Job not found" });
+    const updates = req.body;
+    for (const key of Object.keys(updates)) {
+      if (updates[key] !== undefined) jobs[idx][key] = updates[key];
+    }
+    writeFileSync(CRON_JOBS, JSON.stringify(data, null, 2));
+    log("info", `Updated cron job ${idx}`, { name: jobs[idx].name });
+    res.json({ success: true, job: jobs[idx] });
+  } catch (e: any) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post("/api/cron", (req, res) => {
+  try {
+    const data = existsSync(CRON_JOBS) ? JSON.parse(readFileSync(CRON_JOBS, "utf-8")) : { jobs: [] };
+    if (!data.jobs) data.jobs = [];
+    const newJob = {
+      name: req.body.name || "New Job",
+      id: require("crypto").randomUUID().slice(0, 12),
+      cron: req.body.cron || "0 * * * *",
+      prompt: req.body.prompt || "",
+      provider: req.body.provider || "openai-codex",
+      model: req.body.model || "gpt-5.6-sol",
+      enabled: req.body.enabled !== false,
+      ...req.body,
+    };
+    data.jobs.push(newJob);
+    writeFileSync(CRON_JOBS, JSON.stringify(data, null, 2));
+    log("info", `Created cron job`, { name: newJob.name });
+    res.json({ success: true, job: newJob, index: data.jobs.length - 1 });
+  } catch (e: any) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.delete("/api/cron/:index", (req, res) => {
+  try {
+    const idx = parseInt(req.params.index);
+    const data = JSON.parse(readFileSync(CRON_JOBS, "utf-8"));
+    const jobs = data.jobs || [];
+    if (idx < 0 || idx >= jobs.length) return res.status(404).json({ error: "Job not found" });
+    const removed = jobs.splice(idx, 1)[0];
+    writeFileSync(CRON_JOBS, JSON.stringify(data, null, 2));
+    log("info", `Deleted cron job ${idx}`, { name: removed.name });
+    res.json({ success: true });
+  } catch (e: any) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Skill config — per-skill provider/model overrides
+const SKILL_CONFIG_PATH = resolve(CHILLSPWN_HOME, "skill-config.json");
+
+function loadSkillConfig(): Record<string, { provider: string; model: string }> {
+  if (!existsSync(SKILL_CONFIG_PATH)) return {};
+  try { return JSON.parse(readFileSync(SKILL_CONFIG_PATH, "utf-8")); } catch { return {}; }
+}
+
+function saveSkillConfig(config: Record<string, { provider: string; model: string }>): void {
+  writeFileSync(SKILL_CONFIG_PATH, JSON.stringify(config, null, 2));
+}
+
+// Skills list
+app.get("/api/skills", (_, res) => {
+  const skillsDir = resolve(process.env.HOME || "/root", ".claude/plugins/chillspwn/skills");
+  if (!existsSync(skillsDir)) return res.json([]);
+  const skillConfig = loadSkillConfig();
+
+  // Get available providers
+  let providers: string[] = [];
+  try {
+    const auth = JSON.parse(readFileSync(resolve(HERMES_HOME, "auth.json"), "utf-8"));
+    providers = Object.keys(auth.credential_pool || {});
+  } catch {}
+
+  const skills = readdirSync(skillsDir).map(name => {
+    const fullPath = join(skillsDir, name);
+    const { lstatSync, readlinkSync } = require("fs");
+    const isSymlink = lstatSync(fullPath).isSymbolicLink();
+    const skillMd = join(fullPath, "SKILL.md");
+    let description = "";
+    let skillModel = "";
+    let skillProvider = "";
+    let skillIcon = "";
+    if (existsSync(skillMd)) {
+      const content = readFileSync(skillMd, "utf-8");
+      const descMatch = content.match(/description:\s*["']?(.+?)["']?\s*$/m);
+      if (descMatch) description = descMatch[1].trim();
+      const iconMatch = content.match(/^icon:\s*["']?(.+?)["']?\s*$/m);
+      if (iconMatch) skillIcon = iconMatch[1].trim();
+      // Extract model/provider from skill content
+      const modelMatch = content.match(/model[:\s]+["']?([a-z0-9._-]+)/i);
+      if (modelMatch) skillModel = modelMatch[1];
+      const provMatch = content.match(/provider[:\s]+["']?([a-z0-9._-]+)/i);
+      if (provMatch) skillProvider = provMatch[1];
+    }
+    // Override with user config
+    const override = skillConfig[name] || {};
+    return {
+      name,
+      icon: skillIcon || "📜",
+      description: description.slice(0, 120),
+      symlink: isSymlink,
+      source: isSymlink ? readlinkSync(fullPath) : "local",
+      defaultProvider: skillProvider,
+      defaultModel: skillModel,
+      provider: override.provider || skillProvider || "",
+      model: override.model || skillModel || "",
+    };
+  });
+  res.json({ skills, availableProviders: providers });
+});
+
+// Update skill provider/model config
+app.put("/api/skills/:name/config", (req, res) => {
+  const { provider, model } = req.body;
+  const config = loadSkillConfig();
+  config[req.params.name] = { provider: provider || "", model: model || "" };
+  saveSkillConfig(config);
+  log("info", `Updated skill config: ${req.params.name}`, { provider, model });
+  res.json({ success: true });
+});
+
+// Delegation config (reads from Hermes config.yaml + auth.json)
+const HERMES_CONFIG = resolve(HERMES_HOME, "config.yaml");
+const HERMES_AUTH = resolve(HERMES_HOME, "auth.json");
+
+app.get("/api/delegation", (_, res) => {
+  try {
+    const { execSync } = require("child_process");
+    const configRaw = execSync(
+      `python3 -c "import yaml,json; print(json.dumps(yaml.safe_load(open('${HERMES_CONFIG}'))))"`,
+      { encoding: "utf-8", timeout: 5000 }
+    );
+    const config = JSON.parse(configRaw);
+    const delegation = config.delegation || {};
+
+    // Get available providers from auth.json
+    let providers: string[] = [];
+    try {
+      const auth = JSON.parse(readFileSync(HERMES_AUTH, "utf-8"));
+      providers = Object.keys(auth.credential_pool || {});
+    } catch {}
+
+    res.json({
+      delegation,
+      mainModel: config.model || {},
+      availableProviders: providers,
+    });
+  } catch (e: any) {
+    log("warn", "Failed to read delegation config", { error: e.message });
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.put("/api/delegation", (req, res) => {
+  try {
+    const { model, provider, max_concurrent_children, max_spawn_depth, orchestrator_enabled, child_timeout_seconds } = req.body;
+    const { execSync } = require("child_process");
+
+    // Read current config
+    const configRaw = execSync(
+      `python3 -c "import yaml,json; print(json.dumps(yaml.safe_load(open('${HERMES_CONFIG}'))))"`,
+      { encoding: "utf-8", timeout: 5000 }
+    );
+    const config = JSON.parse(configRaw);
+
+    // Update delegation section
+    if (!config.delegation) config.delegation = {};
+    if (model !== undefined) config.delegation.model = model;
+    if (provider !== undefined) config.delegation.provider = provider;
+    if (max_concurrent_children !== undefined) config.delegation.max_concurrent_children = max_concurrent_children;
+    if (max_spawn_depth !== undefined) config.delegation.max_spawn_depth = max_spawn_depth;
+    if (orchestrator_enabled !== undefined) config.delegation.orchestrator_enabled = orchestrator_enabled;
+    if (child_timeout_seconds !== undefined) config.delegation.child_timeout_seconds = child_timeout_seconds;
+
+    // Write back
+    execSync(
+      `python3 -c "import yaml,json,sys; yaml.dump(json.load(sys.stdin), open('${HERMES_CONFIG}','w'), default_flow_style=False)"`,
+      { input: JSON.stringify(config), encoding: "utf-8", timeout: 5000 }
+    );
+
+    log("info", "Updated delegation config", { model, provider });
+    res.json({ success: true });
+  } catch (e: any) {
+    log("error", "Failed to update delegation config", { error: e.message });
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Logs
+app.get("/api/logs/:name", (req, res) => {
+  const name = req.params.name;
+  const allowed = ["gateway.log", "agent.log", "errors.log", "dashboard.log"];
+  if (!allowed.includes(name)) return res.status(400).json({ error: "invalid log" });
+  const path = name === "dashboard.log" ? LOG_FILE : join(LOG_DIR, name);
+  if (!existsSync(path)) return res.json({ lines: [] });
+  const { execSync } = require("child_process");
+  const raw = execSync(`tail -200 "${path}"`, { encoding: "utf-8" }).split("\n");
+  // Filter out HTML/SVG/binary junk from old API error responses — only keep real log lines
+  const lines = raw.filter((line: string) => {
+    const trimmed = line.trim();
+    if (!trimmed) return false;
+    if (trimmed.startsWith("<")) return false;
+    if (trimmed.startsWith("d=")) return false;
+    if (trimmed.startsWith("/>")) return false;
+    if (trimmed.startsWith("}")) return false;
+    if (trimmed.match(/^\s*(xmlns|viewBox|width=|height=|fill=|stroke|class=|style=|opacity|transform)/)) return false;
+    // Keep lines that look like timestamped logs or known log formats
+    if (trimmed.match(/^\d{4}-\d{2}-\d{2}/) || trimmed.match(/^\[/) || trimmed.match(/^(INFO|WARN|ERROR|DEBUG)/i)) return true;
+    // Keep lines with common log keywords
+    if (trimmed.includes("WARNING") || trimmed.includes("ERROR") || trimmed.includes("INFO")) return true;
+    // Skip anything that looks like code/markup
+    if (trimmed.match(/^[{}\[\]<>\/]/) || trimmed.length < 5) return false;
+    return true;
+  });
+  res.json({ lines: lines.slice(-100) });
+});
+
+// ── Claude API Event Monitor (Splunk-style stream-json viewer) ──────
+// Each spawned `claude` subprocess writes stream-json events to
+//   ${CHILLSPWN_HOME}/session-logs/<sessionId>.stdout.jsonl
+// Each line is a single event:
+//   - type=system  (init, hook_started/hook_response, thinking_tokens)
+//   - type=assistant  (message with usage tokens, model, content blocks)
+//   - type=user       (tool_result content blocks)
+//   - type=result     (final cost + total tokens + duration)
+// These are the same events the Claude SDK would surface — capturing them
+// gives us a faithful record of every Claude API request/response cycle.
+const SESSION_LOG_DIR = resolve(CHILLSPWN_HOME, "session-logs");
+
+interface ApiEventTokens {
+  in?: number;
+  out?: number;
+  cacheRead?: number;
+  cacheCreation?: number;
+}
+
+interface ApiEventSummary {
+  session: string;       // session ID (file basename without .stdout.jsonl)
+  line: number;          // 0-indexed line number inside the JSONL file
+  ts: string | null;     // event timestamp if present, else null
+  type: string;          // "system" | "assistant" | "user" | "result" | ...
+  subtype?: string;
+  model?: string;        // assistant message model, or system/init model
+  uuid?: string;         // event UUID from Claude CLI
+  cliSessionId?: string; // Claude CLI session id (from system/init)
+  endpoint?: string;     // upstream API path (proxy sessions only, e.g. "/v1/messages")
+  method?: string;       // HTTP method (proxy sessions only)
+  summary: string;       // one-line preview for the list view
+  toolName?: string;     // tool name if this is a tool_use / tool_result
+  tokens?: ApiEventTokens;
+}
+
+// Iterate a JSONL file line-by-line. Returning `false` from onLine aborts.
+// Synchronous + buffered — fast for the file sizes we expect (a few MB).
+function readJsonl(path: string, onLine: (line: string, idx: number) => boolean | void): void {
+  const raw = readFileSync(path, "utf-8");
+  let idx = 0;
+  let start = 0;
+  while (start < raw.length) {
+    const nl = raw.indexOf("\n", start);
+    const end = nl < 0 ? raw.length : nl;
+    const line = raw.slice(start, end);
+    if (line.trim()) {
+      if (onLine(line, idx) === false) return;
+      idx++;
+    }
+    if (nl < 0) break;
+    start = nl + 1;
+  }
+}
+
+// Build a Splunk-style one-line summary for an event.
+function summarizeApiEvent(ev: any): { summary: string; toolName?: string; model?: string; tokens?: ApiEventTokens; endpoint?: string; method?: string } {
+  const t = ev.type;
+  if (t === "system") {
+    if (ev.subtype === "init") {
+      // Proxy-captured request — show HTTP method + path + model
+      if (ev.proxy) {
+        const path = (ev.upstream_url || "").replace(/^https?:\/\/[^/]+/, "").split("?")[0];
+        return {
+          summary: `→ ${ev.method || "?"} ${path}  model=${ev.model || "?"}`,
+          model: ev.model,
+          endpoint: path,
+          method: ev.method,
+        };
+      }
+      return { summary: `INIT  model=${ev.model || "?"}  cwd=${ev.cwd || "?"}`, model: ev.model };
+    }
+    if (ev.subtype === "hook_started" || ev.subtype === "hook_response") {
+      return { summary: `${ev.subtype}  ${ev.hook_name || ev.hook_event || ""}` };
+    }
+    if (ev.subtype === "thinking_tokens") {
+      return { summary: `thinking ~${ev.estimated_tokens || 0} tok` };
+    }
+    return { summary: `system/${ev.subtype || "?"}` };
+  }
+  // Proxy: streaming SSE event
+  if (t === "sse_event") {
+    const p = ev.payload || {};
+    const u = p.usage || p.message?.usage;
+    const tokens: ApiEventTokens | undefined = u ? {
+      in: u.input_tokens,
+      out: u.output_tokens,
+      cacheRead: u.cache_read_input_tokens,
+      cacheCreation: u.cache_creation_input_tokens,
+    } : undefined;
+    // Highlight the most useful streaming events
+    if (ev.sse_type === "content_block_delta") {
+      const text = p.delta?.text || p.delta?.partial_json || "";
+      return { summary: `Δ ${String(text).slice(0, 160).replace(/\s+/g, " ")}` };
+    }
+    if (ev.sse_type === "message_start") {
+      return { summary: `message_start  model=${p.message?.model || "?"}`, model: p.message?.model, tokens };
+    }
+    if (ev.sse_type === "message_delta") {
+      return { summary: `message_delta  stop=${p.delta?.stop_reason || "?"}`, tokens };
+    }
+    return { summary: `sse:${ev.sse_type || "?"}`, tokens };
+  }
+  // Proxy: error from fetch
+  if (t === "error") {
+    return { summary: `✗ ERROR  ${ev.error || ""}` };
+  }
+  if (t === "assistant") {
+    const msg = ev.message || {};
+    const content: any[] = msg.content || [];
+    const text = content.find((b) => b.type === "text")?.text;
+    const tu = content.find((b) => b.type === "tool_use");
+    const thinking = content.find((b) => b.type === "thinking");
+    const model = msg.model;
+    const u = msg.usage;
+    const tokens: ApiEventTokens | undefined = u ? {
+      in: u.input_tokens,
+      out: u.output_tokens,
+      cacheRead: u.cache_read_input_tokens,
+      cacheCreation: u.cache_creation_input_tokens,
+    } : undefined;
+    if (tu) {
+      // Best-effort one-arg preview (e.g. command, file_path, pattern)
+      const args = tu.input || {};
+      const previewKey = ["command", "file_path", "path", "pattern", "url", "query"].find((k) => args[k]);
+      const preview = previewKey ? String(args[previewKey]).slice(0, 80) : "";
+      return { summary: `▸ ${tu.name}(${preview})`, toolName: tu.name, model, tokens };
+    }
+    if (text) return { summary: text.slice(0, 200).replace(/\s+/g, " "), model, tokens };
+    if (thinking) return { summary: `thinking…`, model, tokens };
+    return { summary: `assistant`, model, tokens };
+  }
+  if (t === "user") {
+    const msg = ev.message || {};
+    const content: any[] = msg.content || [];
+    const tr = content.find((b) => b.type === "tool_result");
+    if (tr) {
+      const body = typeof tr.content === "string" ? tr.content : JSON.stringify(tr.content);
+      return { summary: `◂ tool_result: ${body.slice(0, 200).replace(/\s+/g, " ")}`, toolName: tr.tool_use_id };
+    }
+    return { summary: `user` };
+  }
+  if (t === "result") {
+    // Proxy result event uses different shape (status + duration)
+    if (ev.status !== undefined) {
+      const u = ev.usage || {};
+      const tokens: ApiEventTokens | undefined = u && (u.input_tokens || u.output_tokens) ? {
+        in: u.input_tokens,
+        out: u.output_tokens,
+        cacheRead: u.cache_read_input_tokens,
+        cacheCreation: u.cache_creation_input_tokens,
+      } : undefined;
+      return {
+        summary: `← ${ev.status}  ${ev.duration_ms || 0}ms  ${ev.response_bytes || 0}B  ${ev.is_stream ? "(stream)" : ""}`,
+        model: ev.model,
+        tokens,
+      };
+    }
+    // CLI result event
+    const u = ev.usage || {};
+    return { summary: `RESULT  in=${u.input_tokens || 0}  out=${u.output_tokens || 0}  cost=$${(ev.total_cost_usd ?? 0).toFixed(4)}` };
+  }
+  return { summary: t || "?" };
+}
+
+// GET /api/api-events/sessions — list every captured session with rollup stats.
+app.get("/api/api-events/sessions", (_, res) => {
+  try {
+    if (!existsSync(SESSION_LOG_DIR)) return res.json({ sessions: [] });
+    const files = readdirSync(SESSION_LOG_DIR).filter((f) => f.endsWith(".stdout.jsonl"));
+    const out = files.map((f) => {
+      const path = join(SESSION_LOG_DIR, f);
+      const stat = statSync(path);
+      const id = f.replace(/\.stdout\.jsonl$/, "");
+      let model: string | undefined;
+      let cliSessionId: string | undefined;
+      let endpoint: string | undefined;
+      let method: string | undefined;
+      let isProxy = false;
+      let lines = 0;
+      let totalInputTokens = 0;
+      let totalOutputTokens = 0;
+      let totalCacheRead = 0;
+      let lastResult: any = null;
+      try {
+        readJsonl(path, (line) => {
+          try {
+            const ev = JSON.parse(line);
+            lines++;
+            if (ev.type === "system" && ev.subtype === "init") {
+              model = ev.model;
+              cliSessionId = ev.session_id;
+              if (ev.proxy) {
+                isProxy = true;
+                method = ev.method;
+                endpoint = (ev.upstream_url || "").replace(/^https?:\/\/[^/]+/, "").split("?")[0];
+              }
+            }
+            // Tokens can live in any of these shapes depending on source:
+            //   CLI stream-json  → ev.message.usage
+            //   Proxy SSE event  → ev.payload.message.usage  or  ev.payload.usage
+            //   Proxy result     → ev.usage (non-stream JSON response)
+            const u = ev.message?.usage
+                   || ev.payload?.message?.usage
+                   || ev.payload?.usage
+                   || (ev.type === "result" ? ev.usage : null);
+            if (u) {
+              totalInputTokens += u.input_tokens || 0;
+              totalOutputTokens += u.output_tokens || 0;
+              totalCacheRead += u.cache_read_input_tokens || 0;
+            }
+            if (ev.type === "result") lastResult = ev;
+          } catch {}
+        });
+      } catch {}
+      const persisted = loadPersistedSession(id);
+      return {
+        id,
+        persona: persisted?.persona || null,
+        model: model || persisted?.model || null,
+        cliSessionId: cliSessionId || null,
+        kind: isProxy ? "proxy" : "cli",
+        endpoint: endpoint || null,
+        method: method || null,
+        lines,
+        sizeBytes: stat.size,
+        mtime: stat.mtime.toISOString(),
+        totalInputTokens,
+        totalOutputTokens,
+        totalCacheRead,
+        totalCostUsd: lastResult?.total_cost_usd ?? null,
+        finalStatus: lastResult ? (lastResult.subtype || "completed") : "active",
+      };
+    });
+    // Newest first
+    out.sort((a, b) => +new Date(b.mtime) - +new Date(a.mtime));
+    res.json({ sessions: out });
+  } catch (e: any) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/api-events?session=<id>&type=<t>&q=<text>&limit=&offset=
+// Returns summarized events (no `raw`) — drill into a single event via /api/api-events/:session/:line
+app.get("/api/api-events", (req, res) => {
+  try {
+    const sessionId = (req.query.session as string) || "";
+    const typeFilter = (req.query.type as string) || "";
+    const endpointFilter = (req.query.endpoint as string) || "";
+    const q = ((req.query.q as string) || "").toLowerCase();
+    const limit = Math.min(parseInt((req.query.limit as string) || "500", 10), 5000);
+    const offset = parseInt((req.query.offset as string) || "0", 10);
+
+    if (!sessionId) return res.status(400).json({ error: "session required" });
+    const path = join(SESSION_LOG_DIR, `${sessionId}.stdout.jsonl`);
+    if (!existsSync(path)) return res.json({ events: [], total: 0 });
+
+    const all: ApiEventSummary[] = [];
+    readJsonl(path, (line, idx) => {
+      try {
+        const ev = JSON.parse(line);
+        if (typeFilter && ev.type !== typeFilter) return;
+        if (q && !line.toLowerCase().includes(q)) return;
+        const s = summarizeApiEvent(ev);
+        if (endpointFilter && s.endpoint !== endpointFilter) return;
+        all.push({
+          session: sessionId,
+          line: idx,
+          ts: ev.timestamp || ev.created_at || null,
+          type: ev.type || "unknown",
+          subtype: ev.subtype,
+          model: s.model,
+          uuid: ev.uuid,
+          endpoint: s.endpoint,
+          method: s.method,
+          summary: s.summary,
+          toolName: s.toolName,
+          tokens: s.tokens,
+        });
+      } catch {}
+    });
+    const total = all.length;
+    const events = all.slice(offset, offset + limit);
+    res.json({ events, total });
+  } catch (e: any) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /api/api-events/:session/:line/ask
+// Body: { question: string, history?: [{role, content}, ...], model?: string }
+// Spawns `claude -p` to analyze the captured event in natural language. Uses
+// the user's existing Claude Code auth — no separate API key needed.
+//
+// Each request is stateless: we pack the event JSON + conversation history +
+// the new question into a single prompt and hand it to a one-shot `claude -p`
+// subprocess with `--output-format json` so we can parse the answer cleanly.
+app.post("/api/api-events/:session/:line/ask", async (req, res) => {
+  const sessionId = req.params.session;
+  const target = parseInt(req.params.line, 10);
+  const { question, history, model } = req.body || {};
+  if (!question || typeof question !== "string") {
+    return res.status(400).json({ error: "question (string) required" });
+  }
+
+  // Load the target event from disk
+  const path = join(SESSION_LOG_DIR, `${sessionId}.stdout.jsonl`);
+  if (!existsSync(path)) return res.status(404).json({ error: "session not found" });
+  let event: any = null;
+  readJsonl(path, (line, idx) => {
+    if (idx === target) {
+      try { event = JSON.parse(line); } catch { event = { raw: line }; }
+      return false;
+    }
+  });
+  if (!event) return res.status(404).json({ error: "event not found" });
+
+  // Cap the event payload so we don't blow context budget on huge tool_result
+  // dumps (60k chars ≈ 15k tokens). The detail pane still shows the full JSON.
+  let eventStr = JSON.stringify(event, null, 2);
+  const FULL_LEN = eventStr.length;
+  if (eventStr.length > 60_000) {
+    eventStr = eventStr.slice(0, 60_000) + "\n\n…[TRUNCATED — full event is " + FULL_LEN + " chars]";
+  }
+
+  // Build the prompt that gets piped into `claude -p`. We embed the system
+  // role inline (claude -p's --system-prompt works too but inline keeps the
+  // whole conversation in one stdin payload).
+  let prompt = `You are a log analyst assistant inside ChillsPwn's API Monitor. The user is inspecting ONE event from a Claude API session log (a Claude Code stream-json event or an Anthropic API proxy capture).
+
+Answer the user's question about this specific event accurately and concisely. Reference exact JSON field names. Explain tool calls, summarize responses, explain errors. If the event doesn't contain what the user asks about, say so — do NOT fabricate.
+
+Session: ${sessionId}
+Line: ${target}
+Event type: ${event.type || "unknown"}${event.subtype ? "/" + event.subtype : ""}
+
+EVENT JSON:
+\`\`\`json
+${eventStr}
+\`\`\`
+`;
+
+  if (Array.isArray(history)) {
+    for (const m of history) {
+      if (m?.role && m?.content) {
+        prompt += `\n\n--- ${String(m.role).toUpperCase()} ---\n${String(m.content)}`;
+      }
+    }
+  }
+  prompt += `\n\n--- USER ---\n${question}\n\n--- ASSISTANT ---\n`;
+
+  // Spawn claude -p in print mode with JSON output for clean parsing.
+  // No tools, no permission prompts — we just want a text answer.
+  const args = [
+    "-p", "--output-format", "json",
+    "--model", model || "haiku",
+    "--permission-mode", "default",
+    "--disallowedTools", "Bash,Edit,Write,WebFetch,WebSearch,Task,Agent",
+  ];
+  try {
+    const proc = spawn("claude", args, { stdio: ["pipe", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+    proc.stdout.on("data", (d) => { stdout += d.toString(); });
+    proc.stderr.on("data", (d) => { stderr += d.toString(); });
+
+    const exit: number = await new Promise((resolve) => {
+      proc.on("close", (code) => resolve(code ?? 1));
+      proc.stdin.write(prompt);
+      proc.stdin.end();
+      // Safety timeout — kill after 60s
+      setTimeout(() => {
+        try { proc.kill("SIGTERM"); } catch {}
+      }, 60_000);
+    });
+
+    if (exit !== 0) {
+      return res.status(500).json({
+        error: `claude -p exited ${exit}`,
+        stderr: stderr.slice(0, 2000),
+      });
+    }
+
+    // --output-format json wraps the response as { result, ..., session_id }
+    let answer = stdout.trim();
+    let usage: any = null;
+    let usedModel: string | undefined;
+    try {
+      const parsed = JSON.parse(stdout);
+      answer = parsed.result || parsed.response || stdout;
+      usage = parsed.usage || null;
+      usedModel = parsed.model;
+    } catch {
+      // Not JSON — fall back to raw stdout
+    }
+    res.json({ answer, model: usedModel, usage });
+  } catch (e: any) {
+    res.status(500).json({ error: e.message || String(e) });
+  }
+});
+
+// GET /api/api-events/:session/:line — full raw event JSON (for the detail pane)
+app.get("/api/api-events/:session/:line", (req, res) => {
+  const sessionId = req.params.session;
+  const target = parseInt(req.params.line, 10);
+  const path = join(SESSION_LOG_DIR, `${sessionId}.stdout.jsonl`);
+  if (!existsSync(path)) return res.status(404).json({ error: "session not found" });
+  let found: any = null;
+  readJsonl(path, (line, idx) => {
+    if (idx === target) {
+      try { found = JSON.parse(line); } catch { found = { raw: line }; }
+      return false;
+    }
+  });
+  if (!found) return res.status(404).json({ error: "event not found" });
+  res.json({ event: found });
+});
+
+// GET /api/api-events/stream?session=<id>  — Server-Sent Events live tail
+// Pushes one `data:` event per new JSONL line as the file grows.
+app.get("/api/api-events/stream", (req, res) => {
+  const sessionId = (req.query.session as string) || "";
+  if (!sessionId) {
+    res.status(400).end("session required");
+    return;
+  }
+  const path = join(SESSION_LOG_DIR, `${sessionId}.stdout.jsonl`);
+
+  res.writeHead(200, {
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache",
+    "Connection": "keep-alive",
+    "X-Accel-Buffering": "no",
+  });
+  res.write(`: connected ${new Date().toISOString()}\n\n`);
+
+  // Anchor at the current EOF — we stream only new lines from here.
+  // Pre-count existing lines so the line numbers we emit match /api/api-events.
+  let pos = existsSync(path) ? statSync(path).size : 0;
+  let lineCounter = 0;
+  if (existsSync(path)) {
+    readJsonl(path, () => { lineCounter++; });
+  }
+
+  const fs = require("fs");
+  let buffer = "";
+  let alive = true;
+
+  const poll = setInterval(() => {
+    if (!alive) return;
+    try {
+      if (!existsSync(path)) return;
+      const stat = statSync(path);
+      if (stat.size <= pos) return;
+      const fd = fs.openSync(path, "r");
+      const len = stat.size - pos;
+      const chunk = Buffer.alloc(len);
+      fs.readSync(fd, chunk, 0, len, pos);
+      fs.closeSync(fd);
+      pos = stat.size;
+      buffer += chunk.toString("utf-8");
+      let nl: number;
+      while ((nl = buffer.indexOf("\n")) >= 0) {
+        const line = buffer.slice(0, nl).trim();
+        buffer = buffer.slice(nl + 1);
+        if (!line) continue;
+        try {
+          const ev = JSON.parse(line);
+          const s = summarizeApiEvent(ev);
+          const summary: ApiEventSummary = {
+            session: sessionId,
+            line: lineCounter++,
+            ts: ev.timestamp || ev.created_at || null,
+            type: ev.type || "unknown",
+            subtype: ev.subtype,
+            model: s.model,
+            uuid: ev.uuid,
+            summary: s.summary,
+            toolName: s.toolName,
+            tokens: s.tokens,
+          };
+          res.write(`data: ${JSON.stringify({ summary, full: ev })}\n\n`);
+        } catch {}
+      }
+    } catch (e: any) {
+      // swallow — keep stream alive
+    }
+  }, 500);
+
+  // Heartbeat every 25s so proxies / browsers don't close idle connection
+  const heartbeat = setInterval(() => {
+    if (alive) res.write(`: heartbeat ${Date.now()}\n\n`);
+  }, 25000);
+
+  req.on("close", () => {
+    alive = false;
+    clearInterval(poll);
+    clearInterval(heartbeat);
+  });
+});
+
+// ── Anthropic API Proxy ─────────────────────────────────────────────
+// Point any Anthropic SDK or the `claude` CLI at this proxy to capture
+// the FULL raw request/response (not just stream-json):
+//
+//   export ANTHROPIC_BASE_URL=http://127.0.0.1:3131/proxy/anthropic
+//   export ANTHROPIC_API_KEY=sk-ant-...     # passed through unchanged
+//   python3 my_script_using_anthropic.py
+//
+// Each request creates ONE JSONL file in SESSION_LOG_DIR so the existing
+// /api/api-events page picks it up automatically (prefix `proxy-` to
+// distinguish from CLI-spawned `s-*` files).
+//
+// We mask the API key in the captured log — every other byte of the
+// request and response (system prompt, messages, tools, usage, content
+// blocks, SSE streaming deltas) is preserved verbatim.
+const ANTHROPIC_UPSTREAM = "https://api.anthropic.com";
+
+// Redact API keys / auth so logs don't store secrets in plaintext.
+function maskSensitiveHeaders(h: Record<string, string>): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(h)) {
+    const lk = k.toLowerCase();
+    if (lk === "x-api-key" || lk === "authorization") {
+      const s = String(v);
+      out[k] = s.length > 8 ? `${s.slice(0, 4)}…${s.slice(-4)}` : "***";
+    } else {
+      out[k] = String(v);
+    }
+  }
+  return out;
+}
+
+// Catch-all proxy: any method, any path under /proxy/anthropic
+app.all("/proxy/anthropic/*", async (req, res) => {
+  // Phase 1: outbound proxy gated by ENABLE_PROXY (default off).
+  if (!SECURITY.enableProxy) {
+    auditSecurity("proxy_blocked", { path: req.path });
+    return res.status(403).json({ error: "proxy disabled (set ENABLE_PROXY=true to enable)" });
+  }
+  const startTime = Date.now();
+  const reqId = randomUUID().slice(0, 12);
+  const upstreamPath = req.originalUrl.replace(/^\/proxy\/anthropic/, "") || "/";
+  const upstreamUrl = `${ANTHROPIC_UPSTREAM}${upstreamPath}`;
+
+  // Build upstream headers — drop hop-by-hop + length headers (fetch sets them).
+  const fwdHeaders = new Headers();
+  for (const [k, v] of Object.entries(req.headers)) {
+    const lk = k.toLowerCase();
+    if (["host", "content-length", "connection", "keep-alive", "transfer-encoding"].includes(lk)) continue;
+    if (v == null) continue;
+    fwdHeaders.set(k, Array.isArray(v) ? v.join(", ") : String(v));
+  }
+
+  // express.raw gave us a Buffer; capture it for the log
+  let bodyBytes: Buffer | undefined;
+  let parsedBody: any = null;
+  if (req.method !== "GET" && req.method !== "HEAD" && req.body) {
+    bodyBytes = req.body instanceof Buffer ? req.body : Buffer.from(req.body);
+    try { parsedBody = JSON.parse(bodyBytes.toString("utf-8")); } catch {}
+  }
+
+  // Open the per-request JSONL log
+  try { mkdirSync(SESSION_LOG_DIR, { recursive: true }); } catch {}
+  const logPath = join(SESSION_LOG_DIR, `proxy-${reqId}.stdout.jsonl`);
+  const fs = require("fs");
+  const logFd = fs.openSync(logPath, "w");
+  const logWrite = (obj: any) => {
+    try { fs.writeSync(logFd, JSON.stringify(obj) + "\n"); } catch {}
+  };
+
+  // Event 1 — INIT (mirrors the shape the CLI emits, plus proxy metadata)
+  logWrite({
+    type: "system",
+    subtype: "init",
+    session_id: reqId,
+    proxy: true,
+    method: req.method,
+    upstream_url: upstreamUrl,
+    model: parsedBody?.model || null,
+    request_headers: maskSensitiveHeaders(Object.fromEntries(fwdHeaders)),
+    request_body: parsedBody !== null
+      ? parsedBody
+      : (bodyBytes ? bodyBytes.toString("utf-8") : null),
+    request_body_bytes: bodyBytes?.length || 0,
+    timestamp: new Date().toISOString(),
+  });
+
+  // Forward to upstream
+  let upstream: Response;
+  try {
+    upstream = await fetch(upstreamUrl, {
+      method: req.method,
+      headers: fwdHeaders,
+      body: bodyBytes,
+    });
+  } catch (e: any) {
+    logWrite({
+      type: "error",
+      error: e.message || String(e),
+      duration_ms: Date.now() - startTime,
+      timestamp: new Date().toISOString(),
+    });
+    try { fs.closeSync(logFd); } catch {}
+    log("error", `Proxy fetch failed for ${upstreamUrl}`, { error: e.message });
+    if (!res.headersSent) res.status(502).json({ error: `Upstream fetch failed: ${e.message}` });
+    return;
+  }
+
+  // Mirror response status + headers to caller
+  res.status(upstream.status);
+  upstream.headers.forEach((v, k) => {
+    const lk = k.toLowerCase();
+    // Skip hop-by-hop and encoding headers (fetch already decoded gzip)
+    if (["transfer-encoding", "content-encoding", "content-length", "connection"].includes(lk)) return;
+    res.setHeader(k, v);
+  });
+
+  const isSSE = (upstream.headers.get("content-type") || "").includes("text/event-stream");
+
+  if (!upstream.body) {
+    logWrite({
+      type: "result",
+      status: upstream.status,
+      duration_ms: Date.now() - startTime,
+      is_stream: false,
+      response_body: null,
+      timestamp: new Date().toISOString(),
+    });
+    try { fs.closeSync(logFd); } catch {}
+    res.end();
+    return;
+  }
+
+  // Tee the stream: pipe bytes to the client AND capture for the log.
+  // For SSE, we additionally parse each event block as it streams so the
+  // detail pane can show individual content-block deltas / message events.
+  const reader = upstream.body.getReader();
+  const decoder = new TextDecoder();
+  const capturedChunks: Buffer[] = [];
+  let sseBuffer = "";
+  let totalBytes = 0;
+
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      if (!value) continue;
+      res.write(value);
+      capturedChunks.push(Buffer.from(value));
+      totalBytes += value.length;
+
+      if (isSSE) {
+        sseBuffer += decoder.decode(value, { stream: true });
+        let nl: number;
+        // Split on \n\n (SSE event delimiter)
+        while ((nl = sseBuffer.indexOf("\n\n")) >= 0) {
+          const block = sseBuffer.slice(0, nl);
+          sseBuffer = sseBuffer.slice(nl + 2);
+          // Parse data: lines (skip "event:" / comments)
+          const dataLine = block.split("\n").find((l) => l.startsWith("data:"));
+          if (!dataLine) continue;
+          const payload = dataLine.slice(5).trim();
+          if (!payload || payload === "[DONE]") continue;
+          try {
+            const obj = JSON.parse(payload);
+            logWrite({
+              type: "sse_event",
+              sse_type: obj.type || "unknown",
+              payload: obj,
+              timestamp: new Date().toISOString(),
+            });
+          } catch {}
+        }
+      }
+    }
+  } catch (e: any) {
+    logWrite({
+      type: "error",
+      error: `Stream interrupted: ${e.message || e}`,
+      timestamp: new Date().toISOString(),
+    });
+  }
+  res.end();
+
+  // Final result event — full response body for non-stream, byte count for stream
+  const fullBuf = Buffer.concat(capturedChunks);
+  let parsedResponse: any = null;
+  if (!isSSE) {
+    try { parsedResponse = JSON.parse(fullBuf.toString("utf-8")); } catch {}
+  }
+  logWrite({
+    type: "result",
+    status: upstream.status,
+    duration_ms: Date.now() - startTime,
+    is_stream: isSSE,
+    response_bytes: totalBytes,
+    response_body: parsedResponse ?? (isSSE ? null : fullBuf.toString("utf-8").slice(0, 200_000)),
+    usage: parsedResponse?.usage || null,
+    model: parsedResponse?.model || parsedBody?.model || null,
+    timestamp: new Date().toISOString(),
+  });
+  try { fs.closeSync(logFd); } catch {}
+  log("info", `Proxied ${req.method} ${upstreamPath} → ${upstream.status} in ${Date.now() - startTime}ms (${totalBytes}B)`, { reqId });
+});
+
+// ── System Resources Monitor ─────────────────────────────────────────
+// Top/htop-style endpoints exposing Linux system telemetry:
+//   GET  /api/system/stats      → CPU%, RAM, swap, load, uptime, threads
+//   GET  /api/system/processes  → top N processes (ps aux, sortable)
+//   GET  /api/system/disk       → mount usage (df)
+//   GET  /api/system/network    → per-interface RX/TX bytes (/proc/net/dev)
+//   GET  /api/system/stream     → SSE polling all of the above every N seconds
+//
+// All reads are from /proc and standard CLI tools — no extra deps.
+
+// CPU sampling: keep a previous snapshot so we can diff and compute %.
+// We initialize this at module load AND re-prime it ~250ms later so the
+// FIRST real call to computeCpuPercent() actually has a delta to diff
+// against — otherwise the first poll returns 0% and the UI looks stuck.
+let prevCpuSnapshot: ReturnType<typeof readCpuTimes> | null = null;
+
+interface CpuCoreTimes { user: number; nice: number; system: number; idle: number; iowait: number; irq: number; softirq: number; steal: number; total: number; }
+
+function readCpuTimes(): CpuCoreTimes[] {
+  // /proc/stat lines: "cpu0 user nice system idle iowait irq softirq steal …"
+  try {
+    const raw = readFileSync("/proc/stat", "utf-8");
+    const cores: CpuCoreTimes[] = [];
+    for (const line of raw.split("\n")) {
+      if (!line.startsWith("cpu") || line.startsWith("cpu ")) continue; // skip "cpu " aggregate
+      const parts = line.trim().split(/\s+/);
+      if (parts.length < 5) continue;
+      const [, user, nice, sys, idle, iowait = "0", irq = "0", softirq = "0", steal = "0"] = parts;
+      const c: CpuCoreTimes = {
+        user: +user, nice: +nice, system: +sys, idle: +idle,
+        iowait: +iowait, irq: +irq, softirq: +softirq, steal: +steal,
+        total: 0,
+      };
+      c.total = c.user + c.nice + c.system + c.idle + c.iowait + c.irq + c.softirq + c.steal;
+      cores.push(c);
+    }
+    return cores;
+  } catch {
+    return [];
+  }
+}
+
+// Prime the CPU snapshot at boot so the first real request has a delta to
+// diff against. We also re-prime ~250ms later, which guarantees that any
+// subsequent computeCpuPercent() call within the first second already has
+// a meaningful sample window. Without this, the FIRST page load shows 0%
+// CPU and only updates on the second tick (~2s later).
+prevCpuSnapshot = readCpuTimes();
+setTimeout(() => { prevCpuSnapshot = readCpuTimes(); }, 250);
+
+function computeCpuPercent(): { overall: number; perCore: number[] } {
+  const snap = readCpuTimes();
+  if (!prevCpuSnapshot || prevCpuSnapshot.length !== snap.length) {
+    prevCpuSnapshot = snap;
+    // Fall back to os.cpus() average so we have something on first read
+    return { overall: 0, perCore: snap.map(() => 0) };
+  }
+  const perCore = snap.map((cur, i) => {
+    const prev = prevCpuSnapshot![i];
+    const totalDelta = cur.total - prev.total;
+    const idleDelta = (cur.idle + cur.iowait) - (prev.idle + prev.iowait);
+    if (totalDelta <= 0) return 0;
+    return Math.max(0, Math.min(100, 100 * (1 - idleDelta / totalDelta)));
+  });
+  prevCpuSnapshot = snap;
+  const overall = perCore.length ? perCore.reduce((a, b) => a + b, 0) / perCore.length : 0;
+  return { overall, perCore };
+}
+
+function readMemInfo(): Record<string, number> {
+  // Parse /proc/meminfo into KB numbers (value is "1234 kB")
+  const out: Record<string, number> = {};
+  try {
+    const raw = readFileSync("/proc/meminfo", "utf-8");
+    for (const line of raw.split("\n")) {
+      const m = line.match(/^([A-Za-z()]+):\s+(\d+)/);
+      if (m) out[m[1]] = parseInt(m[2], 10) * 1024; // convert KB → bytes
+    }
+  } catch {}
+  return out;
+}
+
+function countThreads(): number {
+  // Total Linux thread count = sum of /proc/<pid>/task/ entries
+  try {
+    const pids = readdirSync("/proc").filter((d) => /^\d+$/.test(d));
+    let total = 0;
+    for (const pid of pids) {
+      try {
+        total += readdirSync(`/proc/${pid}/task`).length;
+      } catch {}
+    }
+    return total;
+  } catch {
+    return 0;
+  }
+}
+
+// GET /api/system/stats — single snapshot of CPU + RAM + load + uptime
+app.get("/api/system/stats", (_, res) => {
+  try {
+    const cpu = computeCpuPercent();
+    const mem = readMemInfo();
+    const memTotal = mem.MemTotal || os.totalmem();
+    const memFree = mem.MemFree || os.freemem();
+    const memAvail = mem.MemAvailable || memFree;
+    const memUsed = memTotal - memAvail;
+    const swapTotal = mem.SwapTotal || 0;
+    const swapFree = mem.SwapFree || 0;
+    const swapUsed = swapTotal - swapFree;
+
+    res.json({
+      hostname: os.hostname(),
+      platform: os.platform(),
+      arch: os.arch(),
+      kernel: os.release(),
+      uptime: os.uptime(),
+      loadAvg: os.loadavg(),
+      cpu: {
+        cores: os.cpus().length,
+        model: os.cpus()[0]?.model || "unknown",
+        overallPercent: cpu.overall,
+        perCorePercent: cpu.perCore,
+      },
+      memory: {
+        total: memTotal,
+        used: memUsed,
+        free: memFree,
+        available: memAvail,
+        buffers: mem.Buffers || 0,
+        cached: mem.Cached || 0,
+        percent: memTotal ? (memUsed / memTotal) * 100 : 0,
+      },
+      swap: {
+        total: swapTotal,
+        used: swapUsed,
+        free: swapFree,
+        percent: swapTotal ? (swapUsed / swapTotal) * 100 : 0,
+      },
+      threads: countThreads(),
+      processCount: (() => {
+        try { return readdirSync("/proc").filter((d) => /^\d+$/.test(d)).length; } catch { return 0; }
+      })(),
+      timestamp: new Date().toISOString(),
+    });
+  } catch (e: any) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/system/processes?sort=cpu&limit=50
+app.get("/api/system/processes", (req, res) => {
+  const sort = (req.query.sort as string) || "cpu"; // cpu | mem | pid
+  const limit = Math.min(parseInt((req.query.limit as string) || "60", 10), 500);
+  try {
+    // ps options: pid user pcpu pmem rss vsz nlwp etime stat comm
+    const sortArg = sort === "mem" ? "-pmem" : sort === "pid" ? "pid" : "-pcpu";
+    const raw = execSync(
+      `ps -eo pid,user,pcpu,pmem,rss,vsz,nlwp,etime,stat,comm --sort=${sortArg} --no-headers | head -${limit}`,
+      { encoding: "utf-8", maxBuffer: 4 * 1024 * 1024 }
+    );
+    const procs = raw.split("\n").filter(Boolean).map((line) => {
+      // Multi-field parse — last token is command, may itself contain spaces (rare)
+      const parts = line.trim().split(/\s+/);
+      if (parts.length < 10) return null;
+      const [pid, user, pcpu, pmem, rss, vsz, nlwp, etime, stat, ...rest] = parts;
+      return {
+        pid: parseInt(pid, 10),
+        user,
+        cpuPercent: parseFloat(pcpu),
+        memPercent: parseFloat(pmem),
+        rssKb: parseInt(rss, 10),
+        vszKb: parseInt(vsz, 10),
+        threads: parseInt(nlwp, 10),
+        elapsed: etime,
+        state: stat,
+        command: rest.join(" "),
+      };
+    }).filter(Boolean);
+    res.json({ processes: procs, sort, limit, timestamp: new Date().toISOString() });
+  } catch (e: any) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/system/disk — mount usage (excluding pseudo filesystems)
+app.get("/api/system/disk", (_, res) => {
+  try {
+    const raw = execSync(
+      "df -B1 -T -x tmpfs -x devtmpfs -x squashfs -x overlay --output=source,fstype,size,used,avail,pcent,target",
+      { encoding: "utf-8" }
+    );
+    const lines = raw.split("\n").slice(1).filter(Boolean);
+    const mounts = lines.map((line) => {
+      const parts = line.trim().split(/\s+/);
+      if (parts.length < 7) return null;
+      const [source, fstype, size, used, avail, pcent, ...mountParts] = parts;
+      return {
+        source,
+        fstype,
+        totalBytes: parseInt(size, 10),
+        usedBytes: parseInt(used, 10),
+        availBytes: parseInt(avail, 10),
+        percent: parseFloat(pcent.replace("%", "")),
+        mount: mountParts.join(" "),
+      };
+    }).filter(Boolean);
+    res.json({ mounts, timestamp: new Date().toISOString() });
+  } catch (e: any) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/system/network — per-interface RX/TX byte counters
+app.get("/api/system/network", (_, res) => {
+  try {
+    const raw = readFileSync("/proc/net/dev", "utf-8");
+    const lines = raw.split("\n").slice(2).filter(Boolean);
+    const ifaces = lines.map((line) => {
+      const [name, stats] = line.split(":");
+      if (!stats) return null;
+      const f = stats.trim().split(/\s+/).map((x) => parseInt(x, 10));
+      // Receive: bytes packets errs drop fifo frame compressed multicast
+      // Transmit: bytes packets errs drop fifo colls carrier compressed
+      return {
+        interface: name.trim(),
+        rxBytes: f[0] || 0,
+        rxPackets: f[1] || 0,
+        rxErrs: f[2] || 0,
+        rxDrop: f[3] || 0,
+        txBytes: f[8] || 0,
+        txPackets: f[9] || 0,
+        txErrs: f[10] || 0,
+        txDrop: f[11] || 0,
+      };
+    }).filter(Boolean);
+    res.json({ interfaces: ifaces, timestamp: new Date().toISOString() });
+  } catch (e: any) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/system/stream?interval=2 — SSE: pushes a combined snapshot every N seconds
+app.get("/api/system/stream", (req, res) => {
+  const interval = Math.max(500, Math.min(10000, parseInt((req.query.interval as string) || "2000", 10)));
+  res.writeHead(200, {
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache",
+    "Connection": "keep-alive",
+    "X-Accel-Buffering": "no",
+  });
+  res.write(`: connected ${new Date().toISOString()}\n\n`);
+
+  let alive = true;
+  const tick = () => {
+    if (!alive) return;
+    try {
+      const cpu = computeCpuPercent();
+      const mem = readMemInfo();
+      const memTotal = mem.MemTotal || os.totalmem();
+      const memAvail = mem.MemAvailable || mem.MemFree || os.freemem();
+      const memUsed = memTotal - memAvail;
+      const swapTotal = mem.SwapTotal || 0;
+      const swapUsed = swapTotal - (mem.SwapFree || 0);
+      // Key names MUST match what /api/system/stats returns and what
+      // SystemPage.tsx reads (cpu.overallPercent / cpu.perCorePercent).
+      // Earlier this snapshot used `overall` / `perCore`, which the client's
+      // shallow merge `{...prev.cpu, ...snap.cpu}` tacked on as NEW keys
+      // instead of overwriting the rendered ones — leaving the UI pinned at
+      // 0% forever and only "twitching" when an interaction recreated the
+      // SSE / re-fetched /api/system/stats.
+      const snapshot = {
+        cpu: { overallPercent: cpu.overall, perCorePercent: cpu.perCore },
+        memory: { total: memTotal, used: memUsed, percent: memTotal ? (memUsed / memTotal) * 100 : 0 },
+        swap: { total: swapTotal, used: swapUsed, percent: swapTotal ? (swapUsed / swapTotal) * 100 : 0 },
+        loadAvg: os.loadavg(),
+        uptime: os.uptime(),
+        threads: countThreads(),
+        timestamp: new Date().toISOString(),
+      };
+      res.write(`data: ${JSON.stringify(snapshot)}\n\n`);
+    } catch {}
+  };
+  const t = setInterval(tick, interval);
+  tick();
+  req.on("close", () => { alive = false; clearInterval(t); });
+});
+
+// Project files browser — browse engagement directories and view file contents
+// Phase 1.1: file browsing is scoped to SECURITY.allowedWorkspaceRoots (was PROJECT_ROOTS).
+app.get("/api/files/roots", (_, res) => {
+  // Phase 1.1: roots come from the configured workspace roots, not a broad list.
+  const roots = SECURITY.allowedWorkspaceRoots.filter((p) => existsSync(p)).map((p) => {
+    const name = p.split("/").pop() || p;
+    return { path: p, name };
+  });
+  res.json(roots);
+});
+
+app.get("/api/files/list", (req, res) => {
+  const reqPath = req.query.path as string;
+  if (!reqPath) return res.status(400).json({ error: "path required" });
+
+  // Phase 1.1: resolve + confine to allowed workspace roots (no startsWith, no broad /root).
+  const dirPath = guardWorkspacePath(res, reqPath);
+  if (dirPath === null) return;
+
+  if (!existsSync(dirPath)) return res.json({ entries: [], path: dirPath });
+
+  try {
+    const { statSync, lstatSync } = require("fs");
+    const entries = readdirSync(dirPath)
+      .filter((name: string) => !name.startsWith("."))
+      .map((name: string) => {
+        const fullPath = join(dirPath, name);
+        try {
+          const stat = statSync(fullPath);
+          return {
+            name,
+            path: fullPath,
+            isDir: stat.isDirectory(),
+            size: stat.size,
+            modified: stat.mtime.toISOString(),
+          };
+        } catch {
+          return { name, path: fullPath, isDir: false, size: 0, modified: "" };
+        }
+      })
+      .sort((a: any, b: any) => {
+        if (a.isDir !== b.isDir) return a.isDir ? -1 : 1;
+        return a.name.localeCompare(b.name);
+      });
+    res.json({ entries, path: dirPath });
+  } catch (e: any) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get("/api/files/read", (req, res) => {
+  const reqPath = req.query.path as string;
+  if (!reqPath) return res.status(400).json({ error: "path required" });
+
+  // Phase 1.1: resolve + confine to allowed workspace roots (no startsWith, no broad /root).
+  const filePath = guardWorkspacePath(res, reqPath);
+  if (filePath === null) return;
+
+  if (!existsSync(filePath)) return res.status(404).json({ error: "File not found" });
+
+  try {
+    const { statSync } = require("fs");
+    const stat = statSync(filePath);
+
+    // Don't read huge files
+    if (stat.size > 2 * 1024 * 1024) {
+      return res.json({ content: `[File too large: ${(stat.size / 1024 / 1024).toFixed(1)}MB. Max 2MB.]`, truncated: true });
+    }
+
+    // Check if binary
+    const ext = filePath.split(".").pop()?.toLowerCase() || "";
+    const binaryExts = ["png", "jpg", "jpeg", "gif", "bmp", "ico", "pdf", "zip", "gz", "tar", "exe", "bin", "pcap", "cap"];
+    if (binaryExts.includes(ext)) {
+      return res.json({ content: `[Binary file: ${ext}, ${(stat.size / 1024).toFixed(1)}KB]`, binary: true });
+    }
+
+    const content = readFileSync(filePath, "utf-8");
+    const lines = content.split("\n").length;
+    res.json({ content, lines, size: stat.size });
+  } catch (e: any) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Write/save file
+app.put("/api/files/write", (req, res) => {
+  // Phase 1: arbitrary file writes gated by ENABLE_FILE_WRITE (default off).
+  if (!SECURITY.enableFileWrite) {
+    auditSecurity("file_write_blocked", { path: String(req.body?.path || "") });
+    return res.status(403).json({ error: "file write disabled (set ENABLE_FILE_WRITE=true to enable)" });
+  }
+  const reqPath = req.body.path as string;
+  const content = req.body.content as string;
+  if (!reqPath || content === undefined) return res.status(400).json({ error: "path and content required" });
+
+  // Phase 1.1: resolve + confine to allowed workspace roots (no startsWith, no broad /root).
+  const filePath = guardWorkspacePath(res, reqPath);
+  if (filePath === null) return;
+
+  try {
+    writeFileSync(filePath, content);
+    log("info", `File saved: ${filePath}`, { size: content.length });
+    res.json({ success: true });
+  } catch (e: any) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── Engagements API ───────────────────────────────────────────────
+const ENGAGEMENT_ROOTS = [
+  { path: "/root/htb/boxes", source: "htb" },
+  { path: "/root/engagements", source: "engagement" },
+];
+
+// Track report generation jobs
+const reportJobs = new Map<string, { status: string; output: string; startedAt: string; completedAt?: string; reportPath?: string }>();
+
+// Process history — tracks shells/agents that have completed or disappeared
+// so they show up in the Completed/Failed columns instead of vanishing
+interface ProcessRecord {
+  id: string;
+  type: string;
+  name: string;
+  status: string;
+  pid?: number;
+  parentPid?: number;
+  cmd?: string;
+  startedAt: string;
+  completedAt?: string;
+  provider?: string;
+  model?: string;
+}
+const processHistory: ProcessRecord[] = [];
+const MAX_HISTORY = 50;
+let previousPids = new Set<number>();
+
+function recordCompletedProcesses(currentPids: Set<number>) {
+  // Find PIDs that were running last tick but are gone now
+  for (const pid of previousPids) {
+    if (!currentPids.has(pid)) {
+      // This process exited — find it in the current agents list from last tick
+      // or create a minimal record
+      const existing = processHistory.find(p => p.pid === pid);
+      if (!existing) {
+        processHistory.push({
+          id: `completed-${pid}-${Date.now()}`,
+          type: "shell",
+          name: `Completed shell (PID ${pid})`,
+          status: "completed",
+          pid,
+          startedAt: new Date(Date.now() - 60000).toISOString(),
+          completedAt: new Date().toISOString(),
+        });
+        if (processHistory.length > MAX_HISTORY) processHistory.shift();
+      }
+    }
+  }
+  previousPids = new Set(currentPids);
+}
+
+function analyzeEngagement(boxPath: string, boxName: string, source: string) {
+  const { statSync, realpathSync } = require("fs");
+
+  const dirs: string[] = [];
+  try {
+    for (const entry of readdirSync(boxPath)) {
+      const full = join(boxPath, entry);
+      try {
+        if (statSync(full).isDirectory() && !entry.startsWith(".")) {
+          dirs.push(entry);
+        }
+      } catch {}
+    }
+  } catch {}
+
+  const hasDir = (name: string) => dirs.includes(name);
+
+  // Check if dirs have files
+  const dirHasFiles = (name: string): boolean => {
+    const dirPath = join(boxPath, name);
+    if (!existsSync(dirPath)) return false;
+    try {
+      const entries = readdirSync(dirPath);
+      return entries.some((e: string) => {
+        try {
+          return !statSync(join(dirPath, e)).isDirectory();
+        } catch { return false; }
+      });
+    } catch { return false; }
+  };
+
+  const hasScans = hasDir("scans") && dirHasFiles("scans");
+  const hasLoot = hasDir("loot") && dirHasFiles("loot");
+  const hasExploits = hasDir("exploits") && dirHasFiles("exploits");
+  const hasNotes = hasDir("notes") && dirHasFiles("notes");
+  const hasResearch = hasDir("research") && dirHasFiles("research");
+
+  // Check for report HTML
+  let hasReport = false;
+  let reportFile: string | null = null;
+  const reportDir = join(boxPath, "report");
+  if (existsSync(reportDir)) {
+    try {
+      for (const f of readdirSync(reportDir)) {
+        if (f.endsWith(".html")) {
+          hasReport = true;
+          reportFile = join(reportDir, f);
+          break;
+        }
+      }
+    } catch {}
+  }
+
+  // Count all files recursively and get total size + last modified
+  let fileCount = 0;
+  let totalSize = 0;
+  let lastModified = new Date(0);
+
+  function walkDir(dir: string) {
+    try {
+      for (const entry of readdirSync(dir)) {
+        if (entry.startsWith(".")) continue;
+        const full = join(dir, entry);
+        try {
+          const st = statSync(full);
+          if (st.isDirectory()) {
+            walkDir(full);
+          } else {
+            fileCount++;
+            totalSize += st.size;
+            if (st.mtime > lastModified) lastModified = st.mtime;
+          }
+        } catch {}
+      }
+    } catch {}
+  }
+  walkDir(boxPath);
+
+  // Determine status
+  let status: string = "new";
+  if (hasReport) status = "reported";
+  else if (hasLoot) status = "completed";
+  else if (hasExploits) status = "exploiting";
+  else if (hasScans) status = "scanning";
+
+  return {
+    name: boxName,
+    path: boxPath,
+    source,
+    hasScans,
+    hasLoot,
+    hasExploits,
+    hasNotes,
+    hasReport,
+    hasResearch,
+    reportFile,
+    fileCount,
+    totalSize,
+    lastModified: lastModified.toISOString(),
+    status,
+    dirs,
+  };
+}
+
+// GET /api/engagements — List all engagements with status analysis
+app.get("/api/engagements", (_, res) => {
+  const engagements: any[] = [];
+
+  for (const root of ENGAGEMENT_ROOTS) {
+    if (!existsSync(root.path)) continue;
+    try {
+      for (const name of readdirSync(root.path)) {
+        const boxPath = join(root.path, name);
+        try {
+          const { statSync } = require("fs");
+          if (!statSync(boxPath).isDirectory()) continue;
+          if (name.startsWith(".")) continue;
+          engagements.push(analyzeEngagement(boxPath, name, root.source));
+        } catch {}
+      }
+    } catch {}
+  }
+
+  // Sort by lastModified descending
+  engagements.sort((a, b) => new Date(b.lastModified).getTime() - new Date(a.lastModified).getTime());
+
+  log("info", `Listed ${engagements.length} engagements`);
+  res.json({ engagements });
+});
+
+// ── ADDITIVE: LLM raw-call logs (the "LLM LOGS" app) ──
+// Each engagement that has had LLM activity owns <engagement>/logs/llm_raw.jsonl, written by both
+// backends (claude path: server rawLlmLog; OpenRouter: orchestrator raw_log). These routes let the
+// UI list engagements-with-logs and read a given one's entries (newest first, capped).
+function llmLogPathFor(engagement: string): string | null {
+  const safe = engagement.replace(/[^A-Za-z0-9._-]/g, "");
+  if (!safe) return null;
+  if (safe === "_dashboard") {
+    const cwdLog = join(process.cwd(), "logs", "llm_raw.jsonl");
+    return existsSync(cwdLog) ? cwdLog : null;
+  }
+  for (const root of ENGAGEMENT_ROOTS) {
+    const p = join(root.path, safe, "logs", "llm_raw.jsonl");
+    if (existsSync(p)) return p;
+  }
+  return null;
+}
+
+app.get("/api/llm-logs/engagements", (_, res) => {
+  const { statSync } = require("fs");
+  const out: Array<{ name: string; source: string; entries: number; lastModified: string }> = [];
+  const seen = new Set<string>();
+  for (const root of ENGAGEMENT_ROOTS) {
+    if (!existsSync(root.path)) continue;
+    try {
+      for (const name of readdirSync(root.path)) {
+        const p = join(root.path, name, "logs", "llm_raw.jsonl");
+        if (!existsSync(p) || seen.has(name)) continue;
+        seen.add(name);
+        try {
+          const st = statSync(p);
+          const lines = readFileSync(p, "utf-8").split("\n").filter((l) => l.trim()).length;
+          out.push({ name, source: root.source, entries: lines, lastModified: st.mtime.toISOString() });
+        } catch {}
+      }
+    } catch {}
+  }
+  const cwdLog = join(process.cwd(), "logs", "llm_raw.jsonl");
+  if (existsSync(cwdLog)) {
+    try {
+      const st = statSync(cwdLog);
+      const lines = readFileSync(cwdLog, "utf-8").split("\n").filter((l) => l.trim()).length;
+      out.push({ name: "_dashboard", source: "dashboard-cwd", entries: lines, lastModified: st.mtime.toISOString() });
+    } catch {}
+  }
+  res.json(out.sort((a, b) => b.lastModified.localeCompare(a.lastModified)));
+});
+
+app.get("/api/llm-logs", (req, res) => {
+  const engagement = String(req.query.engagement || "");
+  const limit = Math.min(parseInt(String(req.query.limit || "500"), 10) || 500, 2000);
+  const p = llmLogPathFor(engagement);
+  if (!p) return res.json({ engagement, entries: [] });
+  try {
+    const lines = readFileSync(p, "utf-8").split("\n").filter((l) => l.trim());
+    const slice = lines.slice(-limit).reverse();
+    const entries = slice.map((l) => { try { return JSON.parse(l); } catch { return { parseError: true, raw: l.slice(0, 500) }; } });
+    res.json({ engagement, path: p, total: lines.length, entries });
+  } catch (e: any) {
+    res.status(500).json({ error: e.message, entries: [] });
+  }
+});
+
+// GET /api/engagements/:name/files — List all files recursively
+app.get("/api/engagements/:name/files", (req, res) => {
+  if (!guardSeg(res, req.params.name)) return;
+  const name = req.params.name;
+  const { statSync } = require("fs");
+
+  // Find the engagement directory
+  let boxPath: string | null = null;
+  for (const root of ENGAGEMENT_ROOTS) {
+    const candidate = join(root.path, name);
+    if (existsSync(candidate)) {
+      boxPath = candidate;
+      break;
+    }
+  }
+
+  if (!boxPath) return res.status(404).json({ error: `Engagement '${name}' not found` });
+
+  const files: Array<{ path: string; relativePath: string; size: number; modified: string }> = [];
+
+  function walkFiles(dir: string, prefix: string) {
+    try {
+      for (const entry of readdirSync(dir)) {
+        if (entry.startsWith(".")) continue;
+        const full = join(dir, entry);
+        const rel = prefix ? `${prefix}/${entry}` : entry;
+        try {
+          const st = statSync(full);
+          if (st.isDirectory()) {
+            walkFiles(full, rel);
+          } else {
+            files.push({
+              path: full,
+              relativePath: rel,
+              size: st.size,
+              modified: st.mtime.toISOString(),
+            });
+          }
+        } catch {}
+      }
+    } catch {}
+  }
+
+  walkFiles(boxPath, "");
+
+  // Sort by modified descending
+  files.sort((a, b) => new Date(b.modified).getTime() - new Date(a.modified).getTime());
+
+  res.json({ name, path: boxPath, files });
+});
+
+// POST /api/engagements/:name/generate-report — Trigger report generation
+app.post("/api/engagements/:name/generate-report", (req, res) => {
+  const name = req.params.name;
+
+  // Find the engagement directory
+  let boxPath: string | null = null;
+  for (const root of ENGAGEMENT_ROOTS) {
+    const candidate = join(root.path, name);
+    if (existsSync(candidate)) {
+      boxPath = candidate;
+      break;
+    }
+  }
+
+  if (!boxPath) return res.status(404).json({ error: `Engagement '${name}' not found` });
+
+  const jobId = `report-${name}-${Date.now()}`;
+  const reportDir = join(boxPath, "report");
+  const reportDataPath = join(reportDir, "report_data.json");
+  const reportOutputPath = join(reportDir, "report.html");
+
+  // Ensure report directory exists
+  try { mkdirSync(reportDir, { recursive: true }); } catch {}
+
+  reportJobs.set(jobId, { status: "running", output: "", startedAt: new Date().toISOString() });
+
+  log("info", `Starting report generation for ${name}`, { jobId, boxPath });
+
+  // Copy logo assets into the report directory so the HTML can find them
+  const assetsDir = join(reportDir, "assets");
+  try {
+    mkdirSync(assetsDir, { recursive: true });
+    const templateAssets = "/root/report-template/assets";
+    for (const f of ["Logo.svg", "smallLogo.png"]) {
+      const src = join(templateAssets, f);
+      const dst = join(assetsDir, f);
+      if (existsSync(src) && !existsSync(dst)) {
+        writeFileSync(dst, readFileSync(src));
+      }
+    }
+  } catch {}
+
+  const today = new Date().toISOString().split("T")[0];
+
+  // Check for feedback from previous report
+  const feedbackPath = join(reportDir, "feedback.md");
+  let feedbackSection = "";
+  if (existsSync(feedbackPath)) {
+    const feedback = readFileSync(feedbackPath, "utf-8");
+    feedbackSection = `\n\nIMPORTANT — PREVIOUS FEEDBACK TO ADDRESS:\nThe user reviewed the last report and requested these changes. You MUST incorporate this feedback:\n${feedback}\n`;
+    log("info", `Including report feedback for ${name}`, { feedbackPath });
+  }
+
+  // Build the prompt — matches the EXACT JSON structure from sample_data.json.
+  // Severity scoring is anchored to Intigriti Triage Standards (kb.intigriti.com/en/articles/10335710)
+  // so every finding gets a defensible CVSS vector + rationale, not a vibe-based label.
+  const claudePrompt = `You are a penetration testing report generator. You MUST complete ALL 4 steps below. Do NOT write a summary.md. Do NOT stop early.
+
+═══════════════════════════════════════════════════════════════════════════════
+SCORING METHODOLOGY — INTIGRITI TRIAGE STANDARDS (MANDATORY)
+Reference: https://kb.intigriti.com/en/articles/10335710-intigriti-triage-standards
+═══════════════════════════════════════════════════════════════════════════════
+
+You MUST score every finding using CVSSv3.1 base metrics and the Intigriti triage
+rules below. Do not pick a severity by gut feel — derive it from the vector.
+
+CVSSv3.1 BASE METRICS (score each finding across all 8):
+  AV  Attack Vector       : Network (N) | Adjacent (A) | Local (L) | Physical (P)
+  AC  Attack Complexity   : Low (L) | High (H)
+  PR  Privileges Required : None (N) | Low (L) | High (H)
+  UI  User Interaction    : None (N) | Required (R)
+  S   Scope               : Unchanged (U) | Changed (C)
+  C   Confidentiality     : High (H) | Low (L) | None (N)
+  I   Integrity           : High (H) | Low (L) | None (N)
+  A   Availability        : High (H) | Low (L) | None (N)
+
+SEVERITY BANDS (from numeric CVSS):
+  Critical : 9.0 – 10.0
+  High     : 7.0 – 8.9
+  Medium   : 4.0 – 6.9
+  Low      : 0.1 – 3.9
+  Info     : 0.0  (or unproven / no PoC)
+
+INTIGRITI-SPECIFIC AUTO-CLASSIFICATIONS (these OVERRIDE raw CVSS):
+  • Open redirects with no additional exploitation chain        → Low
+  • HTML / CSS / content injection without confidential leakage → Low
+  • Broken link hijacking without server-side leverage          → Low
+  • Debug / path / stack-trace disclosure with no attacker gain → Low or Info
+  • Cookie-bombing DoS (clearable by victim)                    → Low
+  • WAF bypass with no downstream application impact            → Low or Info
+  • Privacy issues without a clear security impact              → Info
+  • Findings in test/staging that never reach production        → Info
+  • Vulnerabilities in unreachable / unused code paths          → Info (severity: none)
+  • Native cloud SaaS/PaaS vendor flaws                         → Out of scope (omit)
+
+PROOF-OF-CONCEPT GATE:
+  • Score based on IMPACT YOU ACTUALLY DEMONSTRATED in the engagement files.
+  • Do NOT escalate severity for theoretical "could lead to RCE" if you never
+    achieved it. Score the demonstrated impact only.
+  • If no PoC exists for a finding, severity = "info" and set
+    triage_status to "needs_poc".
+
+MULTI-TENANT / SCOPE NUANCES:
+  • C:H / I:H only when the attacker reaches data BEYOND their own tenant or
+    hits core business functionality. Otherwise C:L / I:L.
+  • S:C (Scope Changed) only when exploitation crosses a security/authorization
+    boundary (container escape, cross-tenant SSRF, sandbox break). Same-app
+    horizontal/vertical privesc is S:U.
+
+IDOR / ACCESS-CONTROL NUANCES:
+  • IDORs gated by UUIDs or non-enumerable IDs → AC:H, downgrade unless
+    meaningful data exposure was actually proved.
+  • IDOR exposing system-critical or large-scale personal data → may reach Critical.
+
+LEAKED CREDENTIALS (only if you found any in loot):
+  • System/admin creds, internal first-party source → full severity (likely Critical/High).
+  • System creds via public third-party leak       → severity: "info", triage_status: "undecided".
+  • Personal employee creds                        → triage_status: "undecided".
+  • B2B/B2C user creds                             → Info.
+
+═══════════════════════════════════════════════════════════════════════════════
+
+STEP 1: List and read all files in ${boxPath}. Run:
+find ${boxPath} -type f -not -path '*/report/*' | head -60
+Then read the key files: nmap scans, notes, loot files, exploit scripts.
+
+STEP 2: Create the file ${reportDataPath} using the Write tool. The JSON MUST use this EXACT structure (matching the template engine):
+
+{
+  "CLIENT_NAME": "${name}",
+  "DATE": "${today}",
+  "DATE_RANGE": "${today}",
+  "TARGET": "${name}",
+  "ENGAGEMENT_TYPE": "Penetration Test",
+  "ASSESSOR": "ChillsPwn",
+  "VERSION": "1.0",
+  "BOX_NAME": "${name}",
+  "scoring_standard": "Intigriti Triage Standards v1.3 (CVSSv3.1)",
+  "findings": [
+    {
+      "severity": "critical|high|medium|low|info",
+      "title": "Finding title",
+      "cvss": "9.8",
+      "cvss_version": "3.1",
+      "cvss_vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+      "scoring_rationale": "1-2 sentences explaining the metric choices — especially AV, PR, S, and impact (C/I/A). Note any Intigriti rule applied (e.g. 'auto-Low: open redirect with no chain').",
+      "triage_status": "confirmed",
+      "intigriti_class": "Standard CVSS",
+      "description": "Detailed description of the vulnerability",
+      "evidence": "Exact tool output or proof of exploitation (escape newlines as \\\\n)",
+      "reproduction_steps": ["Step 1", "Step 2", "Step 3"],
+      "exploit_code": "Full exploit code if applicable (escape newlines as \\\\n)",
+      "exploit_language": "Python 3",
+      "exploit_filename": "exploit.py",
+      "exploit_usage": "python3 exploit.py target",
+      "expected_output": "What the exploit returns",
+      "remediation": ["Fix 1", "Fix 2"]
+    }
+  ],
+  "assets": [
+    {
+      "name": "${name}",
+      "type": "Linux Host",
+      "ip": "${name}",
+      "tested": true
+    }
+  ],
+  "tools_used": ["nmap", "ffuf", "nikto"],
+  "flags": {
+    "user": "paste user flag here if found in loot",
+    "root": "paste root flag here if found in loot"
+  }
+}
+
+FIELD REQUIREMENTS:
+- severity: lowercase, MUST match the band derived from the cvss numeric score
+  unless an Intigriti auto-classification overrides it (then severity reflects
+  the override and scoring_rationale must say so).
+- cvss: numeric string, 1 decimal place, e.g. "9.8" — must be consistent with cvss_vector.
+- cvss_version: "3.1".
+- cvss_vector: full CVSSv3.1 vector starting with "CVSS:3.1/" — REQUIRED.
+- scoring_rationale: REQUIRED. Explain WHY this score. Call out any Intigriti rule
+  that triggered (e.g. "auto-Low per Intigriti standard: open redirect, no chain").
+- triage_status: one of "confirmed" | "needs_poc" | "undecided" | "informational".
+- intigriti_class: one of "Standard CVSS" | "Auto-Low (open redirect)" |
+  "Auto-Low (content injection)" | "Auto-Low (debug disclosure)" |
+  "Informational (privacy)" | "Informational (test env)" |
+  "Informational (unused code)" | "Out of scope (cloud native)".
+- Include EVERY vulnerability you actually demonstrated. Include EVERY credential
+  found in loot. Include EVERY exploit used. Evidence must include actual tool output.
+- Remediation must be an array of strings.
+
+STEP 3: IMMEDIATELY run this command (do NOT skip this):
+python3 /root/report-template/generate_report.py --data ${reportDataPath} --output ${reportOutputPath}
+
+STEP 4: Verify the report was created:
+ls -la ${reportOutputPath}
+
+You MUST complete all 4 steps. The final output is ${reportOutputPath}.${feedbackSection}`;
+
+  const proc = spawn("claude", [
+    "-p",
+    "--model", "sonnet",
+    "--permission-mode", "auto",
+    "--no-session-persistence",
+    "--output-format", "stream-json",
+    "--verbose",
+    "--allowedTools", "Bash,Read,Write,Edit,Glob,Grep",
+  ], {
+    stdio: ["pipe", "pipe", "pipe"],
+    env: { ...process.env, PATH: `/opt/chillspwn-bin:${process.env.PATH || ''}` },
+    cwd: boxPath,
+  });
+
+  // Send prompt via stdin (too long for CLI argument)
+  proc.stdin?.write(claudePrompt);
+  proc.stdin?.end();
+
+  let output = "";
+  let stdoutBuffer = "";
+
+  proc.stdout?.on("data", (chunk: Buffer) => {
+    const text = chunk.toString();
+    output += text;
+    stdoutBuffer += text;
+    const job = reportJobs.get(jobId);
+    if (!job) return;
+    job.output = output;
+
+    // Parse stream-json lines for stage detection
+    const lines = stdoutBuffer.split("\n");
+    stdoutBuffer = lines.pop() || "";
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      try {
+        const evt = JSON.parse(line);
+        // Detect stages from tool usage and content
+        if (evt.type === "system") {
+          job.stage = "initializing";
+          job.progress = 5;
+        }
+        if (evt.type === "assistant") {
+          const content = evt.message?.content || [];
+          for (const block of content) {
+            if (block.type === "tool_use") {
+              const name = block.name || "";
+              const input = JSON.stringify(block.input || {});
+              if (name === "Bash" && input.includes("find")) {
+                job.stage = "scanning files";
+                job.progress = 15;
+              } else if (name === "Read") {
+                if (!job._readCount) job._readCount = 0;
+                job._readCount++;
+                job.stage = `reading files (${job._readCount} read)`;
+                job.progress = Math.min(20 + job._readCount * 5, 55);
+              } else if (name === "Write" && input.includes("report_data")) {
+                job.stage = "writing report data JSON";
+                job.progress = 65;
+              } else if (name === "Bash" && input.includes("generate_report")) {
+                job.stage = "generating HTML report";
+                job.progress = 80;
+              } else if (name === "Bash" && input.includes("ls")) {
+                job.stage = "verifying report";
+                job.progress = 95;
+              }
+            }
+            if (block.type === "text" && block.text) {
+              const t = block.text.toLowerCase();
+              if (t.includes("report") && (t.includes("generated") || t.includes("created") || t.includes("successfully"))) {
+                job.stage = "complete";
+                job.progress = 100;
+              }
+            }
+          }
+        }
+        if (evt.type === "result") {
+          job.progress = 100;
+          job.stage = "finalizing";
+        }
+      } catch {}
+    }
+  });
+
+  proc.stderr?.on("data", (chunk: Buffer) => {
+    output += `[stderr] ${chunk.toString()}`;
+    const job = reportJobs.get(jobId);
+    if (job) job.output = output;
+  });
+
+  proc.on("close", (code) => {
+    const job = reportJobs.get(jobId);
+    if (job) {
+      job.completedAt = new Date().toISOString();
+      if (code === 0 && existsSync(reportOutputPath)) {
+        job.status = "completed";
+        job.reportPath = reportOutputPath;
+        log("info", `Report generation completed for ${name}`, { jobId, reportPath: reportOutputPath });
+      } else {
+        job.status = "failed";
+        job.output = output;
+        log("warn", `Report generation failed for ${name}`, { jobId, exitCode: code });
+      }
+    }
+  });
+
+  proc.on("error", (err) => {
+    const job = reportJobs.get(jobId);
+    if (job) {
+      job.status = "failed";
+      job.output = `Process error: ${err.message}`;
+      job.completedAt = new Date().toISOString();
+    }
+    log("error", `Report generation process error for ${name}`, { jobId, error: err.message });
+  });
+
+  // Close stdin immediately since we passed the prompt as an arg
+  proc.stdin?.end();
+
+  res.json({ jobId, status: "running", message: `Report generation started for ${name}` });
+});
+
+// GET /api/engagements/report-status/:jobId — Check report generation status
+app.get("/api/engagements/report-status/:jobId", (req, res) => {
+  const job = reportJobs.get(req.params.jobId);
+  if (!job) return res.status(404).json({ error: "Job not found" });
+  res.json(job);
+});
+
+// GET /api/engagements/:name/report — Get report HTML content
+app.get("/api/engagements/:name/report", (req, res) => {
+  if (!guardSeg(res, req.params.name)) return;
+  const name = req.params.name;
+
+  // Find the engagement directory
+  let boxPath: string | null = null;
+  for (const root of ENGAGEMENT_ROOTS) {
+    const candidate = join(root.path, name);
+    if (existsSync(candidate)) {
+      boxPath = candidate;
+      break;
+    }
+  }
+
+  if (!boxPath) return res.status(404).json({ error: `Engagement '${name}' not found` });
+
+  const reportDir = join(boxPath, "report");
+  if (!existsSync(reportDir)) return res.status(404).json({ error: "No report directory" });
+
+  // Find any HTML report
+  let reportPath: string | null = null;
+  try {
+    for (const f of readdirSync(reportDir)) {
+      if (f.endsWith(".html")) {
+        reportPath = join(reportDir, f);
+        break;
+      }
+    }
+  } catch {}
+
+  if (!reportPath) return res.status(404).json({ error: "No HTML report found" });
+
+  try {
+    let html = readFileSync(reportPath, "utf-8");
+
+    // Embed logos as base64 data URIs so they render in srcDoc iframes
+    const logoSources = [
+      { src: "assets/Logo.svg", file: "/root/report-template/assets/Logo.svg", mime: "image/svg+xml" },
+      { src: "assets/smallLogo.png", file: "/root/report-template/assets/smallLogo.png", mime: "image/png" },
+    ];
+    for (const logo of logoSources) {
+      if (existsSync(logo.file) && html.includes(logo.src)) {
+        const b64 = readFileSync(logo.file).toString("base64");
+        const dataUri = `data:${logo.mime};base64,${b64}`;
+        html = html.split(logo.src).join(dataUri);
+      }
+    }
+
+    res.json({ html, path: reportPath });
+  } catch (e: any) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /api/engagements/create — Create a new engagement
+app.post("/api/engagements/create", (req, res) => {
+  const { name } = req.body;
+  if (!name) return res.status(400).json({ error: "name is required" });
+
+  // Sanitize name
+  const safeName = name.replace(/[^a-zA-Z0-9._-]/g, "_");
+  const boxPath = join("/root/htb/boxes", safeName);
+
+  if (existsSync(boxPath)) return res.status(409).json({ error: `Engagement '${safeName}' already exists` });
+
+  const subdirs = ["scans", "loot", "exploits", "notes", "report", "research"];
+
+  try {
+    for (const sub of subdirs) {
+      mkdirSync(join(boxPath, sub), { recursive: true });
+    }
+    log("info", `Created new engagement: ${safeName}`, { path: boxPath });
+    res.json({ success: true, name: safeName, path: boxPath, dirs: subdirs });
+  } catch (e: any) {
+    log("error", `Failed to create engagement: ${safeName}`, { error: e.message });
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── HELPER / EXPLAIN config ──────────────────────────────────────────────
+// GET returns the JSON config (creating defaults if missing).
+app.get("/api/helper-config", (_req, res) => {
+  try {
+    res.json(readHelperConfig());
+  } catch (e: any) {
+    res.status(500).json({ error: e.message });
+  }
+});
+// PUT validates + atomically writes the config.
+app.put("/api/helper-config", (req, res) => {
+  try {
+    const merged = validateHelperConfig({ ...readHelperConfig(), ...(req.body || {}) });
+    writeHelperConfig(merged);
+    res.json(merged);
+  } catch (e: any) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Explain code — context-aware + configurable via /api/helper-config.
+// Accepts { code, language, context?: [{role, content}, ...] }.
+// NOTE: this is a one-shot helper that is fully separate from the chat claude path
+// (spawnClaude). It does not touch session state or the chat orchestration.
+app.post("/api/explain", async (req, res) => {
+  const { code, language } = req.body || {};
+  const ctx = Array.isArray(req.body?.context) ? req.body.context : [];
+  if (!code) return res.status(400).json({ error: "code required" });
+
+  const cfg = readHelperConfig();
+  // Build conversation context (last contextDepth messages, each truncated).
+  const depth = Math.max(0, Number(cfg.contextDepth) || 0);
+  const recent = depth > 0 ? ctx.slice(-depth) : [];
+  const ctxText = recent
+    .map((m: any) => {
+      const role = (m?.role || "user").toString().slice(0, 24);
+      const content = (m?.content ?? "").toString().slice(0, 2000);
+      return `### ${role}\n${content}`;
+    })
+    .join("\n\n");
+  const styleDirective = cfg.style === "terse"
+    ? "Be concise and direct. A few tight sentences. No filler."
+    : "Teach thoroughly: explain WHAT it does, HOW it works step by step, WHY it matters, and any security implications or notable techniques. Use the conversation context to make the explanation relevant to what is being discussed.";
+  const prompt =
+    `You are a security/coding helper explaining a snippet to an operator inside a live chat.\n` +
+    (ctxText ? `\nRecent conversation context (most recent last):\n${ctxText}\n` : "") +
+    `\nNow explain the following ${language || "code"} that the operator clicked on. ${styleDirective}\n\n` +
+    "```" + (language || "") + "\n" + code + "\n```";
+
+  // provider === "openrouter": call OpenRouter chat-completions directly.
+  if (cfg.provider === "openrouter") {
+    try {
+      const key = resolveOpenRouterKey();
+      if (!key) return res.status(400).json({ error: "OPENROUTER_API_KEY not set" });
+      const orResp = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}` },
+        body: JSON.stringify({
+          model: cfg.model,
+          messages: [{ role: "user", content: prompt }],
+          stream: false,
+        }),
+      });
+      const orJson: any = await orResp.json();
+      const orText = orJson?.choices?.[0]?.message?.content || orJson?.error?.message || "No explanation available.";
+      return res.json({ explanation: orText });
+    } catch (e: any) {
+      log("warn", "explain openrouter error", { text: String(e?.message || e).slice(0, 300) });
+      return res.status(500).json({ error: e.message });
+    }
+  }
+
+  // provider === "anthropic": one-shot claude (same shape as before, configurable model).
+  const model = cfg.model || "claude-haiku-4-5";
+  const proc = spawn("claude", [
+    "-p",
+    "--model", model,
+    "--permission-mode", "auto",
+    "--no-session-persistence",
+    "--output-format", "json",
+  ], { stdio: ["pipe", "pipe", "pipe"] });
+
+  // Send prompt via stdin (code can be long)
+  proc.stdin?.write(prompt);
+  proc.stdin?.end();
+
+  let output = "";
+  proc.stdout?.on("data", (chunk: Buffer) => { output += chunk.toString(); });
+  proc.stderr?.on("data", (chunk: Buffer) => {
+    log("warn", "explain stderr", { text: chunk.toString().slice(0, 300) });
+  });
+  proc.on("close", () => {
+    try {
+      const data = JSON.parse(output);
+      res.json({ explanation: data.result || output });
+    } catch {
+      res.json({ explanation: output });
+    }
+  });
+  proc.on("error", (err) => res.status(500).json({ error: err.message }));
+});
+
+// CLI Sessions — list and read Claude Code terminal sessions
+app.get("/api/cli-sessions", (_, res) => {
+  const sessions: any[] = [];
+  const projectsDir = resolve(process.env.HOME || "/root", ".claude/projects");
+
+  if (!existsSync(projectsDir)) return res.json(sessions);
+
+  try {
+    for (const projDir of readdirSync(projectsDir)) {
+      const projPath = join(projectsDir, projDir);
+      const { statSync: st } = require("fs");
+      if (!st(projPath).isDirectory()) continue;
+
+      for (const file of readdirSync(projPath)) {
+        if (!file.endsWith(".jsonl")) continue;
+        if (file.includes("subagent")) continue;
+
+        const filePath = join(projPath, file);
+        const sessionId = file.replace(".jsonl", "");
+
+        try {
+          const { execSync } = require("child_process");
+          // Read first and last few lines efficiently
+          const firstLine = execSync(`head -1 "${filePath}"`, { encoding: "utf-8", timeout: 2000 }).trim();
+          const lastLines = execSync(`tail -5 "${filePath}"`, { encoding: "utf-8", timeout: 2000 });
+          const lineCount = parseInt(execSync(`wc -l < "${filePath}"`, { encoding: "utf-8", timeout: 2000 }).trim()) || 0;
+          const fileStat = st(filePath);
+
+          // Extract CWD from project dir name
+          const cwd = "/" + projDir.replace(/-/g, "/").replace(/^\//, "");
+
+          // Find first user message for preview
+          let preview = "";
+          let title = "";
+          const lines = lastLines.split("\n").filter(Boolean);
+          for (const l of lines.reverse()) {
+            try {
+              const d = JSON.parse(l);
+              if (d.type === "ai-title" && d.title) title = d.title;
+            } catch {}
+          }
+
+          // Get first user message from head
+          try {
+            const headLines = execSync(`head -20 "${filePath}"`, { encoding: "utf-8", timeout: 2000 });
+            for (const l of headLines.split("\n")) {
+              try {
+                const d = JSON.parse(l);
+                if (d.type === "user") {
+                  const content = d.message?.content;
+                  if (Array.isArray(content)) {
+                    const text = content.find((b: any) => b.type === "text");
+                    if (text) preview = text.text.slice(0, 80);
+                  } else if (typeof content === "string") {
+                    preview = content.slice(0, 80);
+                  }
+                  break;
+                }
+              } catch {}
+            }
+          } catch {}
+
+          sessions.push({
+            sessionId,
+            project: projDir,
+            cwd,
+            title: title || preview || "(untitled)",
+            preview,
+            messageCount: lineCount,
+            lastModified: fileStat.mtime.toISOString(),
+            size: fileStat.size,
+          });
+        } catch {}
+      }
+    }
+  } catch {}
+
+  sessions.sort((a, b) => b.lastModified.localeCompare(a.lastModified));
+  res.json(sessions);
+});
+
+// CLI Session history — read conversation messages from a JSONL file
+app.get("/api/cli-sessions/:sessionId/history", (req, res) => {
+  const { sessionId } = req.params;
+  const projectsDir = resolve(process.env.HOME || "/root", ".claude/projects");
+  const limit = parseInt(req.query.limit as string || "50");
+
+  // Find the JSONL file
+  let filePath: string | null = null;
+  try {
+    for (const projDir of readdirSync(projectsDir)) {
+      const candidate = join(projectsDir, projDir, `${sessionId}.jsonl`);
+      if (existsSync(candidate)) {
+        filePath = candidate;
+        break;
+      }
+    }
+  } catch {}
+
+  if (!filePath) return res.status(404).json({ error: "Session not found" });
+
+  try {
+    const { execSync } = require("child_process");
+    // Read last N*3 lines (user + assistant + metadata lines per turn)
+    // Read more lines for large sessions — JSONL has many metadata/tool_result lines per turn
+    const linesToRead = limit * 20;
+    const raw = execSync(`tail -${linesToRead} "${filePath}"`, { encoding: "utf-8", timeout: 10000, maxBuffer: 50 * 1024 * 1024 });
+    const messages: any[] = [];
+
+    for (const line of raw.split("\n")) {
+      if (!line.trim()) continue;
+      try {
+        const d = JSON.parse(line);
+
+        if (d.type === "user") {
+          const content = d.message?.content;
+          if (Array.isArray(content)) {
+            // Real user text (typed by the human)
+            const userText = content
+              .filter((b: any) => b.type === "text")
+              .map((b: any) => b.text)
+              .join("\n");
+            if (userText) {
+              messages.push({ role: "user", content: userText, timestamp: d.timestamp || "" });
+            }
+            // Tool results — emit as separate "tool" role messages (orange-styled in UI)
+            for (const block of content) {
+              if (block.type !== "tool_result") continue;
+              const inner = typeof block.content === "string"
+                ? block.content
+                : Array.isArray(block.content)
+                  ? block.content.filter((c: any) => c.type === "text").map((c: any) => c.text).join("\n")
+                  : "";
+              if (inner) {
+                messages.push({
+                  role: "tool",
+                  content: inner.slice(0, 2000),
+                  toolName: "result",
+                  toolId: block.tool_use_id,
+                  timestamp: d.timestamp || "",
+                });
+              }
+            }
+          } else if (typeof content === "string") {
+            messages.push({ role: "user", content, timestamp: d.timestamp || "" });
+          }
+        }
+
+        if (d.type === "assistant") {
+          const content = d.message?.content || [];
+          if (!Array.isArray(content)) continue;
+
+          // Assistant text — emit as assistant message
+          const textParts = content
+            .filter((b: any) => b.type === "text")
+            .map((b: any) => b.text);
+          if (textParts.length) {
+            messages.push({
+              role: "assistant",
+              content: textParts.join("\n"),
+              timestamp: d.timestamp || "",
+            });
+          }
+
+          // Tool uses — emit as separate "tool" role messages with JSON input
+          // (matches the live-streaming persistence format so MessageBubble renders tool cards)
+          for (const block of content) {
+            if (block.type !== "tool_use") continue;
+            messages.push({
+              role: "tool",
+              content: JSON.stringify(block.input || {}).slice(0, 500),
+              toolName: block.name,
+              toolId: block.id,
+              timestamp: d.timestamp || "",
+            });
+          }
+        }
+      } catch {}
+    }
+
+    res.json({ messages: messages.slice(-limit), sessionId });
+  } catch (e: any) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── Session management for the navigation menu (list / rename / delete) ──────────
+// The session picker now lives in the app nav (not inside the chat window). These REST
+// endpoints let the nav list/rename/delete sessions independently of the chat WebSocket.
+function broadcastSessionList(): void {
+  const payload = JSON.stringify({ type: "session_list", sessions: listPersistedSessions() });
+  for (const client of wss.clients) {
+    try { if (client.readyState === WebSocket.OPEN) client.send(payload); } catch {}
+  }
+}
+
+app.get("/api/sessions", (req, res) => {
+  // Phase 19 — default returns active/running sessions (terminal specialist sessions hidden).
+  // ?includeClosed=true or ?status=all returns everything; ?status=active|completed|archived filters.
+  const includeClosed = req.query.includeClosed === "true" || req.query.includeClosed === "1";
+  const status = typeof req.query.status === "string" ? req.query.status : undefined;
+  res.json(listPersistedSessions({ includeClosed, status }));
+});
+
+app.post("/api/session/:id/rename", (req, res) => {
+  const id = req.params.id;
+  const title = typeof req.body?.title === "string" ? req.body.title.trim().slice(0, 80) : "";
+  const persisted = loadPersistedSession(id);
+  if (!persisted) return res.status(404).json({ ok: false, error: "session not found" });
+  persisted.title = title;  // empty string clears the custom name (UI falls back to preview/persona)
+  try {
+    const target = sessionFilePath(id);
+    const tmp = `${target}.tmp`;
+    writeFileSync(tmp, JSON.stringify(persisted, null, 2));
+    require("fs").renameSync(tmp, target);
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e) });
+  }
+  // Keep a live session's in-memory copy in sync so its next save() won't clobber the new name.
+  const live = liveSessions.get(id);
+  if (live) live.persisted.title = title;
+  log("info", `Renamed session ${id} -> "${title}"`);
+  broadcastSessionList();
+  res.json({ ok: true, title });
+});
+
+app.delete("/api/session/:id", (req, res) => {
+  const id = req.params.id;
+  const live = liveSessions.get(id);
+  if (live) {
+    try { live.proc.kill("SIGTERM"); } catch {}
+    liveSessions.delete(id);
+  }
+  const filePath = sessionFilePath(id);
+  if (existsSync(filePath)) {
+    try { unlinkSync(filePath); } catch {}
+  }
+  log("info", `Deleted session ${id} (via REST nav)`);
+  broadcastSessionList();
+  res.json({ ok: true });
+});
+
+// Smart session restore — returns last session + context summary for seamless reconnect
+app.get("/api/restore-session", (_, res) => {
+  // Find what to restore: prefer a live session over any stopped one, then
+  // fall back to the most-recently-active stopped session. The list is
+  // already sorted (live first, then by lastActivity) so head is correct.
+  const sessions = listPersistedSessions();
+  if (sessions.length === 0) return res.json({ hasSession: false });
+
+  const latest = sessions[0];
+  const persisted = loadPersistedSession(latest.id);
+  if (!persisted || persisted.messages.length === 0) return res.json({ hasSession: false });
+
+  const isLive = liveSessions.has(latest.id);
+
+  // Build a context summary from the last N messages for the "continue" prompt
+  const msgs = persisted.messages;
+  const lastMessages = msgs.slice(-10);
+  let contextSummary = `You are resuming a previous conversation. Here is what happened:\n\n`;
+  for (const m of lastMessages) {
+    const role = m.role === "user" ? "USER" : "ASSISTANT";
+    contextSummary += `${role}: ${m.content.slice(0, 300)}${m.content.length > 300 ? "..." : ""}\n\n`;
+  }
+  contextSummary += `\nContinue from where we left off. The user just reconnected. Briefly acknowledge what we were doing and ask how to proceed.`;
+
+  // Window the restored history to the most recent page — the SAME cap the WS
+  // load_session path uses (PAGE=120). Without this, opening the app auto-restored
+  // the ENTIRE session (e.g. 3297 msgs / 1.9MB) and rendering every bubble
+  // synchronously froze the page right as the socket connected. The client shows a
+  // "Load older" affordance (hasMore/totalMessages) to page back through the rest.
+  const RESTORE_PAGE = 120;
+  const windowMsgs = msgs.length > RESTORE_PAGE ? msgs.slice(msgs.length - RESTORE_PAGE) : msgs;
+
+  res.json({
+    hasSession: true,
+    sessionId: latest.id,
+    persona: latest.persona,
+    // Read-only fields so the UI can re-derive the provider chip after a hard
+    // refresh (the in-memory provider override Map is lost on restart/refresh).
+    model: persisted.model,
+    provider: (persisted as any).provider,
+    isLive,
+    messageCount: latest.messageCount,
+    preview: latest.preview,
+    createdAt: latest.createdAt,
+    model: latest.model,
+    tokens: latest.totalInputTokens + latest.totalOutputTokens,
+    messages: windowMsgs.map(m => ({
+      id: m.toolId || `restored-${Date.now()}-${Math.random().toString(36).slice(2,6)}`,
+      role: m.role,
+      content: m.content,
+      toolName: m.toolName,
+      toolId: m.toolId,
+      timestamp: new Date(m.timestamp).getTime(),
+    })),
+    hasMore: windowMsgs.length < msgs.length,
+    totalMessages: msgs.length,
+    contextSummary,
+  });
+});
+
+// ── REPORTS API ────────────────────────────────────────────────────
+// Aggregated view of all engagements with their report status.
+
+app.get("/api/reports", (_, res) => {
+  const reports: any[] = [];
+  for (const root of ENGAGEMENT_ROOTS) {
+    if (!existsSync(root.path)) continue;
+    try {
+      for (const name of readdirSync(root.path)) {
+        const boxPath = join(root.path, name);
+        try {
+          const { statSync } = require("fs");
+          if (!statSync(boxPath).isDirectory() || name.startsWith(".")) continue;
+          const reportDir = join(boxPath, "report");
+          let htmlPath: string | null = null;
+          let pdfPath: string | null = null;
+          let htmlSize = 0, htmlMtime = "", pdfSize = 0, pdfMtime = "";
+          if (existsSync(reportDir)) {
+            for (const f of readdirSync(reportDir)) {
+              const full = join(reportDir, f);
+              try {
+                const st = statSync(full);
+                if (!st.isFile()) continue;
+                if (f.endsWith(".html") && !htmlPath) {
+                  htmlPath = full;
+                  htmlSize = st.size;
+                  htmlMtime = st.mtime.toISOString();
+                }
+                if (f.endsWith(".pdf") && !pdfPath) {
+                  pdfPath = full;
+                  pdfSize = st.size;
+                  pdfMtime = st.mtime.toISOString();
+                }
+              } catch {}
+            }
+          }
+          reports.push({
+            name,
+            source: root.source,
+            path: boxPath,
+            hasHtml: !!htmlPath,
+            hasPdf: !!pdfPath,
+            htmlPath, pdfPath,
+            htmlSize, htmlMtime,
+            pdfSize, pdfMtime,
+          });
+        } catch {}
+      }
+    } catch {}
+  }
+  reports.sort((a, b) => (b.htmlMtime || "").localeCompare(a.htmlMtime || ""));
+  res.json({ reports });
+});
+
+// Convert engagement HTML report to PDF using weasyprint
+app.post("/api/reports/:name/pdf", (req, res) => {
+  const name = req.params.name;
+  let boxPath: string | null = null;
+  for (const root of ENGAGEMENT_ROOTS) {
+    const c = join(root.path, name);
+    if (existsSync(c)) { boxPath = c; break; }
+  }
+  if (!boxPath) return res.status(404).json({ error: `Engagement '${name}' not found` });
+
+  const reportDir = join(boxPath, "report");
+  let htmlPath: string | null = null;
+  try {
+    for (const f of readdirSync(reportDir)) {
+      if (f.endsWith(".html")) { htmlPath = join(reportDir, f); break; }
+    }
+  } catch {}
+  if (!htmlPath) return res.status(404).json({ error: "No HTML report — generate it first" });
+
+  const pdfPath = htmlPath.replace(/\.html$/, ".pdf");
+  const { execSync } = require("child_process");
+  try {
+    log("info", `Generating PDF for ${name}`, { htmlPath, pdfPath });
+    execSync(`weasyprint "${htmlPath}" "${pdfPath}"`, { encoding: "utf-8", timeout: 60000 });
+    const { statSync } = require("fs");
+    const st = statSync(pdfPath);
+    res.json({ success: true, pdfPath, size: st.size, generatedAt: new Date().toISOString() });
+  } catch (e: any) {
+    log("error", `PDF generation failed for ${name}`, { error: e.message });
+    res.status(500).json({ error: `PDF generation failed: ${e.message}` });
+  }
+});
+
+// ──────────────────────────────────────────────────────────────
+// POST /api/reports/generate-missing
+//   Find every engagement that doesn't have an HTML report yet and dispatch
+//   report generation for each one. Returns the list of jobs that were kicked off.
+//   This is fire-and-forget: each child generation job is started serially via the
+//   existing /api/engagements/:name/generate-report path (which is async + tracked
+//   in reportJobs), so the user can return later and watch status update.
+// Why loopback fetch instead of refactoring the existing handler into a helper:
+//   The existing generate-report endpoint is large, well-tested, and already does
+//   exactly what we need (spawn claude, track job, parse stream). Inlining a fetch
+//   here means we add zero risk of regression in the proven path.
+// ──────────────────────────────────────────────────────────────
+app.post("/api/reports/generate-missing", async (_, res) => {
+  // 1) Re-discover every engagement directory (same logic as GET /api/reports)
+  const missing: { name: string; path: string; source: string }[] = [];
+  for (const root of ENGAGEMENT_ROOTS) {
+    if (!existsSync(root.path)) continue;
+    try {
+      for (const name of readdirSync(root.path)) {
+        const boxPath = join(root.path, name);
+        try {
+          const { statSync } = require("fs");
+          if (!statSync(boxPath).isDirectory() || name.startsWith(".")) continue;
+
+          // Check whether an HTML report already exists under report/
+          const reportDir = join(boxPath, "report");
+          let hasHtml = false;
+          if (existsSync(reportDir)) {
+            try {
+              for (const f of readdirSync(reportDir)) {
+                if (f.endsWith(".html")) { hasHtml = true; break; }
+              }
+            } catch {}
+          }
+          if (!hasHtml) missing.push({ name, path: boxPath, source: root.source });
+        } catch {}
+      }
+    } catch {}
+  }
+
+  log("info", `Generate-missing: ${missing.length} engagements need reports`, {
+    targets: missing.map(m => m.name),
+  });
+
+  // 2) Kick off generation for each missing engagement.
+  //    We loopback-fetch the existing handler so the same job tracking applies.
+  //    Done serially with a small gap so we don't fork 20 claude processes at once.
+  const jobs: { name: string; jobId?: string; error?: string }[] = [];
+  for (const m of missing) {
+    try {
+      const r = await fetch(`http://127.0.0.1:${PORT}/api/engagements/${encodeURIComponent(m.name)}/generate-report`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+      });
+      const data = await r.json().catch(() => ({} as any));
+      if (r.ok && data.jobId) {
+        jobs.push({ name: m.name, jobId: data.jobId });
+      } else {
+        jobs.push({ name: m.name, error: data.error || `HTTP ${r.status}` });
+      }
+    } catch (e: any) {
+      jobs.push({ name: m.name, error: e.message });
+    }
+    // Tiny pause between spawns — prevents 20 claudes opening simultaneously
+    await new Promise(r => setTimeout(r, 600));
+  }
+
+  res.json({
+    totalMissing: missing.length,
+    queued: jobs.filter(j => j.jobId).length,
+    failed: jobs.filter(j => j.error).length,
+    jobs,
+  });
+});
+
+// ──────────────────────────────────────────────────────────────
+// GET /api/reports/:name/view
+//   Serve the engagement's HTML report INLINE (renderable in a browser tab)
+//   rather than as a download. This powers the "Full Page" button on the
+//   Reports app — open in a new tab and read the full report unconstrained.
+// ──────────────────────────────────────────────────────────────
+app.get("/api/reports/:name/view", (req, res) => {
+  if (!guardSeg(res, req.params.name)) return;
+  const name = req.params.name;
+  let boxPath: string | null = null;
+  for (const root of ENGAGEMENT_ROOTS) {
+    const c = join(root.path, name);
+    if (existsSync(c)) { boxPath = c; break; }
+  }
+  if (!boxPath) return res.status(404).send(`Engagement '${name}' not found`);
+  const reportDir = join(boxPath, "report");
+  let htmlPath: string | null = null;
+  try {
+    for (const f of readdirSync(reportDir)) {
+      if (f.endsWith(".html")) { htmlPath = join(reportDir, f); break; }
+    }
+  } catch {}
+  if (!htmlPath) return res.status(404).send(`No HTML report exists for '${name}' yet`);
+
+  // Read the report HTML and inject a floating "Back to ChillsPwn" escape hatch.
+  // Why: clicking "⛶ Full Page" opens this endpoint in a new tab. The report HTML
+  // has no app chrome of its own, so on mobile / Capacitor / maximized desktop tabs
+  // there's no visible way back to the dashboard. The injected overlay gives the
+  // user a one-click exit (window.close() first; if blocked, navigate to "/").
+  // The overlay is hidden when printing so it never appears in PDF output.
+  let html: string;
+  try {
+    html = readFileSync(htmlPath, "utf8");
+  } catch (e: any) {
+    return res.status(500).send(`Failed to read report HTML: ${e.message}`);
+  }
+
+  // Overlay markup — kept self-contained so it works in any report template.
+  // Positioned top-left because most reports put logos/headers on the right.
+  // The `data-chillspwn-overlay` attribute makes it easy to identify/strip later.
+  const overlay = `
+<style data-chillspwn-overlay>
+  /* Floating back button — fixed so it stays in view while scrolling the report */
+  #chillspwn-back-btn {
+    position: fixed;
+    top: 12px;
+    left: 12px;
+    z-index: 2147483647; /* max — sits above any report content */
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 8px 14px;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    font-size: 13px;
+    font-weight: 600;
+    color: #fff;
+    background: rgba(0, 20, 40, 0.85);
+    border: 1px solid rgba(0, 212, 255, 0.6);
+    border-radius: 6px;
+    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.4), 0 0 0 1px rgba(0, 0, 0, 0.2);
+    cursor: pointer;
+    text-decoration: none;
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+    transition: background 0.15s, transform 0.1s;
+    user-select: none;
+  }
+  #chillspwn-back-btn:hover {
+    background: rgba(0, 40, 80, 0.95);
+    border-color: rgba(0, 212, 255, 1);
+  }
+  #chillspwn-back-btn:active { transform: scale(0.96); }
+  #chillspwn-back-btn .arrow { font-size: 16px; line-height: 1; }
+  /* Never appear in printed/PDF output of the report */
+  @media print { #chillspwn-back-btn { display: none !important; } }
+</style>
+<button id="chillspwn-back-btn" type="button" data-chillspwn-overlay
+        title="Return to ChillsPwn dashboard (Esc)">
+  <span class="arrow">←</span><span>Back to ChillsPwn</span>
+</button>
+<script data-chillspwn-overlay>
+  (function () {
+    // Exit strategy:
+    //   1) Try window.close() — works when the tab was opened via window.open()
+    //      from the same origin, which is exactly how "⛶ Full Page" launches us.
+    //   2) If close is blocked (direct navigation, mobile webview, Capacitor, etc.),
+    //      navigate to "/#reports". The dashboard reads the hash on mount and opens
+    //      the Reports window (or switches the mobile tab) so the user lands back
+    //      where they came from instead of the default chat/comms view.
+    function exitToApp() {
+      try { window.close(); } catch (e) { /* ignore */ }
+      // window.close() is async-ish — give it a tick, then check if we're still here
+      setTimeout(function () {
+        // If we're still loaded, close() was blocked. Send the user to the
+        // Reports view explicitly via the deep-link hash.
+        if (!window.closed) { window.location.href = "/#reports"; }
+      }, 120);
+    }
+    var btn = document.getElementById("chillspwn-back-btn");
+    if (btn) btn.addEventListener("click", exitToApp);
+    // Keyboard shortcut: Esc closes too — matches typical "exit fullscreen" muscle memory
+    document.addEventListener("keydown", function (ev) {
+      if (ev.key === "Escape") exitToApp();
+    });
+  })();
+</script>
+`;
+
+  // Inject before </body> if present; otherwise append. Case-insensitive replace
+  // because some report templates use <BODY> or vary casing.
+  const bodyClose = /<\/body\s*>/i;
+  if (bodyClose.test(html)) {
+    html = html.replace(bodyClose, overlay + "</body>");
+  } else {
+    html = html + overlay;
+  }
+
+  // Inline disposition so the browser renders rather than downloads.
+  res.setHeader("Content-Disposition", `inline; filename="${name}-report.html"`);
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.setHeader("Cache-Control", "no-store");   // reports are regenerated in place — never serve a stale cache
+  res.send(html);
+});
+
+// ──────────────────────────────────────────────────────────────
+// GET /api/reports/:name/assets/:file
+//   The HTML reports reference relative paths like `assets/Logo.svg`. When the
+//   report is served via /view, those relative URLs resolve to /api/reports/:name/assets/...
+//   so we need this companion route to serve those static files from the engagement's
+//   report/assets directory.
+// Security: filename is validated against `..` / path separators to prevent escape.
+// ──────────────────────────────────────────────────────────────
+app.get("/api/reports/:name/assets/:file", (req, res) => {
+  if (!guardSeg(res, req.params.name)) return;
+  if (!guardSeg(res, req.params.file, "file")) return;
+  const { name, file } = req.params;
+  // Refuse anything that could traverse the filesystem
+  if (file.includes("..") || file.includes("/") || file.includes("\\")) {
+    return res.status(400).send("invalid asset name");
+  }
+  let boxPath: string | null = null;
+  for (const root of ENGAGEMENT_ROOTS) {
+    const c = join(root.path, name);
+    if (existsSync(c)) { boxPath = c; break; }
+  }
+  if (!boxPath) return res.status(404).send("engagement not found");
+  const assetPath = join(boxPath, "report", "assets", file);
+  if (!existsSync(assetPath)) return res.status(404).send("asset not found");
+  res.sendFile(assetPath);
+});
+
+// Download report file (html or pdf)
+app.get("/api/reports/:name/download/:format", (req, res) => {
+  const { name, format } = req.params;
+  if (format !== "html" && format !== "pdf") return res.status(400).json({ error: "format must be html or pdf" });
+  let boxPath: string | null = null;
+  for (const root of ENGAGEMENT_ROOTS) {
+    const c = join(root.path, name);
+    if (existsSync(c)) { boxPath = c; break; }
+  }
+  if (!boxPath) return res.status(404).json({ error: `Engagement '${name}' not found` });
+  const reportDir = join(boxPath, "report");
+  let filePath: string | null = null;
+  try {
+    for (const f of readdirSync(reportDir)) {
+      if (f.endsWith(`.${format}`)) { filePath = join(reportDir, f); break; }
+    }
+  } catch {}
+  if (!filePath) return res.status(404).json({ error: `No ${format} report exists` });
+  res.setHeader("Cache-Control", "no-store");   // regenerated in place — always download the current file
+  res.download(filePath, `${name}-report.${format}`);
+});
+
+// ── OSINT API ──────────────────────────────────────────────────────
+// Dispatches a Claude-orchestrated OSINT investigation against a target.
+// Output is saved to /root/htb/boxes/<safe_name>/osint/ as markdown + json + pdf
+
+interface OsintJob {
+  id: string;
+  target: string;
+  targetType: string;
+  scope: string;
+  status: "running" | "completed" | "failed";
+  startedAt: string;
+  completedAt?: string;
+  outputDir: string;
+  reportPath?: string;
+  pdfPath?: string;
+  output: string;
+  stage: string;
+  progress: number;
+  pid?: number;
+  proc?: ChildProcess;
+  model?: string;
+  modelChoice?: string;
+}
+const osintJobs = new Map<string, OsintJob>();
+const OSINT_STATE_DIR = resolve(CHILLSPWN_HOME, "osint-jobs");
+try { mkdirSync(OSINT_STATE_DIR, { recursive: true }); } catch {}
+
+// Persist a snapshot of the job state to disk so we can rehydrate after server restart
+function persistOsintJob(job: OsintJob): void {
+  try {
+    const path = join(OSINT_STATE_DIR, `${job.id}.json`);
+    const { proc, output, ...rest } = job;
+    void proc; // exclude proc reference, but keep last 50K chars of output for replay
+    const snapshot = { ...rest, output: (output || "").slice(-50000) };
+    writeFileSync(path, JSON.stringify(snapshot, null, 2));
+  } catch {}
+}
+
+function isPidAlive(pid: number): boolean {
+  try { process.kill(pid, 0); return true; } catch { return false; }
+}
+
+// On server startup, scan persisted OSINT jobs and reattach those still running
+function rehydrateOsintJobs(): void {
+  if (!existsSync(OSINT_STATE_DIR)) return;
+  for (const file of readdirSync(OSINT_STATE_DIR)) {
+    if (!file.endsWith(".json")) continue;
+    try {
+      const raw = JSON.parse(readFileSync(join(OSINT_STATE_DIR, file), "utf-8"));
+      const job: OsintJob = { ...raw };
+      // If the persisted status was "running" but the process is dead, mark it as failed
+      if (job.status === "running") {
+        if (!job.pid || !isPidAlive(job.pid)) {
+          // Process is gone — check if the report was actually written before death
+          if (job.outputDir && existsSync(join(job.outputDir, "report.md"))) {
+            job.status = "completed";
+            job.reportPath = join(job.outputDir, "report.md");
+            const pdfTry = join(job.outputDir, "report.pdf");
+            if (existsSync(pdfTry)) job.pdfPath = pdfTry;
+          } else {
+            job.status = "failed";
+            job.output += `\n[server restart while running — process ${job.pid} not found on rehydrate]`;
+          }
+          job.completedAt = job.completedAt || new Date().toISOString();
+          job.progress = 100;
+        }
+        // If process is still alive but we can't reattach to its stdout (different parent),
+        // we keep it as running and just poll the filesystem for completion via fsWatcher
+      }
+      osintJobs.set(job.id, job);
+    } catch {}
+  }
+  // Also start a periodic check for running jobs to detect filesystem-based completion
+  setInterval(() => {
+    for (const job of osintJobs.values()) {
+      if (job.status !== "running") continue;
+      const reportPath = join(job.outputDir, "report.md");
+      if (existsSync(reportPath)) {
+        // Report exists — process likely finished
+        if (!job.pid || !isPidAlive(job.pid)) {
+          job.status = "completed";
+          job.reportPath = reportPath;
+          const pdfTry = job.outputDir ? join(job.outputDir, "report.pdf") : "";
+          if (pdfTry && existsSync(pdfTry)) job.pdfPath = pdfTry;
+          job.completedAt = new Date().toISOString();
+          job.progress = 100;
+          job.stage = "complete";
+          persistOsintJob(job);
+          log("info", `OSINT job rehydrated as completed`, { id: job.id, target: job.target });
+        }
+      } else if (job.pid && !isPidAlive(job.pid)) {
+        // Process died without writing report
+        job.status = "failed";
+        job.completedAt = new Date().toISOString();
+        job.progress = 100;
+        job.output += `\n[process ${job.pid} died without writing report]`;
+        persistOsintJob(job);
+      }
+    }
+  }, 5000);
+}
+
+// Build the Claude prompt for an OSINT investigation
+function buildOsintPrompt(target: string, targetType: string, scope: string, outputDir: string): string {
+  const reportPath = join(outputDir, "report.md");
+  const dataPath = join(outputDir, "findings.json");
+
+  const tools = {
+    domain: ["whois", "dig (A/AAAA/MX/NS/TXT/CAA/SOA)", "dig +trace", "amass enum -passive -d", "theHarvester -d <target> -b all", "httpx (probe + tech stack)", "whatweb", "curl https://web.archive.org/web/*/<target>", "curl https://crt.sh/?q=<target>&output=json (subdomain certs)"],
+    ip: ["whois", "nmap -sV -sC -Pn -T4 --top-ports 100", "reverse DNS via dig -x", "shodan-cli (if available) or curl shodan internetdb API", "httpx probe on common ports"],
+    email: ["theHarvester -b all", "haveibeenpwned API check (curl)", "google dorking patterns", "github search for the email", "gravatar lookup"],
+    person: ["sherlock <username>", "Google dorking site-specific patterns (linkedin, twitter, github)", "image reverse search guidance", "username variants enum"],
+    company: ["whois (all known domains)", "amass + subfinder", "theHarvester -b all", "linkedin enumeration via Google dorks", "crunchbase / opencorporates via curl"],
+  };
+  const targetSpecific = (tools as any)[targetType] || tools.domain;
+
+  return `You are conducting a comprehensive OSINT investigation. Be thorough and methodical.
+
+TARGET: ${target}
+TARGET TYPE: ${targetType}
+SCOPE: ${scope} (quick = ~3 min basic, standard = ~10 min full, deep = ~25 min with subdomain brute + cert transparency + dark web)
+OUTPUT DIR: ${outputDir}
+
+MANDATORY — RAW EVIDENCE FIRST:
+The webapp builds a rich HTML/PDF report from ${outputDir}/findings.json AND from every file
+under ${outputDir}/raw/. Every tool you invoke MUST persist its raw output to a file under
+${outputDir}/raw/ named after the tool (e.g. raw/whois.txt, raw/dig-all.txt, raw/amass.txt,
+raw/theHarvester.txt, raw/httpx.txt, raw/whatweb.txt, raw/nmap.txt, raw/crtsh.json,
+raw/wayback.txt, raw/shodan-internetdb.json, raw/robin-search.json).
+
+Examples — DO NOT skip the redirection:
+  whois ${target} | tee ${outputDir}/raw/whois.txt
+  dig ${target} +short ANY  | tee ${outputDir}/raw/dig-any.txt
+  amass enum -passive -d ${target} 2>&1 | tee ${outputDir}/raw/amass.txt
+  theHarvester -d ${target} -b all 2>&1 | tee ${outputDir}/raw/theHarvester.txt
+  httpx -u https://${target} -tech-detect -title -status-code -json | tee ${outputDir}/raw/httpx.json
+  whatweb https://${target} | tee ${outputDir}/raw/whatweb.txt
+  curl -s 'https://crt.sh/?q=${target}&output=json' | tee ${outputDir}/raw/crtsh.json
+
+NEVER run a tool without persisting its output. The raw/ contents are EMBEDDED in the final
+report — empty raw/ means a useless report.
+
+EXECUTE THESE TOOLS (run in parallel where possible — use Bash & for backgrounding):
+
+${targetSpecific.map((t, i) => `${i + 1}. ${t}`).join("\n")}
+
+ADDITIONAL ALWAYS:
+- Cross-reference findings (subdomains from amass against httpx probe results, etc.)
+- For ANY discovered subdomain/host, do a passive lookup — don't actively scan unless scope = "deep"
+- ${scope === "deep" ? "Use the robin skill to query Tor engines for the target if relevant — write JSON output to raw/robin-search.json" : "Skip dark web lookups (not in scope)"}
+
+OUTPUT REQUIREMENTS:
+
+Step 1 — gather: run all tools, EVERY tool's output MUST be tee'd to ${outputDir}/raw/<tool>.<ext>
+Step 2 — synthesize: write ${dataPath} with this JSON schema:
+{
+  "target": "...",
+  "target_type": "...",
+  "scope": "...",
+  "summary": "2-3 sentence executive summary of what was discovered",
+  "infrastructure": {
+    "domains": [],
+    "subdomains": [],
+    "ips": [],
+    "mail_servers": [],
+    "name_servers": [],
+    "ssl_certs": [],
+    "open_ports": [],
+    "technologies": []
+  },
+  "people": {
+    "emails": [],
+    "names": [],
+    "usernames": [],
+    "social_profiles": []
+  },
+  "organization": {
+    "company_name": "",
+    "registrar": "",
+    "registration_date": "",
+    "registration_country": "",
+    "address": ""
+  },
+  "exposure": {
+    "leaked_credentials": [],
+    "exposed_files": [],
+    "open_buckets": [],
+    "github_secrets": [],
+    "data_breach_mentions": []
+  },
+  "dark_web": [],
+  "tools_run": ["whois", "dig", ...],
+  "anomalies_or_pivots": ["interesting findings worth deeper investigation"],
+  "next_steps_suggested": []
+}
+
+Step 3 — write the human-readable report to ${reportPath} as Markdown:
+- # OSINT Report: <target>
+- **Date**, **Type**, **Scope**, **Tools Run**
+- ## Executive Summary
+- ## Infrastructure (tables for domains/IPs/services)
+- ## People & Identities
+- ## Organization
+- ## Exposure & Risks
+- ## Anomalies / Pivot Points
+- ## Recommended Next Steps
+- ## Appendix: Raw Tool Output (link to ${outputDir}/raw/)
+
+Be specific. Don't add fluff. If a tool fails or returns nothing, note it briefly under "Tools Run" rather than padding the report.
+
+FINAL: After writing both files, list the contents of ${outputDir} to confirm everything saved.`;
+}
+
+app.post("/api/osint/start", (req, res) => {
+  const { target, targetType, scope, model } = req.body;
+  if (!target) return res.status(400).json({ error: "target is required" });
+  const validTypes = ["domain", "ip", "email", "person", "company"];
+  const tt = validTypes.includes(targetType) ? targetType : "domain";
+  const sc = ["quick", "standard", "deep"].includes(scope) ? scope : "standard";
+
+  // Allowed explicit models. "auto" (or missing) falls back to scope-based defaults.
+  const allowedModels = new Set([
+    "auto",
+    "claude-haiku-4-5", "haiku",
+    "claude-sonnet-4-6", "sonnet",
+    "claude-opus-4-7",
+    "claude-opus-4-8", "opus",
+  ]);
+  const mdl = (typeof model === "string" && allowedModels.has(model)) ? model : "auto";
+  // ULTRACODING: 'deep' scope now lands on opus-4-8 directly (was "opus" alias).
+  const effectiveModel = mdl === "auto" ? (sc === "deep" ? "claude-opus-4-8" : "sonnet") : mdl;
+
+  const safeName = target.replace(/[^a-zA-Z0-9.-]/g, "_").slice(0, 60);
+  const id = `osint-${Date.now()}-${safeName}`;
+  const outputDir = `/root/htb/boxes/osint-${safeName}-${Date.now()}`;
+  try { mkdirSync(join(outputDir, "raw"), { recursive: true }); } catch {}
+
+  const prompt = buildOsintPrompt(target, tt, sc, outputDir);
+  log("info", `Starting OSINT job`, { id, target, type: tt, scope: sc });
+
+  // Persist stdout to a log file so we can replay output across server restarts
+  const logPath = join(OSINT_STATE_DIR, `${id}.stdout.log`);
+  const errLogPath = join(OSINT_STATE_DIR, `${id}.stderr.log`);
+  const stdoutFd = require("fs").openSync(logPath, "w");
+  const stderrFd = require("fs").openSync(errLogPath, "w");
+
+  const proc = spawn("claude", [
+    "-p",
+    "--model", effectiveModel,
+    "--permission-mode", "auto",
+    "--no-session-persistence",
+    "--output-format", "stream-json",
+    "--verbose",
+    "--allowedTools", "Bash,Read,Write,Edit,Glob,Grep,WebSearch,WebFetch",
+    "--add-dir", outputDir,
+    // Detached OSINT job: Workflow tool available on-demand, but NOT standing
+    // ultracode. Detached + --permission-mode auto + Bash means standing
+    // orchestration here = unattended autonomous command loops with no
+    // approval gate. Keep workflows opt-in only for unattended agents.
+    "--settings", workflowSettings({ standing: false, model: effectiveModel }),
+  ], {
+    // Detached so the subprocess survives if the bun server exits/restarts
+    stdio: ["pipe", stdoutFd, stderrFd],
+    detached: true,
+    env: { ...process.env, PATH: `/opt/chillspwn-bin:${process.env.PATH || ''}` },
+    cwd: outputDir,
+  });
+  proc.unref();
+  proc.stdin?.write(prompt);
+  proc.stdin?.end();
+
+  const job: OsintJob = {
+    id, target, targetType: tt, scope: sc,
+    status: "running",
+    startedAt: new Date().toISOString(),
+    outputDir,
+    output: "",
+    stage: "initializing",
+    progress: 5,
+    pid: proc.pid,
+    proc,
+    modelChoice: mdl,            // what the user picked ("auto"/"opus"/etc.)
+    model: effectiveModel,       // what actually got spawned
+  };
+  osintJobs.set(id, job);
+
+  // Subprocess stdout goes to logPath via fd; we tail it for progress detection.
+  // This makes the job truly survive server restarts (the subprocess writes to a
+  // file independent of the bun parent).
+  let tailOffset = 0;
+  const tailInterval = setInterval(() => {
+    try {
+      if (!existsSync(logPath)) return;
+      const { statSync, openSync, readSync, closeSync } = require("fs");
+      const sz = statSync(logPath).size;
+      if (sz <= tailOffset) return;
+      const fd = openSync(logPath, "r");
+      const buf = Buffer.alloc(sz - tailOffset);
+      readSync(fd, buf, 0, buf.length, tailOffset);
+      closeSync(fd);
+      tailOffset = sz;
+      const text = buf.toString("utf-8");
+      for (const line of text.split("\n")) {
+        if (!line.trim()) continue;
+        try {
+          const d = JSON.parse(line);
+          if (d.type === "assistant") {
+            const content = d.message?.content || [];
+            for (const block of content) {
+              if (block.type === "text" && block.text) {
+                job.output = ((job.output || "") + block.text + "\n").slice(-100000);
+              }
+              if (block.type === "tool_use") {
+                const cmd = block.input?.command || "";
+                if (cmd.includes("whois")) { job.stage = "whois lookup"; job.progress = 15; }
+                else if (cmd.includes("dig")) { job.stage = "DNS enumeration"; job.progress = 25; }
+                else if (cmd.includes("amass") || cmd.includes("subfinder")) { job.stage = "subdomain enum"; job.progress = 40; }
+                else if (cmd.includes("theHarvester")) { job.stage = "email/people harvest"; job.progress = 55; }
+                else if (cmd.includes("httpx") || cmd.includes("whatweb")) { job.stage = "web probing"; job.progress = 70; }
+                else if (cmd.includes("nmap")) { job.stage = "port/service scan"; job.progress = 80; }
+                else if (cmd.includes("crt.sh") || cmd.includes("web.archive")) { job.stage = "passive intel"; job.progress = 85; }
+                else if (block.name === "Write" && block.input?.file_path?.includes("report.md")) { job.stage = "writing report"; job.progress = 95; }
+              }
+            }
+          }
+          if (d.type === "result") {
+            job.progress = 100;
+            job.stage = "finalizing";
+          }
+        } catch {}
+      }
+      persistOsintJob(job);
+    } catch {}
+  }, 3000);
+
+  // When the process actually exits, finalize the job (PDF gen, status update)
+  proc.on("exit", (code) => {
+    clearInterval(tailInterval);
+    job.status = code === 0 ? "completed" : "failed";
+    job.completedAt = new Date().toISOString();
+    job.progress = 100;
+    const mdPath = join(outputDir, "report.md");
+    const findingsPath = join(outputDir, "findings.json");
+    const rawDir = join(outputDir, "raw");
+    const htmlPath = join(outputDir, "report.html");
+    const pdfPath = join(outputDir, "report.pdf");
+
+    // Build a rich HTML report from the structured findings + raw output, then PDF it
+    const { execSync } = require("child_process");
+    if (existsSync(findingsPath)) {
+      try {
+        execSync(
+          `python3 /root/report-template/generate_osint_report.py --data "${findingsPath}" --raw-dir "${rawDir}" --output "${htmlPath}"`,
+          { encoding: "utf-8", timeout: 30000 }
+        );
+        log("info", `OSINT HTML report generated`, { id, htmlPath });
+        try {
+          execSync(`weasyprint "${htmlPath}" "${pdfPath}"`, { timeout: 60000 });
+          job.pdfPath = pdfPath;
+        } catch (pe: any) {
+          log("warn", `OSINT PDF rendering failed (HTML still available)`, { id, error: pe.message });
+        }
+        // Keep the markdown around as a secondary artifact, but the rich HTML is canonical
+        job.reportPath = existsSync(mdPath) ? mdPath : htmlPath;
+      } catch (e: any) {
+        log("warn", `OSINT rich-report generation failed, falling back to MD-only`, { id, error: e.message });
+        if (existsSync(mdPath)) job.reportPath = mdPath;
+      }
+    } else if (existsSync(mdPath)) {
+      // No findings.json but we have markdown — degraded fallback
+      job.reportPath = mdPath;
+      try {
+        const md = readFileSync(mdPath, "utf-8");
+        const fallback = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>OSINT: ${target}</title><style>body{font-family:system-ui;max-width:900px;margin:2em auto;padding:0 1em;color:#222}pre{background:#f5f5f5;padding:1em;overflow:auto;border-radius:4px;white-space:pre-wrap}</style></head><body><pre>${md.replace(/[<>&]/g, c => ({"<":"&lt;",">":"&gt;","&":"&amp;"}[c]!))}</pre></body></html>`;
+        writeFileSync(htmlPath, fallback);
+        execSync(`weasyprint "${htmlPath}" "${pdfPath}"`, { timeout: 30000 });
+        job.pdfPath = pdfPath;
+      } catch {}
+    }
+    delete (job as any).proc;
+    persistOsintJob(job);
+    log("info", `OSINT job ${job.status}`, { id, target, exitCode: code });
+  });
+
+  proc.on("error", (err) => {
+    clearInterval(tailInterval);
+    job.status = "failed";
+    job.output += `Process error: ${err.message}`;
+    job.completedAt = new Date().toISOString();
+    persistOsintJob(job);
+  });
+
+  persistOsintJob(job);
+  res.json({ id, target, targetType: tt, scope: sc, outputDir, status: "running" });
+});
+
+app.get("/api/osint/jobs", (_, res) => {
+  const list = Array.from(osintJobs.values()).map((j) => ({
+    id: j.id, target: j.target, targetType: j.targetType, scope: j.scope,
+    status: j.status, startedAt: j.startedAt, completedAt: j.completedAt,
+    stage: j.stage, progress: j.progress, outputDir: j.outputDir,
+    hasReport: !!j.reportPath, hasPdf: !!j.pdfPath,
+    model: j.model, modelChoice: j.modelChoice,
+  }));
+  list.sort((a, b) => b.startedAt.localeCompare(a.startedAt));
+  res.json(list);
+});
+
+app.get("/api/osint/:id", (req, res) => {
+  const job = osintJobs.get(req.params.id);
+  if (!job) return res.status(404).json({ error: "Job not found" });
+  res.json({
+    ...job, proc: undefined,
+    output: job.output.slice(-10000), // last 10K chars
+  });
+});
+
+app.get("/api/osint/:id/report", (req, res) => {
+  const job = osintJobs.get(req.params.id);
+  if (!job?.reportPath || !existsSync(job.reportPath)) return res.status(404).json({ error: "Report not generated yet" });
+  res.json({ content: readFileSync(job.reportPath, "utf-8"), target: job.target });
+});
+
+app.get("/api/osint/:id/download/:format", (req, res) => {
+  const job = osintJobs.get(req.params.id);
+  if (!job) return res.status(404).json({ error: "Job not found" });
+  const { format } = req.params;
+  let p: string | undefined;
+  if (format === "md") p = job.reportPath;
+  else if (format === "pdf") p = job.pdfPath;
+  else return res.status(400).json({ error: "format must be md or pdf" });
+  if (!p || !existsSync(p)) return res.status(404).json({ error: `No ${format} file generated` });
+  res.download(p, `osint-${job.target.replace(/[^a-zA-Z0-9.-]/g, "_")}.${format}`);
+});
+
+// ── Council of AIs — global state + control ─────────────────────────────
+const COUNCIL_STATE_FILE = join(HERMES_HOME, "council", "state.json");
+const COUNCIL_SCRIPT = join(HERMES_HOME, "skills/red-teaming/council-of-ais/scripts/council_summon.py");
+
+function readCouncilState(): any {
+  try {
+    if (existsSync(COUNCIL_STATE_FILE)) return JSON.parse(readFileSync(COUNCIL_STATE_FILE, "utf-8"));
+  } catch {}
+  return { settings: { default_completion_mode: "auto" }, runs: {} };
+}
+function writeCouncilState(st: any): void {
+  try {
+    mkdirSync(join(HERMES_HOME, "council"), { recursive: true });
+    writeFileSync(COUNCIL_STATE_FILE, JSON.stringify(st, null, 2));
+  } catch (e: any) { log("warn", "writeCouncilState failed", { error: e?.message }); }
+}
+
+
+// ── Council assessment obfuscation (Phase 1.1: gated, default no-op) ─────────
+// maybeObfuscateWithAliases is the identity function unless ENABLE_PROMPT_OBFUSCATION
+// is set, so by default this leaves assessments PLAIN and auditable. Retained only
+// for the explicit legacy opt-in.
+function obfuscateCouncilAssessments(engagementDir: string): number {
+  const councilDir = join(engagementDir, "council");
+  if (!existsSync(councilDir)) return 0;
+  let count = 0;
+  const files = readdirSync(councilDir).filter(f => f.endsWith("_assessment.md") && !f.includes(".obfuscated"));
+  for (const file of files) {
+    const filePath = join(councilDir, file);
+    try {
+      const original = readFileSync(filePath, "utf-8");
+      const obfuscated = maybeObfuscateWithAliases(original);
+      if (obfuscated !== original) {
+        writeFileSync(filePath, obfuscated, "utf-8");
+        count++;
+      }
+    } catch (e: any) {
+      log("warn", `Failed to obfuscate council assessment`, { file, error: e?.message });
+    }
+  }
+  return count;
+}
+// Full state (settings + runs) — the Council page polls this.
+app.get("/api/council/state", (_, res) => res.json(readCouncilState()));
+
+// Set the global DEFAULT completion mode (auto|manual).
+app.post("/api/council/settings", (req, res) => {
+  const mode = req.body?.default_completion_mode === "manual" ? "manual" : "auto";
+  const st = readCouncilState();
+  st.settings = { ...(st.settings || {}), default_completion_mode: mode };
+  writeCouncilState(st);
+  res.json({ ok: true, default_completion_mode: mode });
+});
+
+// Per-run completion-mode toggle (auto|manual).
+app.post("/api/council/mode", (req, res) => {
+  const { engagement, mode } = req.body || {};
+  const st = readCouncilState();
+  const run = st.runs?.[engagement];
+  if (!run) return res.status(404).json({ error: "run not found" });
+  run.completion_mode = mode === "manual" ? "manual" : "auto";
+  writeCouncilState(st);
+  res.json({ ok: true });
+});
+
+// Mark a (manual) run COMPLETE + notify any live ChillsPwn session(s).
+app.post("/api/council/complete", (req, res) => {
+  const { engagement } = req.body || {};
+  const st = readCouncilState();
+  const run = st.runs?.[engagement];
+  if (!run) return res.status(404).json({ error: "run not found" });
+  run.status = "completed";
+  run.completed_at = new Date().toISOString();
+  const obfuscatedCount = obfuscateCouncilAssessments(run.engagement_dir);
+  log("info", "Council assessment obfuscation", { engagement, obfuscatedCount });
+  writeCouncilState(st);
+  const note = `[COUNCIL] The council for "${engagement}" is now COMPLETE. ` +
+    `Read all 6 lane assessments in ${run.engagement_dir}/council/*_assessment.md and decide the next move.`;
+  let notified = 0;
+  for (const sid of liveSessions.keys()) {
+    try { if (injectIntoSession(sid, note).success) notified++; } catch {}
+  }
+  log("info", "Council marked complete", { engagement, notified });
+  res.json({ ok: true, notified });
+});
+
+// One lane's assessment markdown.
+app.get("/api/council/assessment", (req, res) => {
+  const dir = String(req.query.dir || "");
+  const lane = String(req.query.lane || "");
+  if (!dir || !/^[a-z0-9_]+$/i.test(lane)) return res.status(400).json({ error: "dir + valid lane required" });
+  const p = join(dir, "council", `${lane}_assessment.md`);
+  if (!existsSync(p)) return res.status(404).json({ error: "assessment not found" });
+  res.json({ content: readFileSync(p, "utf-8") });
+});
+
+// Summon / relaunch a council (briefing + optional extra context + completion mode).
+app.post("/api/council/summon", (req, res) => {
+  const { engagementDir, briefing, extraContext, completionMode } = req.body || {};
+  if (!engagementDir || !existsSync(engagementDir)) return res.status(400).json({ error: "valid engagementDir required" });
+  if (!briefing || !String(briefing).trim()) return res.status(400).json({ error: "briefing required" });
+  // Phase 1.1: the l33tspeak response mandate is gated behind ENABLE_PROMPT_OBFUSCATION
+  // (via buildCouncilBriefing). In the default runtime the briefing stays plain and
+  // auditable — no obfuscation instruction is appended.
+  const baseBriefing = extraContext && String(extraContext).trim()
+    ? `${briefing}\n\nADDITIONAL CONTEXT (added on relaunch):\n${extraContext}`
+    : String(briefing);
+  const fullBriefing = buildCouncilBriefing(baseBriefing);
+  const mode = completionMode === "manual" ? "manual" : "auto";
+  try { mkdirSync(join(engagementDir, "council"), { recursive: true }); } catch {}
+  const logFd = require("fs").openSync(join(engagementDir, "council", "runner.log"), "w");
+  const proc = spawn("python3", [COUNCIL_SCRIPT, "--engagement-dir", engagementDir,
+    "--briefing", fullBriefing, "--completion-mode", mode, "--timeout", "1800"], {
+    stdio: ["ignore", logFd, logFd], detached: true, env: { ...process.env, PATH: `/opt/chillspwn-bin:${process.env.PATH || ''}` },
+  });
+  proc.unref();
+  log("info", "Council summoned via dashboard", { engagementDir, mode, pid: proc.pid });
+  res.json({ ok: true, pid: proc.pid });
+});
+
+// SPA fallback
+app.get("*", (req, res) => {
+  // A request for a missing /assets/* file (e.g. a stale device asking for a bundle hash
+  // we've since rebuilt away) must 404 — NOT fall through to index.html, which would hand
+  // back HTML where the browser expects JS/CSS and silently white-screen (#42).
+  if (req.path.startsWith("/assets/") || /\.(js|css|map|png|svg|webmanifest|ico|woff2?)$/i.test(req.path)) {
+    res.status(404).type("text/plain").send("Not found");
+    return;
+  }
+  const indexPath = join(distDir, "index.html");
+  if (existsSync(indexPath)) {
+    // never let a navigation cache a stale index that points at a deleted bundle
+    res.setHeader("Cache-Control", "no-store, must-revalidate");
+    res.sendFile(indexPath);
+  } else {
+    res.status(200).send(`
+      <html><head><title>ChillsPwn</title></head>
+      <body style="background:#0f172a;color:#e2e8f0;font-family:system-ui;display:flex;align-items:center;justify-content:center;height:100vh;margin:0">
+        <div style="text-align:center">
+          <h1>ChillsPwn Dashboard</h1>
+          <p>Frontend not built yet. Run: <code>cd webapp && bun install && bun run build</code></p>
+          <p>API is live at <a href="/api/health" style="color:#60a5fa">/api/health</a></p>
+        </div>
+      </body></html>
+    `);
+  }
+});
+
+// ── WebSocket server ───────────────────────────────────────────────
+const httpServer = createServer(app);
+const wss = new WebSocketServer({
+  server: httpServer,
+  // Phase 1: gate WS upgrades behind the same dashboard token (loopback trusted).
+  verifyClient: (info: any, cb: (ok: boolean, code?: number, msg?: string) => void) => {
+    const ok = isWsUpgradeAuthorized(info.req, SECURITY);
+    if (!ok) auditSecurity("ws_auth_failure", { addr: info?.req?.socket?.remoteAddress || "" });
+    cb(ok, 401, "Unauthorized");
+  },
+});
+
+// Prevent ws library crashes in Bun when upgrade requests fail
+httpServer.on("upgrade", (req: any, socket: any, head: any) => {
+  try {
+    if (!req.headers.upgrade || req.headers.upgrade.toLowerCase() !== "websocket") {
+      socket.destroy();
+    }
+  } catch {}
+});
+
+process.on("uncaughtException", (err) => {
+  log("error", `Uncaught exception (non-fatal)`, { error: err.message, stack: err.stack?.slice(0, 200) });
+});
+
+wss.on("connection", (ws) => {
+  log("info", "WebSocket client connected");
+
+  ws.on("message", (raw) => {
+    try {
+      const msg = JSON.parse(raw.toString());
+      log("info", "WS message received", { type: msg.type, sessionId: msg.sessionId });
+
+      switch (msg.type) {
+        case "chat": {
+          const { sessionId: reqSessionId, persona: personaName, prompt, resumeCliSessionId, resumeCliCwd } = msg;
+          if (!prompt) {
+            ws.send(JSON.stringify({ type: "error", message: "prompt is required" }));
+            return;
+          }
+
+          const personas = loadPersonas();
+          const persona =
+            personas.find(
+              (p) =>
+                p.name.toLowerCase() ===
+                (personaName || "chillspwn").toLowerCase()
+            ) || personas[0];
+
+          if (!persona) {
+            ws.send(
+              JSON.stringify({
+                type: "error",
+                message: "No personas configured",
+              })
+            );
+            return;
+          }
+
+          const sessionId = reqSessionId || `s-${Date.now()}-${randomUUID().slice(0, 8)}`;
+
+          // If there is already a live session with this ID, kill it first
+          const existing = liveSessions.get(sessionId);
+          if (existing) {
+            existing.proc.kill("SIGTERM");
+            liveSessions.delete(sessionId);
+          }
+
+          // ── ADDITIVE: apply a per-session mid-conversation override, if one is set. ──
+          // This only changes which backend/model THIS session uses next; persona.json is
+          // untouched, and with no override the effective persona === the loaded persona.
+          const ov = getSessionProviderOverride(sessionId);
+          const effectivePersona: Persona = ov
+            ? { ...persona, provider: ov.provider, model: ov.model }
+            : persona;
+
+          // ── Phase 7.1 Seam A (observe-only; no-op unless ENABLE_CHAT_AGENT_RUNS) ──
+          // Create/attach an observe-only AgentRun + start its log observer BEFORE the fork.
+          // Self-guarded: cannot throw, cannot block, does not alter the prompt or the spawn.
+          attachChatRun(sessionId, effectivePersona, prompt);
+
+          // ── ADDITIVE FORK (the ONLY edit to the existing chat flow) ──
+          // provider "openrouter"/"openai-codex"/"gemini" → the parallel orchestrator backend;
+          // anything else → the unchanged claude -p path, called byte-for-byte as before.
+          if (effectivePersona.provider === "xai-grok") {
+            spawnGrokAcp(sessionId, effectivePersona, prompt, ws);
+          } else if (effectivePersona.provider === "openrouter" || effectivePersona.provider === "openai-codex" || effectivePersona.provider === "gemini") {
+            spawnOpenRouter(sessionId, effectivePersona, prompt, ws);
+          } else {
+            spawnClaude(sessionId, effectivePersona, prompt, ws, resumeCliSessionId, resumeCliCwd);
+          }
+          break;
+        }
+
+        // ── ADDITIVE: mid-conversation provider/model switch ──
+        // Sets a per-session override and ends the current backend gracefully. The frontend
+        // then sends the next turn as a fresh "chat" (resurrection), which re-forks to the
+        // chosen backend — seeded from the persisted conversation so the thread continues.
+        case "switch_provider": {
+          const { sessionId, provider, model } = msg;
+          if (!sessionId || (provider !== "anthropic" && provider !== "openrouter" && provider !== "openai-codex" && provider !== "gemini" && provider !== "xai-grok")) {
+            ws.send(JSON.stringify({ type: "error", sessionId, message: "switch_provider needs sessionId + provider anthropic|openrouter|openai-codex|gemini|xai-grok" }));
+            break;
+          }
+          const persisted = loadPersistedSession(sessionId);
+          const effModel = (typeof model === "string" && model) ? model
+            : (provider === "anthropic" ? "claude-opus-4-8"
+               : provider === "openai-codex" ? "gpt-5.6-sol"
+               : provider === "gemini" ? "gemini-3.5-flash"
+               : provider === "xai-grok" ? "grok-4.5"
+               : (persisted?.model || "deepseek/deepseek-v4-pro"));
+          sessionProviderOverride.set(sessionId, { provider, model: effModel });
+          // Durability: persist provider/model onto the session file so the override
+          // survives a dashboard RESTART too (the Map above is in-memory only). This
+          // is metadata only - it does NOT touch the claude execution path.
+          try {
+            const persistedSwitch = loadPersistedSession(sessionId);
+            if (persistedSwitch) {
+              (persistedSwitch as any).provider = provider;
+              (persistedSwitch as any).model = effModel;
+              savePersistedSession(persistedSwitch);
+            }
+          } catch (e) {
+            log("warn", `Could not persist provider override for ${sessionId}`, { error: String(e) });
+          }
+
+          // End the live backend (if any) so the next send is a fresh, re-forked turn.
+          const live = liveSessions.get(sessionId);
+          if (live) {
+            try { live.proc.kill("SIGTERM"); } catch {}
+            // close handler emits session_end + deletes from liveSessions
+          }
+          // Tell the client which brain will answer next; UI shows it + treats session as
+          // ended so the next message resurrects via "chat" (not "followup").
+          ws.send(JSON.stringify({ type: "provider_switched", sessionId, provider, model: effModel }));
+          log("info", `Provider switch queued for ${sessionId}`, { provider, model: effModel });
+          break;
+        }
+
+        case "followup": {
+          const { sessionId, prompt } = msg;
+          if (!sessionId || !prompt) {
+            ws.send(
+              JSON.stringify({
+                type: "error",
+                message: "sessionId and prompt are required for followup",
+              })
+            );
+            return;
+          }
+          const liveS = liveSessions.get(sessionId);
+          if (liveS && (liveS as any).provider === "xai-grok") {
+            liveS.clients.add(ws);
+            liveS.persisted.messages.push({ role: "user", content: prompt, timestamp: new Date().toISOString() });
+            savePersistedSession(liveS.persisted);
+            (liveS as any).sendGrokAcpPrompt(prompt);
+          } else if (liveS && liveS.turnActive) {
+            if ((liveS as any).orGroup) {
+              // ── OpenRouter: operator interjections are PREEMPTIVE (claude path = queue, below) ──
+              // The one-shot orchestrator can't read stdin mid-turn, so a queued message is LOST when
+              // the process exits (auto-resume then sends "continue", NOT the operator's text) — which
+              // is why mid-run messages felt ignored. Instead INTERRUPT the running turn (group-kill,
+              // also reaps child tools) and re-spawn with the operator's message as a fresh turn so it
+              // is addressed FIRST. interruptSession sets respawnAfterClose; the close handler re-spawns
+              // via spawnOpenRouter, which PERSISTS the prompt — so do NOT push it here. A genuine
+              // operator turn also resets the auto-resume budget.
+              liveS.clients.add(ws);
+              (liveS as any).autoResumeCount = 0;
+              interruptSession(sessionId, prompt, ws);
+            } else {
+              // claude path — queue behind the in-flight turn (unchanged).
+              liveS.clients.add(ws);
+              liveS.persisted.messages.push({ role: "user", content: prompt, timestamp: new Date().toISOString() });
+              savePersistedSession(liveS.persisted);
+              liveS.queuedMessages.push(prompt);
+              broadcastToSession(liveS, { type: "followup_queued", sessionId, queuedCount: liveS.queuedMessages.length });
+            }
+          } else {
+            // ── OpenRouter follow-up (ADDITIVE; claude path = the sendFollowUp branch, unchanged) ──
+            // The OpenRouter orchestrator is one-shot: after a turn it exits and the live
+            // session is deleted, so sendFollowUp would error "No running session". Detect an
+            // OpenRouter session and RE-SPAWN a fresh turn seeded from persisted history.
+            const persistedFU = loadPersistedSession(sessionId);
+            const ovFU = getSessionProviderOverride(sessionId);
+            let isORFU = ovFU?.provider === "openrouter" || ovFU?.provider === "openai-codex" || ovFU?.provider === "gemini";
+            if (!isORFU && persistedFU) {
+              const pFU = loadPersonas().find((p) => p.name === persistedFU.persona);
+              if (pFU?.provider === "openrouter" || pFU?.provider === "openai-codex" || pFU?.provider === "gemini") isORFU = true;
+              if (!isORFU && typeof persistedFU.model === "string" && persistedFU.model.includes("/")) isORFU = true;
+            }
+            if (isORFU && !liveSessions.get(sessionId)) {
+              const baseFU = loadPersonas().find((p) => p.name === persistedFU?.persona) || loadPersonas()[0];
+              // preserve a codex / gemini persona's provider; otherwise default the orchestrator to openrouter
+              const defProv = (baseFU as any).provider === "openai-codex" ? "openai-codex"
+                : (baseFU as any).provider === "gemini" ? "gemini" : "openrouter";
+              const effFU = ovFU
+                ? { ...baseFU, provider: ovFU.provider, model: ovFU.model }
+                : { ...baseFU, provider: defProv as any, model: (persistedFU?.model || baseFU.model) };
+              spawnOpenRouter(sessionId, effFU as Persona, prompt, ws);
+            } else {
+              sendFollowUp(sessionId, prompt, ws);
+            }
+          }
+          break;
+        }
+
+        case "interrupt": {
+          // Graceful cancel of the in-flight turn (keeps the session/process
+          // alive), optionally followed by a new prompt ("steer").
+          const { sessionId, newPrompt } = msg;
+          if (!sessionId) {
+            ws.send(JSON.stringify({ type: "error", message: "sessionId is required for interrupt" }));
+            return;
+          }
+          interruptSession(sessionId, newPrompt, ws);
+          break;
+        }
+
+        case "cancel_queued": {
+          // Drop a queued follow-up before it runs.
+          const { sessionId, index } = msg;
+          const s = liveSessions.get(sessionId);
+          if (s && typeof index === "number" && index >= 0 && index < s.queuedMessages.length) {
+            s.queuedMessages.splice(index, 1);
+            broadcastToSession(s, { type: "followup_queued", sessionId, queuedCount: s.queuedMessages.length });
+          }
+          break;
+        }
+
+        case "stop": {
+          const session = liveSessions.get(msg.sessionId);
+          if (session) {
+            killSession(session, "SIGTERM");
+            log("info", `Stopped session ${msg.sessionId}`);
+          } else {
+            // Session already ended — just update persisted status silently
+            const persisted = loadPersistedSession(msg.sessionId);
+            if (persisted) {
+              persisted.status = "stopped";
+              savePersistedSession(persisted);
+            }
+            // Send session_end instead of error — the session is stopped either way
+            ws.send(
+              JSON.stringify({
+                type: "session_end",
+                sessionId: msg.sessionId,
+                exitCode: 0,
+              })
+            );
+          }
+          break;
+        }
+
+        // 🔒 Close button — fully server-side close-with-memory-check flow that
+        // survives client disconnect. Sends the memory prompt, sets a deferred
+        // close action, and the result-event handler does the kill+delete even
+        // if the client has already navigated away.
+        case "close_with_memory": {
+          const { sessionId: closeSid, deleteAfter } = msg;
+          if (!closeSid) break;
+          const session = liveSessions.get(closeSid);
+          if (!session) {
+            // Session isn't live — if deleteAfter, just delete the file directly
+            if (deleteAfter) {
+              const fp = sessionFilePath(closeSid);
+              if (existsSync(fp)) { try { unlinkSync(fp); } catch {} }
+              ws.send(JSON.stringify({ type: "session_list", sessions: listPersistedSessions() }));
+            }
+            ws.send(JSON.stringify({ type: "session_end", sessionId: closeSid, exitCode: 0 }));
+            break;
+          }
+
+          // Mark intent — the result event handler will execute it once Claude responds
+          session.pendingCloseAction = deleteAfter ? "delete" : "stop";
+
+          // Inject the memory-check prompt
+          const memoryPrompt =
+            "Before this session closes, check if any new facts were learned that should be persisted. " +
+            "If the user shared new preferences, if we discovered new credentials/attack paths, or if " +
+            "important lessons were learned, use the Edit tool to append them to ~/.hermes/memories/USER.md " +
+            "(for preferences, separated by §) or ~/.hermes/memories/MEMORY.md (for facts, separated by §). " +
+            "These memories are shared with Hermes. If nothing notable was learned, just say 'No facts to persist.'";
+          const r = injectIntoSession(closeSid, memoryPrompt);
+          if (!r.success) {
+            // Couldn't inject — just kill immediately
+            try { session.proc.kill("SIGTERM"); } catch {}
+            if (deleteAfter) {
+              const fp = sessionFilePath(closeSid);
+              if (existsSync(fp)) { try { unlinkSync(fp); } catch {} }
+            }
+            session.pendingCloseAction = undefined;
+          }
+
+          // Safety timeout — if Claude doesn't return a result within 90s, force-close anyway
+          setTimeout(() => {
+            const s2 = liveSessions.get(closeSid);
+            if (s2?.pendingCloseAction) {
+              log("warn", `close_with_memory timed out — force-killing ${closeSid}`);
+              try { s2.proc.kill("SIGTERM"); } catch {}
+              if (s2.pendingCloseAction === "delete") {
+                setTimeout(() => {
+                  const fp = sessionFilePath(closeSid);
+                  if (existsSync(fp)) { try { unlinkSync(fp); } catch {} }
+                }, 500);
+              }
+              s2.pendingCloseAction = undefined;
+            }
+          }, 90000);
+
+          log("info", `close_with_memory queued for ${closeSid}`, { deleteAfter: !!deleteAfter });
+          break;
+        }
+
+        case "list_sessions": {
+          const sessions = listPersistedSessions();
+          ws.send(
+            JSON.stringify({
+              type: "session_list",
+              sessions,
+            })
+          );
+          break;
+        }
+
+        case "delete_session": {
+          const { sessionId } = msg;
+          if (!sessionId) break;
+
+          // Kill live session if running
+          const live = liveSessions.get(sessionId);
+          if (live) {
+            try { live.proc.kill("SIGTERM"); } catch {}
+            liveSessions.delete(sessionId);
+          }
+
+          // Delete persisted file
+          const filePath = sessionFilePath(sessionId);
+          if (existsSync(filePath)) {
+            try { unlinkSync(filePath); } catch {}
+          }
+
+          log("info", `Deleted session ${sessionId}`);
+
+          // Send updated list
+          ws.send(JSON.stringify({ type: "session_list", sessions: listPersistedSessions() }));
+          break;
+        }
+
+        case "load_session": {
+          const { sessionId } = msg;
+          if (!sessionId) {
+            ws.send(
+              JSON.stringify({
+                type: "error",
+                message: "sessionId is required",
+              })
+            );
+            return;
+          }
+
+          const persisted = loadPersistedSession(sessionId);
+          if (!persisted) {
+            ws.send(
+              JSON.stringify({
+                type: "error",
+                sessionId,
+                message: `Session ${sessionId} not found`,
+              })
+            );
+            return;
+          }
+
+          // If this session is live, attach this client
+          const liveSession = liveSessions.get(sessionId);
+          if (liveSession) {
+            liveSession.clients.add(ws);
+          }
+
+          // Switching to a big session (e.g. 1334 msgs / 940KB) was unresponsive because we
+          // shipped the ENTIRE history over WS + mounted every bubble. Send only the most
+          // recent window by default; the client can request older via load_session{before}.
+          const allMsgs = persisted.messages || [];
+          const PAGE = 120;
+          const reqLimit = typeof msg.limit === "number" && msg.limit > 0 ? Math.min(msg.limit, 2000) : PAGE;
+          const windowMsgs = allMsgs.length > reqLimit ? allMsgs.slice(allMsgs.length - reqLimit) : allMsgs;
+
+          // Sessions don't persist a `provider`, and many lack a `model`. Fall back to the session
+          // persona's model so the client can derive the right backend (the persisted model is
+          // authoritative about what the session ACTUALLY ran on, so we never override it with the
+          // persona's current model). `provider` stays whatever was persisted (usually none) — the
+          // client derives it from the model, or from the active persona when there's no model.
+          const _histPersona = loadPersonas().find((pp) => pp.name === persisted.persona);
+          ws.send(
+            JSON.stringify({
+              type: "session_history",
+              sessionId,
+              messages: windowMsgs,
+              totalMessages: allMsgs.length,
+              hasMore: windowMsgs.length < allMsgs.length,
+              persona: persisted.persona,
+              status: liveSession ? "running" : persisted.status,
+              model: persisted.model || _histPersona?.model || "",
+              provider: (persisted as any).provider,
+              createdAt: persisted.createdAt,
+            })
+          );
+
+          // ── In-flight replay (bug #55), OpenRouter sessions ONLY ──
+          // If this session is live, OpenRouter-backed, AND has an in-flight turn, replay the
+          // buffered claude_event payloads this (reconnecting) client missed while its WS was
+          // closed, THEN tell the UI the turn is still streaming. Live events continue normally
+          // afterwards (ws is already in liveSession.clients). The claude path streams differently
+          // and is intentionally untouched. The frontend dedups assistant events by message.id and
+          // tools by tool.id, and we gate on turnActive so a completed turn (already in
+          // session_history) is never replayed → no double render.
+          const _isOR = !!(liveSession && ((liveSession as any).orGroup || (persisted.model && persisted.model.includes("/"))));
+          if (liveSession && _isOR && liveSession.turnActive && Array.isArray(liveSession.replayBuffer) && liveSession.replayBuffer.length > 0) {
+            try {
+              for (const ev of liveSession.replayBuffer) {
+                if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(ev));
+              }
+              if (ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({
+                  type: "turn_state",
+                  sessionId,
+                  turnActive: true,
+                  queuedCount: liveSession.queuedMessages?.length || 0,
+                }));
+              }
+              log("info", `Replayed ${liveSession.replayBuffer.length} in-flight OpenRouter events on re-attach for ${sessionId}`);
+            } catch (e: any) {
+              log("warn", `In-flight replay failed for ${sessionId}`, { error: e?.message });
+            }
+          }
+          break;
+        }
+
+        // Lazy-load older history for a big session (pairs with load_session's windowing).
+        // Client sends {sessionId, before:<count already shown>, limit?}; we return the
+        // previous page as a distinct event so the client prepends without re-rendering all.
+        case "load_older": {
+          const { sessionId, before } = msg;
+          if (!sessionId) { break; }
+          const persisted = loadPersistedSession(sessionId);
+          if (!persisted) { break; }
+          const allMsgs = persisted.messages || [];
+          const shown = typeof before === "number" && before > 0 ? Math.min(before, allMsgs.length) : 0;
+          const PAGE = 120;
+          const lim = typeof msg.limit === "number" && msg.limit > 0 ? Math.min(msg.limit, 2000) : PAGE;
+          const end = allMsgs.length - shown;          // index just past the oldest already-shown
+          const start = Math.max(0, end - lim);
+          const older = end > 0 ? allMsgs.slice(start, end) : [];
+          ws.send(JSON.stringify({
+            type: "session_history_older",
+            sessionId,
+            messages: older,
+            hasMore: start > 0,
+            totalMessages: allMsgs.length,
+          }));
+          break;
+        }
+
+        case "term_start": {
+          spawnTerminal(ws);
+          break;
+        }
+
+        case "term_input": {
+          const proc = termSessions.get(ws);
+          if (proc?.stdin?.writable) {
+            proc.stdin.write(msg.data);
+          }
+          break;
+        }
+
+        case "term_resize": {
+          // Resize isn't well-supported via script, but we try
+          break;
+        }
+
+        case "term_close": {
+          const proc = termSessions.get(ws);
+          if (proc) {
+            try { proc.kill(); } catch {}
+            termSessions.delete(ws);
+          }
+          break;
+        }
+
+        default:
+          ws.send(
+            JSON.stringify({
+              type: "error",
+              message: `Unknown message type: ${msg.type}`,
+            })
+          );
+      }
+    } catch (e: any) {
+      log("error", "WS message parse error", { error: e.message });
+      ws.send(
+        JSON.stringify({
+          type: "error",
+          message: `Invalid message: ${e.message}`,
+        })
+      );
+    }
+  });
+
+  ws.on("close", () => {
+    log("info", "WebSocket client disconnected");
+    // Remove this client from all live sessions
+    for (const session of liveSessions.values()) {
+      session.clients.delete(ws);
+    }
+    // Kill any terminal associated with this client
+    const termProc = termSessions.get(ws);
+    if (termProc) {
+      try { termProc.kill(); } catch {}
+      termSessions.delete(ws);
+    }
+  });
+});
+
+// ── Terminal WebSocket ─────────────────────────────────────────────
+// Terminal sessions tracked per WebSocket client
+const termSessions = new Map<WebSocket, ChildProcess>();
+
+function spawnTerminal(ws: WebSocket): void {
+  if (termSessions.has(ws)) return;
+
+  // Phase 1: terminal is a high-risk feature, gated by ENABLE_TERMINAL (default off).
+  if (!SECURITY.enableTerminal) {
+    auditSecurity("terminal_blocked", {});
+    try {
+      ws.send(JSON.stringify({ type: "term_output", data: "\r\n[ChillsPwn] Terminal is disabled (set ENABLE_TERMINAL=true to enable).\r\n" }));
+      ws.send(JSON.stringify({ type: "term_exit", code: 1 }));
+    } catch {}
+    return;
+  }
+
+  log("info", "Spawning terminal for client");
+
+  const proc = spawn("/usr/bin/script", ["-qc", "/bin/zsh", "/dev/null"], {
+    stdio: ["pipe", "pipe", "pipe"],
+    env: { ...process.env, TERM: "xterm-256color", COLUMNS: "120", LINES: "40" },
+    cwd: process.env.HOME || "/root",
+  });
+
+  termSessions.set(ws, proc);
+
+  proc.stdout?.on("data", (chunk: Buffer) => {
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: "term_output", data: chunk.toString() }));
+    }
+  });
+
+  proc.stderr?.on("data", (chunk: Buffer) => {
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: "term_output", data: chunk.toString() }));
+    }
+  });
+
+  proc.on("close", (code) => {
+    log("info", `Terminal process exited`, { code });
+    termSessions.delete(ws);
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: "term_exit", code }));
+    }
+  });
+
+  proc.on("error", (err) => {
+    log("error", `Terminal process error`, { error: err.message });
+    termSessions.delete(ws);
+  });
+
+  ws.send(JSON.stringify({ type: "term_ready" }));
+}
+
+// ── Start ──────────────────────────────────────────────────────────
+// Phase 1: validate security posture; FAIL CLOSED if exposed without a token.
+const _startup = validateStartup(SECURITY);
+for (const w of _startup.warnings) log("warn", `[security] ${w}`);
+if (!_startup.ok) {
+  log("error", `[security] ${_startup.fatal}`);
+  console.error(`\n[ChillsPwn] ${_startup.fatal}\n`);
+  process.exit(1);
+}
+auditSecurity("server_start", {
+  bindHost: SECURITY.bindHost, port: SECURITY.port, authActive: SECURITY.authActive,
+  enableTerminal: SECURITY.enableTerminal, enableProxy: SECURITY.enableProxy,
+  enableFileWrite: SECURITY.enableFileWrite, enableSecurityTools: SECURITY.enableSecurityTools,
+  enablePromptObfuscation: SECURITY.enablePromptObfuscation,
+});
+httpServer.listen(SECURITY.port, SECURITY.bindHost, () => {
+  log("info", `ChillsPwn dashboard running at http://${SECURITY.bindHost}:${SECURITY.port} (auth ${SECURITY.authActive ? "ON" : "OFF"})`);
+  log("info", `Personas: ${loadPersonas().map((p) => p.name).join(", ") || "none"}`);
+  log("info", `Sessions dir: ${SESSIONS_DIR}`);
+  log("info", `Memories: ${MEMORIES_DIR}`);
+  log("info", `Kanban: ${KANBAN_DB}`);
+  // ── AGENT BOARD: ensure schema + start the card-dispatch sweeper (idempotent). ──
+  try { ensureBoardSchema(); } catch (e: any) { log("warn", "ensureBoardSchema failed", { error: e?.message }); }
+  setInterval(dispatchPendingCards, 1500);
+  // Rehydrate any OSINT jobs that were running when the server last stopped
+  rehydrateOsintJobs();
+  log("info", `OSINT jobs rehydrated: ${osintJobs.size}`);
+  // ── ADDITIVE: reconcile stale chat sessions on boot ──
+  // systemd restart kills the whole cgroup, so any claude/orchestrator subprocess is dead.
+  // Sessions left at status "running" are stale; flip them to "stopped" so the UI shows the
+  // true state. Recovery is a clean respawn on the next message (claude --resume cliSessionId,
+  // OpenRouter reseed from persisted history) — there is no live process to re-adopt.
+  try {
+    if (existsSync(SESSIONS_DIR)) {
+      let fixed = 0;
+      for (const file of readdirSync(SESSIONS_DIR)) {
+        if (!file.endsWith(".json")) continue;
+        const id = file.slice(0, -5);
+        if (liveSessions.has(id)) continue;
+        const p = loadPersistedSession(id);
+        if (p && p.status === "running") { p.status = "stopped"; savePersistedSession(p); fixed++; }
+      }
+      if (fixed) log("info", `Reconciled ${fixed} stale 'running' session(s) -> stopped on boot`);
+    }
+  } catch (e: any) {
+    log("warn", `Session reconcile on boot failed`, { error: e?.message });
+  }
+
+  // ── ADDITIVE: reconcile stale runtime RUNS on boot ──
+  // Chat runs are finalized by the in-memory SessionObserver when their session ends, but a
+  // systemd restart kills that observer first → the run is orphaned in a non-terminal state
+  // ("executing") and shows forever in the Agent Cockpit / Mission Board. On boot every
+  // subprocess is dead, so any non-terminal run is stale: complete chat runs, cancel the rest.
+  try {
+    const TERMINAL_RUN = new Set(["completed", "failed", "cancelled"]);
+    let fixedRuns = 0;
+    for (const r of agentRuntime.listRuns()) {
+      if (TERMINAL_RUN.has(r.status)) continue;
+      try { agentRuntime.finalizeChatRun(r.id, "Reconciled on dashboard restart (session ended)."); } catch { /* best-effort */ }
+      const after = agentRuntime.getRun(r.id);
+      if (after && !TERMINAL_RUN.has(after.status)) { try { agentRuntime.cancelRun(r.id); } catch { /* best-effort */ } }
+      fixedRuns++;
+    }
+    if (fixedRuns) log("info", `Reconciled ${fixedRuns} stale runtime run(s) -> terminal on boot`);
+  } catch (e: any) {
+    log("warn", `Runtime run reconcile on boot failed`, { error: e?.message });
+  }
+
+  // ── ADDITIVE: reconcile orphaned board CARDS on boot ──
+  // A card left "running" after a restart has a dead worker (the cgroup was killed), so it shows
+  // as perpetually executing on the Mission Board. Flip orphaned running cards to failed. ('queued'
+  // is left for dispatchPendingCards; terminal/backlog untouched.)
+  try {
+    boardWrite(`UPDATE tasks SET status='failed', last_failure_error='Reconciled on restart: worker process was killed', worker_pid=NULL, completed_at=${Math.floor(Date.now() / 1000)} WHERE status='running';`);
+    log("info", `Reconciled orphaned 'running' board card(s) -> failed on boot`);
+  } catch (e: any) {
+    log("warn", `Board card reconcile on boot failed`, { error: e?.message });
+  }
+
+  // ── ADDITIVE: auto-archive stale commander PLAN cards (boot + hourly) ──
+  // The ChillsPwn (Command) column holds the commander's backlog plan cards. Finished engagements'
+  // plan cards are never closed, so they pile up. Archive backlog plan cards older than 12h
+  // (recent / active-engagement plans are kept); non-destructive + recoverable (status='archived').
+  const archiveStalePlanCards = () => {
+    try {
+      const cutoff = Math.floor(Date.now() / 1000) - 12 * 3600;
+      boardWrite(`UPDATE tasks SET status='archived' WHERE assignee='${bsql(ORCH_PERSONA)}' AND status='backlog' AND created_at < ${cutoff};`);
+    } catch (e: any) { log("warn", `Stale plan-card archive failed`, { error: e?.message }); }
+  };
+  archiveStalePlanCards();
+  setInterval(archiveStalePlanCards, 3600_000);
+});

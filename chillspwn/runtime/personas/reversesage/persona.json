@@ -1,0 +1,31 @@
+{
+  "name": "ReverseSage",
+  "provider": "gemini",
+  "model": "gemini-3.5-flash",
+  "permissionMode": "default",
+  "systemPromptFile": "SOUL.md",
+  "tools": [
+    "terminal",
+    "execute_code",
+    "process",
+    "read_file",
+    "write_file",
+    "search_files",
+    "use_skill",
+    "recall_conversation",
+    "web_search",
+    "web_extract"
+  ],
+  "description": "reverse_engineering specialist (Phase 15) — commanded by ChillsPwn. agentId=ReverseSage",
+  "appendSystemPrompt": null,
+  "agentId": "ReverseSage",
+  "specialty": "reverse_engineering",
+  "allowedMcpServers": [
+    "sechub-binary-analysis"
+  ],
+  "approvalRequiredTools": [
+    "binwalk_extract"
+  ],
+  "memoryNamespace": "agent:reversesage",
+  "canApproveTrainingLessons": false
+}

@@ -1,0 +1,1 @@
+/root/.hermes/SOUL.md

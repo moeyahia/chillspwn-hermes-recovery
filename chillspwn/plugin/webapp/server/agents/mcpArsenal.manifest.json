@@ -1,0 +1,703 @@
+{
+  "schemaVersion": "15.0",
+  "generated": "phase-15 \u2014 inventory only; NO tools were run against any target during inventory",
+  "vendorDir": "/opt/chillspwn-mcp-arsenal",
+  "policy": {
+    "doNotCommitVendor": true,
+    "exposeOnlyViaAgentMapping": true,
+    "noGlobalClaudeExposure": true,
+    "allDisabledByDefault": true,
+    "stateChangingMcpsRequireApproval": true
+  },
+  "taxonomy": [
+    "reconnaissance",
+    "web",
+    "credentials",
+    "active_directory",
+    "cloud",
+    "reverse_engineering",
+    "fuzzing",
+    "osint",
+    "secrets_code",
+    "persistent_execution",
+    "reporting_memory",
+    "vulnerability_intelligence",
+    "cve_lookup",
+    "exploit_prioritization",
+    "kev_epss",
+    "attack_mapping"
+  ],
+  "repos": [
+    {
+      "id": "pentest-mcp-server",
+      "url": "https://github.com/LayeSec006/pentest-mcp-server",
+      "commit": "090c38f9e3db8453c00c2e9fdeb0152e600acc45",
+      "license": "MIT",
+      "runtime": "python",
+      "purpose": "Asynchronous persistent target execution via SSH + tmux sessions."
+    },
+    {
+      "id": "mcp-security-hub",
+      "url": "https://github.com/FuzzingLabs/mcp-security-hub",
+      "commit": "b6800740da9965e9dd3fde2ec3cf4c775c358f72",
+      "license": "MIT",
+      "runtime": "docker",
+      "purpose": "Dockerized multi-tool MCP hub: one server per security category."
+    },
+    {
+      "id": "pentest-mcp",
+      "url": "https://github.com/DMontgomery40/pentest-mcp",
+      "commit": "b644b150a8b837dba8311aad7ab01d90a86c177c",
+      "license": "MIT",
+      "runtime": "node",
+      "purpose": "TypeScript modular pentest toolkit (recon + hashcat)."
+    },
+    {
+      "id": "awesome-cybersecurity-MCP",
+      "url": "https://github.com/JoasASantos/awesome-cybersecurity-MCP",
+      "commit": "c7021c986ae676b7378a490fd157cfd5eb1b27ff",
+      "license": "list",
+      "runtime": "registry",
+      "purpose": "Primary cybersecurity MCP discovery registry (~12 entries) \u2014 discovery only, nothing installed."
+    },
+    {
+      "id": "awesome-cyber-security-mcp",
+      "url": "https://github.com/MorDavid/awesome-cyber-security-mcp",
+      "commit": "8515c3b2f6a52e8993c7a4af636141502b753fed",
+      "license": "MIT",
+      "runtime": "registry",
+      "purpose": "Alternative cybersecurity MCP discovery registry (~49 entries) \u2014 discovery only, nothing installed."
+    }
+  ],
+  "servers": [
+    {
+      "mcpServerName": "sechub-reconnaissance",
+      "sourceRepo": "mcp-security-hub",
+      "runtimeType": "docker",
+      "category": "reconnaissance",
+      "riskClass": "network",
+      "toolNames": [
+        "quick_scan",
+        "port_scan",
+        "os_detection",
+        "masscan_scan",
+        "masscan_top_ports",
+        "run_masscan",
+        "get_scan_results",
+        "list_active_scans"
+      ],
+      "requiredBinaries": [
+        "nmap",
+        "masscan"
+      ],
+      "requiredDockerImages": [
+        "mcp-sechub/reconnaissance"
+      ],
+      "requiredEnv": [],
+      "apiKeysRequired": [],
+      "networkRequirements": "outbound to authorized lab targets only",
+      "installMethod": "docker build -f mcp-security-hub/reconnaissance/Dockerfile",
+      "enabledByDefault": false,
+      "healthCheck": "docker run --rm mcp-sechub/reconnaissance --list-tools",
+      "assignedAgents": [
+        "ReconScout"
+      ],
+      "notes": "Active network discovery \u2014 masscan/nmap require raw-socket caps; lab scope only."
+    },
+    {
+      "mcpServerName": "sechub-web-security",
+      "sourceRepo": "mcp-security-hub",
+      "runtimeType": "docker",
+      "category": "web",
+      "riskClass": "network",
+      "toolNames": [
+        "ffuf_dir",
+        "ffuf_vhost",
+        "ffuf_param",
+        "ffuf_custom",
+        "analyze_urls",
+        "fetch_wayback_urls",
+        "get_fuzz_results",
+        "get_fetch_results"
+      ],
+      "requiredBinaries": [
+        "ffuf",
+        "nuclei",
+        "nikto",
+        "sqlmap"
+      ],
+      "requiredDockerImages": [
+        "mcp-sechub/web-security"
+      ],
+      "requiredEnv": [],
+      "apiKeysRequired": [],
+      "networkRequirements": "outbound to authorized web targets only",
+      "installMethod": "docker build -f mcp-security-hub/web-security/Dockerfile",
+      "enabledByDefault": false,
+      "healthCheck": "docker run --rm mcp-sechub/web-security --list-tools",
+      "assignedAgents": [
+        "WebBreaker"
+      ],
+      "notes": "Web fuzzing/scanning + sqlmap (assessment scope)."
+    },
+    {
+      "mcpServerName": "sechub-password-cracking",
+      "sourceRepo": "mcp-security-hub",
+      "runtimeType": "docker",
+      "category": "credentials",
+      "riskClass": "credential-sensitive",
+      "toolNames": [
+        "hashcat_crack",
+        "hashcat_identify",
+        "get_crack_results"
+      ],
+      "requiredBinaries": [
+        "hashcat"
+      ],
+      "requiredDockerImages": [
+        "mcp-sechub/password-cracking"
+      ],
+      "requiredEnv": [],
+      "apiKeysRequired": [],
+      "networkRequirements": "none (local cracking)",
+      "installMethod": "docker build -f mcp-security-hub/password-cracking/Dockerfile",
+      "enabledByDefault": false,
+      "healthCheck": "docker run --rm mcp-sechub/password-cracking --list-tools",
+      "assignedAgents": [
+        "CredSmith"
+      ],
+      "notes": "Cracking on AUTHORIZED lab hashes only. Operator policy: ChillsPwn cracks on the GPU host; this MCP is local-CPU and is approval-gated. Outputs are secrets \u2014 never stored as reusable memory."
+    },
+    {
+      "mcpServerName": "sechub-active-directory",
+      "sourceRepo": "mcp-security-hub",
+      "runtimeType": "docker",
+      "category": "active_directory",
+      "riskClass": "credential-sensitive",
+      "toolNames": [
+        "bloodhound_collect",
+        "bloodhound_query",
+        "ad_enum"
+      ],
+      "requiredBinaries": [
+        "bloodhound",
+        "bloodhound-python"
+      ],
+      "requiredDockerImages": [
+        "mcp-sechub/active-directory"
+      ],
+      "requiredEnv": [
+        "AD_DC_HOST",
+        "AD_DOMAIN"
+      ],
+      "apiKeysRequired": [],
+      "networkRequirements": "lab AD reachable",
+      "installMethod": "docker build -f mcp-security-hub/active-directory/Dockerfile",
+      "enabledByDefault": false,
+      "healthCheck": "docker run --rm mcp-sechub/active-directory --list-tools",
+      "assignedAgents": [
+        "ADAttackMapper"
+      ],
+      "notes": "AD graph/identity-path analysis. Credentials are secrets \u2014 never stored as reusable memory."
+    },
+    {
+      "mcpServerName": "sechub-binary-analysis",
+      "sourceRepo": "mcp-security-hub",
+      "runtimeType": "docker",
+      "category": "reverse_engineering",
+      "riskClass": "file-write",
+      "toolNames": [
+        "binwalk_scan",
+        "binwalk_extract",
+        "binwalk_entropy",
+        "binwalk_hexdump",
+        "capa_analyze",
+        "get_analysis_results"
+      ],
+      "requiredBinaries": [
+        "radare2",
+        "binwalk",
+        "capa",
+        "yara"
+      ],
+      "requiredDockerImages": [
+        "mcp-sechub/binary-analysis"
+      ],
+      "requiredEnv": [],
+      "apiKeysRequired": [],
+      "networkRequirements": "none (offline analysis)",
+      "installMethod": "docker build -f mcp-security-hub/binary-analysis/Dockerfile",
+      "enabledByDefault": false,
+      "healthCheck": "docker run --rm mcp-sechub/binary-analysis --list-tools",
+      "assignedAgents": [
+        "ReverseSage"
+      ],
+      "notes": "Static binary/firmware analysis (radare2/capa/yara/binwalk). Ghidra/IDA/JADX are heavyweight \u2014 operator-installed."
+    },
+    {
+      "mcpServerName": "sechub-fuzzing",
+      "sourceRepo": "mcp-security-hub",
+      "runtimeType": "docker",
+      "category": "fuzzing",
+      "riskClass": "terminal",
+      "toolNames": [
+        "boofuzz_run_fuzzer",
+        "boofuzz_create_script",
+        "boofuzz_list_scripts",
+        "boofuzz_get_results",
+        "dharma_generate",
+        "dharma_generate_custom",
+        "ftp_fuzzer",
+        "run_dharma"
+      ],
+      "requiredBinaries": [
+        "python3-boofuzz"
+      ],
+      "requiredDockerImages": [
+        "mcp-sechub/fuzzing"
+      ],
+      "requiredEnv": [],
+      "apiKeysRequired": [],
+      "networkRequirements": "lab targets only (protocol fuzzing)",
+      "installMethod": "docker build -f mcp-security-hub/fuzzing/Dockerfile",
+      "enabledByDefault": false,
+      "healthCheck": "docker run --rm mcp-sechub/fuzzing --list-tools",
+      "assignedAgents": [
+        "FuzzSmith"
+      ],
+      "notes": "Protocol/input fuzzing (boofuzz/dharma). DoS-adjacent \u2014 strictly lab scope, approval-gated."
+    },
+    {
+      "mcpServerName": "sechub-cloud-security",
+      "sourceRepo": "mcp-security-hub",
+      "runtimeType": "docker",
+      "category": "cloud",
+      "riskClass": "credential-sensitive",
+      "toolNames": [
+        "prowler_scan",
+        "prowler_compliance",
+        "list_compliance_frameworks",
+        "list_checks",
+        "run_trivy_scan",
+        "run_prowler_scan",
+        "get_scan_results"
+      ],
+      "requiredBinaries": [
+        "trivy",
+        "prowler"
+      ],
+      "requiredDockerImages": [
+        "mcp-sechub/cloud-security"
+      ],
+      "requiredEnv": [
+        "AWS_PROFILE",
+        "KUBECONFIG"
+      ],
+      "apiKeysRequired": [
+        "cloud read-only credentials (lab account)"
+      ],
+      "networkRequirements": "cloud API endpoints",
+      "installMethod": "docker build -f mcp-security-hub/cloud-security/Dockerfile",
+      "enabledByDefault": false,
+      "healthCheck": "docker run --rm mcp-sechub/cloud-security --list-tools",
+      "assignedAgents": [
+        "CloudSentinel"
+      ],
+      "notes": "Cloud posture (prowler) + container/IaC scanning (trivy). Read-only lab credentials only."
+    },
+    {
+      "mcpServerName": "sechub-code-security",
+      "sourceRepo": "mcp-security-hub",
+      "runtimeType": "docker",
+      "category": "secrets_code",
+      "riskClass": "file-write",
+      "toolNames": [
+        "semgrep_scan",
+        "analyze_project",
+        "go_fuzz_run",
+        "analyze_crashes",
+        "fuzz_target"
+      ],
+      "requiredBinaries": [
+        "semgrep",
+        "go"
+      ],
+      "requiredDockerImages": [
+        "mcp-sechub/code-security"
+      ],
+      "requiredEnv": [],
+      "apiKeysRequired": [],
+      "networkRequirements": "none (local SAST)",
+      "installMethod": "docker build -f mcp-security-hub/code-security/Dockerfile",
+      "enabledByDefault": false,
+      "healthCheck": "docker run --rm mcp-sechub/code-security --list-tools",
+      "assignedAgents": [
+        "SecretHunter"
+      ],
+      "notes": "SAST (semgrep) + Go fuzz harness analysis."
+    },
+    {
+      "mcpServerName": "sechub-secrets",
+      "sourceRepo": "mcp-security-hub",
+      "runtimeType": "docker",
+      "category": "secrets_code",
+      "riskClass": "file-write",
+      "toolNames": [
+        "gitleaks_detect",
+        "gitleaks_scan_repo",
+        "gitleaks_scan_dir",
+        "scan_content",
+        "run_gitleaks_scan",
+        "get_scan_results"
+      ],
+      "requiredBinaries": [
+        "gitleaks"
+      ],
+      "requiredDockerImages": [
+        "mcp-sechub/secrets"
+      ],
+      "requiredEnv": [],
+      "apiKeysRequired": [],
+      "networkRequirements": "none (local scan)",
+      "installMethod": "docker build -f mcp-security-hub/secrets/Dockerfile",
+      "enabledByDefault": false,
+      "healthCheck": "docker run --rm mcp-sechub/secrets --list-tools",
+      "assignedAgents": [
+        "SecretHunter"
+      ],
+      "notes": "Secret scanning (gitleaks). FINDINGS may contain secrets \u2014 redact; never store secret values as reusable memory."
+    },
+    {
+      "mcpServerName": "sechub-osint",
+      "sourceRepo": "mcp-security-hub",
+      "runtimeType": "docker",
+      "category": "osint",
+      "riskClass": "network",
+      "toolNames": [
+        "theharvester_search",
+        "subdomain_enum",
+        "username_lookup",
+        "domain_intel"
+      ],
+      "requiredBinaries": [
+        "theHarvester"
+      ],
+      "requiredDockerImages": [
+        "mcp-sechub/osint"
+      ],
+      "requiredEnv": [],
+      "apiKeysRequired": [
+        "optional provider keys"
+      ],
+      "networkRequirements": "PUBLIC network egress (passive recon)",
+      "installMethod": "docker build -f mcp-security-hub/osint/Dockerfile",
+      "enabledByDefault": false,
+      "healthCheck": "docker run --rm mcp-sechub/osint --list-tools",
+      "assignedAgents": [
+        "OSINTSeeker"
+      ],
+      "notes": "Passive recon \u2014 PUBLIC network egress (documented egress decision, like web_search/web_extract)."
+    },
+    {
+      "mcpServerName": "sechub-threat-intel",
+      "sourceRepo": "mcp-security-hub",
+      "runtimeType": "docker",
+      "category": "osint",
+      "riskClass": "network",
+      "toolNames": [
+        "virustotal_lookup",
+        "otx_pulse",
+        "shodan_host",
+        "typosquat_check"
+      ],
+      "requiredBinaries": [],
+      "requiredDockerImages": [
+        "mcp-sechub/threat-intel"
+      ],
+      "requiredEnv": [
+        "VT_API_KEY",
+        "OTX_API_KEY",
+        "SHODAN_API_KEY"
+      ],
+      "apiKeysRequired": [
+        "VirusTotal",
+        "OTX",
+        "Shodan"
+      ],
+      "networkRequirements": "PUBLIC threat-intel APIs",
+      "installMethod": "docker build -f mcp-security-hub/threat-intel/Dockerfile",
+      "enabledByDefault": false,
+      "healthCheck": "docker run --rm mcp-sechub/threat-intel --list-tools",
+      "assignedAgents": [
+        "OSINTSeeker"
+      ],
+      "notes": "Public TI lookups. API keys supplied via env templates ONLY \u2014 never stored in memory or printed."
+    },
+    {
+      "mcpServerName": "sechub-exploitation",
+      "sourceRepo": "mcp-security-hub",
+      "runtimeType": "docker",
+      "category": "web",
+      "riskClass": "exploit-sensitive",
+      "toolNames": [
+        "searchsploit_search",
+        "searchsploit_examine",
+        "list_recent_searches"
+      ],
+      "requiredBinaries": [
+        "searchsploit"
+      ],
+      "requiredDockerImages": [
+        "mcp-sechub/exploitation"
+      ],
+      "requiredEnv": [],
+      "apiKeysRequired": [],
+      "networkRequirements": "none (local exploit-db lookup)",
+      "installMethod": "docker build -f mcp-security-hub/exploitation/Dockerfile",
+      "enabledByDefault": false,
+      "healthCheck": "docker run --rm mcp-sechub/exploitation --list-tools",
+      "assignedAgents": [
+        "WebBreaker",
+        "ReconScout"
+      ],
+      "notes": "ExploitDB lookup (read-only). Exploit EXECUTION is approval-gated + lab scope."
+    },
+    {
+      "mcpServerName": "pentest-mcp-server-ssh",
+      "sourceRepo": "pentest-mcp-server",
+      "runtimeType": "python",
+      "category": "persistent_execution",
+      "riskClass": "terminal",
+      "toolNames": [
+        "create_session",
+        "execute",
+        "read_output",
+        "send_input",
+        "list_sessions",
+        "kill_session",
+        "reconnect",
+        "recover_sessions",
+        "upload_file",
+        "download_file",
+        "get_system_status"
+      ],
+      "requiredBinaries": [
+        "tmux",
+        "ssh"
+      ],
+      "requiredDockerImages": [],
+      "requiredEnv": [
+        "PENTEST_SSH_TARGETS"
+      ],
+      "apiKeysRequired": [],
+      "networkRequirements": "SSH to authorized lab hosts only",
+      "installMethod": "python venv + pip install -r requirements.txt",
+      "enabledByDefault": false,
+      "healthCheck": "python -m pentest_mcp_server --selftest",
+      "assignedAgents": [
+        "SessionRunner"
+      ],
+      "notes": "Persistent SSH/tmux sessions \u2014 long-running interactive ops + session recovery. HIGH risk (arbitrary remote command) \u2192 approval-gated."
+    },
+    {
+      "mcpServerName": "pentest-mcp-recon",
+      "sourceRepo": "pentest-mcp",
+      "runtimeType": "node",
+      "category": "reconnaissance",
+      "riskClass": "network",
+      "toolNames": [
+        "nmap",
+        "gobuster",
+        "nikto",
+        "dnsenum",
+        "whois",
+        "dig",
+        "sslscan",
+        "wpscan",
+        "hashcat"
+      ],
+      "requiredBinaries": [
+        "nmap",
+        "gobuster",
+        "nikto",
+        "hashcat"
+      ],
+      "requiredDockerImages": [
+        "pentest-mcp (optional)"
+      ],
+      "requiredEnv": [],
+      "apiKeysRequired": [],
+      "networkRequirements": "authorized targets only",
+      "installMethod": "npm install && npm run build (or docker)",
+      "enabledByDefault": false,
+      "healthCheck": "node build/index.js --list-tools",
+      "assignedAgents": [
+        "ReconScout",
+        "WebBreaker",
+        "CredSmith"
+      ],
+      "notes": "Modular TS toolkit; tool surface SPLIT across specialists by category in agentMcpMap (recon\u2192ReconScout, nikto/wpscan\u2192WebBreaker, hashcat\u2192CredSmith)."
+    },
+    {
+      "mcpServerName": "chillspwn-reporting",
+      "sourceRepo": "chillspwn-builtin",
+      "runtimeType": "node",
+      "category": "reporting_memory",
+      "riskClass": "read-only",
+      "toolNames": [
+        "generate_final_report",
+        "export_evidence_bundle",
+        "propose_training_lesson",
+        "review_training_lessons"
+      ],
+      "requiredBinaries": [],
+      "requiredDockerImages": [],
+      "requiredEnv": [],
+      "apiKeysRequired": [],
+      "networkRequirements": "none (local dashboard endpoints)",
+      "installMethod": "built-in (RunReport + TrainingMemory endpoints, Phase 11/8.2)",
+      "enabledByDefault": true,
+      "healthCheck": "GET /api/runs/:id/report",
+      "assignedAgents": [
+        "ReportSmith"
+      ],
+      "notes": "Reuses the existing Phase 11 report/evidence + 8.2 training-memory endpoints \u2014 no external MCP needed."
+    },
+    {
+      "mcpServerName": "registry:awesome-cybersecurity-MCP",
+      "sourceRepo": "awesome-cybersecurity-MCP",
+      "runtimeType": "registry",
+      "category": "reconnaissance",
+      "riskClass": "read-only",
+      "toolNames": [],
+      "requiredBinaries": [],
+      "requiredDockerImages": [],
+      "requiredEnv": [],
+      "apiKeysRequired": [],
+      "networkRequirements": "discovery only",
+      "installMethod": "registry/list \u2014 NOT installed",
+      "enabledByDefault": false,
+      "healthCheck": "n/a",
+      "assignedAgents": [],
+      "notes": "Discovery registry (~12 entries). Not installed; used to source additional MCPs on operator request."
+    },
+    {
+      "mcpServerName": "registry:awesome-cyber-security-mcp",
+      "sourceRepo": "awesome-cyber-security-mcp",
+      "runtimeType": "registry",
+      "category": "reconnaissance",
+      "riskClass": "read-only",
+      "toolNames": [],
+      "requiredBinaries": [],
+      "requiredDockerImages": [],
+      "requiredEnv": [],
+      "apiKeysRequired": [],
+      "networkRequirements": "discovery only",
+      "installMethod": "registry/list \u2014 NOT installed",
+      "enabledByDefault": false,
+      "healthCheck": "n/a",
+      "assignedAgents": [],
+      "notes": "Discovery registry (~49 entries). Not installed; used to source additional MCPs on operator request."
+    },
+    {
+      "mcpServerName": "vulnintel-cve-mcp",
+      "sourceRepo": "cve-mcp-server",
+      "runtimeType": "python",
+      "category": "vulnerability_intelligence",
+      "riskClass": "network",
+      "toolNames": [
+        "lookup_cve",
+        "search_cves",
+        "get_cve_summary",
+        "get_epss_score",
+        "check_kev",
+        "parse_cvss",
+        "check_package_vulns",
+        "get_attack_mapping",
+        "calculate_risk_score",
+        "health_check"
+      ],
+      "requiredBinaries": [],
+      "requiredDockerImages": [],
+      "requiredEnv": [],
+      "apiKeysRequired": [
+        "NVD(optional)",
+        "VirusTotal(optional)",
+        "Shodan(optional)",
+        "GreyNoise(optional)"
+      ],
+      "networkRequirements": "outbound HTTPS to NVD/EPSS/KEV/VT/Shodan",
+      "installMethod": "python venv + pip install . ; python -m cve_mcp.server (NVD/EPSS/KEV keyless; VT/Shodan/GreyNoise tools need keys, NOT exposed keyless)",
+      "enabledByDefault": false,
+      "healthCheck": "python -m cve_mcp_server --selftest",
+      "assignedAgents": [
+        "VulnIntel"
+      ],
+      "notes": "Read-only CVE/EPSS/KEV/ATT&CK intelligence. NVD works keyless (rate-limited).",
+      "optionalEnv": [
+        "NVD_API_KEY",
+        "VIRUSTOTAL_KEY",
+        "SHODAN_KEY",
+        "GREYNOISE_API_KEY"
+      ]
+    },
+    {
+      "mcpServerName": "vulnintel-nvd",
+      "sourceRepo": "nvd-cve-mcp-server",
+      "runtimeType": "node",
+      "category": "cve_lookup",
+      "riskClass": "network",
+      "toolNames": [
+        "get_cve_details",
+        "search_cves"
+      ],
+      "requiredBinaries": [
+        "node"
+      ],
+      "requiredDockerImages": [],
+      "requiredEnv": [],
+      "apiKeysRequired": [
+        "NVD(optional)"
+      ],
+      "networkRequirements": "outbound HTTPS to NVD",
+      "installMethod": "npm install ; node src/index.js (NVD keyless)",
+      "enabledByDefault": false,
+      "healthCheck": "node src/index.js --list-tools",
+      "assignedAgents": [
+        "VulnIntel"
+      ],
+      "notes": "Focused NVD lookup; keyless fallback.",
+      "optionalEnv": [
+        "NVD_API_KEY"
+      ]
+    },
+    {
+      "mcpServerName": "vulnintel-cve-search-local",
+      "sourceRepo": "cve-search_mcp",
+      "runtimeType": "python",
+      "category": "cve_lookup",
+      "riskClass": "read-only",
+      "toolNames": [
+        "cve_search_query",
+        "cve_browse",
+        "cve_by_vendor"
+      ],
+      "requiredBinaries": [],
+      "requiredDockerImages": [
+        "cve-search (local)"
+      ],
+      "requiredEnv": [
+        "CVE_SEARCH_BASE"
+      ],
+      "apiKeysRequired": [],
+      "networkRequirements": "local cve-search instance only",
+      "installMethod": "requires a self-hosted cve-search DB",
+      "enabledByDefault": false,
+      "healthCheck": "curl $CVE_SEARCH_BASE/api/dbinfo",
+      "assignedAgents": [
+        "VulnIntel"
+      ],
+      "notes": "Offline/local CVE option; needs a provisioned cve-search instance."
+    }
+  ]
+}

@@ -1,0 +1,32 @@
+{
+  "name": "CloudSentinel",
+  "provider": "openai-codex",
+  "model": "gpt-5.6-sol",
+  "permissionMode": "default",
+  "systemPromptFile": "SOUL.md",
+  "tools": [
+    "terminal",
+    "execute_code",
+    "process",
+    "read_file",
+    "write_file",
+    "search_files",
+    "use_skill",
+    "recall_conversation",
+    "web_search",
+    "web_extract"
+  ],
+  "description": "cloud specialist (Phase 15) — commanded by ChillsPwn. agentId=CloudSentinel",
+  "appendSystemPrompt": null,
+  "agentId": "CloudSentinel",
+  "specialty": "cloud",
+  "allowedMcpServers": [
+    "sechub-cloud-security"
+  ],
+  "approvalRequiredTools": [
+    "prowler_scan",
+    "run_prowler_scan"
+  ],
+  "memoryNamespace": "agent:cloudsentinel",
+  "canApproveTrainingLessons": false
+}

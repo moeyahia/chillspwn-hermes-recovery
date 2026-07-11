@@ -1,0 +1,69 @@
+{
+  "schemaVersion": "17.0",
+  "generated": "phase-17 — inventory only; no CVE lookups were run against any live API during inventory",
+  "vendorDir": "/opt/chillspwn-assets/vuln-intel",
+  "taxonomy": ["vulnerability_intelligence", "cve_lookup", "exploit_prioritization", "kev_epss", "attack_mapping"],
+  "policy": {
+    "doNotCommitVendor": true,
+    "assignedSpecialist": "VulnIntel",
+    "readOnlyLookupOnly": true,
+    "noExploitExecution": true,
+    "cloudCredsNotRequiredForTargetTesting": true
+  },
+  "servers": [
+    {
+      "assetId": "cve-mcp-server", "mcpServerName": "vulnintel-cve-mcp",
+      "repo": "mukul975/cve-mcp-server", "sourceUrl": "https://github.com/mukul975/cve-mcp-server",
+      "commitHash": "809953e04c1db4eaa3b808747e16711d23964af4", "license": "MIT",
+      "category": "vulnerability_intelligence", "runtimeType": "python",
+      "localPath": "/opt/chillspwn-assets/vuln-intel/cve-mcp-server", "sizeBytes": 12582912,
+      "command": "python", "args": ["-m", "cve_mcp_server"], "env": {},
+      "toolNames": ["fetch_cve", "get_cve_summary", "compare_cves", "build_cve_comparison", "get_epss", "get_epss_score", "check_kev", "fetch_kev_catalog", "get_attack_mapping", "check_exploit_availability", "check_poc_exists", "calculate_risk_score", "build_vuln_report", "generate_vuln_report", "get_vendor_advisory", "check_package_vulns", "check_ransomware_intel", "health_check"],
+      "recommendedTools": ["fetch_cve", "get_epss_score", "check_kev", "get_attack_mapping", "calculate_risk_score"],
+      "requiredEnv": ["NVD_API_KEY", "VIRUSTOTAL_KEY", "SHODAN_KEY", "GREYNOISE_API_KEY"],
+      "requiresApiKey": true, "requiresDocker": false, "requiresDownload": true, "enabledByDefault": false,
+      "assignedAgents": ["VulnIntel"],
+      "safeUsageNotes": "Read-only CVE/EPSS/KEV/ATT&CK intelligence over public HTTPS APIs. NVD works keyless (rate-limited); VT/Shodan/GreyNoise enrichers degrade gracefully when keys absent. No exploitation.",
+      "updateCommand": "git -C /opt/chillspwn-assets/vuln-intel/cve-mcp-server pull",
+      "healthCheckCommand": "python -m cve_mcp_server --selftest  # tools/list, no lookup",
+      "consequenceIfNoKey": "core NVD/EPSS/KEV lookups still work keyless (rate-limited); VT/Shodan/GreyNoise enrichment unavailable",
+      "notes": "Broad: 27 tools / 21 sources. The primary VulnIntel MCP. Outbound HTTPS only."
+    },
+    {
+      "assetId": "nvd-cve-mcp-server", "mcpServerName": "vulnintel-nvd",
+      "repo": "SOCTeam-ai/nvd-cve-mcp-server", "sourceUrl": "https://github.com/SOCTeam-ai/nvd-cve-mcp-server",
+      "commitHash": "01fc032e28877f487ed034bd4e8ccf86b0ddce71", "license": "MIT",
+      "category": "cve_lookup", "runtimeType": "node",
+      "localPath": "/opt/chillspwn-assets/vuln-intel/nvd-cve-mcp-server", "sizeBytes": 278528,
+      "command": "node", "args": ["src/index.js"], "env": {},
+      "toolNames": ["get_cve", "search_cve", "cve_lookup"],
+      "recommendedTools": ["get_cve", "search_cve"],
+      "requiredEnv": ["NVD_API_KEY"],
+      "requiresApiKey": false, "requiresDocker": false, "requiresDownload": true, "enabledByDefault": false,
+      "assignedAgents": ["VulnIntel"],
+      "safeUsageNotes": "Focused NVD CVE lookup (Node/npx). Works keyless with a rate-limit fallback; NVD_API_KEY raises the limit. Read-only.",
+      "updateCommand": "git -C /opt/chillspwn-assets/vuln-intel/nvd-cve-mcp-server pull && npm ci",
+      "healthCheckCommand": "node src/index.js --list-tools",
+      "consequenceIfNoKey": "still works, lower NVD rate limit",
+      "notes": "Lightweight NVD-only fallback for VulnIntel."
+    },
+    {
+      "assetId": "cve-search_mcp", "mcpServerName": "vulnintel-cve-search-local",
+      "repo": "roadwy/cve-search_mcp", "sourceUrl": "https://github.com/roadwy/cve-search_mcp",
+      "commitHash": "af1b95327d56e7185b473713b8f749ed628bbfb3", "license": "GPL-ish (see repo)",
+      "category": "cve_lookup", "runtimeType": "python",
+      "localPath": "/opt/chillspwn-assets/vuln-intel/cve-search_mcp", "sizeBytes": 315392,
+      "command": "python", "args": ["server.py"], "env": { "CVE_SEARCH_BASE": "<local cve-search url>" },
+      "toolNames": ["cve_search_query", "cve_browse", "cve_by_vendor"],
+      "recommendedTools": ["cve_search_query"],
+      "requiredEnv": ["CVE_SEARCH_BASE"],
+      "requiresApiKey": false, "requiresDocker": true, "requiresDownload": true, "enabledByDefault": false,
+      "assignedAgents": ["VulnIntel"],
+      "safeUsageNotes": "Bridge to a LOCAL/self-hosted cve-search instance (offline CVE DB). Requires a running cve-search + its data — heavy local setup. Read-only.",
+      "updateCommand": "git -C /opt/chillspwn-assets/vuln-intel/cve-search_mcp pull",
+      "healthCheckCommand": "curl -s $CVE_SEARCH_BASE/api/dbinfo  # local cve-search health",
+      "consequenceIfNoKey": "n/a (no API key); needs a local cve-search DB instance to function",
+      "notes": "Offline/air-gapped CVE option. Disabled until a local cve-search instance is provisioned."
+    }
+  ]
+}

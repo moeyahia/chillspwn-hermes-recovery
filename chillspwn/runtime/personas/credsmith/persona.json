@@ -1,0 +1,33 @@
+{
+  "name": "CredSmith",
+  "provider": "openai-codex",
+  "model": "gpt-5.6-sol",
+  "permissionMode": "default",
+  "systemPromptFile": "SOUL.md",
+  "tools": [
+    "terminal",
+    "execute_code",
+    "process",
+    "read_file",
+    "write_file",
+    "search_files",
+    "use_skill",
+    "recall_conversation",
+    "web_search",
+    "web_extract"
+  ],
+  "description": "credentials specialist (Phase 15) — commanded by ChillsPwn. agentId=CredSmith",
+  "appendSystemPrompt": null,
+  "agentId": "CredSmith",
+  "specialty": "credentials",
+  "allowedMcpServers": [
+    "sechub-password-cracking",
+    "pentest-mcp-recon"
+  ],
+  "approvalRequiredTools": [
+    "hashcat_crack",
+    "hashcat"
+  ],
+  "memoryNamespace": "agent:credsmith",
+  "canApproveTrainingLessons": false
+}

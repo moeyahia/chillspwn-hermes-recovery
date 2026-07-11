@@ -1,0 +1,11 @@
+{
+	"appId": "com.chillspwn.app",
+	"appName": "ChillsPwn",
+	"webDir": "dist",
+	"server": {
+		"url": "https://kali-vps.tail6f91d3.ts.net"
+	},
+	"android": {
+		"allowMixedContent": true
+	}
+}

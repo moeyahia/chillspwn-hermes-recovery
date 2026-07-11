@@ -1,0 +1,183 @@
+<!doctype html>
+<html lang="en" class="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <title>ChillsPwn</title>
+    <link rel="icon" type="image/png" href="/smallLogo.png">
+    <!-- Dark-HUD revamp fonts: Chakra Petch (display) + JetBrains Mono (data/UI) -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+    <!-- Home-screen app (PWA) — iOS + Android -->
+    <meta name="theme-color" content="#0a0e14" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="ChillsPwn" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <script>
+      // ── Diagnostic beacon (temporary) — ships the browser's OWN errors + lifecycle to the
+      //    server, because the iPad PWA's Safari console isn't reachable here. Distinguishes the
+      //    "blank screen on resume" failure modes: full reload (resource-error / pageshow
+      //    persisted:false) vs main-thread FREEZE (heartbeat gap) vs JS exception vs memory.
+      //    Runs FIRST (capture-phase) so it catches a failed bundle load. Remove once diagnosed.
+      (function () {
+        var Q = [], sid = Math.random().toString(36).slice(2, 8), seq = 0, lastBeat = Date.now();
+        function send(force) {
+          if (!Q.length) return;
+          var batch = Q.splice(0, Q.length), body = JSON.stringify(batch);
+          try {
+            if (force && navigator.sendBeacon) navigator.sendBeacon('/api/client-log', new Blob([body], { type: 'application/json' }));
+            else fetch('/api/client-log', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: body, keepalive: true }).catch(function () {});
+          } catch (e) {}
+        }
+        function clog(type, data) {
+          var mem = null; try { if (performance && performance.memory) mem = Math.round(performance.memory.usedJSHeapSize / 1048576); } catch (e) {}
+          Q.push({ sid: sid, seq: seq++, t: Date.now(), type: type, data: data || null, vis: document.visibilityState, memMB: mem });
+          if (Q.length >= 8) send(false);
+        }
+        window.__clog = clog;
+        var standalone = false;
+        try { standalone = (window.navigator.standalone === true) || (window.matchMedia && matchMedia('(display-mode: standalone)').matches); } catch (e) {}
+        clog('boot', { ua: navigator.userAgent, deviceMem: navigator.deviceMemory || null, standalone: standalone, vp: innerWidth + 'x' + innerHeight, dpr: window.devicePixelRatio });
+        addEventListener('error', function (e) {
+          if (e && e.target && (e.target.tagName === 'SCRIPT' || e.target.tagName === 'LINK')) clog('resource-error', { tag: e.target.tagName, url: e.target.src || e.target.href });
+          else clog('js-error', { msg: e && e.message, src: e && e.filename, line: e && e.lineno, stack: e && e.error && e.error.stack ? String(e.error.stack).slice(0, 700) : null });
+          send(true);
+        }, true);
+        addEventListener('unhandledrejection', function (e) { clog('promise-reject', { reason: e && e.reason ? String(e.reason).slice(0, 700) : null }); send(true); });
+        addEventListener('pageshow', function (e) { clog('pageshow', { persisted: e.persisted }); send(true); });
+        addEventListener('pagehide', function (e) { clog('pagehide', { persisted: e.persisted }); send(true); });
+        addEventListener('freeze', function () { clog('freeze', null); send(true); });
+        addEventListener('resume', function () { clog('resume', null); send(true); });
+        document.addEventListener('visibilitychange', function () { clog('visibility', { state: document.visibilityState, sinceBeatMs: Date.now() - lastBeat }); send(true); });
+        document.addEventListener('DOMContentLoaded', function () { clog('domcontentloaded', null); });
+        addEventListener('load', function () { clog('load', null); send(false); });
+        // Heartbeat: a large gap between ticks ⇒ the main thread was BLOCKED (freeze) for that long.
+        setInterval(function () { var now = Date.now(), gap = now - lastBeat; lastBeat = now; if (gap > 2500) { clog('freeze-detected', { gapMs: gap }); send(true); } }, 1000);
+        setInterval(function () { send(false); }, 5000);
+      })();
+    </script>
+  </head>
+  <body class="bg-slate-950 text-slate-200">
+    <style>
+      /* Splash/loading overlay (#63 attempt 5). Lives OUTSIDE #root so React's mount does NOT
+         remove it — it stays up ~800ms to (a) mask the iOS PWA cold-relaunch torn frame and
+         (b) give the viewport time to settle to its full (lvh) height before the UI is revealed. */
+      #splash {
+        position: fixed; inset: 0; z-index: 99999;
+        display: flex; flex-direction: column; align-items: center; justify-content: center;
+        gap: 18px; background: #141825;
+        font-family: system-ui, -apple-system, sans-serif;
+        opacity: 1; transition: opacity .35s ease;
+      }
+      #splash.hide { opacity: 0; pointer-events: none; }
+      #splash .s-brand { font-size: 12px; letter-spacing: .22em; color: #7dd3fc; }
+      #splash .s-track { width: 132px; height: 3px; border-radius: 3px; background: rgba(125,211,252,.14); overflow: hidden; }
+      #splash .s-bar { width: 40%; height: 100%; border-radius: 3px; background: #38bdf8; animation: s-slide 1s ease-in-out infinite; }
+      @keyframes s-slide { 0% { transform: translateX(-120%);} 100% { transform: translateX(330%);} }
+    </style>
+    <script>
+      // App-shell viewport fix for iOS standalone PWAs (#63, attempt 5).
+      //
+      // The shell height is 100lvh (the LARGE viewport — the full screen height computed up front,
+      // not subject to iOS's first-paint dynamic shrink). To cover the brief window before the
+      // viewport settles AND the ugly torn frame iOS paints when the PWA cold-relaunches, we hold
+      // a splash overlay up for ~800ms, force ONE reflow of the shell (so its lvh box is recomputed
+      // against the now-settled viewport), then fade the splash out to reveal a correctly-sized UI.
+      (function () {
+        function reflowShell() {
+          var s = document.querySelector('.app-shell');
+          if (!s) return;
+          var d = s.style.display;
+          s.style.display = 'none';
+          void s.offsetHeight;          // flush: commit removal from layout
+          s.style.display = d || '';    // restore (class → flex): fresh box from settled viewport
+          void s.offsetHeight;          // flush: compute the new box now
+        }
+        var hidden = false;
+        function hideSplash() {
+          if (hidden) return; hidden = true;
+          reflowShell();                // recompute lvh against the settled viewport, under cover
+          var sp = document.getElementById('splash');
+          if (sp) { sp.classList.add('hide'); setTimeout(function () { if (sp.parentNode) sp.parentNode.removeChild(sp); }, 400); }
+        }
+        // Keep the splash up at least ~800ms after load so iOS has settled the viewport.
+        if (document.readyState === 'complete') setTimeout(hideSplash, 800);
+        else addEventListener('load', function () { setTimeout(hideSplash, 800); });
+        // Safety: never let the splash get stuck.
+        setTimeout(hideSplash, 4000);
+        // Re-settle when returning to the app or on viewport changes (cheap, no splash).
+        document.addEventListener('visibilitychange', function () {
+          if (document.visibilityState === 'visible') reflowShell();
+        });
+        addEventListener('orientationchange', reflowShell);
+        addEventListener('resize', reflowShell);
+        var vv = window.visualViewport;
+        if (vv) vv.addEventListener('resize', reflowShell);
+        // First user interaction — iOS re-resolves the viewport box; piggyback one reflow.
+        function firstTouch() {
+          reflowShell();
+          removeEventListener('pointerdown', firstTouch, true);
+          removeEventListener('touchend', firstTouch, true);
+        }
+        addEventListener('pointerdown', firstTouch, true);
+        addEventListener('touchend', firstTouch, true);
+      })();
+    </script>
+    <!-- Splash overlay: outside #root so React mount never removes it (see #splash CSS above). -->
+    <div id="splash">
+      <img src="/smallLogo.png" width="60" height="60" alt="" style="opacity:.9;filter:drop-shadow(0 0 12px rgba(0,212,255,.4))" />
+      <div class="s-brand">CHILLSPWN</div>
+      <div class="s-track"><div class="s-bar"></div></div>
+    </div>
+    <div id="root">
+      <!-- Boot overlay: shown immediately so the app never appears as a pure blank
+           screen on iOS (#42). React replaces #root's children on mount, clearing this.
+           If the bundle fails to load / parse (e.g. a stale cached index pointing at a
+           since-deleted bundle hash), the watchdog below swaps in a Retry button that
+           hard-reloads with cache-busting. -->
+      <div id="boot" style="position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;font-family:system-ui,-apple-system,sans-serif;color:#7dd3fc;background:#0a0e1a;gap:16px">
+        <div style="font-size:13px;letter-spacing:.15em;opacity:.85">CHILLSPWN</div>
+        <div id="boot-msg" style="font-size:12px;color:#64748b">connecting…</div>
+        <div id="boot-actions"></div>
+      </div>
+    </div>
+    <script>
+      (function () {
+        var failed = false;
+        function showRetry(reason) {
+          if (failed) return; failed = true;
+          var msg = document.getElementById('boot-msg');
+          var act = document.getElementById('boot-actions');
+          if (!msg || !act) return;
+          msg.textContent = "Couldn't load the app" + (reason ? " (" + reason + ")" : "");
+          msg.style.color = '#f87171';
+          act.innerHTML =
+            '<button id="boot-retry" style="margin-top:8px;padding:10px 22px;border-radius:8px;' +
+            'border:1px solid #38bdf8;background:rgba(56,189,248,.12);color:#7dd3fc;font-size:14px;' +
+            'font-family:inherit;cursor:pointer">Retry</button>';
+          document.getElementById('boot-retry').onclick = function () {
+            // cache-bust: drop any caches + hard reload to the canonical URL
+            try { if (window.caches && caches.keys) caches.keys().then(function (k) { k.forEach(function (n) { caches.delete(n); }); }); } catch (e) {}
+            location.replace(location.pathname + '?_=' + Date.now());
+          };
+        }
+        // A failed module/asset load fires window 'error' (capture phase).
+        window.addEventListener('error', function (e) {
+          var t = e && e.target;
+          if (t && (t.tagName === 'SCRIPT' || t.tagName === 'LINK')) showRetry('asset');
+        }, true);
+        // Watchdog: if React hasn't mounted (#root still holds only the boot node) after 9s,
+        // assume a white-screen and offer Retry.
+        setTimeout(function () {
+          var root = document.getElementById('root');
+          if (root && document.getElementById('boot') && root.children.length <= 1) showRetry('timeout');
+        }, 9000);
+      })();
+    </script>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
