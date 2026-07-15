@@ -1,0 +1,76 @@
+name: Bug report
+description: Report reproducible incorrect behavior using sanitized evidence.
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not include credentials, target data, private URLs, raw provider logs, or unpatched vulnerabilities. Follow SECURITY.md for private security reports.
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Pre-flight checks
+      options:
+        - label: I searched existing issues and documentation.
+          required: true
+        - label: I removed credentials, client data, targets, and personal information.
+          required: true
+        - label: This is not an unpatched security vulnerability.
+          required: true
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What is broken, and which application or recovery workflow is affected?
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction steps
+      description: Provide the smallest deterministic sequence that reproduces the problem.
+      placeholder: |
+        1. Configure ...
+        2. Run ...
+        3. Observe ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Include OS, commit or recovery tag, Bun/Node/Python versions, browser, provider path, and relevant feature-flag names without secret values.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Sanitized logs, screenshots, and testing evidence
+      description: Include the exact checks run and the smallest useful sanitized evidence.
+  - type: textarea
+    id: regression
+    attributes:
+      label: Regression range and related issues
+      description: Provide the last known-good and first known-bad revision, plus related issues or pull requests when known.
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Contributor checklist
+      options:
+        - label: I can submit a focused fix with a regression test.
+        - label: I can update affected documentation.
