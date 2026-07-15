@@ -439,7 +439,7 @@ in [`obsidian-scale-acceptance.md`](obsidian-scale-acceptance.md).
 | Sensitive-filename inventory | no actual environment, auth, private-key, or certificate files selected for publication |
 | Semgrep review | 7 reported patterns reviewed; all were false positives or intentional bounded paths, with no unresolved release blocker |
 | ChillsPwn webapp production dependency audit | clean in the webapp package scope |
-| Retained Hermes dependency alerts | 119 open GitHub Dependabot alerts: 2 critical, 30 high, 57 medium, 30 low |
+| Retained Hermes dependency alerts | 121 open GitHub Dependabot alerts: 3 critical, 30 high, 58 moderate, 30 low |
 
 The Semgrep run also reported parser/timeout limitations against the legacy
 compatibility shell. The Hermes alerts are distributed across retained Python,

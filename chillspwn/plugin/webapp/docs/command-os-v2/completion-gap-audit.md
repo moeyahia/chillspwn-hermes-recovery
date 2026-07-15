@@ -63,7 +63,7 @@ Current release disposition and residual work:
    explicit Autonomous branch/amendment flow is also implemented with immutable
    contract lineage and focused service/API evidence. Its populated browser
    journey and the remaining manual mobile/screenshot acceptance remain open.
-5. Secret scans and publishable-file review are complete with no unresolved secret finding. The live least-privilege identity, sensitive-file modes, security headers, and migration backup boundary were verified. The ChillsPwn webapp dependency audit is clean, but the retained Hermes snapshot has 119 open Dependabot alerts that require separate triage and prevent a repository-wide clean-dependency claim.
+5. Secret scans and publishable-file review are complete with no unresolved secret finding. The live least-privilege identity, sensitive-file modes, security headers, and migration backup boundary were verified. The ChillsPwn webapp dependency audit is clean, but the retained Hermes snapshot has 121 open Dependabot alerts that require separate triage and prevent a repository-wide clean-dependency claim.
 
 ## Candidate gates closed since the initial audit
 
@@ -447,7 +447,7 @@ See `security.md` for the full review. Release-relevant findings are:
 - provider/API logging stores bounded metadata and hashes instead of raw payloads and uses secure no-follow/exclusive writes;
 - canonical sensitive records are not application-encrypted at rest; host/disk encryption and backup encryption remain deployment responsibilities;
 - the current single-operator V2 actor is hard-coded as `operator:local`/admin after host authentication, not a multi-role authorization implementation;
-- `bun audit --production` is clean for `chillspwn/plugin/webapp`; Gitleaks worktree/history and TruffleHog verified filesystem/history scans reported zero findings, and the seven Semgrep findings were reviewed as false positives or intentional bounded paths. GitHub separately reports 119 open Dependabot alerts in retained Hermes lockfiles (2 critical, 30 high, 57 medium, 30 low), so no repository-wide clean-dependency claim is made. Legacy-shell parser/timeout limitations remain documented, so this is not a claim of whole-program static proof.
+- `bun audit --production` is clean for `chillspwn/plugin/webapp`; Gitleaks worktree/history and TruffleHog verified filesystem/history scans reported zero findings, and the seven Semgrep findings were reviewed as false positives or intentional bounded paths. GitHub separately reports 121 open Dependabot alerts in retained Hermes lockfiles (3 critical, 30 high, 58 moderate, 30 low), so no repository-wide clean-dependency claim is made. Legacy-shell parser/timeout limitations remain documented, so this is not a claim of whole-program static proof.
 
 ## P2 evidence and documentation gaps
 
