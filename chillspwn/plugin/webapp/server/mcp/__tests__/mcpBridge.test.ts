@@ -1,11 +1,11 @@
 import { test, expect, describe, beforeAll, afterAll } from "bun:test";
-import { mkdtempSync, writeFileSync, rmSync } from "fs";
+import { chmodSync, mkdtempSync, writeFileSync, rmSync } from "fs";
 import { join } from "path";
 import { McpServerRegistry } from "../McpServerRegistry";
 import { McpArsenalBridge } from "../McpArsenalBridge";
 import { buildMcpChildEnv, callServerTool, listServerTools, flattenMcpContent, resolveStartCommand } from "../McpToolExecutor";
 
-let dir: string, cfgPath: string, mockPath: string, manifestPath: string;
+let dir: string, cfgPath: string, mockPath: string, manifestPath: string, runnerPath: string;
 const MOCK = `import readline from "readline";
 const rl = readline.createInterface({ input: process.stdin });
 const send = (o) => process.stdout.write(JSON.stringify(o) + "\\n");
@@ -25,10 +25,17 @@ function registry() {
 beforeAll(() => {
   dir = mkdtempSync(join(import.meta.dir, "p16-"));
   mockPath = join(dir, "mock.mjs"); writeFileSync(mockPath, MOCK);
+  runnerPath = join(dir, "trusted-bun-runner");
+  writeFileSync(runnerPath, `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} "$@"\n`);
+  chmodSync(runnerPath, 0o700);
   manifestPath = join(dir, "manifest.json"); writeFileSync(manifestPath, JSON.stringify({ servers: [] }));
   cfgPath = join(dir, ".mcp.arsenal.json");
   writeFileSync(cfgPath, JSON.stringify({ mcpServers: {
-    "mock-recon": { enabled: true, runtime: "stdio", command: "node", args: [mockPath], assignedAgents: ["ReconScout"], toolNames: ["quick_scan", "port_scan"], requiredBinaries: ["node"], requiredDockerImages: [], envTemplate: {}, apiKeysRequired: [], installMethod: "mock" },
+    // Use a fixture executable owned by the current trusted UID rather than a
+    // setup-node/toolcache shim. Production correctly rejects executable paths
+    // that cross a writable or foreign-owned trust chain; the wrapper keeps that
+    // security assertion intact while remaining portable across local and CI UIDs.
+    "mock-recon": { enabled: true, runtime: "stdio", command: runnerPath, args: [mockPath], assignedAgents: ["ReconScout"], toolNames: ["quick_scan", "port_scan"], requiredBinaries: [runnerPath], requiredDockerImages: [], envTemplate: {}, apiKeysRequired: [], installMethod: "mock" },
     "needs-bin": { enabled: true, runtime: "stdio", command: "x", assignedAgents: ["WebBreaker"], toolNames: ["ffuf_dir"], requiredBinaries: ["definitely_missing_bin_xyz"], requiredDockerImages: [], envTemplate: {}, apiKeysRequired: [], installMethod: "mock" },
     "needs-key": { enabled: true, runtime: "stdio", command: "x", assignedAgents: ["OSINTSeeker"], toolNames: ["virustotal_lookup"], requiredBinaries: [], requiredDockerImages: [], envTemplate: { VT_API_KEY: "<set-me>" }, apiKeysRequired: ["VirusTotal"], installMethod: "mock" },
     "docker-srv": { enabled: true, runtime: "docker", assignedAgents: ["ReconScout"], toolNames: ["x"], requiredBinaries: [], requiredDockerImages: ["mcp/foo"], envTemplate: {}, apiKeysRequired: [], installMethod: "docker" },
