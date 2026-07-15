@@ -65,15 +65,17 @@ Execution is ONLY through the gated `POST /api/mcp/execute` — there is no arbi
 
 ## Installing profiles
 ```
-scripts/setup-mcp-arsenal.sh --profile core --write-config --health-check
-scripts/setup-mcp-arsenal.sh --profile web  --write-config --health-check
-scripts/setup-mcp-arsenal.sh --profile ad   --write-config --health-check
-scripts/setup-mcp-arsenal.sh --profile osint --write-config --health-check
+sudo /opt/chillspwn/plugin/webapp/scripts/setup-mcp-arsenal.sh --profile core --write-config --health-check
+sudo /opt/chillspwn/plugin/webapp/scripts/setup-mcp-arsenal.sh --profile web  --write-config --health-check
+sudo /opt/chillspwn/plugin/webapp/scripts/setup-mcp-arsenal.sh --profile ad   --write-config --health-check
+sudo /opt/chillspwn/plugin/webapp/scripts/setup-mcp-arsenal.sh --profile osint --write-config --health-check
 ```
 `--write-config` MERGES each profile into the active config, all `enabled:false`, with env templates
 (no secrets). Run `--health-check` to see which binaries/images/keys are present. The light stdio
 servers (`pentest-mcp-server-ssh` python, `pentest-mcp-recon` node) install via venv/npm; the sechub
 categories are **Docker** images you must build; `chillspwn-reporting` is built-in.
+
+The vendor tree, active config, application manifest, every configured working directory, and every resolved executable must remain root-owned and not group/other-writable. Never make `/opt/chillspwn-mcp-arsenal` service-owned and never use `sudo chown $USER` as a workaround. Writable MCP process state belongs only in `/root/.hermes/chillspwn/mcp-runtime`. The restore helper normalizes and validates this boundary as the real service identity; an enabled entry with an untrusted command or working directory stays non-runnable.
 
 ## Enabling OSINT keys / cloud credentials
 - **OSINT / threat-intel** (`sechub-threat-intel`): set `VT_API_KEY` / `OTX_API_KEY` / `SHODAN_API_KEY`
@@ -99,7 +101,7 @@ categories are **Docker** images you must build; `chillspwn-reporting` is built-
 
 ## Rollback
 - `ENABLE_MCP_ARSENAL=false` (or `MCP_ARSENAL_MODE=disabled`) — bridge inert, no execution.
-- `rm /opt/chillspwn-mcp-arsenal/.mcp.arsenal.json` — no config to load.
+- Move `/opt/chillspwn-mcp-arsenal/.mcp.arsenal.json` into a root-only rollback directory — no config is then loaded.
 - `git checkout` the pre-Phase-16 commit. The Claude path is untouched in every case.
 
 ## Phase 16.2 — approval mode + real local MCP

@@ -5,7 +5,7 @@ import { join } from "path";
 import { TrainingMemoryStore } from "../TrainingMemoryStore";
 import { TrainingMemoryService, TrainingMemoryError } from "../TrainingMemoryService";
 import { EventLog } from "../EventLog";
-import { validateAndNormalizeLesson, buildTrainingLessonContext, findRejectableSecrets, type AttackLessonInput } from "../AttackLesson";
+import { validateAndNormalizeLesson, buildTrainingLessonContext, findRejectableSecrets, findTargetSpecificIdentifiers, type AttackLessonInput } from "../AttackLesson";
 import { buildVerifiedMemoryContext, MemoryService } from "../MemoryService";
 import { MemoryStore } from "../MemoryStore";
 import { classifyMemoryEntry, planCleanup } from "../MemoryCleanup";
@@ -30,6 +30,7 @@ const BASE: AttackLessonInput = {
   observedSignals: ["DONT_REQ_PREAUTH on an account"],
   stepsThatWorked: ["enumerate users", "impacket GetNPUsers"],
   toolsUsed: ["GetNPUsers"],
+  references: ["https://github.com/fortra/impacket"],
   evidenceIds: ["ev_123"],
   sourceRunId: "run_1",
   sourceStepIds: ["step_1"],
@@ -58,6 +59,51 @@ describe("8.2 AttackLesson validation + secrets", () => {
     expect(v.ok).toBe(true);
     if (v.ok) { expect(v.lesson!.reuseGuidance).toContain("REDACTED"); expect(v.lesson!.reuseGuidance).not.toContain("hunter2s3cret"); }
   });
+  test("accepts generalized chains and drops sourceBoxOrLab identity", () => {
+    const v = validateAndNormalizeLesson({ ...BASE, kind: "attack_chain", sourceBoxOrLab: "named-box" });
+    expect(v.ok).toBe(true);
+    if (v.ok) {
+      expect(v.lesson!.kind).toBe("attack_chain");
+      expect((v.lesson as any).sourceBoxOrLab).toBeUndefined();
+      expect(v.lesson!.references).toEqual(["https://github.com/fortra/impacket"]);
+    }
+  });
+  test("rejects box identity and literal target addresses; placeholders remain valid", () => {
+    expect(validateAndNormalizeLesson({ ...BASE, summary: "Use this on HTB Example" }).ok).toBe(false);
+    expect(validateAndNormalizeLesson({ ...BASE, stepsThatWorked: ["scan 10.10.10.10"] }).ok).toBe(false);
+    expect(validateAndNormalizeLesson({ ...BASE, stepsThatWorked: ["scan fe80::1"] }).ok).toBe(false);
+    expect(validateAndNormalizeLesson({ ...BASE, stepsThatWorked: ["scan host.internal"] }).ok).toBe(false);
+    expect(validateAndNormalizeLesson({ ...BASE, stepsThatWorked: ["scan <TARGET_HOST>"] }).ok).toBe(true);
+    expect(findTargetSpecificIdentifiers("/root/htb/boxes/example and host.example.htb").length).toBeGreaterThan(0);
+  });
+  test("keeps public references field-only and rejects literal target URL/user/box names in steps", () => {
+    expect(validateAndNormalizeLesson({ ...BASE, references: ["https://nmap.org/book/man.html"] }).ok).toBe(true);
+    expect(validateAndNormalizeLesson({ ...BASE, stepsThatWorked: ["curl https://victim.example/admin"] }).ok).toBe(false);
+    expect(validateAndNormalizeLesson({ ...BASE, stepsThatWorked: ["authenticate -u administrator"] }).ok).toBe(false);
+    expect(validateAndNormalizeLesson({ ...BASE, stepsThatWorked: ["Use username alice with smbclient"] }).ok).toBe(false);
+    expect(validateAndNormalizeLesson({ ...BASE, stepsThatWorked: ["login as alice"] }).ok).toBe(false);
+    expect(validateAndNormalizeLesson({ ...BASE, summary: "target named orion exposed SMB" }).ok).toBe(false);
+    expect(validateAndNormalizeLesson({ ...BASE, summary: "target 'orion' exposed SMB" }).ok).toBe(false);
+    expect(validateAndNormalizeLesson({ ...BASE, summary: "The target machine CredSmith exposed SMB" }).ok).toBe(false);
+    expect(validateAndNormalizeLesson({ ...BASE, stepsThatWorked: ["curl <TARGET_URL> as <USER_REF>"] }).ok).toBe(true);
+    expect(validateAndNormalizeLesson({ ...BASE, summary: "Use user input to select a target host placeholder" }).ok).toBe(true);
+  });
+  test("redacts natural-language credential and token material before storage", () => {
+    for (const summary of [
+      "password is demo-passphrase",
+      "password demo-passphrase",
+      "credential alice:demo-passphrase",
+      "login with alice and demo-passphrase",
+      "token was demo-token-value",
+      "use the token demo-token-value",
+      "secret is demo-secret-value",
+    ]) {
+      const result = validateAndNormalizeLesson({ ...BASE, summary });
+      expect(result.ok).toBe(true);
+      if (result.ok) expect(result.lesson!.summary).toContain("REDACTED");
+    }
+    expect(validateAndNormalizeLesson({ ...BASE, summary: "Use <USER_REF> with <PASSWORD>" }).ok).toBe(true);
+  });
 });
 
 describe("8.2 lesson lifecycle", () => {
@@ -75,6 +121,20 @@ describe("8.2 lesson lifecycle", () => {
     const noProv = s.proposeLesson({ ...BASE, evidenceIds: [], sourceRunId: undefined });
     expect(() => s.approveLesson(noProv.id)).toThrow(TrainingMemoryError);
   });
+  test("attack-chain approval requires executable structure and references", () => {
+    const s = svc();
+    const incomplete = s.proposeLesson({
+      ...BASE,
+      kind: "attack_chain",
+      stepsThatWorked: [],
+      toolsUsed: [],
+      references: [],
+      verificationMethod: "",
+    });
+    expect(() => s.approveLesson(incomplete.id)).toThrow(TrainingMemoryError);
+    const complete = s.proposeLesson({ ...BASE, kind: "attack_chain", verificationMethod: "confirm the expected protocol artifact" });
+    expect(s.approveLesson(complete.id).status).toBe("verified");
+  });
 });
 
 describe("8.2 verified-lesson planning injection", () => {
@@ -87,20 +147,37 @@ describe("8.2 verified-lesson planning injection", () => {
     expect(got.length).toBe(1);
     expect(got[0].title).toBe("VERIFIED ONE");
   });
-  test("context includes technique/reuse/anti-reuse/evidence; excludes proposed + secrets", () => {
+  test("context includes executable chain/tools/verification/references; excludes proposed + secrets", () => {
     const s = svc();
-    const v = s.proposeLesson(BASE); s.approveLesson(v.id);
+    const v = s.proposeLesson({ ...BASE, verificationMethod: "confirm a response artifact", outcome: "offline material collected", failedAttempts: ["switch transport if signing blocks the first path"] }); s.approveLesson(v.id);
     s.proposeLesson({ ...BASE, title: "PROPOSED hidden" }); // not verified
     const ctx = s.buildPlanningContext();
     expect(ctx).toContain("VERIFIED TRAINING LESSONS");
     expect(ctx).toContain("AS-REP Roasting");
     expect(ctx).toContain("anti-reuse");
+    expect(ctx).toContain("ordered chain");
+    expect(ctx).toContain("impacket GetNPUsers");
+    expect(ctx).toContain("tools: GetNPUsers");
+    expect(ctx).toContain("confirm a response artifact");
+    expect(ctx).toContain("github.com/fortra/impacket");
     expect(ctx).toContain("ev_123"); // evidence ref, not a secret
     expect(ctx).not.toContain("PROPOSED hidden");
   });
   test("empty context when nothing verified", () => {
     const s = svc(); s.proposeLesson(BASE);
     expect(buildTrainingLessonContext(s.listLessons())).toBe(""); // none verified
+  });
+  test("quarantines a legacy verified lesson that bypassed current validation", () => {
+    const legacy = {
+      ...BASE,
+      id: "legacy",
+      category: "verified_attack_lesson",
+      status: "verified",
+      createdAt: new Date().toISOString(),
+      kind: "attack_lesson",
+      stepsThatWorked: ["curl http://old-target.example/admin -u administrator"],
+    } as any;
+    expect(buildTrainingLessonContext([legacy])).toBe("");
   });
 });
 

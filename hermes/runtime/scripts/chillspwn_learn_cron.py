@@ -9,16 +9,35 @@ twice. Registered as a no_agent script cron in jobs.json.
 import json, os, subprocess, sys, time
 from pathlib import Path
 
-HERMES = Path(os.environ.get("HERMES_HOME", "/root/.hermes"))
+HERMES_HOME = os.environ.get("HERMES_HOME", "").strip()
+SESSIONS_PATH = os.environ.get("CHILLSPWN_SESSIONS_DIR", "").strip()
+if not HERMES_HOME:
+    print("[learn-cron] HERMES_HOME is required", file=sys.stderr)
+    raise SystemExit(2)
+if not SESSIONS_PATH:
+    print("[learn-cron] CHILLSPWN_SESSIONS_DIR is required", file=sys.stderr)
+    raise SystemExit(2)
+
+HERMES = Path(HERMES_HOME).expanduser()
 CONV = HERMES / "conversations"
-STATE = HERMES / "scripts" / ".chillspwn_learn_state.json"
-REVIEWER = Path("/root/.hermes/skills/red-teaming/council-of-ais/scripts/chillspwn_learn.py")
-SESSIONS_DIR = Path(os.environ.get("HOME", "/root")) / ".claude" / "chillspwn" / "sessions"
+STATE_ROOT = Path(os.environ.get(
+    "CHILLSPWN_LEARN_STATE_DIR",
+    str(HERMES / "state" / "chillspwn-learning"),
+)).expanduser()
+LOG_ROOT = Path(os.environ.get(
+    "CHILLSPWN_LEARN_LOG_DIR",
+    str(HERMES / "logs"),
+)).expanduser()
+STATE = STATE_ROOT / "state.json"
+REVIEWER = HERMES / "skills" / "red-teaming" / "council-of-ais" / "scripts" / "chillspwn_learn.py"
+SESSIONS_DIR = Path(SESSIONS_PATH).expanduser()
 MAX_PER_RUN = 1          # dispatch ONE detached reviewer per tick (avoid concurrent Opus runs)
 SETTLE_SECONDS = 600     # only review transcripts stable for >10 min — a session that
                          # might be resumed soon shouldn't be reviewed yet (and the fork
                          # keeps the original clean either way).
-LEARN_LOG = HERMES / "scripts" / "chillspwn_learn.log"  # detached reviewer stdout/stderr
+LEARN_LOG = LOG_ROOT / "chillspwn-learning.log"  # detached reviewer stdout/stderr
+SUCCESS_DIR = STATE_ROOT / "success"
+RETRY_GRACE_SECONDS = int(os.environ.get("CHILLSPWN_LEARN_RETRY_GRACE_SECONDS", "1200"))
 DRY = "--dry-run" in sys.argv
 
 
@@ -34,34 +53,102 @@ def resolve_cli_session(md_name):
         return None, None
 
 def load_state():
-    """Returns (processed_md_names:set, mcp_offsets:dict). mcp_offsets maps a
+    """Return processed names, successful MCP offsets, and detached-review state.
+
+    mcp_offsets maps a
     conversation.mcp path -> how many records have already been reviewed, so the reviewer
-    only sees NEW records (the per-cwd append-only log accumulates every session)."""
+    only sees new records. Offsets advance only after a valid reviewer success marker.
+    """
     try:
         d = json.loads(STATE.read_text())
-        return set(d.get("processed", [])), dict(d.get("mcp_offsets", {}))
+        return (
+            set(d.get("processed", [])),
+            dict(d.get("mcp_offsets", {})),
+            dict(d.get("inflight", {})),
+        )
     except Exception:
-        return set(), {}
+        return set(), {}, {}
 
-def save_state(done, offsets):
-    try: STATE.write_text(json.dumps({"processed": sorted(done), "mcp_offsets": offsets}))
-    except Exception as e: print(f"[learn-cron] state save failed: {e}", file=sys.stderr)
+def save_state(done, offsets, inflight):
+    payload = {
+        "processed": sorted(done),
+        "mcp_offsets": offsets,
+        "inflight": inflight,
+    }
+    try:
+        STATE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = STATE.with_suffix(STATE.suffix + ".tmp")
+        tmp.write_text(json.dumps(payload, sort_keys=True))
+        os.replace(tmp, STATE)
+    except Exception as e:
+        print(f"[learn-cron] state save failed: {e}", file=sys.stderr)
 
 def count_records(p):
-    try: return sum(1 for ln in open(p, errors="replace") if ln.strip())
-    except Exception: return 0
+    try:
+        with open(p, errors="replace") as stream:
+            return sum(1 for line in stream if line.strip())
+    except Exception:
+        return 0
+
+
+def success_marker_for(transcript_name):
+    return SUCCESS_DIR / f"{transcript_name}.done.json"
+
+
+def marker_succeeded(marker):
+    """A file exists only as transport; completion requires an explicit JSON `ok: true`."""
+    try:
+        payload = json.loads(Path(marker).read_text())
+        return isinstance(payload, dict) and payload.get("ok") is True
+    except Exception:
+        return False
+
+
+def reconcile_inflight(done, offsets, inflight, now):
+    """Consume valid markers and mark stale reviews eligible for a controlled retry."""
+    changed = False
+    for name, meta in list(inflight.items()):
+        marker = success_marker_for(name)
+        if marker_succeeded(marker):
+            done.add(name)
+            mcp_key = meta.get("mcp_key")
+            if mcp_key:
+                prior = int(offsets.get(mcp_key, 0))
+                offsets[mcp_key] = max(prior, int(meta.get("mcp_total", 0)))
+            inflight.pop(name, None)
+            changed = True
+            continue
+        dispatched_at = float(meta.get("dispatched_at", 0) or 0)
+        if now - dispatched_at >= RETRY_GRACE_SECONDS:
+            if not meta.get("retry_ready"):
+                meta["retry_ready"] = True
+                changed = True
+    return changed
 
 def main():
+    if not REVIEWER.is_file():
+        print("[learn-cron] configured reviewer script is missing", file=sys.stderr)
+        raise SystemExit(2)
+    if not SESSIONS_DIR.is_dir():
+        print("[learn-cron] configured sessions directory is missing", file=sys.stderr)
+        raise SystemExit(2)
     if not CONV.exists():
         print("[learn-cron] no conversations dir"); return
-    done, offsets = load_state()
+    done, offsets, inflight = load_state()
     now = time.time()
+    state_changed = reconcile_inflight(done, offsets, inflight, now)
     # ChillsPwn transcripts only; finished (stable) and not yet reviewed.
     candidates = sorted(
         f for f in CONV.glob("*_ChillsPwn_*.md")
-        if f.name not in done and (now - f.stat().st_mtime) > SETTLE_SECONDS
+        if (
+            f.name not in done
+            and (f.name not in inflight or inflight[f.name].get("retry_ready"))
+            and (now - f.stat().st_mtime) > SETTLE_SECONDS
+        )
     )
     if not candidates:
+        if state_changed and not DRY:
+            save_state(done, offsets, inflight)
         print("[learn-cron] nothing new to review"); return
     print(f"[learn-cron] {len(candidates)} new ChillsPwn transcript(s); processing up to {MAX_PER_RUN}")
     for f in candidates[:MAX_PER_RUN]:
@@ -74,8 +161,14 @@ def main():
         # whatever is available. conversation.mcp lives in the engagement dir (cli_cwd);
         # this is the key fix so OpenRouter sessions (no native session) review the FULL
         # log instead of the 200k-truncated .md.
-        cmd = [sys.executable, str(REVIEWER), "--transcript", str(f)]
+        marker = success_marker_for(f.name)
+        cmd = [
+            sys.executable, str(REVIEWER),
+            "--transcript", str(f),
+            "--success-marker", str(marker),
+        ]
         mcp_key = None
+        cur_total = 0
         if cli_cwd:
             mcp = Path(cli_cwd) / "conversation.mcp"
             if mcp.exists():
@@ -87,10 +180,6 @@ def main():
                 cmd += ["--mcp", mcp_key, "--mcp-since", str(since)]
                 if cli_sid:
                     cmd += ["--session-id", cli_sid]
-                # Advance the offset at DISPATCH (same "mark at dispatch" semantics as the
-                # .md set: the detached reviewer self-caps; a failed review just skips that
-                # delta rather than retry-looping into the gateway's 120s timeout).
-                offsets[mcp_key] = cur_total
         if cli_sid:
             cmd += ["--resume-session", cli_sid]
             if cli_cwd:
@@ -98,19 +187,34 @@ def main():
         # DISPATCH DETACHED: the reviewer runs Opus via `claude -p` (minutes) — far
         # longer than the gateway's 120s no_agent script timeout. start_new_session
         # puts it in its own session so it survives this cron exiting (and the gateway
-        # reaping our process group). We mark the transcript processed at DISPATCH:
-        # chillspwn_learn.py self-caps its own runtime, so a slow/failed review just
-        # skips that transcript instead of retry-looping into the same 120s timeout.
+        # reaping our process group). The transcript and MCP offset remain inflight until
+        # the reviewer atomically writes a valid success marker. Missing/invalid markers
+        # become retryable only after RETRY_GRACE_SECONDS.
         try:
-            lf = open(LEARN_LOG, "a")
-            subprocess.Popen(cmd, stdout=lf, stderr=lf, stdin=subprocess.DEVNULL,
-                             start_new_session=True)
-            done.add(f.name)
+            SUCCESS_DIR.mkdir(parents=True, exist_ok=True)
+            LEARN_LOG.parent.mkdir(parents=True, exist_ok=True)
+            if marker.exists():
+                marker.unlink()  # remove an invalid/stale marker before a new attempt
+            with open(LEARN_LOG, "a", encoding="utf-8") as lf:
+                subprocess.Popen(
+                    cmd,
+                    stdout=lf,
+                    stderr=lf,
+                    stdin=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+            previous_attempt = int(inflight.get(f.name, {}).get("attempt", 0) or 0)
+            inflight[f.name] = {
+                "dispatched_at": now,
+                "attempt": previous_attempt + 1,
+                "mcp_key": mcp_key,
+                "mcp_total": cur_total if mcp_key else 0,
+            }
             print(f"  dispatched (detached): {f.name} via {mode} -> log {LEARN_LOG}")
         except Exception as e:
             print(f"  [learn-cron] dispatch failed for {f.name}: {e} (will retry next run)")
     if not DRY:
-        save_state(done, offsets)
+        save_state(done, offsets, inflight)
 
 if __name__ == "__main__":
     main()

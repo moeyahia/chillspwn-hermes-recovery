@@ -17,7 +17,7 @@ metadata:
 > Use this reference for paths, when-to-use guidance, and command examples.
 > These are your PRIMARY tools. Use them BEFORE reaching for Robin or any wrapper.
 
-**Linked HTB workflow:** `references/htb-openvpn-workflow.md` covers the durable Hack The Box OpenVPN workflow: saving uploaded profiles, starting/stopping VPNs with PID files, avoiding unsafe broad `pkill -f` patterns, per-box workspace layout, and Starting Point-style FTP enumeration.
+**Linked authorized-lab workflow:** `references/authorized-lab-openvpn-workflow.md` covers protected profile storage, tracked VPN processes, safe profile switching, route validation, workspace layout, and cleanup.
 
 ---
 
@@ -97,9 +97,9 @@ autorecon <target_ip> -m 5
 
 **Output structure:** Results are saved per-target in organized directories — `scans/`, `loot/`, `exploit/` — making it easy to review findings.
 
-### HackTheBox VPN + Starting Point workflow
+### Authorized-lab VPN workflow
 
-When the user wants to solve HTB/Starting Point machines, actively prepare the VPN and workspace before waiting for the target IP.
+When the user starts an authorized VPN-backed lab target, actively prepare the tunnel and protected workspace before scanning.
 
 1. Check OpenVPN and current tunnel state:
 ```bash
@@ -110,38 +110,38 @@ ip route | grep -E 'tun|10\.10\.|10\.129\.' || true
 
 2. Create a standard workspace:
 ```bash
-mkdir -p /root/htb/{vpn,boxes,challenges,loot,scans}
-chmod 700 /root/htb /root/htb/vpn
+mkdir -p <ENGAGEMENT_DIR>/{vpn,scans,loot,work,report}
+chmod 700 <ENGAGEMENT_DIR> <ENGAGEMENT_DIR>/vpn
 ```
 
 3. If Telegram rejects `.ovpn` uploads, ask the user to rename it to `.txt`, zip it, or paste the contents. Save the received text document back to `.ovpn` with private permissions:
 ```bash
-install -m 600 /root/.hermes/cache/documents/<uploaded>.txt /root/htb/vpn/htb.ovpn
+install -m 600 <UPLOADED_PROFILE> <ENGAGEMENT_DIR>/vpn/profile.ovpn
 ```
 
 4. Start OpenVPN and verify the tunnel:
 ```bash
-/usr/sbin/openvpn --config /root/htb/vpn/htb.ovpn \
-  --daemon htb-vpn \
-  --writepid /root/htb/vpn/openvpn.pid \
-  --log /root/htb/vpn/openvpn.log
+/usr/sbin/openvpn --config <ENGAGEMENT_DIR>/vpn/profile.ovpn \
+  --daemon lab-vpn \
+  --writepid <ENGAGEMENT_DIR>/vpn/openvpn.pid \
+  --log <ENGAGEMENT_DIR>/vpn/openvpn.log
 sleep 8
 ip -brief addr | grep -E 'tun|tap'
-ip route | grep -E '10\.10\.|10\.129\.'
-tail -80 /root/htb/vpn/openvpn.log
+ip route get <TARGET_IP>
+tail -80 <ENGAGEMENT_DIR>/vpn/openvpn.log
 ```
 
-Success indicator: `Initialization Sequence Completed` and routes for HTB ranges such as `10.129.0.0/16` through `tun0`.
+Success indicator: `Initialization Sequence Completed` and the authorized target route using `tun0`.
 
 5. For spawned machines, immediately enumerate with Kali-native tools and store artifacts per target:
 ```bash
 TARGET=<ip>
-mkdir -p /root/htb/boxes/$TARGET/{scans,loot}
+mkdir -p <ENGAGEMENT_DIR>/{scans,loot}
 ping -c 2 -W 2 $TARGET || true
-nmap -Pn --min-rate 5000 -p- --open -oN /root/htb/boxes/$TARGET/scans/nmap_fast.txt $TARGET
+nmap -Pn --min-rate 5000 -p- --open -oN <ENGAGEMENT_DIR>/scans/nmap_fast.txt "$TARGET"
 ```
 
-**Starting Point FTP pattern:** If only FTP is open, run `nmap -Pn -sCV -p21`, test anonymous login, list files, download readable flags into `/root/htb/boxes/$TARGET/loot/`, and explain the anonymous FTP misconfiguration.
+**Anonymous FTP pattern:** If only FTP is open, run `nmap -Pn -sCV -p21`, test anonymous access, list files, download only authorized evidence into `<ENGAGEMENT_DIR>/loot/`, and explain the access-control misconfiguration.
 
 **Pitfall:** Avoid broad `pkill -f "openvpn.*..."` patterns inside the same shell command that starts OpenVPN; the pattern can match the wrapper shell and terminate the tool run. Check existing processes first, then start with `--writepid` and manage by PID.
 
@@ -238,7 +238,7 @@ Modern successor to CrackMapExec. Swiss army knife for AD environments — passw
 **Example usage:**
 ```bash
 # Check for local admin access across a subnet
-nxc smb 192.168.1.0/24 -u <user> -p <pass>
+nxc smb <AUTHORIZED_SUBNET> -u <USER> -p <PASSWORD>
 
 # Password spray
 nxc smb <dc_ip> -u users.txt -p passwords.txt --continue-on-success
@@ -307,8 +307,8 @@ Dedicated wireless auditing platform with monitor mode, packet injection, and ro
 
 **Connection:**
 ```bash
-# Find Pineapple on LAN (default IP varies — DHCP or 172.16.42.1)
-nmap -p 22 192.168.2.0/24 --open 2>/dev/null | grep -B3 "22/tcp"
+# Find the authorized appliance on the assessment LAN (address varies by DHCP/configuration)
+nmap -p 22 <AUTHORIZED_SUBNET> --open 2>/dev/null | grep -B3 "22/tcp"
 
 # SSH in (Mark VII default: root / hak5pineapple)
 ssh root@<pineapple_ip>
@@ -325,15 +325,15 @@ hcxdumptool -i wlan0mon    # PMKID harvesting (passive WPA2 attack)
 
 ---
 
-## 7. ChillsPwn Arsenal Aliases (MANDATORY on this host)
+## 7. Optional ChillsPwn compatibility aliases
 
-This machine exposes every standard tool through UPPERCASE alias wrappers in `/opt/chillspwn-bin`
-(on `$PATH`). **Always invoke the ALIAS, not the raw tool name** — it is the canonical,
-pre-configured interface. Flags/arguments are identical; only the command name changes
-(e.g. `SURFACE -sC -sV <ip>` instead of `nmap -sC -sV <ip>`).
+Use Kali-native tool names as the portable, canonical interface. Some restored hosts may also
+provide uppercase convenience wrappers under `/opt/chillspwn-bin`; they are optional legacy
+compatibility helpers and must never be assumed to exist. When that directory and its
+`ALIASES.md` are present, flags and arguments remain identical; only the command name differs
+(for example, `SURFACE -sC -sV <ip>` is an optional alias for `nmap -sC -sV <ip>`).
 
-The authoritative, always-current map lives at **`/opt/chillspwn-bin/ALIASES.md`** (generated from
-the wrappers — read it for the full categorized list of all 97). Common ones:
+Common historical aliases include:
 
 | Alias | Tool | Alias | Tool | Alias | Tool |
 |---|---|---|---|---|---|
@@ -349,4 +349,5 @@ the wrappers — read it for the full categorized list of all 97). Common ones:
 | `TUN` | chisel | `CHAIN` | proxychains4 | `LISTEN` | responder |
 | `BROWSE` | gobuster | `WALK` | feroxbuster | `SEEK` | ffuf |
 
-To rediscover everything: `ls /opt/chillspwn-bin` or `cat /opt/chillspwn-bin/ALIASES.md`.
+To inspect aliases on a host that provides them, read `/opt/chillspwn-bin/ALIASES.md`. Otherwise,
+use the native tool column directly.

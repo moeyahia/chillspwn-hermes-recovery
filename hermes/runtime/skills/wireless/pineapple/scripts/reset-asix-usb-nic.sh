@@ -3,8 +3,13 @@
 # Run on Kali. Requires root.
 set -euo pipefail
 
-PINEAPPLE_IP="${PINEAPPLE_IP:-172.16.42.1}"
+PINEAPPLE_HEALTH_HOST="${PINEAPPLE_HEALTH_HOST:-}"
 ASIX_IF="${ASIX_IF:-}"
+
+if [ -z "$PINEAPPLE_HEALTH_HOST" ]; then
+  echo "ERROR: PINEAPPLE_HEALTH_HOST is required; no device address default is allowed" >&2
+  exit 2
+fi
 
 find_binding() {
   for d in /sys/bus/usb/drivers/asix/*:*; do
@@ -36,7 +41,7 @@ pre_iface="$(iface_for_binding || true)"
 echo "[*] ASIX binding: $binding"
 echo "[*] Pre-reset iface: ${pre_iface:-unknown}"
 
-if ping -c 1 -W 1 "$PINEAPPLE_IP" >/dev/null 2>&1; then
+if ping -c 1 -W 1 "$PINEAPPLE_HEALTH_HOST" >/dev/null 2>&1; then
   echo "[*] Pineapple reachable before reset"
 else
   echo "[!] Pineapple not reachable before reset; continuing driver rebind anyway"
@@ -58,7 +63,7 @@ fi
 echo "[*] Post-reset iface: ${post_iface:-unknown}"
 if [ -n "$post_iface" ]; then
   ip link set "$post_iface" up || true
-  if ! ip -4 addr show "$post_iface" | grep -q '172\.16\.42\.'; then
+  if ! ip -4 addr show "$post_iface" | grep -q 'inet '; then
     echo "[*] Requesting DHCP on $post_iface"
     if command -v dhclient >/dev/null 2>&1; then
       dhclient -1 -v "$post_iface" || true
@@ -69,7 +74,7 @@ if [ -n "$post_iface" ]; then
 fi
 
 for i in $(seq 1 20); do
-  if ping -c 1 -W 1 "$PINEAPPLE_IP" >/dev/null 2>&1; then
+  if ping -c 1 -W 1 "$PINEAPPLE_HEALTH_HOST" >/dev/null 2>&1; then
     echo "[+] Pineapple reachable after ${i}s"
     break
   fi

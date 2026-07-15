@@ -2,7 +2,7 @@
 """Validate + stress-test the reused Hermes tools (via council_tools).
 Confirms each exposed tool actually works, then hammers the core ones."""
 import json, os, sys, tempfile, threading, time
-sys.path.insert(0, "/root/.hermes/skills/red-teaming/council-of-ais/scripts")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import council_tools as ct
 
 TID = "selftest"

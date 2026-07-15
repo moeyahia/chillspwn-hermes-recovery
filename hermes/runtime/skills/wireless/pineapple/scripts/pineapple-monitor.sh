@@ -1,72 +1,121 @@
-#!/bin/bash
-# Pineapple Client Monitor — polls for new victims, handshakes, SSIDs
-# Run as cron job; outputs only when new findings exist
-# Usage: bash pineapple-monitor.sh
+#!/usr/bin/env bash
+# Poll an explicitly configured WiFi Pineapple and emit only newly observed events.
+set -euo pipefail
 
-STATE_FILE="/root/.pineapple_state"
-PINEAPPLE="172.16.42.1"
-SSH_KEY="/root/.ssh/id_ed25519"
-SSH="ssh -i $SSH_KEY -o StrictHostKeyChecking=no -o ConnectTimeout=5 root@$PINEAPPLE"
+die() {
+  printf 'pineapple-monitor: %s\n' "$*" >&2
+  exit 2
+}
 
-NOW=$(date +%s)
-[ ! -f "$STATE_FILE" ] && touch "$STATE_FILE"
+PINEAPPLE_SSH_TARGET="${PINEAPPLE_SSH_TARGET:-}"
+PINEAPPLE_SSH_KEY="${PINEAPPLE_SSH_KEY:-}"
+PINEAPPLE_MANAGEMENT_IFACE="${PINEAPPLE_MANAGEMENT_IFACE:-wlan0}"
+PINEAPPLE_HANDSHAKE_DIR="${PINEAPPLE_HANDSHAKE_DIR:-}"
+PINEAPPLE_CONTROL_MAC="${PINEAPPLE_CONTROL_MAC:-}"
+IGNORED_SSIDS_FILE="${PINEAPPLE_IGNORED_SSIDS_FILE:-}"
+STATE_FILE="${PINEAPPLE_STATE_FILE:-${XDG_STATE_HOME:-$HOME/.local/state}/chillspwn/pineapple-monitor.state}"
+CONNECT_TIMEOUT="${PINEAPPLE_CONNECT_TIMEOUT:-5}"
 
-# --- 1. New DHCP leases (new victims) ---
-LEASES=$($SSH "cat /tmp/dhcp.leases 2>/dev/null" 2>/dev/null)
+[[ -n "$PINEAPPLE_SSH_TARGET" ]] || die 'PINEAPPLE_SSH_TARGET is required (user@host).'
+[[ "$PINEAPPLE_SSH_TARGET" =~ ^[A-Za-z0-9._-]+@([A-Za-z0-9._-]+|\[[0-9A-Fa-f:]+\])$ ]] || die 'PINEAPPLE_SSH_TARGET must be a user@host destination.'
+[[ -r "$PINEAPPLE_SSH_KEY" && -f "$PINEAPPLE_SSH_KEY" ]] || die 'PINEAPPLE_SSH_KEY must name a readable regular file.'
+[[ "$PINEAPPLE_MANAGEMENT_IFACE" =~ ^[A-Za-z0-9_.:-]+$ ]] || die 'PINEAPPLE_MANAGEMENT_IFACE contains unsupported characters.'
+[[ "$PINEAPPLE_HANDSHAKE_DIR" =~ ^/[A-Za-z0-9._/-]+$ ]] || die 'PINEAPPLE_HANDSHAKE_DIR must be an absolute appliance path.'
+[[ "$PINEAPPLE_HANDSHAKE_DIR" != *'/../'* && "$PINEAPPLE_HANDSHAKE_DIR" != */.. ]] || die 'PINEAPPLE_HANDSHAKE_DIR cannot traverse parent directories.'
+[[ "$CONNECT_TIMEOUT" =~ ^[0-9]+$ ]] || die 'PINEAPPLE_CONNECT_TIMEOUT must be an integer.'
+if [[ -n "$PINEAPPLE_CONTROL_MAC" && ! "$PINEAPPLE_CONTROL_MAC" =~ ^([[:xdigit:]]{2}:){5}[[:xdigit:]]{2}$ ]]; then
+  die 'PINEAPPLE_CONTROL_MAC is not a valid MAC address.'
+fi
+if [[ -n "$IGNORED_SSIDS_FILE" && ! -r "$IGNORED_SSIDS_FILE" ]]; then
+  die 'PINEAPPLE_IGNORED_SSIDS_FILE is set but is not readable.'
+fi
+
+mkdir -p "$(dirname "$STATE_FILE")"
+touch "$STATE_FILE"
+chmod 600 "$STATE_FILE"
+
+SSH=(
+  ssh -i "$PINEAPPLE_SSH_KEY"
+  -o BatchMode=yes
+  -o ConnectTimeout="$CONNECT_TIMEOUT"
+  -o StrictHostKeyChecking=yes
+  "$PINEAPPLE_SSH_TARGET"
+)
+
+NOW="$(date +%s)"
+TMP_STATE="$(mktemp "${STATE_FILE}.tmp.XXXXXX")"
+trap 'rm -f "$TMP_STATE"' EXIT
+
+is_control_mac() {
+  [[ -n "$PINEAPPLE_CONTROL_MAC" && "${1,,}" == "${PINEAPPLE_CONTROL_MAC,,}" ]]
+}
+
+LEASES="$("${SSH[@]}" 'cat /tmp/dhcp.leases 2>/dev/null' || true)"
 while IFS= read -r line; do
-    [ -z "$line" ] && continue
-    MAC=$(echo "$line" | awk '{print $2}')
-    IP=$(echo "$line" | awk '{print $3}')
-    HOST=$(echo "$line" | awk '{print $4}')
-    [[ "$MAC" == "00:13:37:a7:85:52" ]] && continue  # skip Kali
-    FINGERPRINT="${MAC}|${IP}|${HOST}"
-    if ! grep -qF "$FINGERPRINT" "$STATE_FILE"; then
-        echo "$FINGERPRINT" >> "$STATE_FILE"
-        VENDOR=$($SSH "grep -i '${MAC:0:8}' /etc/pineapple/ouis 2>/dev/null | head -1" 2>/dev/null)
-        echo "🔴 NEW VICTIM CONNECTED: $MAC ($IP) — $HOST — ${VENDOR:-unknown vendor}"
-    fi
+  [[ -n "$line" ]] || continue
+  read -r _lease_epoch mac ip hostname _rest <<< "$line"
+  [[ -n "${mac:-}" ]] || continue
+  [[ "$mac" =~ ^([[:xdigit:]]{2}:){5}[[:xdigit:]]{2}$ ]] || continue
+  is_control_mac "$mac" && continue
+  fingerprint="lease|${mac}|${ip:-}|${hostname:-}"
+  if ! grep -Fqx -- "$fingerprint" "$STATE_FILE"; then
+    printf '%s\n' "$fingerprint" >> "$STATE_FILE"
+    vendor="$("${SSH[@]}" "grep -i '${mac:0:8}' /etc/pineapple/ouis 2>/dev/null | head -1" || true)"
+    printf 'New DHCP client: %s (%s) — %s — %s\n' "$mac" "${ip:-unknown IP}" "${hostname:-unknown host}" "${vendor:-unknown vendor}"
+  fi
 done <<< "$LEASES"
 
-# --- 2. New WPA handshakes ---
-HANDSHAKES=$($SSH "find /root/handshakes/ -name '*.pcap' -newer /root/handshakes/README 2>/dev/null" 2>/dev/null)
-while IFS= read -r hfile; do
-    [ -z "$hfile" ] && continue
-    HFINGERPRINT="handshake|${hfile}"
-    if ! grep -qF "$HFINGERPRINT" "$STATE_FILE"; then
-        echo "$HFINGERPRINT" >> "$STATE_FILE"
-        HSIZE=$($SSH "ls -lh '$hfile' 2>/dev/null | awk '{print \$5}'" 2>/dev/null)
-        echo "🔑 NEW HANDSHAKE CAPTURED: $hfile ($HSIZE)"
-    fi
+HANDSHAKES="$("${SSH[@]}" "find '$PINEAPPLE_HANDSHAKE_DIR' -type f -name '*.pcap' -print 2>/dev/null" || true)"
+while IFS= read -r remote_file; do
+  [[ -n "$remote_file" ]] || continue
+  fingerprint="handshake|${remote_file}"
+  if ! grep -Fqx -- "$fingerprint" "$STATE_FILE"; then
+    printf '%s\n' "$fingerprint" >> "$STATE_FILE"
+    size="$("${SSH[@]}" sh -s -- "$remote_file" <<'REMOTE' || true
+file=$1
+if command -v stat >/dev/null 2>&1; then
+  stat -c '%s' -- "$file" 2>/dev/null
+else
+  wc -c < "$file" 2>/dev/null
+fi
+REMOTE
+)"
+    printf 'New handshake capture: %s (%s bytes)\n' "$remote_file" "${size:-unknown}"
+  fi
 done <<< "$HANDSHAKES"
 
-# --- 3. New captured SSIDs ---
-SSIDS=$($SSH "sqlite3 /etc/pineapple/pineapple.db 'SELECT ssid FROM ssids ORDER BY rowid DESC LIMIT 20;' 2>/dev/null" 2>/dev/null)
+SSIDS="$("${SSH[@]}" "sqlite3 /etc/pineapple/pineapple.db 'SELECT ssid FROM ssids ORDER BY rowid DESC LIMIT 20;' 2>/dev/null" || true)"
 while IFS= read -r ssid; do
-    [ -z "$ssid" ] && continue
-    [[ "$ssid" == "linksys" || "$ssid" == "Ghossein" ]] && continue
-    SFINGERPRINT="ssid|${ssid}"
-    if ! grep -qF "$SFINGERPRINT" "$STATE_FILE"; then
-        echo "$SFINGERPRINT" >> "$STATE_FILE"
-        echo "📡 NEW SSID CAPTURED: $ssid"
-    fi
+  [[ -n "$ssid" ]] || continue
+  if [[ -n "$IGNORED_SSIDS_FILE" ]] && grep -Fqx -- "$ssid" "$IGNORED_SSIDS_FILE"; then
+    continue
+  fi
+  fingerprint="ssid|${ssid}"
+  if ! grep -Fqx -- "$fingerprint" "$STATE_FILE"; then
+    printf '%s\n' "$fingerprint" >> "$STATE_FILE"
+    printf 'New captured SSID: %s\n' "$ssid"
+  fi
 done <<< "$SSIDS"
 
-# --- 4. Connected clients ---
-CLIENTS=$($SSH "iw dev wlan0 station dump 2>/dev/null | grep '^Station' | awk '{print \$2}'" 2>/dev/null)
+CLIENTS="$("${SSH[@]}" "iw dev '$PINEAPPLE_MANAGEMENT_IFACE' station dump 2>/dev/null | awk '/^Station/ {print \$2}'" || true)"
 while IFS= read -r client_mac; do
-    [ -z "$client_mac" ] && continue
-    [[ "$client_mac" == "00:13:37:a7:85:52" ]] && continue
-    if ! grep -q "client|${client_mac}" "$STATE_FILE"; then
-        echo "client|${client_mac}|${NOW}" >> "$STATE_FILE"
-        SIGNAL=$($SSH "iw dev wlan0 station get $client_mac 2>/dev/null | grep 'signal:' | awk '{print \$2}'" 2>/dev/null)
-        echo "📶 CLIENT ASSOCIATED: $client_mac — signal: ${SIGNAL:-?} dBm"
-    fi
+  [[ -n "$client_mac" ]] || continue
+  [[ "$client_mac" =~ ^([[:xdigit:]]{2}:){5}[[:xdigit:]]{2}$ ]] || continue
+  is_control_mac "$client_mac" && continue
+  if ! grep -Fq -- "client|${client_mac}|" "$STATE_FILE"; then
+    printf 'client|%s|%s\n' "$client_mac" "$NOW" >> "$STATE_FILE"
+    signal="$("${SSH[@]}" "iw dev '$PINEAPPLE_MANAGEMENT_IFACE' station get '$client_mac' 2>/dev/null | awk '/signal:/ {print \$2; exit}'" || true)"
+    printf 'New associated client: %s — signal: %s dBm\n' "$client_mac" "${signal:-unknown}"
+  fi
 done <<< "$CLIENTS"
 
-# Cleanup old client entries (>24h)
-grep -v "^client|" "$STATE_FILE" > "${STATE_FILE}.tmp" 2>/dev/null
-grep "^client|" "$STATE_FILE" | while IFS= read -r cline; do
-    CTIME=$(echo "$cline" | awk -F'|' '{print $3}')
-    [ $((NOW - CTIME)) -lt 86400 ] && echo "$cline" >> "${STATE_FILE}.tmp"
-done
-mv "${STATE_FILE}.tmp" "$STATE_FILE"
+grep -v '^client|' "$STATE_FILE" > "$TMP_STATE" || true
+while IFS='|' read -r kind mac seen_at; do
+  [[ "$kind" == client && "$seen_at" =~ ^[0-9]+$ ]] || continue
+  if (( NOW - seen_at < 86400 )); then
+    printf 'client|%s|%s\n' "$mac" "$seen_at" >> "$TMP_STATE"
+  fi
+done < "$STATE_FILE"
+chmod 600 "$TMP_STATE"
+mv -f "$TMP_STATE" "$STATE_FILE"
+trap - EXIT

@@ -33,6 +33,24 @@ export function safeFilename(name: string): string {
   return (name || "artifact").replace(/[\\/]+/g, "_").replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 120) || "artifact";
 }
 
+/**
+ * Headers for untrusted evidence artifacts. Artifacts may contain HTML, SVG, or
+ * other active content supplied by a target/tool, so they are always downloaded
+ * as inert bytes rather than rendered in the authenticated dashboard origin.
+ */
+export function artifactDownloadHeaders(meta: Pick<ArtifactMeta, "filename" | "size" | "sha256">): Record<string, string> {
+  return {
+    "Content-Type": "application/octet-stream",
+    "Content-Length": String(meta.size),
+    "Content-Disposition": `attachment; filename="${safeFilename(meta.filename)}"`,
+    "Content-Security-Policy": "default-src 'none'; sandbox",
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "no-referrer",
+    "Cache-Control": "private, no-store",
+    "X-Artifact-Sha256": meta.sha256,
+  };
+}
+
 export class ArtifactStore {
   private readonly dir: string;
   private readonly indexPath: string;

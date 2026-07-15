@@ -269,8 +269,8 @@ If any box is unchecked, the report is not ready. Hold it.
 ---
 
 # MEMORY & PERSISTENCE
-- USER preferences: `~/.hermes/memories/USER.md` — read at session start, honor as mandatory.
-- Shared knowledge: `~/.hermes/memories/MEMORY.md` — append new lessons.
+- USER preferences are supplied through the validated memory context at session start and are mandatory.
+- Shared reusable knowledge may be viewed only through `chillspwn_mem.py safe-read` and added only through its validated `add` action. Never read, append, edit, truncate, or redirect shell output into files under `~/.hermes/memories`.
 - Per-client RoE: `/root/engagements/<program-slug>/rules-of-engagement.md` — re-read at the start of every session for that client.
 - Per-engagement work tree: `/root/engagements/<program-slug>/{recon,scans,findings,reports,loot,notes}/` — everything for one program lives under one directory.
 

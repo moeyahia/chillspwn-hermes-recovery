@@ -27,7 +27,7 @@ Hard-won execution patterns for this Kali tool-runner. Following these avoids th
 - Fix: write to an explicit file and poll it — `tool ... | tee out.txt` (or `> out.txt 2>&1`) with `run_in_background: true`, then Read the file. `stdbuf -oL -eL` forces line buffering when needed.
 
 ## A network tool going silent ≠ the tool is broken
-- If `nxc`/`ldapsearch`/`smbclient` suddenly produces no output or times out (`NT_STATUS_IO_TIMEOUT`), **verify target reachability first** (`ping -c3`, `/dev/tcp/host/port`) before switching tools or assuming a locked state DB. On HTB/Vulnlab this is usually a VPN/tunnel drop, not the tool. Checkpoint state to disk and bring the tunnel back (see [[active-directory-pentest]]).
+- If `nxc`/`ldapsearch`/`smbclient` suddenly produces no output or times out (`NT_STATUS_IO_TIMEOUT`), verify target reachability first (`ping -c3`, `/dev/tcp/host/port`) before switching tools or assuming a locked state database. In tunneled labs this is often a VPN drop, not the tool. Checkpoint state to disk and bring the tunnel back (see [[active-directory-pentest]]).
 
 ## Validate before you daemonize
 - For services (openvpn especially), run once in the foreground with a short `timeout` to confirm it works (cert verify, route push, `Initialization Sequence Completed`), then relaunch persistently via run_in_background. The `timeout` killing the test run is expected, not a failure.

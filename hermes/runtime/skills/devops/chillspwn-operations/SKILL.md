@@ -30,7 +30,7 @@ Do not use for generic Hermes configuration unless ChillsPwn is specifically inv
 
 ## Dashboard and persona model
 
-Personas live under `/root/.claude/chillspwn/personas/<name>/persona.json`. The dashboard reads `permissionMode` at spawn time and launches `claude -p` with the selected mode. Changing persona JSON or allowlist files requires a fresh spawned session; do not expect hot reload.
+Personas live under `/root/.hermes/chillspwn/personas/<name>/persona.json`. The dashboard reads `permissionMode` at spawn time and launches `claude -p` with the selected mode. Changing persona JSON or allowlist files requires a fresh spawned session; do not expect hot reload.
 
 Common `permissionMode` values:
 - `auto`: classifier-driven. In observed ChillsPwn sessions, commands fall through to a safety classifier; static allow rules may not help if the mode routes every command through classification.

@@ -19,13 +19,14 @@ describe("SessionRunMap", () => {
     expect(m.size()).toBe(0);
   });
 
-  test("rebuildFrom re-attaches only executing, source=chat runs", () => {
+  test("rebuildFrom re-attaches only executing, observe-mode chat runs", () => {
     const store: RunLister = {
       listRuns: () => [
-        { id: "run_a", sessionId: "sA", persona: "p", providerKind: "claude", objective: "o", status: "executing", source: "chat" },
-        { id: "run_b", sessionId: "sB", persona: "p", providerKind: "openrouter", objective: "o", status: "completed", source: "chat" }, // terminal → skip
-        { id: "run_c", sessionId: "sC", persona: "p", providerKind: "claude", objective: "o", status: "executing", source: "api" }, // api → skip
-        { id: "run_d", sessionId: "sD", persona: "p", providerKind: "claude", objective: "o", status: "executing" }, // no source → skip
+        { id: "run_a", sessionId: "sA", persona: "p", providerKind: "claude", objective: "o", status: "executing", source: "chat", mode: "observe" },
+        { id: "run_b", sessionId: "sB", persona: "p", providerKind: "openrouter", objective: "o", status: "completed", source: "chat", mode: "observe" }, // terminal → skip
+        { id: "run_c", sessionId: "sC", persona: "p", providerKind: "claude", objective: "o", status: "executing", source: "api", mode: "observe" }, // api → skip
+        { id: "run_d", sessionId: "sD", persona: "p", providerKind: "claude", objective: "o", status: "executing", mode: "observe" }, // no source → skip
+        { id: "run_e", sessionId: "sE", persona: "p", providerKind: "xai-grok", objective: "o", status: "executing", source: "chat", mode: "managed" }, // managed → skip
       ],
     };
     const m = new SessionRunMap(() => 1);
@@ -35,6 +36,7 @@ describe("SessionRunMap", () => {
     expect(m.has("sB")).toBe(false);
     expect(m.has("sC")).toBe(false);
     expect(m.has("sD")).toBe(false);
+    expect(m.has("sE")).toBe(false);
   });
 
   test("rebuildFrom never throws if the store throws", () => {

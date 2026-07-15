@@ -2,7 +2,7 @@
  * sessionLifecycle (Phase 19) — pure, testable classification + naming + list-filtering for sessions.
  *
  * Problem: every delegated specialist/board worker creates a session that LINGERS in the active
- * session list after it finishes (the repeated "Task: PingPong…" spam). This module decides, without
+ * session list after it finishes (repeated generated "Task: …" entries). This module decides, without
  * deleting anything, which sessions are GENERATED specialist sessions vs real user chats, whether a
  * session is terminal, and how to name/filter them so the active list stays focused on running work.
  *

@@ -1,22 +1,47 @@
 [Unit]
 Description=ChillsPwn Dashboard
-After=network-online.target tailscaled.service
+After=network-online.target tailscaled.service chillspwn-memory.service
 Wants=network-online.target
+Requires=chillspwn-memory.service
 
 [Service]
 Type=simple
 User=chillspwn
-WorkingDirectory=/root/.claude/plugins/chillspwn/webapp
+Group=chillspwn
+WorkingDirectory=/opt/chillspwn/plugin/webapp
 Environment=PATH=/root/.bun/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 Environment=NODE_ENV=production
+EnvironmentFile=-/opt/chillspwn/plugin/webapp/.env
 EnvironmentFile=-/root/.hermes/.env
+Environment=HOME=/root
+Environment=HERMES_HOME=/root/.hermes
+Environment=HERMES_KANBAN_DB=/root/.hermes/kanban.db
+Environment=HERMES_PYTHON=/root/hermes-venv/bin/python
+Environment=CHILLSPWN_HERMES_SRC=/opt/chillspwn/hermes-agent
+Environment=CHILLSPWN_PLUGIN_DIR=/opt/chillspwn/plugin
+Environment=CHILLSPWN_STATE_DIR=/root/.hermes/chillspwn
+Environment=CHILLSPWN_SESSIONS_DIR=/root/.hermes/chillspwn/sessions
+Environment=CHILLSPWN_PERSONAS_DIR=/root/.hermes/chillspwn/personas
+Environment=GROK_BIN=/opt/chillspwn/bin/grok
+Environment=GROK_HOME=/root/.hermes/chillspwn/grok
+Environment=GROK_AUTH_PATH=/root/.hermes/auth/grok/auth.json
+Environment=CHILLSPWN_MEMORY_GUARD=required
+Environment=CHILLSPWN_MEM_CLI=/root/.hermes/skills/red-teaming/council-of-ais/scripts/chillspwn_mem.py
+Environment=CHILLSPWN_MEMORY_SOCKET=/run/chillspwn-memory/broker.sock
+Environment=MCP_ARSENAL_CONFIG=/opt/chillspwn-mcp-arsenal/.mcp.arsenal.json
+Environment=MCP_ARSENAL_RUNTIME_DIR=/root/.hermes/chillspwn/mcp-runtime
+Environment=CLAUDE_CONFIG_DIR=/root/.hermes/auth/claude
+Environment=CODEX_HOME=/root/.hermes/auth/codex
+ExecStartPre=/root/hermes-venv/bin/python /opt/chillspwn/libexec/validate-hermes-config.py --allow-missing /root/.hermes/config.yaml
 ExecStart=/root/.bun/bin/bun run --no-hot server/index.ts
 Restart=always
 RestartSec=5
 KillSignal=SIGTERM
+KillMode=control-group
 TimeoutStopSec=20
-StandardOutput=append:/root/.claude/chillspwn/logs/dashboard.log
-StandardError=append:/root/.claude/chillspwn/logs/dashboard.log
+UMask=0077
+StandardOutput=append:/root/.hermes/chillspwn/logs/dashboard.log
+StandardError=append:/root/.hermes/chillspwn/logs/dashboard.log
 
 [Install]
 WantedBy=multi-user.target

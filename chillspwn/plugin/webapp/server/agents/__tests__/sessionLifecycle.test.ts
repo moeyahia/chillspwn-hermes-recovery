@@ -72,10 +72,10 @@ describe("Phase 19 — Mission Board Open/Completed grouping", () => {
 });
 
 // session fixtures
-const liveChat: SessionLike = { id: "s-100", persona: "ChillsPwn", status: "running", isLive: true, title: "", preview: "lets pwn pingpong" };
+const liveChat: SessionLike = { id: "s-100", persona: "ChillsPwn", status: "running", isLive: true, title: "", preview: "assess the authorized lab" };
 const doneChat: SessionLike = { id: "s-101", persona: "ChillsPwn", status: "stopped", isLive: false, title: "", preview: "old chat" };
-const cardDone: SessionLike = { id: "card-abc", persona: "ReconScout", status: "stopped", isLive: false, title: "", preview: "Task: PingPong port scan" };
-const cardRunning: SessionLike = { id: "card-def", persona: "ReconScout", status: "running", isLive: true, title: "", preview: "Task: PingPong port scan" };
+const cardDone: SessionLike = { id: "card-abc", persona: "ReconScout", status: "stopped", isLive: false, title: "", preview: "Task: authorized target port scan" };
+const cardRunning: SessionLike = { id: "card-def", persona: "ReconScout", status: "running", isLive: true, title: "", preview: "Task: authorized target port scan" };
 const specByPersona: SessionLike = { id: "s-200", persona: "ADAttackMapper", status: "completed", isLive: false, title: "", preview: "gMSA path" };
 const taskPrefixChat: SessionLike = { id: "s-201", persona: "ChillsPwn", status: "completed", isLive: false, title: "", preview: "Task: kerberoast pong" };
 const awaitingApproval: SessionLike = { id: "card-ghi", persona: "SessionRunner", status: "awaiting_approval", isLive: false, title: "", preview: "Task: WinRM validation" };
@@ -100,7 +100,7 @@ describe("Phase 19 — session classification", () => {
 
 describe("Phase 19 — structured session naming (Part 3)", () => {
   test("specialist session: AgentName · task · status", () => {
-    expect(structuredSessionName(cardDone)).toBe("ReconScout · PingPong port scan · stopped");
+    expect(structuredSessionName(cardDone)).toBe("ReconScout · authorized target port scan · stopped");
     expect(structuredSessionName(awaitingApproval)).toBe("SessionRunner · WinRM validation · awaiting approval");
   });
   test("real chat has no structured name (UI keeps title/preview)", () => {

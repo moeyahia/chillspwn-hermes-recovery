@@ -1,39 +1,30 @@
 # Pineapple Cron Status Checks
 
-Use this when Mr. Wong asks whether Pineapple monitoring jobs are running.
+Use this workflow when the operator asks whether Pineapple monitoring is healthy.
 
-## What to verify
+## Verify
 
-1. **Hermes cron job state**
-   - `Pineapple Client Alerts` should be enabled, scheduled every 5 minutes, and normally silent unless real client/victim activity is found.
-   - `Perimeter Monitor` should be enabled, scheduled every 10 minutes, and normally silent unless new devices/events are detected.
-   - `perimeter_daily_summary` should be enabled, scheduled daily.
+1. Confirm the scheduler entry is enabled and record its last/next run time.
+2. Distinguish a successful silent run from a configuration or provider-authentication error.
+3. Verify each configured script path is executable; never assume a path under a particular user's home directory.
+4. Verify SSH host identity, SSH reachability, and PineAP daemon state through `PINEAPPLE_SSH_TARGET` and `PINEAPPLE_SSH_KEY`.
+5. Run a bounded smoke test with the same protected environment used by the scheduler.
 
-2. **Last run result**
-   - `last_status=ok` means the job executed successfully.
-   - `last_status=error` requires checking the recent cron session dump. A common actionable failure is provider auth invalidation, e.g. `token_invalidated`; the fix is provider re-auth, not a Pineapple/script failure.
-   - If a job was recently failing, force/run or wait for the next scheduled run after auth/session recovery and re-check status before reporting final state.
+Required scheduler path variables:
 
-3. **Scripts and Pineapple health**
-   - Verify monitor scripts exist and are executable:
-     - `/root/pineapple_monitor.sh`
-     - `/root/perimeter_monitor.sh`
-     - `/root/perimeter_daily_summary.sh`
-   - Check Pineapple reachability via SSH and daemon status. SSH success + `pineapd running` is stronger than ICMP; the Pineapple may answer SSH even when ping reports failure.
+- `PINEAPPLE_MONITOR_SCRIPT`
+- `PINEAPPLE_DEFENSE_SCRIPT`
+- `PERIMETER_MONITOR_SCRIPT`, when deployed
+- `PERIMETER_DAILY_SCRIPT`, when deployed
 
-4. **Manual smoke tests**
-   - Run `/root/pineapple_monitor.sh` with an explicit timeout. Empty stdout with exit 0 means no new alert-worthy events.
-   - Run `/root/perimeter_monitor.sh` with an explicit timeout. “No new devices detected” with exit 0 means the script is healthy and quiet.
+An empty stdout stream with exit status `0` means no new event. Exit status `2` indicates missing or invalid configuration. A timeout or SSH failure is a real operational error and must not be reported as a quiet scan.
 
-## Reporting style
+## Report
 
-Return results, not commands. Keep it short:
+- job name and schedule;
+- last and next run;
+- last exit status;
+- SSH/PineAP status;
+- whether silence means no events or a blocker.
 
-- Job name
-- Enabled/schedule
-- Last run time/status
-- Next run time
-- Pineapple SSH/PineAP status
-- Whether silence means “no events” or there is a real blocker
-
-Do **not** add heartbeat output to recurring jobs unless Mr. Wong explicitly requests liveness pings.
+Do not add heartbeat delivery to recurring alert jobs unless explicitly requested.

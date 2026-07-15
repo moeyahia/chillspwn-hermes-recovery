@@ -6,6 +6,7 @@ import {
   parseCookies,
   isWsUpgradeAuthorized,
   TOKEN_COOKIE,
+  tokenFreeRedirectTarget,
 } from "../auth";
 import { loadSecurityConfig } from "../config";
 
@@ -79,12 +80,12 @@ describe("evaluateAuth", () => {
   test("loopback socket WITH X-Forwarded-For (reverse-proxied remote, e.g. Tailscale Serve) is NOT bypassed", () => {
     // Came through a proxy on behalf of a remote client → must present the token.
     const noToken = evaluateAuth(
-      { headers: { "x-forwarded-for": "100.101.102.103" }, socket: { remoteAddress: "127.0.0.1" }, path: "/api/board" },
+      { headers: { "x-forwarded-for": "198.51.100.103" }, socket: { remoteAddress: "127.0.0.1" }, path: "/api/board" },
       exposedCfg,
     );
     expect(noToken.allow).toBe(false);
     const withToken = evaluateAuth(
-      { headers: { "x-forwarded-for": "100.101.102.103", "x-dashboard-token": "s3cr3t" }, socket: { remoteAddress: "127.0.0.1" }, path: "/api/board" },
+      { headers: { "x-forwarded-for": "198.51.100.103", "x-dashboard-token": "s3cr3t" }, socket: { remoteAddress: "127.0.0.1" }, path: "/api/board" },
       exposedCfg,
     );
     expect(withToken.allow).toBe(true);
@@ -144,6 +145,33 @@ describe("evaluateAuth", () => {
     );
     expect(out.allow).toBe(true);
     if (out.allow) expect(out.setCookie).toContain(`${TOKEN_COOKIE}=`);
+  });
+
+  test("query tokens are rejected outside the one-time root bootstrap", () => {
+    const api = evaluateAuth(
+      { headers: {}, url: "/api/board?token=s3cr3t", socket: { remoteAddress: "203.0.113.9" } },
+      exposedCfg,
+    );
+    expect(api.allow).toBe(false);
+    const websocket = evaluateAuth(
+      { headers: {}, url: "/ws?token=s3cr3t", socket: { remoteAddress: "203.0.113.9" } },
+      exposedCfg,
+    );
+    expect(websocket.allow).toBe(false);
+  });
+
+  test("HTTPS bootstrap sets Secure and token cleanup preserves other query state", () => {
+    const out = evaluateAuth(
+      {
+        headers: { "x-forwarded-proto": "https" },
+        url: "/?token=s3cr3t&b=build-1",
+        socket: { remoteAddress: "203.0.113.9" },
+      },
+      exposedCfg,
+    );
+    expect(out.allow).toBe(true);
+    if (out.allow) expect(out.setCookie).toContain("; Secure");
+    expect(tokenFreeRedirectTarget("/?token=s3cr3t&b=build-1&view=live")).toBe("/?b=build-1&view=live");
   });
 });
 

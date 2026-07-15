@@ -8,7 +8,8 @@
  */
 
 import type { MemoryItem } from "./types";
-import { findRejectableSecrets } from "./AttackLesson";
+import type { AttackLesson } from "./AttackLesson";
+import { findRejectableSecrets, findReusableContentIdentifiers, isPromotable, redactLessonText } from "./AttackLesson";
 
 export type CleanupCategory =
   | "verified_attack_lesson_candidate"
@@ -37,7 +38,9 @@ export interface CleanupPlan {
 /** Classify a single memory item. Secret-bearing + stale checks take precedence. */
 export function classifyMemoryEntry(item: MemoryItem): CleanupCategory {
   if (item.status === "stale") return "stale";
-  if (findRejectableSecrets(item.content ?? "").length) return "target_specific_secret";
+  if (findRejectableSecrets(item.content ?? "").length
+      || findReusableContentIdentifiers(item.content ?? "").length
+      || redactLessonText(item.content ?? "") !== (item.content ?? "")) return "target_specific_secret";
   if (item.type === "hypothesis") return "hypothesis";
   const hasProvenance = !!item.sourceEvidenceId || (!!item.sourceAgentRunId && !!item.sourceStepId);
   if (hasProvenance && (item.type === "finding" || item.type === "tool_observation")) {
@@ -85,9 +88,6 @@ export function planCleanup(items: MemoryItem[], mode: CleanupMode): CleanupPlan
   }
   return { mode, counts, actions, mutates: mode !== "dry-run" };
 }
-
-import type { AttackLesson } from "./AttackLesson";
-import { findRejectableSecrets, isPromotable } from "./AttackLesson";
 
 export interface LessonFilters { agent?: string; scope?: string; category?: string }
 

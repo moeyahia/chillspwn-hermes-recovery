@@ -22,6 +22,10 @@ export interface AcpPermissionOption {
   [key: string]: unknown;
 }
 
+export interface GrokQuestionAnswerMap {
+  [question: string]: string | string[];
+}
+
 export type GrokStopClassification =
   | "completed"
   | "cancelled"
@@ -37,18 +41,42 @@ export interface GrokToolUpdate {
   [key: string]: unknown;
 }
 
+export interface GrokToolInvocation {
+  name: string;
+  input: unknown;
+  detail: string;
+  kind: "tool" | "skill";
+}
+
 /** Grok has its own tools, so Chillspwn must not advertise callbacks it does not implement. */
 export const GROK_ACP_CLIENT_CAPABILITIES: Readonly<Record<string, never>> = Object.freeze({});
 
+export interface GrokAgentLaunchOptions {
+  alwaysApprove?: boolean;
+  agentProfile?: string;
+  pluginDirs?: readonly string[];
+  /** Session-scoped plugins are ignored by Grok's shared leader. */
+  noLeader?: boolean;
+}
+
 /** Build argv in the order required by `grok agent`: all options precede `stdio`. */
-export function buildGrokAgentArgs(model: string, alwaysApprove: boolean): string[] {
+export function buildGrokAgentArgs(
+  model: string,
+  options: boolean | GrokAgentLaunchOptions,
+): string[] {
+  const opts: GrokAgentLaunchOptions = typeof options === "boolean"
+    ? { alwaysApprove: options }
+    : options;
   return [
     "agent",
     "-m",
     model,
     "--reasoning-effort",
     "high",
-    ...(alwaysApprove ? ["--always-approve"] : []),
+    ...(opts.noLeader ? ["--no-leader"] : []),
+    ...(opts.agentProfile ? ["--agent-profile", opts.agentProfile] : []),
+    ...((opts.pluginDirs || []).flatMap((dir) => ["--plugin-dir", dir])),
+    ...(opts.alwaysApprove ? ["--always-approve"] : []),
     "stdio",
   ];
 }
@@ -78,6 +106,31 @@ export function isAcpClientRequest(message: unknown): message is AcpClientReques
     typeof candidate.method === "string" &&
     candidate.method.length > 0 &&
     (typeof id === "string" || (typeof id === "number" && Number.isFinite(id)))
+  );
+}
+
+/**
+ * Return true only for ACP traffic that proves the current turn is progressing.
+ *
+ * Grok emits extension maintenance responses such as `skills-reload` while it is
+ * otherwise idle. Counting every stdout line as turn activity prevents the
+ * dead-turn watchdog from ever firing, so only official session updates,
+ * agent-to-client requests, and responses to requests owned by Chillspwn count.
+ */
+export function isMeaningfulGrokAcpActivity(
+  message: unknown,
+  pendingRequests?: { has(id: number): boolean },
+): boolean {
+  if (!message || typeof message !== "object") return false;
+  if (isAcpClientRequest(message)) return true;
+
+  const candidate = message as Record<string, unknown>;
+  if (candidate.method === "session/update") return true;
+
+  return (
+    typeof candidate.id === "number" &&
+    Number.isFinite(candidate.id) &&
+    pendingRequests?.has(candidate.id) === true
   );
 }
 
@@ -132,6 +185,47 @@ export function permissionCancelledResponse(id: AcpRequestId) {
   };
 }
 
+/**
+ * Grok's private question extension uses a flatter result envelope than ACP
+ * permissions. This shape was validated against the installed Grok Build
+ * client: `outcome: "accepted"` plus an answers map resumes the blocked tool.
+ */
+export function questionAcceptedResponse(id: AcpRequestId, answers: GrokQuestionAnswerMap) {
+  return {
+    jsonrpc: "2.0" as const,
+    id,
+    result: {
+      outcome: "accepted" as const,
+      answers,
+    },
+  };
+}
+
+/** Cancel a Grok question when no interactive operator is available. */
+export function questionCancelledResponse(id: AcpRequestId) {
+  return {
+    jsonrpc: "2.0" as const,
+    id,
+    result: {
+      outcome: "cancelled" as const,
+    },
+  };
+}
+
+/**
+ * Extension maintenance traffic can be extremely frequent and contains no
+ * conversation evidence. Suppressing only these known messages keeps raw ACP
+ * logs useful without synchronously writing hundreds of megabytes of reloads.
+ */
+export function isNoisyGrokMaintenanceMessage(message: unknown): boolean {
+  if (!message || typeof message !== "object") return false;
+  const candidate = message as Record<string, any>;
+  if (candidate.id === "skills-reload") return true;
+  if (candidate.method === "_x.ai/models/update" || candidate.method === "_x.ai/settings/update") return true;
+  return candidate.method === "session/update"
+    && candidate.params?.update?.sessionUpdate === "available_commands_update";
+}
+
 /** Construct a JSON-RPC notification (notifications intentionally have no `id`). */
 export function acpNotification(method: string, params: unknown) {
   return {
@@ -184,6 +278,74 @@ function hasOwn(object: object, key: string): boolean {
   return Object.prototype.hasOwnProperty.call(object, key);
 }
 
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value != null && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
+}
+
+function parseObjectString(value: unknown): unknown {
+  if (typeof value !== "string") return value;
+  try { return JSON.parse(value); } catch { return value; }
+}
+
+/**
+ * Normalize a Grok ACP tool call for persistence and board progress.
+ *
+ * Native tools expose their name in x.ai metadata. MCP tools first appear as
+ * the generic `use_tool` wrapper, with the real server/tool name and arguments
+ * nested under `rawInput.tool_name` / `rawInput.tool_input`. Unwrapping that
+ * envelope keeps live board timelines useful instead of showing every MCP call
+ * as an opaque `use_tool` event.
+ */
+export function extractGrokToolInvocation(update: unknown): GrokToolInvocation | null {
+  const candidate = asRecord(update);
+  if (!candidate) return null;
+
+  const rawInput = parseObjectString(candidate.rawInput ?? candidate.input ?? candidate.arguments ?? "");
+  const rawRecord = asRecord(rawInput);
+  const nestedName = typeof rawRecord?.tool_name === "string" ? rawRecord.tool_name.trim() : "";
+  const input = nestedName && hasOwn(rawRecord!, "tool_input")
+    ? rawRecord!.tool_input
+    : rawInput;
+
+  const meta = asRecord(candidate._meta);
+  const xaiTool = asRecord(meta?.["x.ai/tool"]);
+  const metadataName = typeof xaiTool?.name === "string" ? xaiTool.name.trim() : "";
+  const directName = [candidate.name, candidate.toolName, candidate.title]
+    .find((value) => typeof value === "string" && value.trim().length > 0);
+  const name = nestedName || metadataName || (typeof directName === "string" ? directName.trim() : "");
+  if (!name) return null;
+
+  const inputRecord = asRecord(input);
+  const detailValue = inputRecord
+    ? [
+      inputRecord.skill,
+      inputRecord.command,
+      inputRecord.path,
+      inputRecord.file_path,
+      inputRecord.pattern,
+      inputRecord.query,
+      inputRecord.code,
+      inputRecord.task,
+      inputRecord.description,
+    ].find((value) => typeof value === "string" && value.length > 0)
+    : input;
+  let detail = "";
+  if (typeof detailValue === "string") detail = detailValue;
+  else if (input != null && input !== "") {
+    try { detail = JSON.stringify(input); } catch { detail = ""; }
+  }
+
+  const baseName = name.includes("__") ? name.slice(name.lastIndexOf("__") + 2) : name;
+  return {
+    name,
+    input,
+    detail,
+    kind: baseName === "use_skill" ? "skill" : "tool",
+  };
+}
+
 function flattenAcpValue(value: unknown, seen = new WeakSet<object>()): string {
   if (typeof value === "string") return value;
   if (value == null) return "";
@@ -205,6 +367,18 @@ function flattenAcpValue(value: unknown, seen = new WeakSet<object>()): string {
   const record = value as Record<string, unknown>;
 
   // ACP ContentBlock and Grok raw-output payloads use these known nesting keys.
+  // Grok MCP calls wrap the server's serialized result in a Rust-enum-shaped
+  // envelope: `output: { OkayOutput: "..." }`.  Error results use the
+  // corresponding `ErrorOutput` variant.  Decode only these explicit variants
+  // rather than falling back to arbitrary object stringification.
+  if (hasOwn(record, "OkayOutput")) {
+    const output = flattenAcpValue(record.OkayOutput, seen);
+    if (output) return output;
+  }
+  if (hasOwn(record, "ErrorOutput")) {
+    const error = flattenAcpValue(record.ErrorOutput, seen);
+    if (error) return error;
+  }
   if (typeof record.output_for_prompt === "string") return record.output_for_prompt;
   if (typeof record.text === "string") return record.text;
   if (hasOwn(record, "content")) {

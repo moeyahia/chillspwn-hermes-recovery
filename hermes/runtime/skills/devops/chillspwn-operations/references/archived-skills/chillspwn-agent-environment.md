@@ -14,7 +14,7 @@ description: "ChillsPwn agent env: permissions, restart, bg procs"
 How this agent runs and why allowlisted Bash commands sometimes still get classifier-blocked. Written from a session that burned ~30 min fighting permission blocks before the mechanics were understood.
 
 ## How the agent is launched
-- Spawned by `chillspwn.service` (a Bun dashboard, `/root/.claude/plugins/chillspwn/webapp`) which launches `/usr/bin/claude -p ... --permission-mode auto`. There is **no standalone `claude` systemd service** — `/usr/bin/claude` is just the binary, launched on demand.
+- Spawned by `chillspwn.service` (a Bun dashboard, `/opt/chillspwn/plugin/webapp`) which launches `/usr/bin/claude -p ... --permission-mode auto`. There is **no standalone `claude` systemd service** — `/usr/bin/claude` is just the binary, launched on demand.
 - To reload anything read at spawn time, restart the dashboard (system service, root, no sudo): `systemctl restart chillspwn`. The fresh `claude` child re-reads `~/.claude/settings.json`. Surgical alt: `pkill -f "claude -p --input-format stream-json"` (dashboard respawns it on next message).
 - The operator runs the restart in their own terminal — don't run it yourself (you'd kill your own process mid-command).
 
@@ -34,4 +34,4 @@ How this agent runs and why allowlisted Bash commands sometimes still get classi
    - For persistent infra (openvpn, chisel SOCKS), use the Bash tool's native `run_in_background:true`. Shell backgrounding (`setsid nohup ... &`) both fails to match the allowlist AND gets SIGTERM-reaped by the harness at session/turn boundaries (minutes later) — the native background mechanism survives.
 
 ## Self-modification boundary — do NOT fight it
-The agent **cannot edit its own permission allowlist.** The classifier blocks any write to `~/.claude/settings.json` permissions — and enabling steps toward it (a `cp` backup of it, `apt-get install jq` "to edit the allowlist") — flagging **"Self-Modification / Auto-Mode Bypass."** This is by design. Don't retry, don't disguise it via Write/python/sed. Recognize it immediately and hand the operator a ready-to-paste command (jq preferred — Mr. Wong corrected "using jq please not python") plus the restart, and let THEM run it. You may READ the allowlist back afterward (read-only) to verify entries landed.
+The agent **cannot edit its own permission allowlist.** The classifier blocks any write to `~/.claude/settings.json` permissions — and enabling steps toward it (a `cp` backup of it, `apt-get install jq` "to edit the allowlist") — flagging **"Self-Modification / Auto-Mode Bypass."** This is by design. Don't retry, don't disguise it via Write/python/sed. Recognize it immediately and hand the operator a ready-to-paste command (jq preferred — the operator corrected "using jq please not python") plus the restart, and let THEM run it. You may READ the allowlist back afterward (read-only) to verify entries landed.

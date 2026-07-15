@@ -4,7 +4,7 @@ When the user says "resummon the council with the same info" (or similar), treat
 
 ## Pattern
 
-1. Identify the likely engagement directory from current context or recent box state, e.g. `/root/htb/boxes/<box>/council/`.
+1. Require the active engagement directory from current context or explicit configuration, then inspect `$ENGAGEMENT_DIR/council/`.
 2. Re-use the newest substantive briefing file, preferring numbered round files such as `briefing_r4.txt` over older `briefing.txt`.
 3. Before launching duplicate lanes, check whether a council is already running for that same briefing/output directory.
    - Look for `hermes chat` processes whose args include the engagement `council/` path and current assessment filenames.

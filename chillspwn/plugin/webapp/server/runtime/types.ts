@@ -543,6 +543,11 @@ export interface WorkerResult {
   confidence: number;
   assumptions: string[];
   recommendedNextSteps: string[];
+  /**
+   * Box-agnostic reusable attack-chain candidates. The runtime preserves these as proposed
+   * AttackLessons; workers can never mark their own proposals verified.
+   */
+  proposedAttackChains?: JsonValue[];
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

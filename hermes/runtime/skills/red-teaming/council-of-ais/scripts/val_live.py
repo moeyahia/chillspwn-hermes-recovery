@@ -4,7 +4,8 @@ Proves end-to-end: distillation (old turns -> ledger via real LLM), compaction
 (token budget exceeded -> 🗜 distill+drop), recall_conversation, and ledger-awareness
 (model reads injected state instead of re-running work). Bounded + cheap.
 
-Run on the server from the scripts dir. Reads OPENROUTER_API_KEY from /root/.hermes/.env."""
+Run on the server from the scripts directory with `OPENROUTER_API_KEY` supplied through the
+protected process environment."""
 import json, os, re, subprocess, sys, shutil
 
 SCRIPTS = os.path.dirname(os.path.abspath(__file__))
@@ -13,15 +14,7 @@ MODEL = "deepseek/deepseek-v4-pro"
 WORK = "/tmp/val_live"
 
 def read_key():
-    for path in ("/root/.hermes/.env", "/root/.zshenv"):
-        try:
-            for line in open(path):
-                m = re.search(r'OPENROUTER_API_KEY\s*=\s*["\']?([A-Za-z0-9._\-]+)', line)
-                if m:
-                    return m.group(1)
-        except Exception:
-            pass
-    return ""
+    return os.environ.get("OPENROUTER_API_KEY", "").strip()
 
 def main():
     key = read_key()
@@ -34,11 +27,11 @@ def main():
     # --- seed session: oldest 8 carry the FINDINGS (get distilled), recent 16 are bulky filler
     findings = [
         {"role": "user", "content": "kick off recon on the target"},
-        {"role": "assistant", "content": "nmap shows 10.10.10.50 has 22/ssh and 80/http (Apache 2.4.49)"},
+        {"role": "assistant", "content": "nmap shows 192.0.2.50 has 22/ssh and 80/http (ExampleServer 1.0)"},
         {"role": "user", "content": "check the web app"},
-        {"role": "assistant", "content": "found working credentials admin:S3cr3tPass on the /login page"},
+        {"role": "assistant", "content": "found synthetic credentials test-user:TEST_ONLY_NOT_A_SECRET on the /login page"},
         {"role": "user", "content": "any known CVEs?"},
-        {"role": "assistant", "content": "10.10.10.50 Apache 2.4.49 is vulnerable to CVE-2021-41773 path traversal"},
+        {"role": "assistant", "content": "192.0.2.50 ExampleServer 1.0 is mapped to synthetic CVE-2099-0001"},
         {"role": "user", "content": "good, log that"},
         {"role": "assistant", "content": "recorded host, creds, and the CVE. proceeding."},
     ]
@@ -54,7 +47,7 @@ def main():
 
     # --- pre-seed conversation.mcp with a recallable canary (cwd == engagement dir)
     import conversation_recall as CR
-    CR.append(WORK, {"role": "assistant", "content": "earlier note: the root flag hint is /root/proof_CANARY9911.txt"})
+    CR.append(WORK, {"role": "assistant", "content": "earlier note: the test artifact is /tmp/TEST_CANARY9911.txt"})
     CR.append(WORK, {"role": "user", "content": "ok continue"})
 
     soul = os.path.join(WORK, "soul.txt")
@@ -121,11 +114,11 @@ def main():
     except Exception:
         pass
     led_str = json.dumps(led).lower()
-    has_host = "10.10.10.50" in led_str
+    has_host = "192.0.2.50" in led_str
     has_cred = "s3cr3tpass" in led_str or "admin" in led_str
     has_cve = "41773" in led_str
     final_blob = " ".join(final_texts).lower()
-    aware = ("10.10.10.50" in final_blob) and ("41773" in final_blob or "cve" in final_blob)
+    aware = ("192.0.2.50" in final_blob) and ("2099-0001" in final_blob or "cve" in final_blob)
 
     print("\n================ LIVE VALIDATION RESULTS ================")
     def line(name, ok, extra=""):

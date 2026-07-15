@@ -1,7 +1,74 @@
-# ChillsPwn dashboard — security model (Phase 1)
+# Security Policy
 
-This document describes the security posture introduced in Phase 1 of the agent-runtime
-work. It is a living document; Phase 3 (tool policy + approvals) and later phases extend it.
+## Supported versions
+
+ChillsPwn has not published a stable release yet.
+
+| Version | Supported |
+|---|---|
+| Current reviewed default branch | Yes |
+| Historical phase snapshots and unmaintained forks | No |
+
+Security fixes are developed against the current maintained branch. A supported-release table will replace this policy when versioned releases begin.
+
+## Reporting a vulnerability
+
+Do not disclose an unpatched vulnerability in a public issue, discussion, pull request, chat log, or demonstration environment.
+
+Use GitHub private vulnerability reporting when it is enabled for the repository. If that feature is unavailable, contact the repository owner through a pre-established private channel and request a secure reporting path. Do not put vulnerability details in the initial public contact.
+
+Include:
+
+- the affected commit or version;
+- the affected component and configuration;
+- clear reproduction steps or a minimal proof of concept;
+- expected and actual behavior;
+- impact and realistic attack prerequisites;
+- whether credentials, target data, or user information may be exposed;
+- suggested remediation, if known;
+- a safe way to contact you for follow-up.
+
+Do not include real provider credentials, private keys, engagement data, or third-party personal information. Use synthetic fixtures and redact logs. Maintainers will acknowledge a complete report, investigate it, coordinate a fix and disclosure timeline, and credit the reporter when requested and appropriate. Response-time commitments will be published once a monitored reporting channel and maintainer rotation exist.
+
+If a credential may have been exposed, revoke or rotate it immediately; deleting a file or commit does not make the credential safe.
+
+## Application security model
+
+This section summarizes the maintained current branch. Later phase-numbered sections preserve implementation history; where historical deployment wording conflicts with this summary, the summary and current code take precedence.
+
+### Current enforcement matrix
+
+| Execution path | Current boundary |
+|---|---|
+| Runtime-owned `/api/runs` tools | Enforced allow/deny/approval lifecycle; results require approved, step-bound calls. |
+| Managed OpenRouter/Codex | Gateable when the retained orchestrator integration and `ENABLE_OPENROUTER_RUNTIME_GATING` are active. `enforce` fails closed; `dry-run` records without blocking. |
+| Normal OpenRouter chat | Observe-only unless launched through the managed gated path. |
+| Claude CLI chat | Observe-only for native CLI tools; the dashboard does not claim it can block Claude-owned execution. |
+| Grok ACP commander | Enforced coordination-only boundary: Mission Board and conversation recall only. Native execution, Grok subagents/tasks, and unapproved MCP tools are denied. |
+| Grok ACP specialist | Scoped specialist execution under its persona/tool contract; it is not the ChillsPwn commander. |
+| Grok planning/preview | Tool-free; any permission request is denied and interactive questions fail explicitly. |
+
+### Grok OAuth and ACP boundary
+
+Grok is launched through the installed CLI's ACP stdio protocol with `--reasoning-effort high`. The application passes the path to a refreshable, service-owned OAuth file but never reads its value, and removes `XAI_API_KEY` from child environments so this path does not consume API credits.
+
+Commander/planner processes receive an isolated HOME, controlled Grok configuration, `--no-leader`, a reviewed agent profile, the canonical commander Soul, and only explicitly supplied Mission Board/conversation MCP servers. Startup must attest the profile, blocking pre-tool deny capability, and exact MCP/tool surface before the first prompt. A commander-only pre-tool hook and ACP permission handler share the same fail-closed allowlist. Sessions created before the current boundary version are not silently resumed as trusted commander sessions.
+
+OAuth state must be a regular service-owned file with mode `0600` in a service-owned directory with mode `0700`, and both must be writable for atomic token refresh. Recursive/read-only named-user ACLs are not an accepted substitute.
+
+### Lifecycle and delegation
+
+The Phase 18 no-hands policy is the current commander rule: every execution unit, including a quick command, belongs to a different named specialist through the Mission Board. Phase 19 lifecycle controls add ACP activity classification, setup/dead-turn timeouts, queued-turn draining, terminal process-tree shutdown, session reconciliation, and attack-chain memory fields that remove target/box identifiers.
+
+The detailed sections below explain how these boundaries evolved. Labels such as “Phase 7.5.1 deployed” describe an old checkpoint, not the refreshed recovery snapshot.
+
+### Deployment credential and memory boundaries
+
+The integrated recovery units load the optional legacy `/opt/chillspwn/plugin/webapp/.env` first and canonical `/root/.hermes/.env` second. Both are root-owned mode `0600` with no ACL, and `chillspwn` must be unable to read or write them. systemd injects selected values before applying `User=chillspwn`; application and provider code consumes only inherited variables and does not reopen these files. A root-owned startup validator rejects duplicate Hermes YAML keys, structured literal credentials, credential-bearing URLs, and selected high-confidence patterns without printing values.
+
+Direct provider subprocesses and individual Council lanes receive provider-aware environment subsets; the multi-provider Council launcher still holds the inputs required to create those lanes. This limits accidental cross-provider inheritance but is not a strong process boundary: the dashboard and children share the `chillspwn` UID, so same-UID `/proc` inspection and access to service-readable OAuth stores remain possible where host policy permits them. Strong mutual isolation requires separate provider UIDs and a credential broker.
+
+Reusable memory under `/root/.hermes/memories` is `root:root` mode `0700`/`0600` and cannot be traversed directly by the dashboard, gateway, or provider children. The root-owned `chillspwn-memory.service` exposes only validated `add` and policy-filtered `safe-read` operations over `/run/chillspwn-memory/broker.sock`. Whole-file mutation and arbitrary paths are not exposed to the service account; broker failure does not fall back to raw filesystem access.
 
 ## Threat model in one line
 
@@ -28,9 +95,10 @@ Rules enforced at startup (`server/security/config.ts` → `validateStartup`):
   start** (fail closed), unless `CHILLSPWN_ALLOW_UNSAFE_NO_AUTH=true` is explicitly set
   (which logs a loud warning).
 - A valid token may be supplied as `Authorization: Bearer <t>`, `X-Dashboard-Token: <t>`,
-  a `chillspwn_token` cookie, or a `?token=<t>` query. A valid `?token=` sets an HttpOnly
-  cookie, so the **existing built PWA keeps working without a rebuild**: visit
-  `https://host:3131/?token=<t>` once.
+  or a `chillspwn_token` cookie. Only the root path accepts the one-time
+  `?token=<t>` bootstrap query; API, report, artifact, and WebSocket query tokens
+  are rejected. A valid root bootstrap sets an HttpOnly cookie, so the **existing
+  built PWA keeps working without a rebuild**: visit `https://host:3131/?token=<t>` once.
 - Token comparison is constant-time (`server/security/auth.ts` → `tokensMatch`).
 - WebSocket upgrades are gated by the same logic (`verifyClient`).
 
@@ -99,11 +167,26 @@ Untrusted `:name`/`:file` route params are validated with `server/security/paths
 **File-browser routes (Phase 1.1):** `/api/files/list`, `/api/files/read`,
 `/api/files/write` (and `/api/files/roots`) no longer use `startsWith()` or a broad
 `/root` allowance. They resolve the requested path and confine it to
-`SECURITY.allowedWorkspaceRoots` via `resolveWithinRoots()` (default:
-`/root/htb`, `/root/engagements`, `/root/.hermes/memories`, `/root/report-template`;
-override with `ALLOWED_WORKSPACE_ROOTS`). A sibling whose name is a prefix
+`SECURITY.allowedWorkspaceRoots` via lexical and real-path containment (default:
+`/root/htb/boxes` and `/root/engagements`; override with `ALLOWED_WORKSPACE_ROOTS`).
+That same allowlist now defines engagement discovery/creation/report roots, engagement working
+directories, interactive Claude `--add-dir` roots, and the permitted parents for detached OSINT
+output. The recovery helper creates and grants only the two defaults; a custom root must be
+pre-created as a real non-symlink directory with read/write/traverse access for `chillspwn`.
+Reusable memory, provider authentication, reviewed code, and report-template paths are deliberately
+excluded from generic writes.
+A sibling whose name is a prefix
 (`/root/htb2` vs `/root/htb`) and any `../` escape are rejected (`403`, audited as
-`path_denied`).
+`path_denied`). Existing reads reject final symlinks and real-path escapes; writes use a
+no-follow temporary file followed by an atomic rename.
+
+**OSINT persistence:** user-supplied targets are type-normalized and rendered as inert quoted data
+before they reach the Claude prompt. Job IDs, persisted JSON, log tails, output directories, and
+report/PDF downloads are revalidated on every read or restart. State and worker logs live under the
+service-owned `CHILLSPWN_STATE_DIR/osint-jobs`; output artifacts must remain in a correctly named,
+non-symlink directory below an allowed workspace root. State/artifact reads use no-follow file
+descriptors, real-path containment, and size bounds. Malformed, traversing, symlinked, oversized, or
+out-of-root persisted records are ignored or rejected rather than trusted during rehydration.
 
 ## Process-kill hardening (Phase 1.1)
 
@@ -138,7 +221,7 @@ engine files are retained for a controlled removal in a later cleanup phase. Tes
 ## Audit log
 
 Security-relevant events are appended as JSON lines to
-`~/.claude/chillspwn/runtime/events.jsonl` (`server/runtime/EventLog.ts`), queryable by
+the `runtime/events.jsonl` child of `CHILLSPWN_STATE_DIR` (`server/runtime/EventLog.ts`), queryable by
 `agentRunId` / `sessionId`. Emits: `server_start`, `auth_failure`, `ws_auth_failure`,
 `terminal_blocked`, `file_write_blocked`, `proxy_blocked`, `kill_refused`,
 `process_killed`, `prompt_obfuscation_enabled`, and (Phase 1.1) `path_denied`,
@@ -164,17 +247,15 @@ Security-relevant events are appended as JSON lines to
 
 ### Enforced vs observe-only — read this
 
-> **State note (read first).** The table below describes the table's *baseline*. The Phase 8–14
-> branch ADDS real OpenRouter/Codex gating (see the row + the "Phase 8–14 security posture" section
-> at the end of this file). It is **off by default** and only active once the orchestrator patch is
-> applied AND `ENABLE_OPENROUTER_RUNTIME_GATING=true`. **The currently-deployed build (Phase 7.5.1)
-> does NOT have OpenRouter gating.**
+> **Historical checkpoint.** This table records the Phase 7/8 transition that motivated the later
+> gate. It is retained for design provenance, not as the current recovery state. Consult the current
+> enforcement matrix above before enabling a provider path.
 
 | Path | Status |
 |---|---|
 | **`/api/runs` (runtime-owned)** | **ENFORCED** — deny/approval are real; results require approval. |
 | **Live chat — `claude -p`** | **OBSERVE-ONLY** — `POST /api/observe/tool` records what policy *would* decide (`tool_observed`, `enforced=false`). It never blocks and never touches the Claude CLI. Real gating of claude tools is impossible without changing the frozen invocation, so it is intentionally not attempted. |
-| **Managed OpenRouter / Codex (Phase 8 branch)** | **GATEABLE.** Deployed 7.5.1: not gated. With the orchestrator patch applied + `ENABLE_OPENROUTER_RUNTIME_GATING=true`: `OPENROUTER_GATE_MODE=off` → no gating; `dry-run` → records the would-be decision as a non-blocking observation (no approval created, tool still runs); `enforce` → real allow / deny / wait-for-approval. Fails **closed** (deny) if the runtime gate is unreachable. |
+| **Managed OpenRouter / Codex (Phase 8 design)** | **GATEABLE.** With the retained orchestrator integration + `ENABLE_OPENROUTER_RUNTIME_GATING=true`: `off` disables gating; `dry-run` records without blocking; `enforce` performs real allow/deny/approval and fails closed if the runtime gate is unreachable. |
 | **Normal chat — OpenRouter** | **OBSERVE-ONLY** (not a managed gated run) — same as `claude -p`: classified, never blocked. |
 
 This split is deliberate: it avoids a false sense of protection over the frozen Claude path, while
@@ -187,8 +268,10 @@ making OpenRouter/Codex genuinely enforceable (that path owns its tool execution
 - **Live (non-managed) chat** tool calls — both `claude -p` and OpenRouter — are
   **classified/audited only**, not gated. Real enforcement applies to **managed OpenRouter/Codex
   runs** (Phase 8, off by default) and `/api/runs`; Claude is never gated.
-- `server/index.ts` is still a 6.8k-line monolith run untyped by Bun; strict typing +
-  modular split is Phase 6. The new modules are strictly type-checked (`tsconfig.server.json`).
+- `server/index.ts` remains an approximately 9.3k-line legacy composition root executed directly by
+  Bun and excluded from strict checking. Runtime, provider, agent, route, MCP, and security modules
+  have been split out and are strictly type-checked through `tsconfig.server.json`; reducing the
+  composition root remains technical debt.
 
 ---
 

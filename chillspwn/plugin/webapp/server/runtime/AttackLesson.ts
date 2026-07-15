@@ -1,7 +1,7 @@
 /**
- * AttackLesson (Phase 8–14.2 — HTB Training Memory) — the reusable TRAINING unit.
+ * AttackLesson (Phase 8–14.2 — box-agnostic Training Memory) — the reusable TRAINING unit.
  *
- * The goal of authorized HTB/lab work is not just to solve a box: it is to distil VERIFIED,
+ * The goal of authorized lab work is not just to solve a target: it is to distil VERIFIED,
  * evidence-backed attack lessons the agent can reuse. A lesson is distinct from:
  *   - raw evidence (a captured artifact — not knowledge),
  *   - a hypothesis (an untrusted guess — never reusable),
@@ -16,6 +16,7 @@
  */
 
 import { redactSecrets } from "./RunReport";
+import { isIP } from "net";
 
 export const TECHNIQUE_CATEGORIES = [
   "recon", "web", "smb", "ldap", "active_directory", "kerberos", "winrm",
@@ -37,7 +38,7 @@ export const ATTACK_LESSON_CATEGORY = "verified_attack_lesson" as const;
 // 15.10 + 17: lesson kinds. attack_lesson (default reusable) | failed_attempt (avoidance) | Phase-17
 // strategy/intel lessons (describe STRATEGY/INTEL, never secrets/hashes/passwords/wordlists/exploit
 // code). Strategy/intel lessons inject like reusable attack lessons (NOT the failed-attempt section).
-export const LESSON_KINDS = ["attack_lesson", "failed_attempt", "wordlist_strategy_lesson", "hashcat_strategy_lesson", "vulnerability_intelligence_lesson"] as const;
+export const LESSON_KINDS = ["attack_lesson", "attack_chain", "failed_attempt", "wordlist_strategy_lesson", "hashcat_strategy_lesson", "vulnerability_intelligence_lesson"] as const;
 export type LessonKind = (typeof LESSON_KINDS)[number];
 
 export interface AttackLesson {
@@ -55,10 +56,11 @@ export interface AttackLesson {
   observedSignals: string[];
   stepsThatWorked: string[];
   toolsUsed: string[];
+  /** Public technique/tool/advisory references or an on-demand local playbook pointer. */
+  references: string[];
   evidenceIds: string[];
   sourceRunId?: string;
   sourceStepIds: string[];
-  sourceBoxOrLab?: string;
   verificationMethod: string;
   outcome: string;
   confidence: number; // 0..1
@@ -114,15 +116,88 @@ export function redactLessonText(text: string): string {
   return redactSecrets(text ?? "");
 }
 
-/** The text fields that are scanned for secrets (references like evidenceIds are NOT scanned). */
+/** Reusable text fields scanned for secrets and target identity. Provenance IDs are not scanned. */
 const TEXT_FIELDS: (keyof AttackLesson)[] = [
   "title", "techniqueName", "summary", "verificationMethod", "outcome", "reuseGuidance",
   // 15.10: failed-attempt text fields are scanned/redacted for secrets too.
   "attemptedTechnique", "whyItWasTried", "whyItFailed", "conditions", "futureAvoidanceGuidance",
 ];
 const TEXT_ARRAY_FIELDS: (keyof AttackLesson)[] = [
-  "prerequisites", "observedSignals", "stepsThatWorked", "antiReuseWarnings", "failedAttempts", "toolsUsed",
+  "prerequisites", "observedSignals", "stepsThatWorked", "antiReuseWarnings", "failedAttempts", "toolsUsed", "references",
 ];
+
+/** Reusable memory describes a technique, never the lab/box where it was learned. */
+export function findTargetSpecificIdentifiers(text: string): string[] {
+  if (!text) return [];
+  const kinds = new Set<string>();
+  if (/\b(?:HTB|Hack\s*The\s*Box)\b/i.test(text) || /hackthebox\.com/i.test(text)) kinds.add("box_reference");
+  if (/(?:^|[\\/])(?:root[\\/])?htb[\\/]boxes[\\/]/i.test(text) || /\.htb\b/i.test(text)) kinds.add("box_path_or_domain");
+  if (/(?:^|[\\/])root[\\/](?:engagements|labs)[\\/]/i.test(text)) kinds.add("engagement_path");
+  if (/\b[a-z0-9][a-z0-9.-]*\.(?:local|internal|lan|test)\b/i.test(text)) kinds.add("target_domain");
+  if (/\b(?:\d{1,3}\.){3}\d{1,3}\b/.test(text)) kinds.add("target_ip");
+  const addressCandidates = text.match(/\[?[0-9A-Fa-f:]{2,}\]?/g) ?? [];
+  if (addressCandidates.some((value) => isIP(value.replace(/^\[|\]$/g, "")) === 6)) kinds.add("target_ipv6");
+  return [...kinds];
+}
+
+/** Strict scan for executable/durable content outside a dedicated public-reference field. */
+export function findReusableContentIdentifiers(text: string): string[] {
+  const kinds = new Set(findTargetSpecificIdentifiers(text));
+  if (/\b(?:https?|ftp):\/\/(?!<(?:TARGET_URL|REFERENCE_URL)>)[^\s)>'"]+/i.test(text)) {
+    kinds.add("literal_url_outside_references");
+  }
+  if (/\b(?:[a-z0-9](?:[a-z0-9-]{0,62})\.)+[a-z]{2,63}\b/i.test(text)) {
+    kinds.add("literal_domain_outside_references");
+  }
+  const explicitUser = /(?:\busername\s*(?:(?:is|was)\s+|[:=]\s*)?|\blogin\s+as\s+|\buser\s+(?:named\s+)?|\buser(?:name)?\s*[:=]\s*|\baccount\s*[:=]\s*|(?:^|\s)-(?:u|U)\s+|\\|\/home\/)(?!<(?:USER|USER_REF)>)([a-z][a-z0-9._$-]{1,31})\b/ig;
+  const genericUserTerms = new Set([
+    "account", "agent", "authentication", "context", "controlled", "credentials", "data",
+    "enumeration", "home", "input", "interface", "list", "output", "preference", "provided",
+    "record", "session", "supplied",
+  ]);
+  if ([...text.matchAll(explicitUser)].some((match) => !genericUserTerms.has(match[1].toLowerCase()))) {
+    kinds.add("target_username");
+  }
+  if (
+    /\b(?:box|machine|target|host|engagement)\s+(?:named|called)\s+["'`]?(?!<(?:TARGET|TARGET_HOST)>)[a-z0-9][a-z0-9_-]{2,}["'`]?\b/i.test(text)
+    || /\b(?:box|machine|target|host|engagement)\s+["'`](?!<(?:TARGET|TARGET_HOST)>)[a-z0-9][a-z0-9_-]{2,}["'`](?:\s|$)/i.test(text)
+    || /\b(?:box|machine|target|host|engagement)\s+[A-Z][A-Za-z0-9_-]{2,}\b/.test(text)
+  ) {
+    kinds.add("named_target");
+  }
+  return [...kinds];
+}
+
+/**
+ * Field-aware target scan for reusable lessons. Public research URLs are allowed only in the
+ * dedicated references field; literal URLs/domains/usernames in executable lesson text must be
+ * placeholders so a legacy verified record cannot steer a future run toward the wrong target.
+ */
+export function findLessonTargetSpecificIdentifiers(l: Partial<AttackLesson>): string[] {
+  const kinds = new Set<string>();
+  const add = (values: string[]) => values.forEach((value) => kinds.add(value));
+  const scanExecutableText = (text: string) => add(findReusableContentIdentifiers(text));
+
+  for (const field of TEXT_FIELDS) {
+    const value = l[field];
+    if (typeof value === "string") scanExecutableText(value);
+  }
+  for (const field of TEXT_ARRAY_FIELDS) {
+    const value = l[field];
+    if (!isStringArray(value)) continue;
+    if (field === "references") value.forEach((entry) => add(findTargetSpecificIdentifiers(entry)));
+    else value.forEach(scanExecutableText);
+  }
+  return [...kinds];
+}
+
+/** Defense-in-depth for legacy records loaded from disk before planning-context injection. */
+export function isReusableLessonSafe(l: Partial<AttackLesson>): boolean {
+  const text = lessonScannableText(l);
+  return detectLessonSecrets(l).length === 0
+    && redactLessonText(text) === text
+    && findLessonTargetSpecificIdentifiers(l).length === 0;
+}
 
 /** All scannable text of a lesson, concatenated (for secret detection). */
 export function lessonScannableText(l: Partial<AttackLesson>): string {
@@ -179,10 +254,10 @@ export function validateAndNormalizeLesson(raw: unknown): LessonValidation & { l
     observedSignals: strArr(r.observedSignals),
     stepsThatWorked: strArr(r.stepsThatWorked),
     toolsUsed: strArr(r.toolsUsed),
+    references: strArr(r.references),
     evidenceIds: strArr(r.evidenceIds),
     sourceRunId: typeof r.sourceRunId === "string" ? r.sourceRunId : undefined,
     sourceStepIds: strArr(r.sourceStepIds),
-    sourceBoxOrLab: typeof r.sourceBoxOrLab === "string" ? r.sourceBoxOrLab : undefined,
     verificationMethod: String(r.verificationMethod ?? "").trim(),
     outcome: String(r.outcome ?? "").trim(),
     confidence: conf,
@@ -197,6 +272,10 @@ export function validateAndNormalizeLesson(raw: unknown): LessonValidation & { l
   const secretKinds = detectLessonSecrets(candidate);
   if (secretKinds.length) {
     errors.push(`lesson contains target-specific secret(s) [${secretKinds.join(", ")}] — store an evidence reference, not the secret`);
+  }
+  const targetKinds = findLessonTargetSpecificIdentifiers(candidate);
+  if (targetKinds.length) {
+    errors.push(`lesson contains target-specific identifier(s) [${targetKinds.join(", ")}] — use placeholders and omit the box identity`);
   }
   if (errors.length) return { ok: false, errors };
 
@@ -214,7 +293,7 @@ export function validateAndNormalizeLesson(raw: unknown): LessonValidation & { l
 }
 
 /**
- * True when a lesson is promotable to `verified`. For the HTB training goal a verified lesson MUST
+ * True when a lesson is promotable to `verified`. A verified lesson MUST
  * be EVIDENCE-BACKED (8.3 — stricter than 8.2): it requires BOTH `evidenceIds` AND `sourceRunId`,
  * plus at least one corroborating field (a source step, a verification method, an outcome, or reuse
  * guidance), and no target-specific secret. A lesson may exist as `proposed` without these — it
@@ -222,8 +301,17 @@ export function validateAndNormalizeLesson(raw: unknown): LessonValidation & { l
  */
 export function isPromotable(l: AttackLesson): { ok: boolean; reason?: string } {
   if (detectLessonSecrets(l).length) return { ok: false, reason: "contains a target-specific secret" };
+  if (redactLessonText(lessonScannableText(l)) !== lessonScannableText(l)) return { ok: false, reason: "contains credential or token material" };
+  if (findLessonTargetSpecificIdentifiers(l).length) return { ok: false, reason: "contains target/box identity" };
   if (!((l.evidenceIds?.length ?? 0) > 0)) return { ok: false, reason: "no evidenceIds — a verified lesson must be evidence-backed" };
   if (!l.sourceRunId) return { ok: false, reason: "no sourceRunId — a verified lesson must cite the run it came from" };
+  if (l.kind === "attack_chain") {
+    if (!(l.prerequisites.length || l.observedSignals.length)) return { ok: false, reason: "attack chain needs prerequisites or observed signals" };
+    if (!l.stepsThatWorked.length) return { ok: false, reason: "attack chain needs ordered executable steps" };
+    if (!l.toolsUsed.length) return { ok: false, reason: "attack chain needs its tools" };
+    if (!l.verificationMethod.trim()) return { ok: false, reason: "attack chain needs a validation checkpoint" };
+    if (!l.references.length) return { ok: false, reason: "attack chain needs a reusable technique/tool/advisory reference" };
+  }
   const corroborated =
     (l.sourceStepIds?.length ?? 0) > 0 ||
     !!l.verificationMethod?.trim() ||
@@ -243,7 +331,10 @@ export function isPromotable(l: AttackLesson): { ok: boolean; reason?: string } 
 export function buildTrainingLessonContext(lessons: AttackLesson[], opts: { max?: number; header?: string } = {}): string {
   const max = opts.max ?? 15;
   // 15.10: failed-attempt lessons are NEVER presented here (they get their own avoidance section).
-  const usable = lessons.filter((l) => l.status === "verified" && l.kind !== "failed_attempt").slice(0, max);
+  const usable = lessons
+    .filter((l) => l.status === "verified" && l.kind !== "failed_attempt")
+    .filter(isReusableLessonSafe)
+    .slice(0, max);
   if (!usable.length) return "";
   const lines: string[] = [
     opts.header ?? "=== VERIFIED TRAINING LESSONS (operator-approved, evidence-backed — reusable knowledge) ===",
@@ -254,10 +345,16 @@ export function buildTrainingLessonContext(lessons: AttackLesson[], opts: { max?
     lines.push(
       `\n• ${l.title}  [${l.techniqueCategory} · ${l.techniqueName} · confidence ${Math.round(l.confidence * 100)}%]`,
       `  technique: ${l.summary}`,
-      l.prerequisites.length ? `  when to consider — prerequisites/signals: ${[...l.prerequisites, ...l.observedSignals].join("; ")}` : "",
+      (l.prerequisites ?? []).length ? `  when to consider — prerequisites/signals: ${[...(l.prerequisites ?? []), ...(l.observedSignals ?? [])].join("; ")}` : "",
+      (l.stepsThatWorked ?? []).length ? `  ordered chain: ${(l.stepsThatWorked ?? []).map((s, i) => `${i + 1}) ${s}`).join(" → ")}` : "",
+      (l.toolsUsed ?? []).length ? `  tools: ${(l.toolsUsed ?? []).join(", ")}` : "",
+      l.verificationMethod ? `  verify: ${l.verificationMethod}` : "",
+      l.outcome ? `  expected outcome: ${l.outcome}` : "",
+      (l.failedAttempts ?? []).length ? `  failure recovery: ${(l.failedAttempts ?? []).join("; ")}` : "",
       l.reuseGuidance ? `  reuse guidance: ${l.reuseGuidance}` : "",
-      l.antiReuseWarnings.length ? `  ⚠ anti-reuse: ${l.antiReuseWarnings.join("; ")}` : "",
-      l.evidenceIds.length ? `  evidence refs: ${l.evidenceIds.join(", ")}` : "",
+      (l.antiReuseWarnings ?? []).length ? `  ⚠ anti-reuse: ${(l.antiReuseWarnings ?? []).join("; ")}` : "",
+      (l.references ?? []).length ? `  references: ${(l.references ?? []).join("; ")}` : "",
+      (l.evidenceIds ?? []).length ? `  evidence refs: ${(l.evidenceIds ?? []).join(", ")}` : "",
     );
   }
   lines.push("=== END VERIFIED TRAINING LESSONS ===");
@@ -270,7 +367,10 @@ export function buildTrainingLessonContext(lessons: AttackLesson[], opts: { max?
  */
 export function buildFailedAttemptContext(lessons: AttackLesson[], opts: { max?: number } = {}): string {
   const max = opts.max ?? 10;
-  const usable = lessons.filter((l) => l.status === "verified" && l.kind === "failed_attempt").slice(0, max);
+  const usable = lessons
+    .filter((l) => l.status === "verified" && l.kind === "failed_attempt")
+    .filter(isReusableLessonSafe)
+    .slice(0, max);
   if (!usable.length) return "";
   const lines: string[] = [
     "=== RELEVANT FAILED ATTEMPTS / AVOIDANCE LESSONS (these did NOT work — do not repeat) ===",
@@ -303,7 +403,7 @@ export function buildFailedAttemptContext(lessons: AttackLesson[], opts: { max?:
  */
 export function buildLayeredPlanningContext(lessons: AttackLesson[], opts: { agentId?: string; max?: number } = {}): string {
   const agent = (opts.agentId || "").toLowerCase();
-  const verified = lessons.filter((l) => l.status === "verified");
+  const verified = lessons.filter((l) => l.status === "verified" && isReusableLessonSafe(l));
   const attack = verified.filter((l) => l.kind !== "failed_attempt");
 
   const globalL = attack.filter((l) => l.scope === "global");

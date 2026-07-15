@@ -1,11 +1,21 @@
-import { test, expect, describe } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
+import { mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from "fs";
+import { tmpdir } from "os";
+import { join } from "path";
 import {
   safeSegment,
   resolveWithin,
   resolveWithinRoots,
   isWithinRoot,
   PathSecurityError,
+  resolveExistingWithinRoots,
+  resolveWriteTargetWithinRoots,
 } from "../paths";
+
+const temporaryPaths: string[] = [];
+afterEach(() => {
+  while (temporaryPaths.length) rmSync(temporaryPaths.pop()!, { recursive: true, force: true });
+});
 
 describe("safeSegment", () => {
   test("accepts ordinary names", () => {
@@ -64,5 +74,31 @@ describe("resolveWithinRoots (file-route guard)", () => {
   test("rejects traversal that escapes a root", () => {
     expect(() => resolveWithinRoots(roots, "/root/htb/../../etc/shadow")).toThrow(PathSecurityError);
     expect(() => resolveWithinRoots(roots, "/root/htb/ping/../../../.ssh/id_rsa")).toThrow(PathSecurityError);
+  });
+});
+
+describe("real filesystem containment", () => {
+  test("rejects a symlink that escapes an allowed root", () => {
+    const base = mkdtempSync(join(tmpdir(), "chillspwn-paths-"));
+    temporaryPaths.push(base);
+    const root = join(base, "allowed");
+    const outside = join(base, "outside");
+    mkdirSync(root);
+    mkdirSync(outside);
+    writeFileSync(join(outside, "secret.txt"), "not workspace data");
+    symlinkSync(join(outside, "secret.txt"), join(root, "escape.txt"));
+
+    expect(() => resolveExistingWithinRoots([root], join(root, "escape.txt"))).toThrow(PathSecurityError);
+    expect(() => resolveWriteTargetWithinRoots([root], join(root, "escape.txt"))).toThrow(PathSecurityError);
+  });
+
+  test("accepts regular existing files and new files under a real allowed parent", () => {
+    const root = mkdtempSync(join(tmpdir(), "chillspwn-paths-"));
+    temporaryPaths.push(root);
+    const existing = join(root, "existing.txt");
+    writeFileSync(existing, "ok");
+
+    expect(resolveExistingWithinRoots([root], existing, "path", { rejectFinalSymlink: true })).toBe(existing);
+    expect(resolveWriteTargetWithinRoots([root], join(root, "new.txt"))).toBe(join(root, "new.txt"));
   });
 });

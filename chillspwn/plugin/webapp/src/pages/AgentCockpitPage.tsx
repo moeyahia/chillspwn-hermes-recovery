@@ -595,29 +595,37 @@ export default function AgentCockpitPage() {
             {lessons.length > 0 && (
               <Section title="Training memory — verified attack lessons" count={lessons.length}>
                 <div style={{ fontSize: 9.5, color: MUTED, marginBottom: 6 }}>
-                  Reusable, evidence-backed lessons. Only <b>verified</b> lessons are injected into managed planning (never hypotheses / raw notes / secrets).
+                  Reusable, evidence-backed, box-agnostic chains. Only <b>verified</b> chains are injected into provider context (never hypotheses / raw notes / secrets).
                 </div>
                 {lessons.slice(0, 14).map((l) => {
                   const lc: Record<string, string> = { verified: "#2bd47f", proposed: "#ffae42", rejected: "#ff4d63", stale: "#9aa6b6" };
                   return (
-                    <div key={l.id} style={{ display: "flex", alignItems: "center", gap: 8, padding: "4px 0", fontSize: 11, borderBottom: `1px solid ${BORDER}` }}>
-                      <Pill badge={{ label: l.status, color: lc[l.status] || "#9aa6b6" }} sm />
-                      <span style={{ color: MUTED, fontSize: 9 }}>{l.techniqueCategory}</span>
-                      <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1 }}>{l.title}</span>
-                      {l.status === "verified" && <span style={{ fontSize: 8.5, color: "#2bd47f" }} title="injected into managed planning">▶ in planning</span>}
-                      {l.evidenceIds?.length > 0 && <span style={{ fontSize: 8.5, color: MUTED }}>🔎{l.evidenceIds.length}</span>}
-                      {l.status === "proposed" && (
-                        <span style={{ display: "flex", gap: 4 }}>
-                          <button onClick={() => lessonAction(l.id, "approve")} disabled={busy} title="Verify"
-                            style={{ fontSize: 9, color: "#2bd47f", background: "transparent", border: "1px solid #2bd47f55", borderRadius: 3, padding: "1px 6px", cursor: "pointer" }}>✓</button>
-                          <button onClick={() => lessonAction(l.id, "reject")} disabled={busy} title="Reject"
-                            style={{ fontSize: 9, color: "#ff4d63", background: "transparent", border: "1px solid #ff4d6355", borderRadius: 3, padding: "1px 6px", cursor: "pointer" }}>✕</button>
-                        </span>
-                      )}
-                      {l.status === "verified" && (
-                        <button onClick={() => lessonAction(l.id, "stale")} disabled={busy} title="Mark stale"
-                          style={{ fontSize: 9, color: MUTED, background: "transparent", border: `1px solid ${BORDER}`, borderRadius: 3, padding: "1px 6px", cursor: "pointer" }}>stale</button>
-                      )}
+                    <div key={l.id} style={{ padding: "6px 0", fontSize: 11, borderBottom: `1px solid ${BORDER}` }}>
+                      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                        <Pill badge={{ label: l.status, color: lc[l.status] || "#9aa6b6" }} sm />
+                        <span style={{ color: MUTED, fontSize: 9 }}>{l.techniqueCategory}</span>
+                        <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1 }}>{l.title}</span>
+                        {l.status === "verified" && <span style={{ fontSize: 8.5, color: "#2bd47f" }} title="injected into every provider">▶ in provider context</span>}
+                        {l.evidenceIds?.length > 0 && <span style={{ fontSize: 8.5, color: MUTED }}>🔎{l.evidenceIds.length}</span>}
+                        {l.status === "proposed" && (
+                          <span style={{ display: "flex", gap: 4 }}>
+                            <button onClick={() => lessonAction(l.id, "approve")} disabled={busy} title="Verify this displayed generalized chain"
+                              style={{ fontSize: 9, color: "#2bd47f", background: "transparent", border: "1px solid #2bd47f55", borderRadius: 3, padding: "1px 6px", cursor: "pointer" }}>✓</button>
+                            <button onClick={() => lessonAction(l.id, "reject")} disabled={busy} title="Reject"
+                              style={{ fontSize: 9, color: "#ff4d63", background: "transparent", border: "1px solid #ff4d6355", borderRadius: 3, padding: "1px 6px", cursor: "pointer" }}>✕</button>
+                          </span>
+                        )}
+                        {l.status === "verified" && (
+                          <button onClick={() => lessonAction(l.id, "stale")} disabled={busy} title="Mark stale"
+                            style={{ fontSize: 9, color: MUTED, background: "transparent", border: `1px solid ${BORDER}`, borderRadius: 3, padding: "1px 6px", cursor: "pointer" }}>stale</button>
+                        )}
+                      </div>
+                      <div style={{ margin: "5px 0 0 58px", color: MUTED, fontSize: 9.5, lineHeight: 1.45 }}>
+                        {l.summary && <div>{l.summary}</div>}
+                        {l.stepsThatWorked?.length > 0 && <div><b style={{ color: "var(--text-primary)" }}>Chain:</b> {l.stepsThatWorked.map((s: string, i: number) => `${i + 1}) ${s}`).join(" → ")}</div>}
+                        {l.verificationMethod && <div><b style={{ color: "var(--text-primary)" }}>Verify:</b> {l.verificationMethod}</div>}
+                        {l.references?.length > 0 && <div><b style={{ color: "var(--text-primary)" }}>References:</b> {l.references.join(" · ")}</div>}
+                      </div>
                     </div>
                   );
                 })}

@@ -12,21 +12,40 @@ Purpose:
 
 import json
 import os
+import sys
 import time
 from pathlib import Path
 
-# Warning threshold requested by Mr. Wong.
+# Warning threshold requested by the operator.
 WARNING_PERCENT = 70.0
 
-# Critical threshold requested by Mr. Wong.
+# Critical threshold requested by the operator.
 CRITICAL_PERCENT = 95.0
 
 # Minimum time between repeated alerts while the same severity remains active.
 # This prevents Telegram spam if CPU/RAM stays above a threshold for a while.
 COOLDOWN_SECONDS = 15 * 60
 
-# Persistent state file used by the cron script.
-STATE_PATH = Path("/root/.hermes/state/server_resource_alert.json")
+def configured_state_path() -> Path:
+    """Return the explicitly configured private state path."""
+    raw_path = os.environ.get("HERMES_RESOURCE_ALERT_STATE_PATH", "").strip()
+    if not raw_path:
+        raise RuntimeError("HERMES_RESOURCE_ALERT_STATE_PATH is required")
+
+    state_path = Path(raw_path).expanduser()
+    if not state_path.is_absolute():
+        raise RuntimeError("HERMES_RESOURCE_ALERT_STATE_PATH must be absolute")
+    return state_path
+
+
+def configured_host_label() -> str:
+    """Return a non-sensitive operator-provided label for alert routing."""
+    host_label = os.environ.get("HERMES_RESOURCE_ALERT_HOST_LABEL", "").strip()
+    if not host_label:
+        raise RuntimeError("HERMES_RESOURCE_ALERT_HOST_LABEL is required")
+    if "\n" in host_label or "\r" in host_label:
+        raise RuntimeError("HERMES_RESOURCE_ALERT_HOST_LABEL must be one line")
+    return host_label
 
 
 def read_cpu_percent(interval: float = 1.0) -> float:
@@ -112,18 +131,19 @@ def triggered_metrics(cpu_percent: float, ram_percent: float, threshold: float) 
     return triggered
 
 
-def load_state() -> dict:
+def load_state(state_path: Path) -> dict:
     """Load the previous alert timestamp/state if it exists."""
     try:
-        return json.loads(STATE_PATH.read_text(encoding="utf-8"))
+        return json.loads(state_path.read_text(encoding="utf-8"))
     except Exception:
         return {}
 
 
-def save_state(state: dict) -> None:
+def save_state(state_path: Path, state: dict) -> None:
     """Persist alert state for cooldown tracking."""
-    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    STATE_PATH.write_text(json.dumps(state, indent=2), encoding="utf-8")
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+    state_path.chmod(0o600)
 
 
 def should_alert(now: int, state: dict, severity: str) -> bool:
@@ -141,33 +161,38 @@ def should_alert(now: int, state: dict, severity: str) -> bool:
 
 def main() -> None:
     """Check resources and print an alert only if threshold/cooldown conditions match."""
+    try:
+        state_path = configured_state_path()
+        host_label = configured_host_label()
+    except RuntimeError as error:
+        print(f"server-resource-alert: {error}", file=sys.stderr)
+        raise SystemExit(2) from error
+
     cpu_percent = read_cpu_percent()
     ram_percent = read_ram_percent()
     severity, threshold, emoji = determine_severity(cpu_percent, ram_percent)
 
-    state = load_state()
+    state = load_state(state_path)
     now = int(time.time())
 
     # If usage is below 70%, mark the monitor inactive and stay silent.
     if severity is None:
         if state.get("active"):
-            save_state({"active": False, "severity": None, "last_alert": int(state.get("last_alert", 0))})
+            save_state(state_path, {"active": False, "severity": None, "last_alert": int(state.get("last_alert", 0))})
         return
 
     # If this is the same severity and still inside cooldown, stay silent.
     if not should_alert(now, state, severity):
-        save_state({"active": True, "severity": severity, "last_alert": int(state.get("last_alert", 0))})
+        save_state(state_path, {"active": True, "severity": severity, "last_alert": int(state.get("last_alert", 0))})
         return
 
-    save_state({"active": True, "severity": severity, "last_alert": now})
-
-    hostname = os.uname().nodename
+    save_state(state_path, {"active": True, "severity": severity, "last_alert": now})
     trigger_text = ", ".join(triggered_metrics(cpu_percent, ram_percent, threshold))
 
     # Cron no_agent delivers stdout verbatim to Telegram.
     print(
         f"{emoji} Server Resource {severity}\n\n"
-        f"Host: {hostname}\n"
+        f"Host: {host_label}\n"
         f"Severity: {severity}\n"
         f"Threshold: {threshold:.0f}%\n"
         f"Triggered: {trigger_text}\n\n"

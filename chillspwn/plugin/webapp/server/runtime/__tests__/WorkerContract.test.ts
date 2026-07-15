@@ -54,7 +54,23 @@ describe("validateWorkerResult", () => {
       expect(v.result.assumptions).toEqual([]);
       expect(v.result.evidence).toEqual([]);
       expect(v.result.artifacts).toEqual([]);
+      expect(v.result.proposedAttackChains).toEqual([]);
     }
+  });
+
+  test("preserves structured box-agnostic attack-chain proposals and rejects scalar entries", () => {
+    const chain = {
+      title: "Relay coerced authentication into certificate enrollment",
+      techniqueName: "Coercion relay chain",
+      techniqueCategory: "active_directory",
+      summary: "Relay a coerced machine authentication to an eligible enrollment endpoint.",
+      stepsThatWorked: ["coerce <DOMAIN_CONTROLLER>", "relay to <ENROLLMENT_ENDPOINT>"],
+      references: ["https://github.com/fortra/impacket"],
+    };
+    const good = validateWorkerResult({ ...goodResult, proposedAttackChains: [chain] });
+    expect(good.ok).toBe(true);
+    if (good.ok) expect(good.result.proposedAttackChains).toEqual([chain]);
+    expect(validateWorkerResult({ ...goodResult, proposedAttackChains: ["not-an-object"] }).ok).toBe(false);
   });
 
   describe("evidence.kind must be a valid EvidenceKind (Phase 4.1)", () => {

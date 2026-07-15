@@ -16,7 +16,8 @@ context_window / auth_headers / build_body / parse_choice — plus complete(), w
 turn and returns a CHAT-COMPLETIONS-shaped dict so the shared loop's parse_choice / Path-A logic is
 identical to every other provider.
 
-Key: GEMINI_API_KEY (env, or read from /root/.hermes/.env / /root/.gemini.env as a fallback).
+Key: `GEMINI_API_KEY` or `GOOGLE_API_KEY` from the protected process environment. This module
+does not inspect user home directories or credential files.
 """
 import json
 import os
@@ -233,20 +234,7 @@ class GeminiProvider:
 
     # ---- key resolution ----
     def _key(self):
-        k = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY") or ""
-        if not k:
-            for envf in ("/root/.hermes/.env", "/root/.gemini.env"):
-                try:
-                    for line in open(envf):
-                        line = line.strip()
-                        if line.startswith("GEMINI_API_KEY="):
-                            k = line.split("=", 1)[1].strip().strip('"').strip("'")
-                            break
-                except Exception:
-                    pass
-                if k:
-                    break
-        return k
+        return os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY") or ""
 
     # ---- Provider interface parity (used by the shared loop) ----
     def auth_headers(self) -> dict:

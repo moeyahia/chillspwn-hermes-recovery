@@ -6,6 +6,11 @@ Wraps Hermes' MemoryStore (flock + char caps + injection scan) and adds the
 governance the reviewer MUST obey, so that an automated model review can NEVER
 silently destroy important knowledge:
 
+  • BROKERED IN SERVICE MODE — when CHILLSPWN_MEMORY_SOCKET is configured, only
+    add/safe-read are sent to the root-owned Unix-socket mediator. The ordinary
+    service account has no raw memory-tree access. Curator verbs require a
+    deliberate root/operator invocation outside broker client mode.
+
   • ADDITIVE-ONLY by default — `add` is allowed; `replace`/`remove` are REFUSED
     unless --curator is passed (the deliberate, gated consolidation path only).
     The reviewer is given the `add` verb only.
@@ -28,23 +33,171 @@ Usage (the reviewer is instructed to call ONLY `add`):
   chillspwn_mem.py restore --backup <dir-name>                 # recover a snapshot
 """
 import argparse
+import hashlib
 import json
 import os
+import re
 import shutil
+import socket
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-HERMES_SRC = "/media/sf_hermes-agent"
+HERMES_SRC = os.environ.get("CHILLSPWN_HERMES_SRC", "").strip()
+if not HERMES_SRC:
+    raise RuntimeError("CHILLSPWN_HERMES_SRC is required")
+if not Path(HERMES_SRC, "tools").is_dir():
+    raise RuntimeError("CHILLSPWN_HERMES_SRC does not contain the Hermes tools package")
 if HERMES_SRC not in sys.path:
     sys.path.insert(0, HERMES_SRC)
 
 from tools.memory_tool import MemoryStore, get_memory_dir, ENTRY_DELIMITER
+from chillspwn_learn import generalize_reusable_text, reusable_content_violations
 
 PIN_MARKERS = ("📌", "[PIN]", "[PINNED]")
 MEM_CAP = 60000          # ChillsPwn treats MEMORY.md as a KB, not 2.2KB working memory
 USER_CAP = 12000
 KEEP_BACKUPS = 40
+BROKER_MAX_RESPONSE = 256 * 1024
+
+
+def _broker_socket():
+    if os.environ.get("CHILLSPWN_MEMORY_BROKER_INTERNAL", "") == "1":
+        return ""
+    return os.environ.get("CHILLSPWN_MEMORY_SOCKET", "").strip()
+
+
+def _broker_request(payload):
+    """Send one bounded JSON request to the privileged memory mediator."""
+    socket_path = _broker_socket()
+    if not socket_path or not os.path.isabs(socket_path):
+        return {"ok": False, "error": "memory broker socket is not configured"}
+    request = (json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8")
+    if len(request) > 128 * 1024:
+        return {"ok": False, "error": "memory broker request exceeds limit"}
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.settimeout(30)
+            client.connect(socket_path)
+            client.sendall(request)
+            response = bytearray()
+            while b"\n" not in response:
+                chunk = client.recv(min(65536, BROKER_MAX_RESPONSE + 1 - len(response)))
+                if not chunk:
+                    break
+                response.extend(chunk)
+                if len(response) > BROKER_MAX_RESPONSE:
+                    return {"ok": False, "error": "memory broker response exceeds limit"}
+    except OSError:
+        return {"ok": False, "error": "memory broker is unavailable"}
+    try:
+        result = json.loads(bytes(response).split(b"\n", 1)[0].decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return {"ok": False, "error": "memory broker returned an invalid response"}
+    return result if isinstance(result, dict) else {
+        "ok": False,
+        "error": "memory broker returned an invalid response",
+    }
+
+
+def _dispatch_broker(a):
+    """Route non-privileged CLI use through the root-owned broker only."""
+    if a.cmd == "add":
+        result = _broker_request({
+            "action": "add",
+            "target": a.target,
+            "content": a.text,
+        })
+    elif a.cmd == "safe-read":
+        result = _broker_request({
+            "action": "safe-read",
+            "target": a.target,
+            **({"path": a.path} if a.path else {}),
+        })
+        if a.format == "text":
+            if result.get("ok") and isinstance(result.get("content"), str):
+                print(result["content"])
+            return 0 if result.get("ok") else 1
+    else:
+        result = {
+            "ok": False,
+            "error": (
+                "the broker permits only add and safe-read; curator operations "
+                "require an explicit root/operator invocation"
+            ),
+        }
+    return _emit(result)
+
+
+def contains_non_reusable_global(text):
+    """Use the same strict reusable-content boundary as skills and AttackLesson.
+
+    Flat memory has no dedicated References field, so literal URLs/domains are
+    intentionally rejected along with target identities, usernames, and secrets.
+    """
+    return bool(reusable_content_violations(text or ""))
+
+
+def non_reusable_global_violations(text):
+    return reusable_content_violations(text or "")
+
+
+def safe_read_memory(target, path=None):
+    """Return only entries that already satisfy the reusable-content boundary.
+
+    This is a fail-closed injection path for legacy files. Dirty entries are
+    counted but never returned, logged, audited, or partially echoed. An optional
+    path must remain beneath the configured memories directory (project memory).
+    """
+    if _broker_socket():
+        return _broker_request({
+            "action": "safe-read",
+            "target": target,
+            **({"path": str(path)} if path else {}),
+        })
+    memory_dir = Path(get_memory_dir()).resolve()
+    candidate = Path(path).expanduser() if path else memory_dir / (
+        "USER.md" if target == "user" else "MEMORY.md"
+    )
+    try:
+        candidate = candidate.resolve()
+        candidate.relative_to(memory_dir)
+    except (OSError, ValueError):
+        return {
+            "ok": False,
+            "error": "memory path is outside the configured memory directory",
+            "content": "",
+            "included": 0,
+            "excluded": 0,
+        }
+    if not candidate.is_file():
+        return {"ok": True, "content": "", "included": 0, "excluded": 0}
+    try:
+        raw = candidate.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return {
+            "ok": False,
+            "error": "memory file is unreadable",
+            "content": "",
+            "included": 0,
+            "excluded": 0,
+        }
+    clean = []
+    excluded = 0
+    for entry in raw.split(ENTRY_DELIMITER):
+        entry = entry.strip()
+        if not entry:
+            continue
+        if reusable_content_violations(entry):
+            excluded += 1
+            continue
+        clean.append(entry)
+    return {
+        "ok": True,
+        "content": ENTRY_DELIMITER.join(clean),
+        "included": len(clean),
+        "excluded": excluded,
+    }
 
 
 def _now():
@@ -75,9 +228,24 @@ def _snapshot(reason: str) -> str:
     return dest.name
 
 
+def _safe_audit_detail(detail):
+    """Redact operational errors before they enter the durable audit stream."""
+    safe, _ = generalize_reusable_text(str(detail or ""))
+    safe = re.sub(r"(?i)\b(?:https?|ftp)://\S+", "<URL>", safe)
+    safe = re.sub(
+        r"(?i)(?:[A-Z]:[\\/]|/(?:root|home|tmp|var|opt|srv)/)[^\s,;]+",
+        "<PATH>",
+        safe,
+    )
+    return " ".join(safe.split())[:400]
+
+
 def _audit(action, target, actor, ok, detail, text=""):
+    raw = (text or "").encode("utf-8", errors="replace")
     rec = {"ts": _now(), "action": action, "target": target, "actor": actor,
-           "ok": ok, "detail": detail, "text": (text or "")[:400]}
+           "ok": ok, "detail": _safe_audit_detail(detail),
+           "content_sha256": hashlib.sha256(raw).hexdigest(),
+           "content_length": len(raw)}
     try:
         with open(get_memory_dir() / "audit.log", "a", encoding="utf-8") as f:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
@@ -94,7 +262,15 @@ def _archive(target, entry, reason):
 
 
 def _store():
-    ms = MemoryStore(memory_char_limit=MEM_CAP, user_char_limit=USER_CAP)
+    # This CLI is the mediated writer selected by the ChillsPwn deployment.
+    # Ordinary Hermes MemoryStore instances are mutation-disabled while the
+    # guard is active; this instance still performs the validated, audited,
+    # backup-before-write workflow below.
+    ms = MemoryStore(
+        memory_char_limit=MEM_CAP,
+        user_char_limit=USER_CAP,
+        mediated_writer=True,
+    )
     ms.load_from_disk()
     return ms
 
@@ -148,8 +324,19 @@ def _evict_to_fit(ms, target, incoming_text, actor):
 
 
 def cmd_add(a):
-    _snapshot("add")
+    # Flat shared memory is reusable planning context regardless of actor. Attack chains belong
+    # in generalized playbooks; raw target state remains in evidence/session storage.
+    violations = non_reusable_global_violations(a.text or "")
+    if violations:
+        detail = "automated memory write rejected: " + ", ".join(sorted(set(violations)))
+        _audit("add", a.target, a.actor, False, detail, a.text)
+        return _emit({"ok": False, "error": detail, "violations": sorted(set(violations))})
     ms = _store()
+    normalized = (a.text or "").strip()
+    if any((entry or "").strip() == normalized for entry in _entries(ms, a.target)):
+        _audit("add", a.target, a.actor, True, "already present (idempotent skip)", a.text)
+        return _emit({"ok": True, "message": "already present (idempotent skip)", "skipped": True})
+    _snapshot("add")
     evicted = _evict_to_fit(ms, a.target, a.text, a.actor)
     r = ms.add(a.target, a.text)
     ok = bool(r.get("success", True)) and not r.get("error")
@@ -159,6 +346,15 @@ def cmd_add(a):
     _audit("add", a.target, a.actor, ok, r.get("error") or msg, a.text)
     return _emit({"ok": ok, **({} if ok else {"error": r.get("error")}),
                   "message": msg, **({"evicted": evicted} if evicted else {})})
+
+
+def cmd_safe_read(a):
+    result = safe_read_memory(a.target, a.path)
+    if a.format == "text":
+        if result.get("ok") and result.get("content"):
+            print(result["content"])
+        return 0 if result.get("ok") else 1
+    return _emit(result)
 
 
 def cmd_pin(a):
@@ -187,6 +383,11 @@ def cmd_replace(a):
         _audit("replace", a.target, a.actor, False, "BLOCKED: additive-only (no --curator)", a.match)
         return _emit({"ok": False, "error": "replace is blocked. The reviewer is additive-only; "
                       "destructive edits require the curator path (--curator)."})
+    violations = non_reusable_global_violations(a.text or "")
+    if violations:
+        detail = "curator replacement rejected: " + ", ".join(sorted(set(violations)))
+        _audit("replace", a.target, a.actor, False, detail, a.text)
+        return _emit({"ok": False, "error": detail, "violations": sorted(set(violations))})
     ms = _store()
     matches = [e for e in _entries(ms, a.target) if a.match in e]
     if not matches:
@@ -285,6 +486,24 @@ def cmd_restore(a):
     src = _backup_dir() / a.backup
     if not src.is_dir():
         return _emit({"ok": False, "error": f"No backup '{a.backup}'. See: {_backup_dir()}"})
+    rejected = {}
+    for name, target in (("MEMORY.md", "memory"), ("USER.md", "user")):
+        source_file = src / name
+        if not source_file.exists():
+            continue
+        result = safe_read_memory(target, source_file)
+        if not result.get("ok") or result.get("excluded", 0):
+            rejected[name] = int(result.get("excluded", 0))
+    if rejected:
+        detail = "restore rejected: backup contains non-reusable entries in " + ", ".join(
+            f"{name} ({count})" for name, count in sorted(rejected.items())
+        )
+        _audit("restore", "both", a.actor, False, detail)
+        return _emit({
+            "ok": False,
+            "error": detail,
+            "files": sorted(rejected),
+        })
     _snapshot("pre-restore")
     md = get_memory_dir()
     restored = []
@@ -306,7 +525,20 @@ def main():
             p.add_argument("--target", choices=["memory", "user"], required=True)
         p.add_argument("--actor", default="reviewer", help="who is making the change (for the audit log)")
 
-    p = sub.add_parser("add"); common(p); p.add_argument("--text", required=True); p.set_defaults(fn=cmd_add)
+    p = sub.add_parser("add"); common(p)
+    add_input = p.add_mutually_exclusive_group(required=True)
+    add_input.add_argument("--text")
+    add_input.add_argument(
+        "--stdin",
+        action="store_true",
+        help="read entry content from stdin so it never appears in the process list",
+    )
+    p.set_defaults(fn=cmd_add)
+    p = sub.add_parser("safe-read")
+    p.add_argument("--target", choices=["memory", "user"], required=True)
+    p.add_argument("--path", help="optional project-memory path beneath the configured memories dir")
+    p.add_argument("--format", choices=["json", "text"], default="json")
+    p.set_defaults(fn=cmd_safe_read)
     p = sub.add_parser("pin"); common(p); p.add_argument("--match", required=True); p.set_defaults(fn=cmd_pin)
     p = sub.add_parser("list"); common(p); p.set_defaults(fn=cmd_list)
     p = sub.add_parser("replace"); common(p); p.add_argument("--match", required=True)
@@ -319,6 +551,10 @@ def main():
     p.add_argument("--backup", required=True); p.set_defaults(fn=cmd_restore)
 
     a = ap.parse_args()
+    if a.cmd == "add" and getattr(a, "stdin", False):
+        a.text = sys.stdin.read()
+    if _broker_socket():
+        sys.exit(_dispatch_broker(a))
     sys.exit(a.fn(a))
 
 

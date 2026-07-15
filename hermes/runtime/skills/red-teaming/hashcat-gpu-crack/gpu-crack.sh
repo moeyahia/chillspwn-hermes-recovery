@@ -2,8 +2,8 @@
 #
 # gpu-crack.sh — ChillsPwn / Hermes remote GPU hashcat cracker
 # ============================================================
-# Cracks hashes on the Windows GPU host (2x NVIDIA RTX 2080 Ti) over the
-# host-only SSH tunnel, instead of on the CPU-only Kali VM.
+# Cracks authorized hashes on an explicitly configured remote GPU host over
+# SSH instead of relying on a CPU-only local runtime.
 #
 # RESILIENCE GUARANTEES (by design, not by convention):
 #   1. The model's wordlist is STREAMED over SSH stdin -> hashcat runs in pure
@@ -35,17 +35,17 @@
 #     | gpu-crack.sh -m 1000 -H ntlm.txt -w -
 #
 # ENV OVERRIDES:
-#   WINHOST_KEY   ssh key            (default ~/.ssh/id_ed25519_winhost)
-#   WINHOST       user@host          (default mhmde@100.92.5.83  — Tailscale)
-#   WINHC_DIR     hashcat dir on host(default D:\Tools\hashcat-7.1.2)
+#   WINHOST_KEY   dedicated SSH private-key path (required; no default)
+#   WINHOST       SSH destination in user@host form (required; no default)
+#   WINHC_DIR     remote directory containing hashcat.exe (required; no default)
 #
 # EXIT CODES:  0 = at least one hash cracked   1 = exhausted (nothing cracked)
 #              2 = usage / validation error    >2 = transport/remote error
 set -uo pipefail
 
-KEY="${WINHOST_KEY:-$HOME/.ssh/id_ed25519_winhost}"
-HOST="${WINHOST:-mhmde@100.92.5.83}"
-HCDIR="${WINHC_DIR:-D:\\Tools\\hashcat-7.1.2}"
+KEY="${WINHOST_KEY:-}"
+HOST="${WINHOST:-}"
+HCDIR="${WINHC_DIR:-}"
 SSH=(ssh    -i "$KEY" -o BatchMode=yes -o ConnectTimeout=15 -o StrictHostKeyChecking=accept-new)  # crack call only (needs piped stdin)
 SSHN=(ssh -n -i "$KEY" -o BatchMode=yes -o ConnectTimeout=15 -o StrictHostKeyChecking=accept-new) # helpers: -n so they DON'T eat the wordlist on stdin
 SCP=(scp    -i "$KEY" -o BatchMode=yes -o ConnectTimeout=15 -o StrictHostKeyChecking=accept-new)
@@ -56,6 +56,11 @@ filt() { grep -avE "$NOISE"; }
 
 die()  { echo "[gpu-crack] ERROR: $*" >&2; exit 2; }
 log()  { echo "[gpu-crack] $*" >&2; }
+
+[[ -n "$HOST" ]] || die "WINHOST is required (user@host); no destination default is allowed."
+[[ -n "$KEY" ]] || die "WINHOST_KEY is required; no private-key default is allowed."
+[[ -r "$KEY" && -f "$KEY" ]] || die "WINHOST_KEY must name a readable regular file."
+[[ -n "$HCDIR" ]] || die "WINHC_DIR is required; no remote Hashcat path default is allowed."
 
 MODE="" ; HASHFILE="" ; WORDLIST="" ; OUTFILE="" ; EXTRA=()
 while [[ $# -gt 0 ]]; do

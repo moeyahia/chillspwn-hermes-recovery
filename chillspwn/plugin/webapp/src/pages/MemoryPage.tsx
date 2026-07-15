@@ -9,12 +9,9 @@ interface MemoryData {
 
 export default function MemoryPage() {
   const [data, setData] = useState<MemoryData>({ "USER.md": "", "MEMORY.md": "" });
-  const [drafts, setDrafts] = useState<MemoryData>({ "USER.md": "", "MEMORY.md": "" });
   const [activeTab, setActiveTab] = useState<MemoryFile>("USER.md");
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [saving, setSaving] = useState(false);
-  const [saveStatus, setSaveStatus] = useState<string | null>(null);
 
   const fetchMemory = () => {
     setLoading(true);
@@ -26,7 +23,6 @@ export default function MemoryPage() {
       })
       .then((d: MemoryData) => {
         setData(d);
-        setDrafts(d);
         setLoading(false);
       })
       .catch((e) => {
@@ -39,45 +35,6 @@ export default function MemoryPage() {
     fetchMemory();
   }, []);
 
-  const handleSave = (file: MemoryFile) => {
-    setSaving(true);
-    setSaveStatus(null);
-    fetch(`/api/memory/${file}`, {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ content: drafts[file] }),
-    })
-      .then((r) => {
-        if (!r.ok) throw new Error(`HTTP ${r.status}`);
-        setData((prev) => ({ ...prev, [file]: drafts[file] }));
-        setSaveStatus("Saved");
-        setTimeout(() => setSaveStatus(null), 2000);
-      })
-      .catch((e) => {
-        setSaveStatus(`Error: ${e.message}`);
-      })
-      .finally(() => setSaving(false));
-  };
-
-  const isDirty = drafts[activeTab] !== data[activeTab];
-
-  // Highlight section separators (lines that are just "---" or contain only special chars)
-  const renderHighlighted = (text: string) => {
-    return text.split("\n").map((line, i) => {
-      const isSeparator = /^\s*[#\-=]{3,}\s*$/.test(line) || /^##?\s/.test(line);
-      return (
-        <span key={i}>
-          {isSeparator ? (
-            <span className="text-cyan-400 font-semibold">{line}</span>
-          ) : (
-            line
-          )}
-          {"\n"}
-        </span>
-      );
-    });
-  };
-
   const TABS: MemoryFile[] = ["USER.md", "MEMORY.md"];
 
   return (
@@ -86,27 +43,18 @@ export default function MemoryPage() {
       <div className="px-4 py-3 border-b border-slate-800 bg-slate-900/50">
         <div className="flex items-center justify-between">
           <div>
-            <h2 className="text-sm font-semibold text-white">Memory Files</h2>
+            <h2 className="text-sm font-semibold text-white">Validated Memory</h2>
             <p className="text-xs text-slate-500">
-              Shared with Hermes -- edits here propagate to all personas
+              Safe-read view shared across providers. Additions use the mediated memory CLI; whole-file editing is disabled.
             </p>
           </div>
           <div className="flex items-center gap-2">
-            {saveStatus && (
-              <span
-                className={`text-xs ${
-                  saveStatus === "Saved" ? "text-green-400" : "text-red-400"
-                }`}
-              >
-                {saveStatus}
-              </span>
-            )}
             <button
-              onClick={() => handleSave(activeTab)}
-              disabled={!isDirty || saving}
+              onClick={fetchMemory}
+              disabled={loading}
               className="px-3 py-1.5 text-xs bg-blue-600 hover:bg-blue-700 disabled:bg-slate-700 disabled:text-slate-500 text-white rounded transition-colors"
             >
-              {saving ? "Saving..." : "Save"}
+              {loading ? "Refreshing..." : "Refresh"}
             </button>
           </div>
         </div>
@@ -124,9 +72,6 @@ export default function MemoryPage() {
               }`}
             >
               {tab}
-              {drafts[tab] !== data[tab] && (
-                <span className="ml-1 text-amber-400">*</span>
-              )}
             </button>
           ))}
         </div>
@@ -151,13 +96,11 @@ export default function MemoryPage() {
 
         {!loading && !error && (
           <textarea
-            value={drafts[activeTab]}
-            onChange={(e) =>
-              setDrafts((prev) => ({ ...prev, [activeTab]: e.target.value }))
-            }
+            value={data[activeTab]}
+            readOnly
             spellCheck={false}
-            className="w-full h-full bg-slate-900 text-slate-200 font-mono text-sm leading-relaxed rounded-lg border border-slate-700 focus:border-blue-500 focus:outline-none p-4 resize-none"
-            placeholder={`${activeTab} content...`}
+            className="w-full h-full bg-slate-900 text-slate-200 font-mono text-sm leading-relaxed rounded-lg border border-slate-700 focus:outline-none p-4 resize-none"
+            placeholder={`No validated ${activeTab} entries.`}
           />
         )}
       </div>

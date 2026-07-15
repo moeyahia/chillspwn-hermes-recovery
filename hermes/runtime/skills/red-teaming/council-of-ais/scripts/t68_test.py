@@ -19,8 +19,8 @@ def intent(t):
     s = t.strip()
     return bool(_INTENT.search(s)) or s.endswith(":")
 
-# the real failure string from the deepseek resume stop:
-real = ("Hey! Back online — we're mid-engagement on retro2.vl (10.129.6.198). Quick recap...\n\n"
+# Representative resume-stall string using RFC 5737 documentation identifiers:
+real = ("Back online — we're mid-engagement on target.example (192.0.2.68). Quick recap...\n\n"
         "Let me verify the target is still reachable and pick up:")
 ck("intent: real resume-stall string", intent(real) is True)
 ck("intent: 'Let me try smbexec'", intent("Let me try **PIPE (smbexec)** next") is True)

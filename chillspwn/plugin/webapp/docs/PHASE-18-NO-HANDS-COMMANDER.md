@@ -4,17 +4,11 @@
 plans, routes, supervises, approves, synthesizes. **Specialists execute.**
 
 ## The gap this closes
-The PingPong HTB session (`s-1780414494347`, persona ChillsPwn) ran attacks directly instead of
-delegating — measured from its own ledger:
 
-| | count |
-|---|---|
-| `terminal` (direct) | 418 |
-| `execute_code` (direct) | 367 |
-| `process` (direct) | 43 |
-| **direct execution total** | **828** |
-| delegations (`delegate_task` + `board_create_task`) | 63 |
-| ratio delegations : direct | **0.076** |
+A prior authorized-lab engagement showed that the commander could execute extensively through the
+generic terminal/code surface instead of delegating. The reusable finding was architectural, not
+target-specific: chat sessions bypassed the managed-run gate, and generic execution tools had been
+misclassified as coordination tools.
 
 Root causes: (1) **chat sessions bypass the managed-run gate** (the gate needs a run); (2)
 `terminal`/`execute_code` were classified as "commander coordination tools" and slipped through; (3)
@@ -52,7 +46,7 @@ Specialist actions that pass policy can still auto-approve.
 - Orchestrator module under commander env: `_NO_HANDS_ACTIVE=True`,
   `_COMMANDER_BLOCK={terminal,execute_code,process,mcp_execute}`; under a specialist persona or with the
   flag off → `False`.
-- Ledger validator on the Pong session: **828 commander direct-execution violations** (the "before").
+- Ledger validator on the historical engagement: commander direct-execution violations were present (the "before").
   Expected after enforcement on a NEW session: **0**.
 - Full test suite **418 pass / 0 fail**; server typecheck clean. Health 200, chat + Mission Board OK.
 
@@ -61,48 +55,16 @@ Specialist actions that pass policy can still auto-approve.
   chat OR managed regardless), plus a deterministic `isManagedMissionPrompt()` detector. Automatic
   AgentRun/PlanStep creation from a chat HTB prompt is **not** auto-wired (deferred — the safety goal
   is already met by no-hands).
-- `write_file`/`patch`/`read_file`/`search_files` remain available to the commander as
-  **coordination-safe** (plans, synthesis, reports). They cannot launch an attack once the four
-  execution tools are blocked. Tighten via `COMMANDER_BLOCKED_EXEC_TOOLS` if you want them blocked too.
+- Only Mission Board operations and read-only context/skill lookup remain coordination-safe.
+  File mutations, private delegation, research execution, and memory/skill writes are denied.
 - Specialists other than SessionRunner do not yet own raw `terminal` in their allowlists; cross-domain
   shell work routes to SessionRunner. Extend per-specialist allowlists as needed.
 
-## Orchestrator patch (Phase 18.1 — release packaging)
-The **chat-path enforcement** lives in the OpenRouter/Codex orchestrator, which is **outside this repo**:
-`~/.hermes/skills/red-teaming/council-of-ais/scripts/orchestrator_openrouter.py`. To make Phase 18
-reproducible, that change is captured as a patch artifact **inside the repo**:
+## Orchestrator recovery packaging
 
-`integration/phase18-no-hands-orchestrator.patch`  — purely additive (89 lines, 0 removed).
-
-**Why it exists:** without it, a fresh checkout would deploy the TypeScript gate (managed-run
-enforcement) but NOT the orchestrator change (chat-session enforcement) — the exact gap Phase 18
-fixed. The patch re-creates the chat-path enforcement on any clean orchestrator.
-
-**Where to apply:** the live orchestrator script directory:
-```
-cd ~/.hermes/skills/red-teaming/council-of-ais/scripts
-```
-**Dry-run / apply / reverse / verify** (exact commands, all verified):
-```
-# 0. back up first (rollback reference)
-cp orchestrator_openrouter.py orchestrator_openrouter.py.pre-phase18.bak
-
-# 1. dry-run (no changes made)
-patch -p1 --dry-run < /path/to/webapp/integration/phase18-no-hands-orchestrator.patch
-
-# 2. apply
-patch -p1 < /path/to/webapp/integration/phase18-no-hands-orchestrator.patch
-
-# 3. verify it compiles + the no-hands symbols are present
-python3 -m py_compile orchestrator_openrouter.py
-grep -c '_NO_HANDS_ACTIVE\|_COMMANDER_BLOCK\|_recommend_specialist\|_no_hands_denial' orchestrator_openrouter.py   # → nonzero
-
-# 4. reverse (emergency rollback)
-patch -R -p1 < /path/to/webapp/integration/phase18-no-hands-orchestrator.patch
-```
-No service restart is needed for the orchestrator change — it is spawned fresh per chat turn, so the
-patch takes effect on the next turn. (The TypeScript gate/config change DID require the one restart
-already done at deploy.)
+The chat-path implementation is retained directly by the outer recovery repository at
+`hermes/runtime/skills/red-teaming/council-of-ais/scripts/orchestrator_openrouter.py`. The restore
+script installs that reviewed source exactly; there is no secondary patch artifact to drift or apply.
 
 **Confirm `ENFORCE_CHILLSPWN_NO_HANDS` is active (live):**
 ```
@@ -120,12 +82,5 @@ curl -s -H "Authorization: Bearer $DASHBOARD_TOKEN" \
    Gate + orchestrator both become inert for no-hands; the commander can execute again. **Use this ONLY
    as an emergency rollback** — the default and intended state is `true`.
 
-**Full revert:**
-2. Reverse the orchestrator patch:
-   `cd ~/.hermes/skills/red-teaming/council-of-ais/scripts && patch -R -p1 < <webapp>/integration/phase18-no-hands-orchestrator.patch`
-   (or `cp orchestrator_openrouter.py.pre-phase18.bak orchestrator_openrouter.py`).
-3. Restore SOUL: `cp /root/.claude/chillspwn/personas/chillspwn/SOUL.md.pre-phase18.bak /root/.hermes/SOUL.md`.
-4. Restore env: `cp /root/.hermes/.env.pre-phase18.bak /root/.hermes/.env`.
-5. `git checkout <pre-Phase-18 commit>` for the webapp code; `systemctl restart chillspwn.service`.
-
-The frozen Claude path is untouched in every case.
+For a full historical revert, restore a previously reviewed private recovery tag and run the
+documented exact-sync restore. Do not reverse individual enforcement files in place.

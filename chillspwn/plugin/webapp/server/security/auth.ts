@@ -6,8 +6,8 @@
  *
  *   - Loopback clients are ALWAYS trusted (local dev + SSH-tunnel mode need no token).
  *   - The token may arrive via: `Authorization: Bearer <t>`, `X-Dashboard-Token: <t>`,
- *     a `chillspwn_token` cookie, or a `?token=<t>` query param.
- *   - A valid `?token=` sets an HttpOnly cookie, so the existing built PWA keeps
+ *     a `chillspwn_token` cookie, or a one-time root `/?token=<t>` bootstrap.
+ *   - A valid root bootstrap sets an HttpOnly cookie, so the existing built PWA keeps
  *     working WITHOUT a rebuild: the operator visits `https://host/?token=<t>` once,
  *     then same-origin fetch + WS upgrades carry the cookie automatically.
  *   - Comparison is constant-time (hash both sides, then timingSafeEqual).
@@ -30,7 +30,14 @@ interface MinimalRequest {
   query?: Record<string, unknown>;
   url?: string;
   path?: string;
-  socket?: { remoteAddress?: string };
+  protocol?: string;
+  socket?: { remoteAddress?: string; encrypted?: boolean };
+}
+
+function requestPath(req: MinimalRequest): string {
+  if (typeof req.path === "string" && req.path) return req.path;
+  try { return new URL(req.url || "/", "http://chillspwn.invalid").pathname; }
+  catch { return "/"; }
 }
 
 function headerStr(headers: HeaderBag, name: string): string | undefined {
@@ -98,6 +105,19 @@ export function tokensMatch(provided: string, expected: string): boolean {
   return timingSafeEqual(a, b);
 }
 
+function isSecureRequest(req: MinimalRequest): boolean {
+  if (req.protocol === "https" || req.socket?.encrypted === true) return true;
+  const forwarded = headerStr(req.headers, "x-forwarded-proto");
+  return forwarded?.split(",", 1)[0].trim().toLowerCase() === "https";
+}
+
+/** Remove only the one-time dashboard token while preserving other URL state. */
+export function tokenFreeRedirectTarget(rawUrl: string): string {
+  const parsed = new URL(rawUrl || "/", "http://chillspwn.invalid");
+  parsed.searchParams.delete("token");
+  return `${parsed.pathname}${parsed.search}` || "/";
+}
+
 export type AuthOutcome =
   | { allow: true; setCookie?: string }
   | { allow: false; reason: string };
@@ -118,10 +138,17 @@ export function evaluateAuth(req: MinimalRequest, cfg: SecurityConfig): AuthOutc
   if (p.startsWith("/api/health") || p.startsWith("/manifest.webmanifest")) return { allow: true };
 
   const { token, fromQuery } = extractToken(req);
+  // Query tokens are a one-time browser bootstrap only. Accepting them on API,
+  // report, artifact, or WebSocket URLs would leave the dashboard secret in
+  // histories and infrastructure logs without any compatibility benefit.
+  if (fromQuery && requestPath(req) !== "/") {
+    return { allow: false, reason: "query token is only allowed on the root bootstrap path" };
+  }
   if (token && cfg.token && tokensMatch(token, cfg.token)) {
     if (fromQuery) {
       const cookie =
-        `${TOKEN_COOKIE}=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000`;
+        `${TOKEN_COOKIE}=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000` +
+        (isSecureRequest(req) ? "; Secure" : "");
       return { allow: true, setCookie: cookie };
     }
     return { allow: true };
@@ -141,7 +168,8 @@ export interface ExpressLike {
   headers: HeaderBag;
   query?: Record<string, unknown>;
   url?: string;
-  socket?: { remoteAddress?: string };
+  protocol?: string;
+  socket?: { remoteAddress?: string; encrypted?: boolean };
 }
 
 export interface ResponseLike {

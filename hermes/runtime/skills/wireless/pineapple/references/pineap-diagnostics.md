@@ -1,32 +1,24 @@
 # PineAP Daemon Diagnostics
 
-**Context**: Session where `pineapd` did not appear in initial `ps` output despite the Evil Twin / management AP being active.
+Use the configured SSH destination and key. Do not rely on a remembered device address, hostname, or SSH shortcut.
 
-## Reliable Verification Sequence
+## Verification sequence
 
-1. **Start with init scripts** (most reliable indicator):
-   ```bash
-   /etc/init.d/pineapd status
-   /etc/init.d/pineapple status
-   ```
+```bash
+: "${PINEAPPLE_SSH_TARGET:?set user@host}"
+: "${PINEAPPLE_SSH_KEY:?set the dedicated private-key path}"
 
-2. **Confirm process after status check**:
-   ```bash
-   ps | grep pineapd | grep -v grep
-   ```
+ssh -i "$PINEAPPLE_SSH_KEY" -o BatchMode=yes -o StrictHostKeyChecking=yes \
+  "$PINEAPPLE_SSH_TARGET" \
+  '/etc/init.d/pineapd status; /etc/init.d/pineapple status'
+```
 
-3. **Inspect supporting state**:
-   - Binaries: `/usr/sbin/pineapd`, `/usr/bin/pineap`, `/usr/sbin/pineapd_wrapper`
-   - UCI config: `uci show wireless` (look for wlan0 as hidden "linksys" AP)
-   - Logs: `logread | grep -E 'hostapd|wlan0' | tail -30`
+Then verify the process and supporting state:
 
-## Observed Behavior
+```bash
+ssh -i "$PINEAPPLE_SSH_KEY" -o BatchMode=yes -o StrictHostKeyChecking=yes \
+  "$PINEAPPLE_SSH_TARGET" \
+  "ps | grep '[p]ineapd'; uci show wireless; logread | grep -E 'hostapd|pineap' | tail -30"
+```
 
-- `wlan0` runs a hidden "linksys" management AP via hostapd independently.
-- Clients are often rejected due to MAC allow filter (normal for management interface).
-- `wlan1`/`wlan1mon` stay in monitor mode for PineAP features.
-- `pineapd` can be running even when a simple `ps` grep misses it on the first try.
-
-## Pitfall
-
-Raw process greps are flaky on the Pineapple. The init script status command is the authoritative source. Always run the status check before concluding PineAP is down.
+Init-script state is stronger evidence than a single process grep. Compare UCI output with the operator-owned expected configuration, but never paste SSIDs, keys, client MACs, or uplink credentials into shared logs.

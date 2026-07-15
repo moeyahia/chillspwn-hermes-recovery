@@ -9,23 +9,15 @@ gain is measurable. Run from the scripts dir (needs orchestrator_openrouter impo
 import json, os, re, sys, time
 import orchestrator_openrouter as O
 
-SESS = "/root/.claude/chillspwn/sessions/s-1780173556310.json"
+SESS = os.environ.get("CHILLSPWN_TEST_SESSION_FILE", "").strip()
 MODEL = "deepseek/deepseek-v4-pro"
 KEEP_RAW = O.KEEP_RAW_MSGS        # 16 — kept raw on resume
 PER_MSG_CAP = 4000                # chars retained per message when rendering for distillation
 CHUNK_CHARS = 40000               # < DISTILL_INPUT_CAP(48000) so no per-chunk truncation
-OUT = "/tmp/full.ledger.json"
+OUT = os.environ.get("CHILLSPWN_TEST_LEDGER_OUTPUT", "").strip()
 
 def read_key():
-    for path in ("/root/.hermes/.env", "/root/.zshenv"):
-        try:
-            for line in open(path):
-                m = re.search(r'OPENROUTER_API_KEY\s*=\s*["\']?([A-Za-z0-9._\-]+)', line)
-                if m:
-                    return m.group(1)
-        except Exception:
-            pass
-    return ""
+    return os.environ.get("OPENROUTER_API_KEY", "").strip()
 
 def render_msg(m):
     role = m.get("role", "")
@@ -46,6 +38,12 @@ def log(*a):
     print(*a, flush=True)
 
 def main():
+    if not SESS or not os.path.isfile(SESS):
+        log("CHILLSPWN_TEST_SESSION_FILE must name a readable test-session file")
+        sys.exit(2)
+    if not OUT or not os.path.isabs(OUT):
+        log("CHILLSPWN_TEST_LEDGER_OUTPUT must be an absolute output path")
+        sys.exit(2)
     key = read_key()
     if not key:
         log("NO_KEY"); sys.exit(2)

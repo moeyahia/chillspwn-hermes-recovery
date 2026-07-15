@@ -1,66 +1,74 @@
-# Provider-aware Council routing (May 2026)
+# Provider-aware Council routing
 
-Session learning: the council launcher should not blindly route every model through OpenRouter. Mr. Wong explicitly prefers direct/OAuth lanes when Hermes has working credentials.
+The Council launcher is the routing, billing, and credential-isolation boundary. Do not reproduce
+its subprocess commands in a prompt, shell loop, or `execute_code` block.
 
-## Current preferred routing
+## Current routing
 
-- `claude_opus`: `--provider anthropic --model claude-opus-4-7`
-  - Auth: `ANTHROPIC_API_KEY` / Anthropic provider credentials.
-  - Rationale: Claude Opus has historically 502'd through OpenRouter.
-- `gpt55`: `--provider openai-codex --model gpt-5.5`
-  - Auth: OpenAI Codex OAuth (`hermes login --provider openai-codex`).
-- `grok`: `--provider xai-oauth --model grok-4.20-reasoning`
-  - Auth: xAI OAuth credentials in `~/.hermes/auth.json`.
-- `deepseek_v4`: `--provider openrouter --model deepseek/deepseek-v4-pro`
-- `nemotron`: `--provider openrouter --model nvidia/nemotron-3-super-120b-a12b:free`
-- `glm`: `--provider openrouter --model z-ai/glm-5.1`
+| Lane | Provider | Model | Billing route |
+|---|---|---|---|
+| Claude Opus | `claude-cli` | `claude-opus-4-8` | logged-in Claude subscription |
+| DeepSeek | `openrouter` | `deepseek/deepseek-v4-pro` | OpenRouter API credits |
+| Qwen | `openrouter` | `qwen/qwen3.7-max` | OpenRouter API credits |
+| GPT | `openai-codex` | `gpt-5.5` | Codex OAuth subscription |
+| GLM | `openrouter` | `z-ai/glm-5.2` | OpenRouter API credits |
+| Grok | `xai-oauth` | `grok-4.20-reasoning` | xAI OAuth subscription |
 
-## Implementation pattern
+Grok deliberately has no direct mode or OpenRouter fallback. Claude deliberately receives no
+Anthropic API-key variables.
 
-Each `COUNCIL_MEMBERS` entry in `scripts/council_summon.py` should carry both:
+## Child-environment contract
 
-```python
-{
-    "id": "gpt55",
-    "display_name": "GPT-5.5",
-    "model": "gpt-5.5",
-    "provider": "openai-codex",
-    "emoji": "⚪",
-}
-```
+`build_lane_environment()` starts with a small runtime allowlist, then adds only the selected
+provider's credential or auth path:
 
-The launcher should use:
+- OpenRouter: `OPENROUTER_API_KEY`; direct web tools may also receive
+  `FIRECRAWL_API_KEY`/`FIRECRAWL_API_URL`.
+- Claude CLI: `CLAUDE_CONFIG_DIR`, optional `CLAUDE_CODE_OAUTH_TOKEN`, and the
+  `COUNCIL_CLAUDE_*` runtime settings. `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, and
+  `ANTHROPIC_TOKEN` are excluded.
+- Codex OAuth: `HERMES_HOME` and `CODEX_HOME`. Set `COUNCIL_CODEX_HERMES_HOME` to map a
+  separately provisioned Hermes profile into the lane as `HERMES_HOME`.
+- xAI OAuth: `HERMES_HOME`. Set `COUNCIL_XAI_HERMES_HOME` to map a separately provisioned Hermes
+  profile into the lane as `HERMES_HOME`.
 
-```python
-"--model", member["model"],
-"--provider", member.get("provider", "openrouter"),
-```
+The optional provider-specific Hermes homes must contain the required non-secret configuration,
+SOUL/skills, and that provider's authenticated `auth.json`; merely creating empty directories will
+break the lanes. Existing installations can continue to use the shared `HERMES_HOME` fallback.
 
-Do not hard-code `--provider openrouter` inside `spawn_agent()`.
+The memory guard/socket settings are propagated so native Hermes memory remains mediated.
+`DASHBOARD_TOKEN`, Telegram credentials, unrelated inference keys, cloud/GitHub secrets, and
+`SSH_AUTH_SOCK` are never copied into a lane. Telegram settings remain in the Council parent only.
+Both independent and live OAuth subprocesses use this same builder. The Claude CLI applies the
+allowlist again as defense in depth, and the standalone lane worker never reopens
+`~/.hermes/.env`.
 
-## Verification pattern
+## Verification
 
-After editing the launcher, run a dry run and inspect emitted commands:
+Inspect `COUNCIL_MEMBERS`, `build_agent_command()`, `build_lane_environment()`, and
+`spawn_agent()` in `scripts/council_summon.py`, then run a non-billing dry run:
 
 ```bash
-python3 /root/.hermes/skills/red-teaming/council-of-ais/scripts/council_summon.py \
-  --engagement-dir /tmp/council-dryrun \
-  --briefing "dry run provider verification" \
+: "${COUNCIL_SCRIPT:?set the installed council_summon.py path}"
+: "${ENGAGEMENT_DIR:?set an authorized engagement directory}"
+python3 "$COUNCIL_SCRIPT" \
+  --engagement-dir "$ENGAGEMENT_DIR" \
+  --briefing "provider routing audit only" \
   --dry-run
 ```
 
-Expected key lines:
-
-```text
-Claude Opus 4.7: --model claude-opus-4-7 --provider anthropic
-GPT-5.5:         --model gpt-5.5 --provider openai-codex
-Grok 4.3:        --model grok-4.20-reasoning --provider xai-oauth
-```
-
-Also verify auth status without printing secrets:
+Verify OAuth status without reading or printing token files:
 
 ```bash
 hermes auth list
 ```
 
-Look for `anthropic`, `openai-codex`, `xai-oauth`, and `openrouter` credentials.
+Run the focused regression class after any launcher change:
+
+```bash
+python3 -m unittest \
+  hermes.runtime.tests.test_chillspwn_learning_pipeline.CouncilRoutingTests -v
+```
+
+The sentinel tests assert that every lane excludes dashboard, Telegram, unrelated provider,
+cloud, GitHub, and SSH-agent secrets.

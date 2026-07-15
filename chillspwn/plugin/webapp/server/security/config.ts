@@ -121,10 +121,8 @@ function parseIntDefault(v: string | undefined, dflt: number): number {
 }
 
 const DEFAULT_WORKSPACE_ROOTS = [
-  "/root/htb",
+  "/root/htb/boxes",
   "/root/engagements",
-  "/root/.hermes/memories",
-  "/root/report-template",
 ];
 
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "::1", "localhost", "::ffff:127.0.0.1"]);

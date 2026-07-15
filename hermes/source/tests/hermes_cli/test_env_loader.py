@@ -70,6 +70,25 @@ def test_user_env_takes_precedence_over_project_env(tmp_path, monkeypatch):
     assert os.getenv("OPENAI_API_KEY") == "project-key"
 
 
+def test_unreadable_user_env_preserves_systemd_injected_values(tmp_path, monkeypatch):
+    home = tmp_path / "hermes"
+    home.mkdir()
+    env_file = home / ".env"
+    env_file.write_text("OPENAI_BASE_URL=https://file.example/v1\n", encoding="utf-8")
+
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://injected.example/v1")
+
+    def deny_root_only_env(*_args, **_kwargs):
+        raise PermissionError(env_file)
+
+    monkeypatch.setattr("hermes_cli.env_loader.load_dotenv", deny_root_only_env)
+
+    loaded = load_hermes_dotenv(hermes_home=home)
+
+    assert loaded == []
+    assert os.getenv("OPENAI_BASE_URL") == "https://injected.example/v1"
+
+
 def test_main_import_applies_user_env_over_shell_values(tmp_path, monkeypatch):
     home = tmp_path / "hermes"
     home.mkdir()

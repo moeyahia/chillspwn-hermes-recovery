@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback } from "react";
+import { renderSafeMarkdownLink } from "../lib/safeMarkdown";
 
 interface FileEntry {
   name: string;
@@ -77,7 +78,7 @@ function renderMarkdown(md: string): string {
     .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
     .replace(/\*(.+?)\*/g, '<em>$1</em>')
     // Links
-    .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" style="color:var(--jarvis-blue);text-decoration:underline" target="_blank">$1</a>')
+    .replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_match, label, href) => renderSafeMarkdownLink(label, href))
     // Unordered lists
     .replace(/^[-*]\s+(.+)$/gm, '<li style="margin-left:1.2rem;list-style:disc">$1</li>')
     // Ordered lists
@@ -447,7 +448,7 @@ export default function ProjectFilesPage({ onSendToChat }: { onSendToChat?: (tex
               /* HTML render — iframe sandbox */
               <iframe
                 srcDoc={fileContent || ""}
-                sandbox="allow-same-origin"
+                sandbox=""
                 className="w-full rounded-lg"
                 style={{
                   border: "1px solid var(--border-color)",

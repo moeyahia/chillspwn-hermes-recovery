@@ -14,7 +14,7 @@ description: "ChillsPwn persona permissionMode behavior & fixes"
 How the dashboard decides command-approval behavior, and how to debug it.
 
 ## Where it lives
-`/root/.claude/chillspwn/personas/<persona>/persona.json` → field `permissionMode`.
+`/root/.hermes/chillspwn/personas/<persona>/persona.json` → field `permissionMode`.
 The dashboard reads this at launch and runs `claude --permission-mode <value>`. Changing it requires **respawning the claude process** to take effect.
 
 ## Mode behavior (the gotcha)
@@ -26,7 +26,7 @@ The dashboard reads this at launch and runs `claude --permission-mode <value>`. 
 2. Flip to `bypassPermissions`:
    ```bash
    sed -i 's/"permissionMode": "auto"/"permissionMode": "bypassPermissions"/' \
-     /root/.claude/chillspwn/personas/chillspwn/persona.json
+     /root/.hermes/chillspwn/personas/chillspwn/persona.json
    ```
 3. Respawn claude (dashboard re-reads persona.json at launch).
 

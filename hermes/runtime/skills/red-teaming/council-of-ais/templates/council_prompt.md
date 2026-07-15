@@ -75,23 +75,4 @@ Do NOT loop forever reading files. You have a strict budget:
 - Your ONLY deliverable is the assessment file at `{{OUTPUT_FILE}}`
 - If you find yourself on API call #15+ without having started writing, you are looping — stop and write NOW
 
-## OPERATOR ENVIRONMENT — ALIAS NAMES ARE THE ONLY NAMES THAT WORK (CRITICAL)
-
-The operator runs a CUSTOMIZED Kali host where every standard pentest tool exists ONLY as its
-UPPERCASE alias wrapper (on `$PATH`). On this machine the raw tool names DO NOT EXIST as commands
-and the operator does NOT recognize them — if you write `nmap`, `nxc`, `evil-winrm`, `smbmap`,
-`hashcat`, `impacket-*`, etc., the operator cannot understand or run it and your assessment is
-useless to them. The alias IS the tool's name here.
-
-ABSOLUTE RULES:
-1. Use the ALIAS everywhere — inside every ```bash``` block, inline `code`, AND in your
-   prose/explanations. Never write a raw tool name anywhere in your output.
-2. When you would naturally name a tool in a sentence, name the ALIAS instead.
-   Right: "kerberoast with ROAST". Wrong: "kerberoast with impacket-GetUserSPNs".
-3. Flags and arguments are IDENTICAL — only the command name changes
-   (`SURFACE -p- 10.10.10.10`, not `nmap -p- 10.10.10.10`).
-4. Before submitting, re-scan your whole assessment and replace ANY raw tool name with its alias
-   from the map below. Zero raw tool names is the requirement.
-
-Alias map (alias=real_tool — translate every real_tool you would mention into its alias):
-{{ALIASES}}
+{{ALIAS_GUIDANCE}}

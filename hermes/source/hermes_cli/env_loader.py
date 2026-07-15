@@ -81,17 +81,30 @@ def _sanitize_loaded_credentials() -> None:
         )
 
 
-def _load_dotenv_with_fallback(path: Path, *, override: bool) -> None:
+def _load_dotenv_with_fallback(path: Path, *, override: bool) -> bool:
+    """Load an environment file when the current identity may read it.
+
+    A hardened systemd deployment can inject a root-only ``EnvironmentFile``
+    before dropping privileges. In that case the service must keep the already
+    populated process environment and must not fail startup (or weaken the file
+    mode) merely because the runtime identity cannot reopen the source file.
+    """
     try:
         load_dotenv(dotenv_path=path, override=override, encoding="utf-8")
     except UnicodeDecodeError:
-        load_dotenv(dotenv_path=path, override=override, encoding="latin-1")
+        try:
+            load_dotenv(dotenv_path=path, override=override, encoding="latin-1")
+        except PermissionError:
+            return False
+    except PermissionError:
+        return False
     # Strip non-ASCII characters from credential env vars that were just
     # loaded.  API keys must be pure ASCII since they're sent as HTTP
     # header values (httpx encodes headers as ASCII).  Non-ASCII chars
     # typically come from copy-pasting keys from PDFs or rich-text editors
     # that substitute Unicode lookalike glyphs (e.g. ʋ U+028B for v).
     _sanitize_loaded_credentials()
+    return True
 
 
 def _sanitize_env_file_if_needed(path: Path) -> None:
@@ -164,12 +177,14 @@ def load_hermes_dotenv(
     if project_env_path and project_env_path.exists():
         _sanitize_env_file_if_needed(project_env_path)
 
-    if user_env.exists():
-        _load_dotenv_with_fallback(user_env, override=True)
+    if user_env.exists() and _load_dotenv_with_fallback(user_env, override=True):
         loaded.append(user_env)
 
-    if project_env_path and project_env_path.exists():
-        _load_dotenv_with_fallback(project_env_path, override=not loaded)
+    if (
+        project_env_path
+        and project_env_path.exists()
+        and _load_dotenv_with_fallback(project_env_path, override=not loaded)
+    ):
         loaded.append(project_env_path)
 
     return loaded

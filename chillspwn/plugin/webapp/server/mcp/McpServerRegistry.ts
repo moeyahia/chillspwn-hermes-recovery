@@ -4,11 +4,96 @@
  * Pure of side effects beyond reading files + checking binary/docker/env presence (NO target scans).
  */
 
-import { existsSync, readFileSync } from "fs";
+import { accessSync, constants, existsSync, lstatSync, readFileSync, realpathSync, statSync } from "fs";
 import { execFileSync } from "child_process";
+import { dirname, isAbsolute, join } from "path";
 import type { McpServerSpec, McpServerState, McpHealthResult, McpRuntimeType } from "./McpTypes";
 
 const VENDOR = "/opt/chillspwn-mcp-arsenal";
+const SAFE_ENV_KEYS = new Set(["MCP_TRANSPORT", "NODE_ENV", "PYTHONUNBUFFERED"]);
+
+function assertTrustedDirectoryChain(path: string, label: string, trustedOwnerUid: number): void {
+  let current = realpathSync(path);
+  while (true) {
+    const state = statSync(current);
+    if (!state.isDirectory() || ![0, trustedOwnerUid].includes(state.uid) || (state.mode & 0o022) !== 0) {
+      throw new Error(`${label} crosses a directory not controlled by the trusted owner`);
+    }
+    const parent = dirname(current);
+    if (parent === current) break;
+    current = parent;
+  }
+}
+
+function assertRootControlledFile(path: string, label: string, trustedOwnerUid = 0): string {
+  if (!isAbsolute(path)) throw new Error(`${label} must be absolute`);
+  const lexical = lstatSync(path);
+  if (!lexical.isFile() || lexical.isSymbolicLink()) throw new Error(`${label} must be a regular non-symlink file`);
+  const resolved = realpathSync(path);
+  const file = statSync(resolved);
+  if (![0, trustedOwnerUid].includes(file.uid) || (file.mode & 0o022) !== 0) {
+    throw new Error(`${label} must be root-owned and not writable by group/other`);
+  }
+  assertTrustedDirectoryChain(dirname(resolved), label, trustedOwnerUid);
+  return resolved;
+}
+
+function assertRootControlledDirectory(path: string, label: string, trustedOwnerUid = 0): string {
+  if (!isAbsolute(path)) throw new Error(`${label} must be absolute`);
+  const lexical = lstatSync(path);
+  if (!lexical.isDirectory() || lexical.isSymbolicLink()) {
+    throw new Error(`${label} must be a regular non-symlink directory`);
+  }
+  assertTrustedDirectoryChain(dirname(path), label, trustedOwnerUid);
+  const resolved = realpathSync(path);
+  const stat = statSync(resolved);
+  if (!stat.isDirectory() || ![0, trustedOwnerUid].includes(stat.uid) || (stat.mode & 0o022) !== 0) {
+    throw new Error(`${label} must be a root-owned directory not writable by group/other`);
+  }
+  assertTrustedDirectoryChain(resolved, label, trustedOwnerUid);
+  return resolved;
+}
+
+function resolveTrustedBinary(bin: string, trustedOwnerUid = 0): string | null {
+  if (typeof bin !== "string" || !bin || bin.length > 4096 || bin.includes("\0")) return null;
+  const candidates = isAbsolute(bin)
+    ? [bin]
+    : /^[A-Za-z0-9._+-]+$/.test(bin)
+      ? String(process.env.PATH || "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+          .split(":")
+          .filter(Boolean)
+          .map((dir) => join(dir, bin))
+      : [];
+  for (const candidate of candidates) {
+    try {
+      accessSync(candidate, constants.X_OK);
+      const lexical = lstatSync(candidate);
+      if (![0, trustedOwnerUid].includes(lexical.uid)) continue;
+      if (!lexical.isFile() && !lexical.isSymbolicLink()) continue;
+      if (lexical.isFile() && (lexical.mode & 0o022) !== 0) continue;
+      assertTrustedDirectoryChain(dirname(candidate), `MCP executable '${bin}'`, trustedOwnerUid);
+      const resolved = realpathSync(candidate);
+      const file = statSync(resolved);
+      if (file.isFile() && [0, trustedOwnerUid].includes(file.uid) && (file.mode & 0o022) === 0) {
+        assertTrustedDirectoryChain(dirname(resolved), `MCP executable '${bin}'`, trustedOwnerUid);
+        return resolved;
+      }
+    } catch { /* try the next PATH entry */ }
+  }
+  return null;
+}
+
+function sanitizedEnv(raw: unknown): Record<string, string> | undefined {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+  const out: Record<string, string> = {};
+  for (const [key, value] of Object.entries(raw)) {
+    if (!SAFE_ENV_KEYS.has(key) || typeof value !== "string" || value.length > 1024 || value.includes("\0")) {
+      throw new Error(`unsupported MCP process environment key '${key}'`);
+    }
+    out[key] = value;
+  }
+  return Object.keys(out).length ? out : undefined;
+}
 
 function nowIso(): string { return new Date(0).toISOString().replace("1970-01-01T00:00:00.000Z", "checked"); }
 // (avoid Date.now; callers stamp real time — registry only needs a marker)
@@ -35,7 +120,11 @@ export class McpServerRegistry {
   private specs: McpServerSpec[] = [];
   private loadError: string | null = null;
 
-  constructor(private readonly configPath: string, private readonly manifestPath?: string) {
+  constructor(
+    private readonly configPath: string,
+    private readonly manifestPath?: string,
+    private readonly trustedOwnerUid = 0,
+  ) {
     this.reload();
   }
 
@@ -44,12 +133,33 @@ export class McpServerRegistry {
     this.loadError = null;
     try {
       if (!existsSync(this.configPath)) { this.loadError = `arsenal config not found: ${this.configPath}`; return; }
-      const cfg = JSON.parse(readFileSync(this.configPath, "utf-8"));
-      const manifest = this.manifestPath && existsSync(this.manifestPath) ? JSON.parse(readFileSync(this.manifestPath, "utf-8")) : { servers: [] };
+      const trustedConfigPath = assertRootControlledFile(this.configPath, "MCP arsenal config", this.trustedOwnerUid);
+      const cfg = JSON.parse(readFileSync(trustedConfigPath, "utf-8"));
+      const trustedManifestPath = this.manifestPath && existsSync(this.manifestPath)
+        ? assertRootControlledFile(this.manifestPath, "MCP arsenal manifest", this.trustedOwnerUid)
+        : null;
+      const manifest = trustedManifestPath ? JSON.parse(readFileSync(trustedManifestPath, "utf-8")) : { servers: [] };
       const byName: Record<string, any> = Object.fromEntries((manifest.servers || []).map((s: any) => [s.mcpServerName, s]));
       for (const [name, raw] of Object.entries<any>(cfg.mcpServers || {})) {
         const m = byName[name] || {};
         const runtime = normRuntime(raw.runtime || m.runtimeType || "stdio");
+        const derived = deriveCommand(name, runtime);
+        const requestedCommand = typeof raw.command === "string" ? raw.command : derived.command;
+        const command = requestedCommand ? resolveTrustedBinary(requestedCommand, this.trustedOwnerUid) : null;
+        const startErrors: string[] = [];
+        if (requestedCommand && !command) startErrors.push("configured command is missing or not a trusted executable");
+        const args = Array.isArray(raw.args) ? raw.args : (derived.args || []);
+        if (!args.every((arg: unknown) => typeof arg === "string" && arg.length <= 4096 && !arg.includes("\0"))) {
+          throw new Error(`MCP server '${name}' has invalid process arguments`);
+        }
+        const requestedCwd = typeof raw.cwd === "string" ? raw.cwd : derived.cwd;
+        let cwd: string | undefined;
+        if (requestedCwd) {
+          try { cwd = assertRootControlledDirectory(requestedCwd, `MCP server '${name}' cwd`, this.trustedOwnerUid); }
+          catch { startErrors.push("configured working directory is missing or not root-controlled"); }
+        }
+        const startError = startErrors.length ? startErrors.join("; ") : undefined;
+        const env = sanitizedEnv(raw.env);
         this.specs.push({
           name,
           runtime,
@@ -65,9 +175,9 @@ export class McpServerRegistry {
           riskClass: m.riskClass,
           // config-provided command wins over the derived default (lets an active config pin the
           // exact start command for an installed server).
-          ...deriveCommand(name, runtime),
-          ...(typeof raw.command === "string" ? { command: raw.command, args: Array.isArray(raw.args) ? raw.args : [], cwd: typeof raw.cwd === "string" ? raw.cwd : undefined } : {}),
-          ...(raw.env && typeof raw.env === "object" ? { env: raw.env as Record<string, string> } : {}),
+          ...(command ? { command, args, cwd } : {}),
+          ...(startError ? { startError } : {}),
+          ...(env ? { env } : {}),
         });
       }
     } catch (e) {
@@ -84,7 +194,7 @@ export class McpServerRegistry {
   }
 
   private binaryPresent(bin: string): boolean {
-    try { execFileSync("bash", ["-lc", `command -v ${JSON.stringify(bin).slice(1, -1)} >/dev/null 2>&1`], { stdio: "ignore" }); return true; } catch { return false; }
+    return resolveTrustedBinary(bin, this.trustedOwnerUid) !== null;
   }
   private dockerImagePresent(img: string): boolean {
     try { execFileSync("docker", ["image", "inspect", img], { stdio: "ignore", timeout: 5000 }); return true; } catch { return false; }
@@ -109,6 +219,7 @@ export class McpServerRegistry {
       : [];
 
     if (base.missingBinaries.length) { base.state = "missing_dependency"; base.reasons.push(`missing binaries: ${base.missingBinaries.join(", ")}`); }
+    if (s.startError) { base.state = "missing_dependency"; base.reasons.push(s.startError); }
     if (s.runtime === "docker" && !opts.allowDocker) { base.state = "missing_dependency"; base.reasons.push("docker MCP — requires MCP_ARSENAL_ALLOW_DOCKER=true + a built image"); }
     else if (base.missingDockerImages.length) { base.state = "missing_dependency"; base.reasons.push(`missing docker images (run a build): ${base.missingDockerImages.join(", ")}`); }
     if (base.missingEnv.length || s.apiKeysRequired.length && s.requiredEnv.length === 0 && base.missingEnv.length) {

@@ -32,7 +32,7 @@ Environment: OPENROUTER_API_KEY (required), optional CHILLSPWN_OR_MAX_ITERS,
              CHILLSPWN_OR_CONTEXT_WINDOW.
 """
 
-import argparse, json, os, re, sys, threading, time, uuid
+import argparse, ipaddress, json, os, re, sys, threading, time, uuid
 from urllib.request import Request, urlopen
 from urllib.error import URLError, HTTPError
 
@@ -272,7 +272,7 @@ if cr is not None:
 # cracking, recon pipeline, report gen, etc. and FOLLOW them, without bloating the prompt with
 # every skill's full text. The curated plugin skills are indexed; use_skill can load from either tree.
 SKILLS_DIRS = [
-    os.path.expanduser("~/.claude/plugins/chillspwn/skills"),   # curated, user-facing → indexed
+    os.path.join(os.environ.get("CHILLSPWN_PLUGIN_DIR", "/opt/chillspwn/plugin"), "skills"),
     os.path.expanduser("~/.hermes/skills"),                     # learning/knowledge tree → loadable
 ]
 _SKILL_NAME_RE = re.compile(r"^name:\s*(.+?)\s*$", re.M)
@@ -386,6 +386,32 @@ _SKILL_TOOL = {"type": "function", "function": {
 def _slugify_skill(name):
     return re.sub(r"[^a-z0-9]+", "-", (name or "").strip().lower()).strip("-")[:64]
 
+_REUSABLE_MEMORY_DENY = re.compile(
+    r"(?i)(\b(?:HTB|Hack\s*The\s*Box)\b|hackthebox\.com|(?:^|[\\/])(?:root[\\/])?htb[\\/]boxes[\\/]|"
+    r"(?:^|[\\/])root[\\/](?:engagements|labs)[\\/]|\.(?:htb|local|internal|lan|test)\b|"
+    r"\b(?:\d{1,3}\.){3}\d{1,3}\b|\b(?:HTB|FLAG|root|user)\{[^}\n]+\}|"
+    r"\b[a-f0-9]{32,}\b|-----BEGIN [A-Z ]*PRIVATE KEY-----|"
+    r"\b(?:password|passwd|pwd|token|secret|api[_ -]?key)\s*[:=]\s*"
+    r"(?!<(?:CREDENTIAL|TOKEN|SECRET|API_KEY)_REF>)\S+)"
+)
+_IPV6_TOKEN = re.compile(r"(?<![0-9A-Za-z])\[?[0-9A-Fa-f:]{2,}\]?(?![0-9A-Za-z])")
+
+
+def _contains_non_reusable_memory(text):
+    if _REUSABLE_MEMORY_DENY.search(text or ""):
+        return True
+    for match in _IPV6_TOKEN.finditer(text or ""):
+        token = match.group(0).strip("[]")
+        if token.count(":") < 2:
+            continue
+        try:
+            if ipaddress.ip_address(token).version == 6:
+                return True
+        except ValueError:
+            pass
+    return False
+
+
 def skill_manage(action, name, description, content, mode="append"):
     """Create a NEW reusable skill or PATCH an existing one (Hermes-style self-improving skills).
     Writes SKILL.md into the CURATED plugin skills dir so it's indexed next session AND shared
@@ -393,9 +419,18 @@ def skill_manage(action, name, description, content, mode="append"):
     slug = _slugify_skill(name)
     if not slug:
         return "Error: a valid skill name (kebab-case) is required."
+    if _contains_non_reusable_memory("\n".join((name or "", description or "", content or ""))):
+        return ("Error: reusable playbooks must be box-agnostic and secret-free. Replace target values "
+                "with <TARGET_HOST>/<DOMAIN>/<USER_REF>/<CREDENTIAL_REF>/<LHOST> placeholders and omit box/writeup references.")
     sdir = os.path.join(SKILLS_DIRS[0], slug)
     md = os.path.join(sdir, "SKILL.md")
     act = (action or "").strip().lower()
+    if act in ("save", "create", "new"):
+        required = ("prerequisite", "attack chain", "command", "validat", "failure", "cleanup", "reference")
+        low = (content or "").lower()
+        missing = [heading for heading in required if heading not in low]
+        if missing:
+            return "Error: generalized attack-chain playbook is incomplete; missing sections: " + ", ".join(missing)
     try:
         if act in ("save", "create", "new"):
             if not (content or "").strip():
@@ -428,9 +463,10 @@ def skill_manage(action, name, description, content, mode="append"):
 
 _SKILL_MANAGE_TOOL = {"type": "function", "function": {
     "name": "skill_manage",
-    "description": "Create a NEW reusable skill or PATCH an existing one — capture a working "
-                   "attack chain / workflow so you and future sessions reuse it instead of "
-                   "re-deriving it (Hermes-style self-improving skills). action='save' needs "
+    "description": "Create or patch a GENERALIZED reusable attack-chain playbook. Preserve prerequisites/signals, "
+                   "ordered executable steps, command templates with placeholders, validation, failure recovery, "
+                   "cleanup, tools, and useful official/tool/advisory/general-research references. Never include a "
+                   "box name/URL, walkthrough, target IP/domain/user, credential, hash, flag, or engagement path. action='save' needs "
                    "name+description+content; action='patch' needs name+content (mode='append' "
                    "default, or 'replace' to rewrite the body). Do this whenever you complete a "
                    "non-trivial repeatable procedure, or find a loaded skill outdated/wrong.",
@@ -457,6 +493,8 @@ def _remember(text, target, sid, mem_now):
     if len(text) < 8:
         return json.dumps({"error": "nothing to remember (text too short / empty)"})
     target = target if target in ("memory", "user") else "memory"
+    if target == "memory" and _contains_non_reusable_memory(text):
+        return json.dumps({"error": "target-specific facts are engagement evidence, not global memory; save a generalized attack-chain skill with placeholders"})
     if text.lower()[:140] in re.sub(r"\s+", " ", (mem_now or "").lower()):
         return json.dumps({"ok": True, "skipped": "already in memory", "text": text[:80]})
     import subprocess
@@ -472,17 +510,12 @@ def _remember(text, target, sid, mem_now):
 
 _REMEMBER_TOOL = {"type": "function", "function": {
     "name": "remember",
-    "description": "Immediately persist a DURABLE, reusable learning to GLOBAL memory — shared across ALL "
-                   "future sessions and read back by recall_conversation. Call it the MOMENT you confirm "
-                   "something worth keeping for next time: a validated credential, a working exploit / "
-                   "technique / command, a confirmed vulnerability, a key environment fact, or a user "
-                   "preference or correction (use target='user' for those). Do NOT save transient state or "
-                   "raw command spam — the per-session engagement ledger already records every command+result; "
-                   "this is ONLY for distilled, lasting knowledge. For a repeatable multi-step PROCEDURE, "
-                   "prefer skill_manage(action='save'). Writes go through the gated additive memory store and "
-                   "are deduplicated automatically.",
+    "description": "Persist only a genuinely CROSS-TARGET provider/tool/environment fact, or an operator preference "
+                   "(target='user'). Never store target findings, credentials, flags, IPs/domains, named engagements, "
+                   "or attack steps here; those remain in evidence. Save a successful repeatable procedure as a "
+                   "generalized skill_manage attack-chain playbook with placeholders instead.",
     "parameters": {"type": "object", "properties": {
-        "text": {"type": "string", "description": "the durable fact to remember, as ONE concise sentence"},
+        "text": {"type": "string", "description": "one concise cross-target tool/provider/environment fact or operator preference"},
         "target": {"type": "string", "enum": ["memory", "user"],
                    "description": "memory = an ops / engagement / environment fact (default); user = a fact or preference about the operator"}},
         "required": ["text"]}}}
@@ -495,9 +528,9 @@ _TOOL_NAMES = set(_TOOL_NAMES) | {"remember"}
 # memory the moment they're recorded — gated (chillspwn_mem add → backup/audit), deduped (per-session
 # set + current-memory snapshot), category-filtered, and fully disablable. CHILLSPWN_OR_AUTO_MEMORY=0
 # turns it off entirely; CHILLSPWN_OR_AUTO_MEMORY_CATS picks which of the 4 categories promote.
-_AUTO_PROMOTE = (os.environ.get("CHILLSPWN_OR_AUTO_MEMORY") or "1").strip().lower() not in ("0", "false", "no", "off")
+_AUTO_PROMOTE = (os.environ.get("CHILLSPWN_OR_AUTO_MEMORY") or "0").strip().lower() not in ("0", "false", "no", "off")
 _PROMOTE_CATS = {c.strip() for c in (os.environ.get("CHILLSPWN_OR_AUTO_MEMORY_CATS")
-                 or "credentials,vulns,flags,key_facts").split(",") if c.strip()}
+                 or "").split(",") if c.strip()}
 
 
 def _durable_facts(ledger):
@@ -823,18 +856,23 @@ _GUIDED_EXEC_BLOCK = {"terminal", "execute_code", "process", "patch", "write_fil
 
 # ── Phase 18: HARD "no-hands commander" — ChillsPwn (the Commander-in-Chief) may NOT directly run the
 # execution surface. This is the CHAT-path enforcement (managed runs are gated by the dashboard).
-# The PingPong session proved the gap: ChillsPwn ran 418 terminal + 367 execute_code actions (Kerberos
-# abuse, Certipy, DCSync, LDAP, SOCKS pivots) instead of delegating. We (a) remove these tools from the
+# A prior engagement exposed the gap: the commander ran a large volume of terminal and execute_code
+# actions instead of delegating. We (a) remove these tools from the
 # commander's tool list for the turn and (b) hard-deny them in dispatch (belt-and-suspenders for text
 # tool-calls), returning the specialist to route to. Flag-gated: ENFORCE_CHILLSPWN_NO_HANDS (default on).
 _NO_HANDS = (os.environ.get("ENFORCE_CHILLSPWN_NO_HANDS", "true").strip().lower() in ("1", "true", "yes", "on"))
 _SELF_PERSONA = (os.environ.get("CHILLSPWN_OR_PERSONA", "") or "").strip().lower()
 _COMMANDER_PERSONAS = {"chillspwn", "commander", "commander-in-chief", "commander_in_chief", "orchestrator"}
 _IS_COMMANDER = _SELF_PERSONA in _COMMANDER_PERSONAS
-# The execution surface a commander may never touch directly (these are the only exec tools the OR
-# model is even given; specialist MCP tool names are never exposed here). file read/write/patch,
-# board_*, delegate_task, memory, skills, web_* stay available so it can still plan/route/synthesize.
-_COMMANDER_BLOCK = {"terminal", "execute_code", "process", "mcp_execute"}
+# The mutation/execution surface a commander may never touch directly. This includes private
+# sub-agent delegation: executable work must be represented by a Mission Board card assigned to a
+# named specialist, where lifecycle/ownership are visible and stale work can be reconciled. The
+# commander retains read-only context and board supervision tools only.
+_COMMANDER_BLOCK = {
+    "terminal", "execute", "execute_code", "process", "mcp_execute",
+    "write_file", "patch", "delegate_task", "remember", "skill_manage",
+    "web_search", "web_extract",
+}
 _NO_HANDS_ACTIVE = bool(_NO_HANDS and _IS_COMMANDER)
 
 # (toolName/command signal → specialist) — mirrors server/agents/ChillspwnCommanderPolicy.ts. Ordered:
@@ -858,7 +896,7 @@ def _recommend_specialist(name, command=None):
     for rx, agent, domain in _SPECIALIST_SIGNALS:
         if rx.search(hay):
             return agent, domain
-    if name in ("terminal", "execute_code", "process"):
+    if name in ("terminal", "execute", "execute_code", "process", "mcp_execute"):
         return "SessionRunner", "persistent_execution"
     return "ReconScout", "reconnaissance"
 
@@ -871,8 +909,7 @@ def _no_hands_denial(name, a):
     return (f"⛔ DELEGATION REQUIRED — ChillsPwn is the Commander-in-Chief and cannot run '{name}' "
             f"directly. This is {domain} work. Route it to {agent}: create a delegated specialist task "
             f"with board_create_task(agent=\"{agent}\", title=..., body=<the exact objective + command>) "
-            f"or delegate_task(targetAgentId=\"{agent}\", ...). Plan, route, supervise, approve, "
-            f"synthesize — specialists execute.")
+            f"on the Mission Board. Plan, route, supervise, approve, synthesize — specialists execute.")
 
 def _detect_engagement_mode(session_file: str) -> str:
     try:
@@ -1204,14 +1241,14 @@ def render_ledger(ledger: dict) -> str:
         "skill / tool / technique or attack surface. Never burn turns re-loading or re-running a skill/tool that "
         "is not advancing the objective — adapt to an alternative approach, and if you exhaust your alternatives "
         "say so and consider use_skill('council-of-ais') for fresh attack vectors.",
-        "NARRATE AS YOU WORK — Mr. Wong wants to FOLLOW ALONG, not watch silent command spam. In the SAME turn "
+        "NARRATE AS YOU WORK — the operator wants to FOLLOW ALONG, not watch silent command spam. In the SAME turn "
         "as your action: your FIRST line MUST be a SHORT present-tense status naming the SPECIFIC action + "
         "target (≤8 words — e.g. 'Kerberoasting svc_sql', 'Reading /etc/passwd', 'Cracking the gMSA NTLM on GPU', "
         "'Port-scanning 10.129.x') — it becomes the live activity label the operator watches; THEN one line of WHY/what you expect; "
         "AFTER the result, ONE line on what it means in plain English + the next move. Teach as you go and keep "
         "him oriented — but narrate WHILE acting, never INSTEAD of acting (don't stop on a mere summary — keep "
         "executing routine next steps; BUT DO pause and ask — emit a <user-question> — at genuine decision points "
-        "and ESPECIALLY when an approach has FAILED, which is Mr. Wong's standing preference). Silent back-to-back "
+        "and ESPECIALLY when an approach has FAILED, which is the operator's standing preference). Silent back-to-back "
         "tool calls with no explanation are wrong.",
     ]
     body = _render_ledger_body(ledger)
@@ -1572,7 +1609,7 @@ def distill_texts_chunked(texts, ledger, model, headers):
 # NOTE: some models (deepseek-v4-pro over OpenRouter) emit the DSML pipe as the FULLWIDTH
 # vertical bar U+FF5C ("｜") instead of ASCII "|" (U+007C). The old regexes only matched
 # ASCII, so a fullwidth-pipe tool call was NOT parsed → it leaked into the final text and
-# silently ENDED the turn (observed live on retro2.vl turn -10). Match BOTH pipe forms.
+# silently ended a live turn. Match both pipe forms.
 _P = r"[|｜]"   # ASCII pipe OR fullwidth pipe
 _DSML_INVOKE = re.compile(
     rf"<{_P}DSML{_P}invoke\s+name=\"(?P<name>[^\"]+)\">(?P<body>.*?)</{_P}DSML{_P}invoke>",
@@ -1787,28 +1824,29 @@ def main(prompt_override=None):
         _active_tools = _OPENAI_TOOLS
 
     # Phase 18 — HARD no-hands commander: strip the execution surface from ChillsPwn's tool list this
-    # turn (the model never even sees terminal/execute_code/process/mcp_execute) and inject the
+    # turn (the model never sees execution/mutation/private-delegation tools) and inject the
     # commander directive. Specialists are unaffected; only the commander persona is hands-off.
     if _NO_HANDS_ACTIVE:
         _active_tools = [t for t in _active_tools
                          if ((t.get("function") or {}).get("name")) not in _COMMANDER_BLOCK]
         messages.insert(2, {"role": "system", "content":
             "## COMMANDER-IN-CHIEF — NO HANDS (Phase 18). You are ChillsPwn, the Commander-in-Chief. "
-            "You DO NOT run attacks yourself. terminal, execute_code, process, and MCP execution are "
-            "DISABLED for you this session — they are SPECIALIST work. For ANY execution (scanning, "
+            "You DO NOT run attacks or mutate durable state yourself. Execution, file writes/patches, "
+            "memory/skill writes, web/MCP execution, and private delegate_task sub-agents are DISABLED "
+            "for you this session — they are SPECIALIST work. For ANY execution (scanning, "
             "exploitation, credential attacks, AD/Kerberos, web fuzzing, cracking, reverse engineering, "
             "shell/pivot/session ops) you MUST delegate: board_create_task(agent=\"<Specialist>\", "
-            "title, body=<exact objective + command>) for parallel fan-out, or delegate_task("
-            "targetAgentId=\"<Specialist>\", ...). Routing: nmap/masscan/discovery→ReconScout; "
+            "title, body=<exact objective + command>) on the Mission Board. Routing: "
+            "nmap/masscan/discovery→ReconScout; "
             "ffuf/gobuster/nikto/nuclei/sqlmap/web→WebBreaker; hashcat/john/hydra/wordlists→CredSmith; "
             "certipy/impacket/nxc/kerberos/ldap/bloodhound/WinRM/ADCS/gMSA/DCSync→ADAttackMapper; "
             "shell/tmux/ssh/socks/pivot/long-running→SessionRunner; gitleaks/semgrep/secrets→"
             "SecretHunter; CVE/NVD/EPSS/KEV/version lookups→VulnIntel; final report/evidence→"
-            "ReportSmith. You MAY read_file/search_files/write_file (plans, synthesis, reports), "
-            "recall_conversation, remember, use_skill, web_search, and the board_*/delegate_task tools. "
+            "ReportSmith. You MAY use read-only context tools, recall_conversation, use_skill, and "
+            "board_create_task/board_await/board_list/board_update to supervise visible specialist work. "
             "PLAN → ROUTE → SUPERVISE → APPROVE → SYNTHESIZE. Specialists execute."})
         emit({"type": "status", "kind": "no_hands",
-              "text": "🎖️ No-Hands Commander — ChillsPwn delegates execution to specialists (terminal/execute_code disabled)"})
+              "text": "🎖️ No-Hands Commander — ChillsPwn routes execution through Mission Board specialists"})
 
     # Context chip: surface WHAT memory/context was injected into THIS turn — the passive
     # "the model is referring to the MCP/memory" signal, distinct from an explicit recall_conversation.
@@ -2226,7 +2264,7 @@ def main(prompt_override=None):
         re.I)
     # Detect "asks permission / waits for go-ahead" stalls. The engagement is operator-
     # authorized + autonomous, so these should auto-proceed (Hermes drives forward; it does
-    # not pause to ask "want me to continue?"). 8/37 retro2.vl turns died on exactly this.
+    # not pause to ask "want me to continue?"). Repeated live turns previously ended on this stall.
     # NOTE: bare "should i"/"shall i" is too broad (it swallows genuine choice questions like
     # "which subnet should I focus on?"), so permission requires a CONTINUATION verb.
     _PERMISSION = re.compile(
