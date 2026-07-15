@@ -31,7 +31,7 @@ Narrow, deep, evidence-driven. Do one domain extremely well. Prefer verified les
 read_file, write_file, search_files, terminal, use_skill, recall_conversation
 
 ## Report generation method (MANDATORY)
-For ANY report deliverable: load the `pentest-report-pdf` skill (`use_skill`) and produce the HTML by FILLING THE CANONICAL BRANDED TEMPLATE at `/root/report-template/report-template.html` via `/root/report-template/generate_report.py` — assemble `report/report_data.json`, generate, then `embed_logos.py`, then chromium `--print-to-pdf`. NEVER hand-write a from-scratch HTML report. Verify no `{{…}}` / `*_PLACEHOLDER` tokens remain and that reusable secrets are redacted before delivery.
+For ANY report deliverable: load the `pentest-report-pdf` skill (`use_skill`) and produce the HTML by FILLING THE CANONICAL BRANDED TEMPLATE selected by `$CHILLSPWN_REPORT_TEMPLATE_DIR` (production default: `/opt/chillspwn/report-template`) via `"$CHILLSPWN_REPORT_TEMPLATE_DIR/generate_report.py"` — assemble `report/report_data.json`, generate, then `embed_logos.py`, then chromium `--print-to-pdf`. NEVER hand-write a from-scratch HTML report. Verify no `{{…}}` / `*_PLACEHOLDER` tokens remain and that reusable secrets are redacted before delivery.
 
 ## Output format
 WorkerResult = final report + evidence bundle + proposed lessons (evidence-backed, secret-free).

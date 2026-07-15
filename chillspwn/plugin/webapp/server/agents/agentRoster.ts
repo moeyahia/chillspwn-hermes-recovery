@@ -194,7 +194,8 @@ export const AGENT_ROSTER: AgentSpec[] = [
     personaId: "reportsmith", defaultProvider: "openrouter",
     allowedMcpServers: ["chillspwn-reporting"],
     // Native operational tools the OR orchestrator actually implements. `terminal` is granted so the
-    // report deliverable is produced by FILLING THE CANONICAL TEMPLATE at /root/report-template/ via
+    // report deliverable is produced by filling the canonical template selected by
+    // CHILLSPWN_REPORT_TEMPLATE_DIR via
     // generate_report.py + embed_logos.py + chromium PDF (see the pentest-report-pdf skill) — without
     // it the agent free-hands an off-brand HTML and cannot render a PDF ("no execution tool"). Scope is
     // local report assembly only; offensive tools stay denied below.

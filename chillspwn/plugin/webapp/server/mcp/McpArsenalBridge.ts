@@ -79,7 +79,7 @@ export class McpArsenalBridge {
    * policy/routing/gate/approval already passed. Still re-verifies the tool↔specialist↔server binding
    * (defense in depth). Returns a normalized, truncated, secret-redacted McpToolResult.
    */
-  async execute(input: { specialistAgentId: string; mcpServer: string; toolName: string; arguments?: unknown; startedAtMs: number }): Promise<McpToolResult> {
+  async execute(input: { specialistAgentId: string; mcpServer: string; toolName: string; arguments?: unknown; startedAtMs: number; signal?: AbortSignal }): Promise<McpToolResult> {
     const base: McpToolResult = { success: false, dryRun: this.isDryRun(), mcpServer: input.mcpServer, toolName: input.toolName, specialistAgentId: input.specialistAgentId, outputPreview: "", fullOutputBytes: 0, artifactId: null, evidenceIds: [], error: null, durationMs: 0, isError: false };
     const fin = (over: Partial<McpToolResult>): McpToolResult => ({ ...base, ...over, durationMs: Math.max(0, (over.durationMs ?? 0)) });
 
@@ -105,7 +105,11 @@ export class McpArsenalBridge {
     if (h.state === "missing_dependency" || h.state === "missing_secret" || h.state === "failed" || h.state === "disabled") {
       return fin({ error: `server '${input.mcpServer}' not runnable (${h.state}): ${h.reasons.join("; ")}` });
     }
-    const opts: ExecOptions = { timeoutMs: this.cfg.defaultTimeoutMs, allowDocker: this.cfg.allowDocker };
+    const opts: ExecOptions = {
+      timeoutMs: this.cfg.defaultTimeoutMs,
+      allowDocker: this.cfg.allowDocker,
+      signal: input.signal,
+    };
     const raw = await callServerTool(spec, input.toolName, input.arguments ?? {}, opts);
     const dur = 0; // real ms is stamped by the caller (registry avoids Date.now)
     if (!raw.ok) return fin({ error: raw.error ?? "MCP call failed", durationMs: dur });

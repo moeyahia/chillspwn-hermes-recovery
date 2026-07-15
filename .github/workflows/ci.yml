@@ -98,6 +98,10 @@ jobs:
         working-directory: chillspwn/plugin/webapp
         run: bun run typecheck:client
 
+      - name: Typecheck browser journeys
+        working-directory: chillspwn/plugin/webapp
+        run: bun run typecheck:e2e
+
       - name: Run ChillsPwn unit tests
         working-directory: chillspwn/plugin/webapp
         run: bun test ./server ./src/lib
@@ -111,6 +115,18 @@ jobs:
       - name: Build production client
         working-directory: chillspwn/plugin/webapp
         run: bun run build
+
+      - name: Validate production bundle budgets
+        working-directory: chillspwn/plugin/webapp
+        run: bun run performance:bundle
+
+      - name: Install Playwright Chromium
+        working-directory: chillspwn/plugin/webapp
+        run: bunx playwright install --with-deps chromium
+
+      - name: Run Command OS browser journeys
+        working-directory: chillspwn/plugin/webapp
+        run: bun run test:e2e:run
 
       - name: Audit web dependencies
         working-directory: chillspwn/plugin/webapp

@@ -6,15 +6,18 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 INSTALL_DEPS=0
 ENABLE_SERVICE=0
 FORCE=0
+LEGACY_ROOT_LAYOUT=0
 
 usage() {
   cat <<'EOF'
-Usage: sudo ./scripts/restore.sh [options]
+Usage: sudo ./scripts/restore.sh --legacy-root-layout [options]
 
 Options:
   --install-deps    create the Hermes venv and install Bun dependencies
-  --enable-service  install, enable, and start all three recovery services
+  --enable-service  install, enable, and start all three legacy services
   --force           back up, then exactly replace source-owned installation trees
+  --legacy-root-layout
+                    explicitly acknowledge the obsolete /root/.hermes layout
   -h, --help        show this help
 EOF
 }
@@ -24,6 +27,7 @@ while (($#)); do
     --install-deps) INSTALL_DEPS=1 ;;
     --enable-service) ENABLE_SERVICE=1 ;;
     --force) FORCE=1 ;;
+    --legacy-root-layout) LEGACY_ROOT_LAYOUT=1 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -32,6 +36,16 @@ done
 
 if (( EUID != 0 )); then
   echo "restore must run as root" >&2
+  exit 1
+fi
+
+if (( LEGACY_ROOT_LAYOUT != 1 )); then
+  cat >&2 <<'EOF'
+Refusing to run the legacy three-service restore helper.
+Command OS V2.1 uses the hardened /opt plus /var/lib/chillspwn layout documented
+in RECOVERY.md. Use --legacy-root-layout only for a separately approved legacy
+recovery; it is not a V2 deployment path.
+EOF
   exit 1
 fi
 
@@ -60,7 +74,7 @@ MCP_ARSENAL_DIR=/opt/chillspwn-mcp-arsenal
 MCP_ARSENAL_CONFIG="$MCP_ARSENAL_DIR/.mcp.arsenal.json"
 MCP_ARSENAL_RUNTIME="$CHILLSPWN_RUNTIME/mcp-runtime"
 MCP_ARSENAL_MANIFEST="$PLUGIN_DIR/webapp/server/agents/mcpArsenal.manifest.json"
-REPORT_TEMPLATE=/root/report-template
+REPORT_TEMPLATE=/opt/chillspwn/report-template
 HTB_ROOT=/root/htb
 HTB_ENGAGEMENT_ROOT=/root/htb/boxes
 ENGAGEMENT_ROOT=/root/engagements
@@ -1023,11 +1037,11 @@ if (( ENABLE_SERVICE == 1 || ${#PRIOR_RUNNING_UNITS[@]} > 0 )); then
 fi
 
 if (( ENABLE_SERVICE == 1 || FORCE == 1 )); then
-  install -m 0644 "$ROOT/deployment/systemd/chillspwn.service" /etc/systemd/system/chillspwn.service
-  install -m 0644 "$ROOT/deployment/systemd/hermes-gateway.service" /etc/systemd/system/hermes-gateway.service
-  install -m 0644 "$ROOT/deployment/systemd/chillspwn-memory.service" /etc/systemd/system/chillspwn-memory.service
+  install -m 0644 "$ROOT/deployment/legacy/chillspwn.service" /etc/systemd/system/chillspwn.service
+  install -m 0644 "$ROOT/deployment/legacy/hermes-gateway.service" /etc/systemd/system/hermes-gateway.service
+  install -m 0644 "$ROOT/deployment/legacy/chillspwn-memory.service" /etc/systemd/system/chillspwn-memory.service
   install -d -m 0755 /etc/systemd/system/chillspwn.service.d
-  install -m 0644 "$ROOT/deployment/systemd/chillspwn.service.d-warm.conf" /etc/systemd/system/chillspwn.service.d/warm.conf
+  install -m 0644 "$ROOT/deployment/legacy/chillspwn.service.d-warm.conf" /etc/systemd/system/chillspwn.service.d/warm.conf
   systemctl daemon-reload
 fi
 if (( ENABLE_SERVICE == 1 )); then

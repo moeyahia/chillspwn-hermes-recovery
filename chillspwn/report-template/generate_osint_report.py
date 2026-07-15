@@ -12,6 +12,7 @@ import argparse
 import datetime
 import html
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -317,11 +318,20 @@ def fill_placeholders(html_template, mapping):
 
 
 def main():
+    configured_template_dir = os.environ.get(
+        "CHILLSPWN_REPORT_TEMPLATE_DIR",
+        "/opt/chillspwn/report-template",
+    )
+    if not os.path.isabs(configured_template_dir):
+        raise SystemExit("CHILLSPWN_REPORT_TEMPLATE_DIR must be an absolute path")
     parser = argparse.ArgumentParser()
     parser.add_argument("--data", required=True, help="Path to findings.json")
     parser.add_argument("--raw-dir", help="Path to raw/ directory of tool outputs")
     parser.add_argument("--output", required=True, help="Output HTML path")
-    parser.add_argument("--template", default="/root/report-template/osint-template.html")
+    parser.add_argument(
+        "--template",
+        default=str(Path(configured_template_dir).resolve() / "osint-template.html"),
+    )
     args = parser.parse_args()
 
     data = load_data(args.data)

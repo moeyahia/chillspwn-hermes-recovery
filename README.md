@@ -8,12 +8,14 @@ Keep this repository **private**. Use ChillsPwn only on systems and targets you 
 
 ## What this repository preserves
 
-- ChillsPwn's React dashboard, Bun/Express backend, Mission Board, agent runtime, personas, and report tooling.
+- ChillsPwn Command OS V2.1: its React shell, Bun/Express backend, two-journey mission runtime, specialist orchestration, evidence, reports, and observability.
 - Claude, OpenRouter, Codex, Gemini, and OAuth-backed Grok ACP integration source.
-- Grok ACP Expert mode, commander Soul, delegation boundary, tool policy, runtime isolation, and fail-closed attestation.
+- OAuth-backed Grok ACP Expert mode, commander Soul, planning-only boundary, specialist delegation, tool policy, runtime isolation, and fail-closed attestation.
+- Canonical SQLite mission/event/evidence state plus the user-owned Second Brain and optional Obsidian-compatible vault bridge.
 - Hermes Agent 0.14.0 source plus selected deployed runtime skills and configuration.
 - Android/Capacitor native project source; generated web assets are intentionally excluded and recreated during a mobile build.
-- Systemd deployment material and a guarded restoration helper for a fresh Linux server.
+- Hardened systemd deployment material, a manual V2 recovery runbook, and a
+  fail-closed legacy restore helper retained for migration history.
 
 The repository is a curated snapshot, not a copy of either original Git history. See [SOURCE-MANIFEST.md](SOURCE-MANIFEST.md) for provenance.
 
@@ -27,13 +29,13 @@ A screenshot is intentionally omitted until a capture can be proven free of enga
 |---|---|
 | ChillsPwn runtime | Bun 1.3.14, TypeScript, Express 4, WebSockets |
 | Client | React 19, Vite 6, Tailwind CSS 4, xterm.js |
-| State | Hermes SQLite board plus JSON/JSONL runtime stores, excluded from Git |
+| State | Command OS SQLite/WAL canonical database plus a temporary legacy Hermes/file-state compatibility layer |
 | Mobile | Capacitor 8 and Android native project source |
 | Hermes | Python 3.11+, Hermes Agent 0.14.0 |
 | Tests | Bun test runner, TypeScript checks, portable Python integration checks |
 | Deployment | Linux systemd services and SSH-tunnel-friendly loopback binding |
 
-Application architecture, data flow, contracts, configuration, and operations are documented under [chillspwn/plugin/webapp/docs](chillspwn/plugin/webapp/docs/architecture.md).
+Application architecture, data flow, contracts, configuration, and operations are documented under [Command OS V2.1 docs](chillspwn/plugin/webapp/docs/command-os-v2/current-state-audit.md).
 
 ## Prerequisites
 
@@ -60,7 +62,7 @@ Open `http://127.0.0.1:3132`. Vite proxies API and WebSocket traffic to the back
 
 The sanitized [.env.example](chillspwn/plugin/webapp/.env.example) documents dashboard defaults. Optional MCP variable names are in [.env.mcp.example](chillspwn/plugin/webapp/.env.mcp.example). Real `.env` files are ignored at both repository and application scope.
 
-`ALLOWED_WORKSPACE_ROOTS` is shared by the file browser, engagement APIs and working directories, interactive Claude workspace access, and OSINT output. The defaults are `/root/htb/boxes` and `/root/engagements`; recovery provisions only those defaults. Pre-create any custom root as a real directory writable/traversable by `chillspwn` before enabling the services.
+`ALLOWED_WORKSPACE_ROOTS` is shared by the file browser, engagement APIs and working directories, interactive Claude workspace access, and OSINT output. Production uses `/var/lib/chillspwn/workspaces/htb/boxes` and `/var/lib/chillspwn/workspaces/engagements`; tracked systemd mount units bind the existing operator data into those paths. Pre-create and review any additional root before enabling the services.
 
 ## Build, test, and code-quality checks
 
@@ -70,10 +72,12 @@ From `chillspwn/plugin/webapp`:
 bun run check:server-entry
 bun run typecheck
 bun run typecheck:client
+bun run typecheck:e2e
 bun test ./server ./src/lib
 python3 integration/test_or_gate_client.py
 python3 integration/test_board_mcp_server.py
 bun run build
+bun run test:e2e:run
 bun audit
 ```
 
@@ -90,18 +94,17 @@ From the repository root on a restored host, validate the recovery boundary and 
 ```bash
 ./scripts/verify-snapshot.sh
 bash -n scripts/restore.sh scripts/verify-snapshot.sh
-/root/hermes-venv/bin/python -m unittest \
+/opt/chillspwn-runtime/hermes-venv/bin/python -m unittest \
   hermes.runtime.tests.test_chillspwn_learning_pipeline \
   hermes.runtime.tests.test_validate_hermes_config
-/root/hermes-venv/bin/python -m compileall -q \
+/opt/chillspwn-runtime/hermes-venv/bin/python -m compileall -q \
   hermes/source/agent \
   hermes/source/acp_adapter \
   hermes/source/hermes_cli \
   hermes/source/run_agent.py \
   hermes/source/tools/memory_tool.py \
   hermes/runtime/scripts/chillspwn_learn_cron.py \
-  hermes/runtime/skills/red-teaming/council-of-ais/scripts \
-  scripts/chillspwn-memory-broker.py
+  hermes/runtime/skills/red-teaming/council-of-ais/scripts
 git diff --check
 ```
 
@@ -109,21 +112,17 @@ There is no repository-wide formatter or linter baseline yet. `.editorconfig`, `
 
 ## Production recovery
 
-On a clean supported Linux server, clone the private repository and run:
+The supported V2.1 recovery is the reviewed two-service `/opt` plus
+`/var/lib/chillspwn` procedure in [RECOVERY.md](RECOVERY.md). It stages an
+immutable root-controlled release and runtimes, restores service-owned state,
+installs the two tracked workspace bind mounts, performs backup-first database
+migration/reconciliation, and starts `hermes-gateway.service` and
+`chillspwn.service` as an unprivileged identity.
 
-```bash
-cd chillspwn-hermes-recovery
-sudo ./scripts/restore.sh --install-deps
-```
-
-Recreate `/root/.hermes/.env` from a password manager or encrypted offline backup, authenticate each enabled CLI, validate the host, and only then enable the service:
-
-```bash
-sudo ./scripts/restore.sh --force --install-deps --enable-service
-sudo systemctl status chillspwn-memory.service chillspwn.service hermes-gateway.service --no-pager
-```
-
-The helper refuses to overwrite a populated installation without `--force`. Read [RECOVERY.md](RECOVERY.md) before using that option. Deployment, rollback, configuration, and operational details are also covered in the [application deployment guide](chillspwn/plugin/webapp/docs/deployment.md).
+The earlier `scripts/restore.sh` targets the legacy three-service
+`/root/.hermes` layout and is retained for historical validation only. Do not
+use it to deploy Command OS V2.1 until that helper is separately rewritten and
+rehearsed for the hardened host contract.
 
 For Android packaging, build the sanitized web client and regenerate Capacitor assets locally:
 
@@ -139,11 +138,11 @@ Do not commit the generated `android/app/src/main/assets` output.
 
 After a secure local start:
 
-1. Configure sanitized personas and the provider integrations you intend to use.
-2. Create or select an authorized engagement.
-3. Coordinate multi-step work through the Mission Board and delegated specialist flows.
-4. Review approvals, evidence, artifacts, reports, and proposed training-memory lessons.
-5. Preserve operational state only through a separate, consistent, client-side encrypted backup.
+1. Verify provider, MCP, authorization, and Second Brain readiness.
+2. Choose **Go Autonomous** or **Start Guided Mission**; no provider-specific third journey is exposed.
+3. Define the exact authorized target and constraints. Autonomous additionally requires a complete signed mission contract.
+4. Observe specialist ownership, decisions, checkpoints, evidence, recovery, evaluation, and proposed lessons.
+5. Export a verified database backup and, when enabled, an Obsidian-compatible knowledge projection. Keep secrets and engagement evidence outside Git.
 
 The dashboard HTTP surface is an internal UI contract, not a versioned public API. See the [API overview](chillspwn/plugin/webapp/docs/api.md), [integration contracts](chillspwn/plugin/webapp/docs/integrations.md), and [operations guide](chillspwn/plugin/webapp/docs/operations.md).
 
@@ -158,7 +157,7 @@ hermes/
   source/             Hermes Agent source snapshot
   runtime/            selected Soul, skills, scripts, and cron definitions
 deployment/systemd/   deployed service definitions
-scripts/              snapshot verifier and guarded restore helper
+scripts/              snapshot verifier and legacy guarded restore helper
 .github/               CI, issue forms, PR template, and dependency updates
 ```
 
@@ -168,7 +167,7 @@ Credentials, provider auth stores, databases, sessions, conversations, memories,
 
 ### No personas are available
 
-Set `CHILLSPWN_PERSONAS_DIR` to the restored persona directory. The integrated recovery units use `/root/.hermes/chillspwn/personas`; local development defaults to `${HERMES_HOME:-$HOME/.hermes}/chillspwn/personas`. The repository includes sanitized source definitions, but it does not include provider authentication or live session state.
+Set `CHILLSPWN_PERSONAS_DIR` to the restored persona directory. The integrated units use `/opt/chillspwn/plugin/webapp/server/agents/personas`; local development may use a checkout-relative path. The repository includes sanitized source definitions, but it does not include provider authentication or live session state.
 
 ### A provider does not start
 
@@ -178,13 +177,16 @@ Confirm its CLI is installed and authenticated as the service account. Keep refr
 
 This is fail-closed behavior. Keep `CHILLSPWN_BIND=127.0.0.1` for local or tunneled access, or configure a strong `DASHBOARD_TOKEN` before binding to a non-loopback address.
 
-### Mission Board state is unavailable
+### Command OS or legacy Board state is unavailable
 
-The operational SQLite database is intentionally absent. Restore it only from a consistent encrypted state backup and review [data and migrations](chillspwn/plugin/webapp/docs/data-and-migrations.md).
+Operational databases are intentionally absent from Git. Restore only from a verified encrypted backup. For the canonical V2.1 database follow [migration](chillspwn/plugin/webapp/docs/command-os-v2/migration.md) and [rollback](chillspwn/plugin/webapp/docs/command-os-v2/rollback.md); retained legacy Board guidance remains in [data and migrations](chillspwn/plugin/webapp/docs/data-and-migrations.md).
 
-### Restore refuses to overwrite files
+### Recovery finds an existing release or state tree
 
-Inspect the existing destination and backup any needed operational state. Use `--force` only after reading [RECOVERY.md](RECOVERY.md); it is intentionally never implied.
+Stop and inventory it. Create checksummed application and operational-state
+backups, preserve the current release symlink and unit hashes, then follow the
+explicit promotion/migration/rollback gates in [RECOVERY.md](RECOVERY.md).
+Never overwrite the only copy of state or point systemd at a mutable worktree.
 
 ## Contributing, security, and license
 

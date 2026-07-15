@@ -1,5 +1,6 @@
+# LEGACY ONLY. Do not install on a Command OS V2.1 host.
 [Unit]
-Description=ChillsPwn validated memory broker
+Description=ChillsPwn validated memory broker (legacy)
 After=local-fs.target
 Before=chillspwn.service hermes-gateway.service
 
@@ -21,9 +22,6 @@ ExecStart=/opt/chillspwn/libexec/chillspwn-memory-broker
 Restart=on-failure
 RestartSec=2
 UMask=0077
-
-# The root process is deliberately narrow: Unix socket only, immutable host,
-# and write access only to the protected memory tree and its runtime socket.
 NoNewPrivileges=true
 PrivateDevices=true
 PrivateNetwork=true

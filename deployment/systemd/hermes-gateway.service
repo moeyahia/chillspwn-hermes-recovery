@@ -1,47 +1,45 @@
 [Unit]
-Description=Hermes Gateway (message adapters and cron scheduler)
-After=network-online.target chillspwn-memory.service
+Description=Hermes Gateway (unprivileged message adapters and scheduler)
+After=network-online.target tailscaled.service
 Wants=network-online.target
-Requires=chillspwn-memory.service
+RequiresMountsFor=/var/lib/chillspwn/workspaces/htb/boxes /var/lib/chillspwn/workspaces/engagements
 
 [Service]
 Type=simple
 User=chillspwn
 Group=chillspwn
-WorkingDirectory=/opt/chillspwn/hermes-agent
-Environment=HOME=/root
-Environment=HERMES_HOME=/root/.hermes
-Environment=HERMES_KANBAN_DB=/root/.hermes/kanban.db
-Environment=HERMES_PYTHON=/root/hermes-venv/bin/python
-Environment=CHILLSPWN_HERMES_SRC=/opt/chillspwn/hermes-agent
-Environment=CHILLSPWN_PLUGIN_DIR=/opt/chillspwn/plugin
-Environment=CHILLSPWN_STATE_DIR=/root/.hermes/chillspwn
-Environment=CHILLSPWN_SESSIONS_DIR=/root/.hermes/chillspwn/sessions
-Environment=CHILLSPWN_PERSONAS_DIR=/root/.hermes/chillspwn/personas
-Environment=GROK_BIN=/opt/chillspwn/bin/grok
-Environment=GROK_HOME=/root/.hermes/chillspwn/grok
-Environment=GROK_AUTH_PATH=/root/.hermes/auth/grok/auth.json
-Environment=CHILLSPWN_MEMORY_GUARD=required
-Environment=CHILLSPWN_MEM_CLI=/root/.hermes/skills/red-teaming/council-of-ais/scripts/chillspwn_mem.py
-Environment=CHILLSPWN_MEMORY_SOCKET=/run/chillspwn-memory/broker.sock
-Environment=MCP_ARSENAL_CONFIG=/opt/chillspwn-mcp-arsenal/.mcp.arsenal.json
-Environment=MCP_ARSENAL_RUNTIME_DIR=/root/.hermes/chillspwn/mcp-runtime
-Environment=CLAUDE_CONFIG_DIR=/root/.hermes/auth/claude
-Environment=CODEX_HOME=/root/.hermes/auth/codex
+SupplementaryGroups=
+Environment=HOME=/home/chillspwn
+Environment=HERMES_HOME=/var/lib/chillspwn/hermes
+Environment=HERMES_PYTHON=/opt/chillspwn-runtime/hermes-venv/bin/python
 Environment=PYTHONUNBUFFERED=1
-Environment=PATH=/root/.bun/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-EnvironmentFile=-/opt/chillspwn/plugin/webapp/.env
-EnvironmentFile=-/root/.hermes/.env
-ExecStartPre=/root/hermes-venv/bin/python /opt/chillspwn/libexec/validate-hermes-config.py --allow-missing /root/.hermes/config.yaml
-ExecStart=/root/hermes-venv/bin/python -m hermes_cli.main gateway run --replace
+Environment=PATH=/opt/chillspwn-bin:/opt/chillspwn-runtime/hermes-venv/bin:/opt/chillspwn-runtime/bin:/opt/chillspwn/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+EnvironmentFile=-/etc/chillspwn/chillspwn.env
+EnvironmentFile=-/etc/hermes-gateway.env
+WorkingDirectory=/var/lib/chillspwn/hermes
+ExecStart=/opt/chillspwn-runtime/hermes-venv/bin/python -m hermes_cli.main gateway run --replace
 Restart=always
 RestartSec=5
 KillSignal=SIGTERM
 KillMode=control-group
 TimeoutStopSec=240
 UMask=0077
-StandardOutput=append:/root/.hermes/logs/gateway.service.log
-StandardError=append:/root/.hermes/logs/gateway.service.log
+LimitNOFILE=65536
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallArchitectures=native
+StandardOutput=append:/var/log/chillspwn/hermes-gateway.log
+StandardError=append:/var/log/chillspwn/hermes-gateway.log
 
 [Install]
 WantedBy=multi-user.target

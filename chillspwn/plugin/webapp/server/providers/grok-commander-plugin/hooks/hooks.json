@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "/root/.bun/bin/bun \"$GROK_PLUGIN_ROOT/bin/commander-tool-guard.ts\"",
+            "command": "\"/opt/chillspwn-runtime/bin/bun\" \"$GROK_PLUGIN_ROOT/bin/commander-tool-guard.ts\"",
             "timeout": 5
           }
         ]

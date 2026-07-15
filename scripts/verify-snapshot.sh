@@ -37,8 +37,15 @@ required=(
   "hermes/runtime/scripts/chillspwn_learn_cron.py"
   "deployment/systemd/chillspwn.service"
   "deployment/systemd/hermes-gateway.service"
-  "deployment/systemd/chillspwn-memory.service"
+  "deployment/systemd/var-lib-chillspwn-workspaces-htb-boxes.mount"
+  "deployment/systemd/var-lib-chillspwn-workspaces-engagements.mount"
+  "deployment/systemd/README.md"
+  "deployment/legacy/chillspwn-memory.service"
+  "deployment/legacy/chillspwn.service"
+  "deployment/legacy/hermes-gateway.service"
   "scripts/bootstrap-board.py"
+  "scripts/stage-chillspwn-release.sh"
+  "scripts/test-stage-chillspwn-release.sh"
   "scripts/smoke-skills.py"
   "scripts/chillspwn-memory-broker.py"
   "scripts/validate-hermes-config.py"
@@ -84,21 +91,26 @@ while IFS= read -r -d '' rel; do
   path="$ROOT/$rel"
   if [[ -L "$path" ]]; then
     target="$(readlink "$path")"
-    case "$target" in
-      /root/.hermes/SOUL.md)
-        retained="$ROOT/hermes/runtime/SOUL.md"
-        ;;
-      /root/.hermes/skills/*)
-        retained="$ROOT/hermes/runtime/skills/${target#/root/.hermes/skills/}"
+    if [[ "$target" == /* ]]; then
+      echo "absolute symlink target is forbidden: $rel" >&2
+      fail=1
+      continue
+    fi
+    if ! retained="$(realpath -e -- "$path" 2>/dev/null)"; then
+      echo "symlink has no retained recovery target: $rel" >&2
+      fail=1
+      continue
+    fi
+    case "$retained" in
+      "$ROOT/hermes/runtime/SOUL.md"|"$ROOT/hermes/runtime/skills/"*)
         ;;
       *)
         echo "symlink target is outside the reviewed recovery contract: $rel" >&2
         fail=1
-        retained=""
         ;;
     esac
-    if [[ -n "${retained:-}" && ! -e "$retained" ]]; then
-      echo "symlink has no retained recovery target: $rel -> $target" >&2
+    if [[ ! -e "$retained" ]]; then
+      echo "symlink has no retained recovery target: $rel" >&2
       fail=1
     fi
     continue
@@ -166,16 +178,29 @@ if grep -Fq 'grok ACP stderr' "$server_index"; then
   fail=1
 fi
 
-if ! grep -Fq 'Environment=HOME=/root' "$ROOT/deployment/systemd/chillspwn.service" \
-  || ! grep -Fq '"$CHILLSPWN_RUNTIME/logs"' "$ROOT/scripts/restore.sh" \
-  || ! grep -Fq 'GROK_BIN=/opt/chillspwn/bin/grok' "$ROOT/scripts/restore.sh" \
-  || ! grep -Fq 'validate_trusted_grok_binary "$GROK_BIN"' "$ROOT/scripts/restore.sh" \
-  || ! grep -Fq 'chmod 0700 "$GROK_RUNTIME_HOME" "$GROK_AUTH_DIR"' "$ROOT/scripts/restore.sh" \
-  || ! grep -Fq 'chmod 0600 "$GROK_AUTH_PATH"' "$ROOT/scripts/restore.sh" \
+if ! grep -Fq 'Environment=HOME=/home/chillspwn' "$ROOT/deployment/systemd/chillspwn.service" \
+  || ! grep -Fq 'SupplementaryGroups=' "$ROOT/deployment/systemd/chillspwn.service" \
+  || ! grep -Fq 'Environment=CHILLSPWN_BUN_BIN=/opt/chillspwn-runtime/bin/bun' "$ROOT/deployment/systemd/chillspwn.service" \
+  || ! grep -Fq 'Environment=GROK_COMMANDER_BUN=/opt/chillspwn-runtime/bin/bun' "$ROOT/deployment/systemd/chillspwn.service" \
   || ! grep -Fq 'Environment=GROK_BIN=/opt/chillspwn/bin/grok' "$ROOT/deployment/systemd/chillspwn.service" \
-  || ! grep -Fq 'Environment=GROK_AUTH_PATH=/root/.hermes/auth/grok/auth.json' "$ROOT/deployment/systemd/chillspwn.service" \
-  || grep -Eq 'setfacl[[:space:]]+-R([[:space:]]+-m|m)' "$ROOT/scripts/restore.sh"; then
-  echo "Restored service state or Grok executable/OAuth split contract not found" >&2
+  || ! grep -Fq 'Environment=GROK_AUTH_PATH=/var/lib/chillspwn/grok-auth/auth.json' "$ROOT/deployment/systemd/chillspwn.service" \
+  || ! grep -Fq 'Environment=COMMAND_OS_DB_PATH=/var/lib/chillspwn/command-os-v2.sqlite' "$ROOT/deployment/systemd/chillspwn.service" \
+  || ! grep -Fq 'Environment=CHILLSPWN_VAULT_ROOT=/var/lib/chillspwn/brain-vaults' "$ROOT/deployment/systemd/chillspwn.service" \
+  || grep -Fq 'Environment=HOME=/root' "$ROOT/deployment/systemd/chillspwn.service"; then
+  echo "Hardened service state or Grok executable/OAuth split contract not found" >&2
+  fail=1
+fi
+
+htb_mount="$ROOT/deployment/systemd/var-lib-chillspwn-workspaces-htb-boxes.mount"
+engagement_mount="$ROOT/deployment/systemd/var-lib-chillspwn-workspaces-engagements.mount"
+workspace_requires='RequiresMountsFor=/var/lib/chillspwn/workspaces/htb/boxes /var/lib/chillspwn/workspaces/engagements'
+if ! grep -Fq 'What=/root/htb/boxes' "$htb_mount" \
+  || ! grep -Fq 'Where=/var/lib/chillspwn/workspaces/htb/boxes' "$htb_mount" \
+  || ! grep -Fq 'What=/root/engagements' "$engagement_mount" \
+  || ! grep -Fq 'Where=/var/lib/chillspwn/workspaces/engagements' "$engagement_mount" \
+  || ! grep -Fq "$workspace_requires" "$ROOT/deployment/systemd/chillspwn.service" \
+  || ! grep -Fq "$workspace_requires" "$ROOT/deployment/systemd/hermes-gateway.service"; then
+  echo "Hardened workspace bind-mount contract is missing" >&2
   fail=1
 fi
 
@@ -214,20 +239,20 @@ if ! grep -Fq 'kanban_db.init_db(db_path=db_path)' "$board_bootstrap" \
   || ! grep -Fq '"$HERMES_HOME/logs"' "$ROOT/scripts/restore.sh" \
   || ! grep -Fq '"$CHILLSPWN_RUNTIME/runtime"' "$ROOT/scripts/restore.sh" \
   || ! grep -Fq '"$HERMES_HOME/runtime.env.example"' "$ROOT/scripts/restore.sh" \
-  || ! grep -Fq 'Environment=HERMES_KANBAN_DB=/root/.hermes/kanban.db' "$ROOT/deployment/systemd/chillspwn.service" \
-  || ! grep -Fq 'Environment=HERMES_KANBAN_DB=/root/.hermes/kanban.db' "$ROOT/deployment/systemd/hermes-gateway.service" \
-  || ! grep -Fq 'Environment=HERMES_PYTHON=/root/hermes-venv/bin/python' "$ROOT/deployment/systemd/chillspwn.service" \
-  || ! grep -Fq 'Environment=HERMES_PYTHON=/root/hermes-venv/bin/python' "$ROOT/deployment/systemd/hermes-gateway.service" \
+  || ! grep -Fq 'Environment=HERMES_HOME=/var/lib/chillspwn/hermes' "$ROOT/deployment/systemd/chillspwn.service" \
+  || ! grep -Fq 'Environment=HERMES_HOME=/var/lib/chillspwn/hermes' "$ROOT/deployment/systemd/hermes-gateway.service" \
+  || ! grep -Fq 'Environment=HERMES_PYTHON=/opt/chillspwn-runtime/hermes-venv/bin/python' "$ROOT/deployment/systemd/chillspwn.service" \
+  || ! grep -Fq 'ExecStart=/opt/chillspwn-runtime/hermes-venv/bin/python' "$ROOT/deployment/systemd/hermes-gateway.service" \
   || ! grep -Fq 'Environment=CHILLSPWN_PLUGIN_DIR=/opt/chillspwn/plugin' "$ROOT/deployment/systemd/chillspwn.service" \
-  || ! grep -Fq 'Environment=CHILLSPWN_STATE_DIR=/root/.hermes/chillspwn' "$ROOT/deployment/systemd/chillspwn.service" \
-  || ! grep -Fq 'Environment=CHILLSPWN_SESSIONS_DIR=/root/.hermes/chillspwn/sessions' "$ROOT/deployment/systemd/chillspwn.service" \
-  || ! grep -Fq 'Environment=CHILLSPWN_PERSONAS_DIR=/root/.hermes/chillspwn/personas' "$ROOT/deployment/systemd/chillspwn.service" \
+  || ! grep -Fq 'Environment=CHILLSPWN_STATE_DIR=/var/lib/chillspwn/state' "$ROOT/deployment/systemd/chillspwn.service" \
+  || ! grep -Fq 'Environment=CHILLSPWN_SESSIONS_DIR=/var/lib/chillspwn/state/sessions' "$ROOT/deployment/systemd/chillspwn.service" \
+  || ! grep -Fq 'Environment=CHILLSPWN_PERSONAS_DIR=/opt/chillspwn/plugin/webapp/server/agents/personas' "$ROOT/deployment/systemd/chillspwn.service" \
   || ! grep -Fq 'WorkingDirectory=/opt/chillspwn/plugin/webapp' "$ROOT/deployment/systemd/chillspwn.service" \
   || ! grep -Fq 'process.env.CHILLSPWN_PLUGIN_DIR' "$server_index" \
   || [[ $(grep -Fc 'spawn(HERMES_PYTHON' "$server_index") -lt 2 ]] \
   || ! grep -Fq 'missingAdditive' "$server_index" \
   || ! grep -Fq 'missingBoard' "$server_index"; then
-  echo "Clean-host Mission Board bootstrap or rolled-back CRUD guard is missing" >&2
+  echo "Clean-host database/bootstrap or hardened runtime-path guard is missing" >&2
   fail=1
 fi
 
@@ -256,31 +281,25 @@ if ! grep -Fq 'refuse_nonforce_collisions' "$ROOT/scripts/restore.sh" \
   fail=1
 fi
 
-if ! grep -Fq 'harden_environment_file "$PLUGIN_DIR/webapp/.env"' "$ROOT/scripts/restore.sh" \
-  || ! grep -Fq 'harden_environment_file "$HERMES_HOME/.env"' "$ROOT/scripts/restore.sh" \
-  || ! grep -Fq 'setfacl -b -- "$path"' "$ROOT/scripts/restore.sh" \
-  || ! grep -Fq 'refusing multiply-linked environment file' "$ROOT/scripts/restore.sh" \
-  || ! grep -Fq 'chown root:root "$path"' "$ROOT/scripts/restore.sh" \
-  || ! grep -Fq 'chmod 0600 "$path"' "$ROOT/scripts/restore.sh" \
-  || ! grep -Fq 'chillspwn can directly access protected environment file' "$ROOT/scripts/restore.sh" \
-  || ! grep -Fq 'EnvironmentFile=-/opt/chillspwn/plugin/webapp/.env' "$ROOT/deployment/systemd/chillspwn.service" \
-  || ! grep -Fq 'EnvironmentFile=-/root/.hermes/.env' "$ROOT/deployment/systemd/chillspwn.service" \
-  || ! grep -Fq 'EnvironmentFile=-/opt/chillspwn/plugin/webapp/.env' "$ROOT/deployment/systemd/hermes-gateway.service" \
-  || ! grep -Fq 'EnvironmentFile=-/root/.hermes/.env' "$ROOT/deployment/systemd/hermes-gateway.service" \
+if ! grep -Fq 'EnvironmentFile=-/etc/chillspwn/chillspwn.env' "$ROOT/deployment/systemd/chillspwn.service" \
+  || ! grep -Fq 'EnvironmentFile=-/etc/chillspwn/chillspwn.env' "$ROOT/deployment/systemd/hermes-gateway.service" \
+  || ! grep -Fq 'EnvironmentFile=-/etc/hermes-gateway.env' "$ROOT/deployment/systemd/hermes-gateway.service" \
+  || ! grep -Fq 'User=chillspwn' "$ROOT/deployment/systemd/chillspwn.service" \
+  || ! grep -Fq 'Group=chillspwn' "$ROOT/deployment/systemd/chillspwn.service" \
+  || ! grep -Fq 'SupplementaryGroups=' "$ROOT/deployment/systemd/hermes-gateway.service" \
   || grep -Fq 'join(HERMES_HOME, ".env")' "$server_index" \
   || grep -Fq 'readFileSync("/root/.hermes/.env"' "$server_index" \
   || ! grep -Fq 'return process.env.OPENROUTER_API_KEY || "";' "$server_index" \
   || ! grep -Fq 'except PermissionError:' "$ROOT/hermes/source/hermes_cli/env_loader.py"; then
-  echo "Root-only systemd environment-file or runtime secret isolation guard is missing" >&2
+  echo "Root-only systemd environment injection or service identity guard is missing" >&2
   fail=1
 fi
 
 config_validator="$ROOT/scripts/validate-hermes-config.py"
-if ! grep -Fq 'validate_hermes_config' "$ROOT/scripts/restore.sh" \
-  || ! grep -Fq 'literal credential value is prohibited' "$config_validator" \
+if ! grep -Fq 'literal credential value is prohibited' "$config_validator" \
   || ! grep -Fq 'UniqueKeyLoader' "$config_validator" \
-  || ! grep -Fq 'ExecStartPre=/root/hermes-venv/bin/python /opt/chillspwn/libexec/validate-hermes-config.py --allow-missing /root/.hermes/config.yaml' "$ROOT/deployment/systemd/chillspwn.service" \
-  || ! grep -Fq 'ExecStartPre=/root/hermes-venv/bin/python /opt/chillspwn/libexec/validate-hermes-config.py --allow-missing /root/.hermes/config.yaml' "$ROOT/deployment/systemd/hermes-gateway.service"; then
+  || ! grep -Fq '/opt/chillspwn-runtime/hermes-venv/bin/python' "$ROOT/chillspwn/plugin/webapp/docs/configuration.md" \
+  || ! grep -Fq '/var/lib/chillspwn/hermes/config.yaml' "$ROOT/chillspwn/plugin/webapp/docs/configuration.md"; then
   echo "Hermes config literal-secret validation guard is missing" >&2
   fail=1
 fi
@@ -296,35 +315,23 @@ if ! grep -Fq 'def build_lane_environment(member, source_env=None, file_env=None
   || ! grep -Fq 'return os.environ.get(name, "").strip()' "$council_lane_agent" \
   || grep -Fq '.hermes/.env' "$council_lane_agent" \
   || grep -REq 'env[[:space:]]*=[[:space:]]*\{[[:space:]]*\*\*os\.environ' "$council_dir" \
-  || ! grep -Fq '# COUNCIL_CODEX_HERMES_HOME=/root/.hermes/profiles/council-codex' "$ROOT/hermes/runtime/runtime.env.example" \
-  || ! grep -Fq '# COUNCIL_XAI_HERMES_HOME=/root/.hermes/profiles/council-xai' "$ROOT/hermes/runtime/runtime.env.example"; then
+  || ! grep -Fq '# COUNCIL_CODEX_HERMES_HOME=/var/lib/chillspwn/hermes/profiles/council-codex' "$ROOT/hermes/runtime/runtime.env.example" \
+  || ! grep -Fq '# COUNCIL_XAI_HERMES_HOME=/var/lib/chillspwn/hermes/profiles/council-xai' "$ROOT/hermes/runtime/runtime.env.example"; then
   echo "Council provider-specific child environment boundary is missing" >&2
   fail=1
 fi
 
-memory_broker="$ROOT/scripts/chillspwn-memory-broker.py"
-memory_routes="$ROOT/chillspwn/plugin/webapp/server/runtime/LegacyMemoryBroker.ts"
-if ! grep -Fq 'Environment=CHILLSPWN_MEMORY_GUARD=required' "$ROOT/deployment/systemd/chillspwn.service" \
-  || ! grep -Fq 'Environment=CHILLSPWN_MEM_CLI=/root/.hermes/skills/red-teaming/council-of-ais/scripts/chillspwn_mem.py' "$ROOT/deployment/systemd/chillspwn.service" \
-  || ! grep -Fq 'Environment=CHILLSPWN_MEMORY_SOCKET=/run/chillspwn-memory/broker.sock' "$ROOT/deployment/systemd/chillspwn.service" \
-  || ! grep -Fq 'Environment=CHILLSPWN_MEMORY_GUARD=required' "$ROOT/deployment/systemd/hermes-gateway.service" \
-  || ! grep -Fq 'Environment=CHILLSPWN_MEM_CLI=/root/.hermes/skills/red-teaming/council-of-ais/scripts/chillspwn_mem.py' "$ROOT/deployment/systemd/hermes-gateway.service" \
-  || ! grep -Fq 'Environment=CHILLSPWN_MEMORY_SOCKET=/run/chillspwn-memory/broker.sock' "$ROOT/deployment/systemd/hermes-gateway.service" \
-  || ! grep -Fq 'CHILLSPWN_MEMORY_GUARD=required' "$ROOT/hermes/runtime/runtime.env.example" \
-  || ! grep -Fq 'CHILLSPWN_MEM_CLI=/root/.hermes/skills/red-teaming/council-of-ais/scripts/chillspwn_mem.py' "$ROOT/hermes/runtime/runtime.env.example" \
-  || ! grep -Fq 'CHILLSPWN_MEMORY_SOCKET=/run/chillspwn-memory/broker.sock' "$ROOT/hermes/runtime/runtime.env.example" \
-  || ! grep -Fq 'SERVICE_UNITS=(chillspwn-memory.service chillspwn.service hermes-gateway.service)' "$ROOT/scripts/restore.sh" \
-  || ! grep -Fq 'install -d -o root -g root -m 0700 "$HERMES_HOME/memories"' "$ROOT/scripts/restore.sh" \
-  || ! grep -Fq 'setfacl -Rb -k "$HERMES_HOME/memories"' "$ROOT/scripts/restore.sh" \
-  || ! grep -Fq 'find -P "$memories" -type f -links +1' "$ROOT/scripts/restore.sh" \
-  || ! grep -Fq 'unsafe reusable memory file:' "$ROOT/scripts/restore.sh" \
-  || ! grep -Fq 'chillspwn can bypass the broker and directly access reusable memory' "$ROOT/scripts/restore.sh" \
-  || ! grep -Fq 'validate_memory_boundary' "$ROOT/scripts/restore.sh" \
-  || grep -Fq '"--add-dir", "/root/.hermes/memories"' "$ROOT/chillspwn/plugin/webapp/server/index.ts" \
-  || ! grep -Fq 'registerLegacyMemoryRoutes(app' "$ROOT/chillspwn/plugin/webapp/server/index.ts" \
-  || ! grep -Fq 'MEMORY_MUTATION_MEDIATED' "$memory_routes" \
-  || [[ ! -f "$memory_broker" || ! -f "$memory_routes" ]]; then
-  echo "Fail-closed reusable-memory broker or read-only service boundary is missing" >&2
+memory_repository="$ROOT/chillspwn/plugin/webapp/server/memory/MemoryRepository.ts"
+memory_policy="$ROOT/chillspwn/plugin/webapp/server/memory/MemoryControlPolicy.ts"
+memory_migration="$ROOT/chillspwn/plugin/webapp/server/db/migrations/002_memory_learning.ts"
+if ! grep -Fq 'Environment=COMMAND_OS_DB_PATH=/var/lib/chillspwn/command-os-v2.sqlite' "$ROOT/deployment/systemd/chillspwn.service" \
+  || ! grep -Fq 'Environment=CHILLSPWN_VAULT_ROOT=/var/lib/chillspwn/brain-vaults' "$ROOT/deployment/systemd/chillspwn.service" \
+  || grep -Fq 'chillspwn-memory.service' "$ROOT/deployment/systemd/chillspwn.service" \
+  || grep -Fq 'chillspwn-memory.service' "$ROOT/deployment/systemd/hermes-gateway.service" \
+  || grep -Fq 'CHILLSPWN_MEMORY_SOCKET' "$ROOT/hermes/runtime/runtime.env.example" \
+  || [[ ! -f "$memory_repository" || ! -f "$memory_policy" || ! -f "$memory_migration" ]] \
+  || ! grep -Fq 'Do not install them on the hardened V2.1 host.' "$ROOT/deployment/legacy/README.md"; then
+  echo "Canonical Second Brain database/vault or legacy-broker isolation guard is missing" >&2
   fail=1
 fi
 
@@ -338,7 +345,7 @@ if ! grep -Fq 'assertTrustedDirectoryChain' "$mcp_registry" \
   || ! grep -Fq 'chown -hR root:root "$MCP_ARSENAL_DIR"' "$ROOT/scripts/restore.sh" \
   || ! grep -Fq 'normalize_readonly_tree "$PLUGIN_DIR"' "$ROOT/scripts/restore.sh" \
   || ! grep -Fq 'smoke_mcp_arsenal_registry' "$ROOT/scripts/restore.sh" \
-  || ! grep -Fq 'Environment=MCP_ARSENAL_RUNTIME_DIR=/root/.hermes/chillspwn/mcp-runtime' "$ROOT/deployment/systemd/chillspwn.service" \
+  || ! grep -Fq 'Environment=MCP_ARSENAL_ALLOW_DOCKER=false' "$ROOT/deployment/systemd/chillspwn.service" \
   || ! grep -Fq 'Refusing mutable MCP arsenal setup as a non-root user' "$mcp_setup" \
   || grep -Fq 'sudo chown $USER' "$mcp_setup"; then
   echo "MCP arsenal immutable config/manifest/cwd/executable boundary is missing" >&2
@@ -361,4 +368,4 @@ if (( fail != 0 )); then
   exit 1
 fi
 
-echo "Snapshot structure, root-only secret injection, service paths, quiesced recovery, Mission Board bootstrap, and Grok OAuth/Expert/delegation guards verified."
+echo "Snapshot structure, hardened service paths, root-only secret injection, canonical memory, and Grok OAuth/Expert/delegation guards verified."

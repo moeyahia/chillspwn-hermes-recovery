@@ -19,6 +19,7 @@ const source = {
   CODEX_HOME: "/auth/codex",
   HERMES_HOME: "/auth/hermes",
   CHILLSPWN_HERMES_SRC: "/opt/chillspwn/hermes-agent",
+  CHILLSPWN_REPORT_TEMPLATE_DIR: "/opt/chillspwn/report-template",
   COUNCIL_CODEX_HERMES_HOME: "/auth/codex-hermes",
   COUNCIL_XAI_HERMES_HOME: "/auth/xai-hermes",
   COUNCIL_CLAUDE_USER: "council-claude",
@@ -35,6 +36,7 @@ const source = {
 describe("provider child environments", () => {
   test("Claude OAuth process receives no provider or dashboard API secrets", () => {
     const env = buildProviderChildEnv("claude", source);
+    expect(env.CHILLSPWN_REPORT_TEMPLATE_DIR).toBe("/opt/chillspwn/report-template");
     for (const key of ["DASHBOARD_TOKEN", "CHILLSPWN_DASHBOARD_TOKEN", "OPENROUTER_API_KEY", "GEMINI_API_KEY", "ANTHROPIC_API_KEY", "XAI_API_KEY", "UNRELATED_SENTINEL"]) {
       expect(env[key]).toBeUndefined();
     }

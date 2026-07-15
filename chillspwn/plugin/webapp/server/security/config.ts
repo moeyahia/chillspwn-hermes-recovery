@@ -36,6 +36,11 @@ export interface SecurityConfig {
   enableFileWrite: boolean;
   enableSecurityTools: boolean;
 
+  // ── retired unversioned execution compatibility (secure default = off) ──
+  // Covers legacy REST mutations, chat/terminal WebSocket commands, and the
+  // background Kanban/OSINT compatibility workers. Canonical /api/v2 is separate.
+  enableLegacyExecutionApi: boolean;
+
   // ── approval gates (enforced in Phase 3; recorded here in Phase 1) ──
   requireApprovalForTerminal: boolean;
   requireApprovalForFileWrite: boolean;
@@ -121,8 +126,8 @@ function parseIntDefault(v: string | undefined, dflt: number): number {
 }
 
 const DEFAULT_WORKSPACE_ROOTS = [
-  "/root/htb/boxes",
-  "/root/engagements",
+  "/var/lib/chillspwn/workspaces/htb/boxes",
+  "/var/lib/chillspwn/workspaces/engagements",
 ];
 
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "::1", "localhost", "::ffff:127.0.0.1"]);
@@ -181,6 +186,8 @@ export function loadSecurityConfig(env: NodeJS.ProcessEnv = process.env): Securi
     enableProxy: parseBool(env.ENABLE_PROXY, false),
     enableFileWrite: parseBool(env.ENABLE_FILE_WRITE, false),
     enableSecurityTools: parseBool(env.ENABLE_SECURITY_TOOLS, false),
+
+    enableLegacyExecutionApi: parseBool(env.ENABLE_LEGACY_EXECUTION_API, false),
 
     requireApprovalForTerminal: parseBool(env.REQUIRE_APPROVAL_FOR_TERMINAL, true),
     requireApprovalForFileWrite: parseBool(env.REQUIRE_APPROVAL_FOR_FILE_WRITE, true),
@@ -305,6 +312,14 @@ export function validateStartup(cfg: SecurityConfig): StartupCheck {
     warnings.push(
       "ENABLE_PROMPT_OBFUSCATION=true: legacy g0dm0d3/parseltongue prompt rewriting is ACTIVE. " +
         "This is unsafe and non-auditable; it is scheduled for removal. Disable unless you know why.",
+    );
+  }
+
+  if (cfg.enableLegacyExecutionApi) {
+    warnings.push(
+      "ENABLE_LEGACY_EXECUTION_API=true: unversioned REST mutations, legacy chat/terminal WebSocket commands, " +
+        "and compatibility background workers are ACTIVE. This bypasses the two-journey Command OS boundary; " +
+        "use only for a time-bounded, monitored rollback window.",
     );
   }
 

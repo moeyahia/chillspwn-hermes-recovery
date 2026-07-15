@@ -73,6 +73,22 @@ describe("16.2 stdio MCP client", () => {
     expect((await callServerTool({ ...spec, command: "sleep", args: ["30"] }, "x", {}, { timeoutMs: 800, allowDocker: false })).error).toContain("timed out");
     expect((await callServerTool({ ...spec, command: "/no/such/bin" }, "x", {}, { timeoutMs: 3000, allowDocker: false })).ok).toBe(false);
   });
+  test("cancellation terminates an in-flight MCP process group", async () => {
+    const controller = new AbortController();
+    const started = Date.now();
+    const pending = callServerTool(
+      { ...spec, command: "sleep", args: ["30"] },
+      "x",
+      {},
+      { timeoutMs: 30_000, allowDocker: false, signal: controller.signal },
+    );
+    setTimeout(() => controller.abort("test cancellation"), 50);
+    const result = await pending;
+    expect(result.error).toContain("cancelled");
+    // This proves abort won over the 30s hard timeout. The host may be heavily
+    // CPU-throttled in CI, so do not assert sub-second event-loop scheduling.
+    expect(Date.now() - started).toBeLessThan(25_000);
+  });
   test("third-party MCP receives only explicitly required environment", async () => {
     spec.args = [mockPath];
     spec.requiredEnv = [];

@@ -19,6 +19,7 @@ import {
   closeSync,
   fsyncSync,
   accessSync,
+  chmodSync,
   constants as fsConstants,
 } from "fs";
 import { spawn, ChildProcess, execFileSync } from "child_process";
@@ -39,6 +40,11 @@ import {
 import type { GodmodeConfig } from "./lib/g0dm0d3";
 // ── Agent runtime + security foundation (Phase 1) ──
 import { loadSecurityConfig, validateStartup, toPolicyConfig } from "./security/config";
+import {
+  createLegacyExecutionHttpGate,
+  legacyExecutionWebSocketError,
+  legacyWebSocketMutation,
+} from "./security/LegacyExecutionGate";
 import { createAuthMiddleware, isWsUpgradeAuthorized, tokenFreeRedirectTarget } from "./security/auth";
 import {
   safeSegment,
@@ -47,13 +53,22 @@ import {
 } from "./security/paths";
 import { boundedPositiveInteger, safeEngagementName, safeSessionId } from "./security/identifiers";
 import { normalizeOsintTarget, shellQuote, type OsintTargetType } from "./security/OsintTarget";
+import { configuredAbsoluteDirectory } from "./security/configuredPath";
 import { assertPassiveReportMarkup, reportAssetHeaders, REPORT_VIEW_CSP } from "./security/reportView";
 import { buildProviderChildEnv, type ProviderChildKind } from "./security/childEnv";
 import {
+  BoundedByteCapture,
+  BoundedSseParser,
   buildAnthropicRequestHeaders,
   buildAnthropicResponseHeaders,
   buildAnthropicUpstreamUrl,
-  redactProxyHeaders,
+  redactDiagnosticText,
+  redactDiagnosticValue,
+  sanitizeApiEvent,
+  sanitizeLlmLogEntry,
+  sha256Bytes,
+  summarizeAnthropicPayload,
+  summarizeAnthropicStreamEvent,
 } from "./security/anthropicProxy";
 import { EventLog } from "./runtime/EventLog";
 // ── Agent runtime lifecycle (Phase 2) ──
@@ -69,7 +84,11 @@ import {
   registerLegacyMemoryRoutes,
 } from "./runtime/LegacyMemoryBroker";
 import { executeBoardSqlWrite, quoteBoardSqlText } from "./runtime/BoardSql";
-import { claudeProjectsDir } from "./runtime/ProviderPaths";
+import { claudeProjectsDir, claudeStateDir } from "./runtime/ProviderPaths";
+import {
+  hasHermesCredentialProvider,
+  readHermesCredentialProviderNames,
+} from "./runtime/HermesCredentialReadiness";
 import { resolveEngagementWorkingDirectory } from "./runtime/EngagementScope";
 import {
   readOsintArtifact,
@@ -107,7 +126,7 @@ import { TrainingMemoryService } from "./runtime/TrainingMemoryService";
 import { buildTrainingLessonContext, isReusableLessonSafe } from "./runtime/AttackLesson";
 import { registerTrainingRoutes } from "./routes/trainingRoutes";
 import { registerAgentRoutes } from "./routes/agentRoutes";
-import { getAgent as getSpecialistAgent } from "./agents/agentRoster";
+import { AGENT_ROSTER, getAgent as getSpecialistAgent } from "./agents/agentRoster";
 import { canonicalBoardAssignee } from "./agents/BoardAssignee";
 import { classifySessionKind, structuredSessionName, filterSessionsForList, type ListFilterOpts } from "./agents/sessionLifecycle";
 import { registerMcpRoutes } from "./routes/mcpRoutes";
@@ -153,25 +172,70 @@ import {
 import {
   buildGrokCommanderEnv,
   buildGrokCommanderMcpServers,
+  buildGrokPlanningOnlyRules,
   createGrokCommanderLaunchRuntime,
   ensureGrokCommanderRuntime,
+  GROK_COMMANDER_BUN,
   resolveGrokOAuthAuthPath,
   validateGrokCommanderAssets,
 } from "./providers/GrokCommanderRuntime";
+import {
+  createCommandOsApplication,
+  createRuntimeReadinessProviders,
+  type CommandOsApplication,
+  type McpServerProjection,
+  type ProviderReadiness,
+  type RuntimeProjectionInput,
+  type RuntimeReadinessSnapshot,
+} from "./app";
+import {
+  createCommandOsRuntimeAdapters,
+  type CommandOsToolInventory,
+  type GrokOAuthTurnResult,
+} from "./app/CommandOsRuntimeAdapters";
+import {
+  createMissionRuntime,
+  type MissionRuntimeEngine,
+} from "./command-runtime";
+import { createMissionRuntimeV2Router } from "./routes/missionRuntimeV2Routes";
+import { createOperationsRouter } from "./routes/operationsRoutes";
+import { getDatabaseHealth } from "./db";
+import { createSecondBrainRouter } from "./memory/SecondBrainRouter";
+import { MemoryRepository } from "./memory";
+import {
+  ObsidianVaultBridge,
+  ObsidianVaultWatcher,
+  VaultPathPolicy,
+} from "./vault";
+import {
+  createGrokGuidedCommanderPort,
+  createGuidedCommanderRouter,
+} from "./guided-commander";
 
 
 // ── Constants ──────────────────────────────────────────────────────
 const PORT = parseInt(process.env.CHILLSPWN_PORT || "3131", 10);
-const HERMES_HOME = resolve(process.env.HERMES_HOME || resolve(process.env.HOME || "/root", ".hermes"));
-const HERMES_PYTHON = resolve(process.env.HERMES_PYTHON || "/root/hermes-venv/bin/python");
+const HERMES_HOME = resolve(
+  process.env.HERMES_HOME || resolve(process.env.HOME || "/var/lib/chillspwn", ".hermes"),
+);
+const HERMES_PYTHON = resolve(process.env.HERMES_PYTHON || "/opt/chillspwn-runtime/hermes-venv/bin/python");
 const CHILLSPWN_MEM_CLI = resolve(
   process.env.CHILLSPWN_MEM_CLI
     || join(HERMES_HOME, "skills/red-teaming/council-of-ais/scripts/chillspwn_mem.py"),
 );
 const CLAUDE_PROJECTS_DIR = claudeProjectsDir(process.env);
+const CLAUDE_STATE_DIR = claudeStateDir(process.env);
 const CHILLSPWN_PLUGIN_DIR = resolve(
   process.env.CHILLSPWN_PLUGIN_DIR || "/opt/chillspwn/plugin",
 );
+const CHILLSPWN_REPORT_TEMPLATE_DIR = configuredAbsoluteDirectory(
+  "CHILLSPWN_REPORT_TEMPLATE_DIR",
+  process.env.CHILLSPWN_REPORT_TEMPLATE_DIR,
+  "/opt/chillspwn/report-template",
+);
+// Provider subprocesses receive this through the explicit child-environment
+// allowlist, including when the deployment relies on the secure default.
+process.env.CHILLSPWN_REPORT_TEMPLATE_DIR = CHILLSPWN_REPORT_TEMPLATE_DIR;
 const CLAUDE_BIN_CONFIG = process.env.CLAUDE_BIN || "/usr/local/bin/claude";
 if (!isAbsolute(CLAUDE_BIN_CONFIG)) throw new Error("CLAUDE_BIN must be an absolute path");
 const CLAUDE_BIN = resolve(CLAUDE_BIN_CONFIG);
@@ -204,12 +268,13 @@ const GROK_COMMANDER_SOUL = resolve(import.meta.dir, "agents/personas/chillspwn-
 const GROK_OAUTH_AUTH_PATH = resolveGrokOAuthAuthPath(process.env);
 const GROK_COMMANDER_RUNTIME_ROOT = join(HERMES_HOME, "runtime", "grok-commander");
 
-function prepareGrokCommanderRuntime(label: string) {
+function prepareGrokCommanderRuntime(label: string, requireMcpScripts = true) {
   validateGrokCommanderAssets({
     profile: GROK_COMMANDER_PROFILE,
     pluginDir: GROK_COMMANDER_PLUGIN,
     soul: GROK_COMMANDER_SOUL,
     authPath: GROK_OAUTH_AUTH_PATH,
+    requireMcpScripts,
   });
   const runtime = createGrokCommanderLaunchRuntime(GROK_COMMANDER_RUNTIME_ROOT, label);
   ensureGrokCommanderRuntime(runtime, GROK_COMMANDER_GUARD);
@@ -380,11 +445,19 @@ for (const dir of [CHILLSPWN_LOG_DIR, SESSIONS_DIR]) {
 // ── Logging ─────────────────────────────────────────────────────────
 function log(level: string, msg: string, data?: any) {
   const ts = new Date().toISOString();
-  const line = `[${ts}] [${level.toUpperCase()}] ${msg}`;
-  const fullLine = data ? `${line} ${JSON.stringify(data)}` : line;
+  const safeLevel = String(level || "info").replace(/[^A-Za-z]/gu, "").slice(0, 16).toUpperCase() || "INFO";
+  const safeMessage = redactDiagnosticText(msg, 8_000);
+  const safeData = data === undefined ? undefined : redactDiagnosticValue(data);
+  const line = `[${ts}] [${safeLevel}] ${safeMessage}`;
+  let fullLine = line;
+  if (safeData !== undefined) {
+    try { fullLine = `${line} ${JSON.stringify(safeData)}`; }
+    catch { fullLine = `${line} {"diagnostic":"[UNSERIALIZABLE]"}`; }
+  }
   console.log(fullLine);
   try {
-    appendFileSync(LOG_FILE, fullLine + "\n");
+    appendFileSync(LOG_FILE, fullLine + "\n", { encoding: "utf8", mode: 0o600 });
+    chmodSync(LOG_FILE, 0o600);
   } catch {}
 }
 
@@ -494,15 +567,10 @@ function loadPersistedSession(sessionId: string): PersistedSession | null {
   }
 }
 
-// ── Raw LLM audit log ──────────────────────────────────────────────────────
-// One JSONL file per engagement at <cwd>/logs/llm_raw.jsonl capturing what the dashboard
-// sends to / receives from the LLM, one level above parsing. For the claude path we can't see
-// the CLI's literal HTTPS body (it's inside the closed binary), so the boundary we control is:
-//   request  = the full `claude` argv (incl. --system-prompt / --append-system-prompt) at spawn,
-//              plus each user turn written to stdin;
-//   response = each raw stdout stream-json line BEFORE we parse it.
-// Each entry is tagged provider/model/auth so claude (subscription OAuth) is distinguishable from
-// the OpenRouter path (which logs its own true wire payloads to the same file via the orchestrator).
+// ── Legacy LLM diagnostic log ──────────────────────────────────────────────
+// The historical filename remains for compatibility, but new entries retain
+// metadata, sizes, and content hashes only. Prompts, responses, tool arguments,
+// authentication material, and raw payloads are never written by this path.
 // Detect the engagement directory a session is working in by scanning its persisted
 // messages for a configured workspace-root path. Returns the engagement dir if found, else null. Used ONLY
 // to choose where raw LLM logs are filed — never changes how a backend runs.
@@ -550,13 +618,23 @@ function rawLlmLog(
     }
     const dir = base ? join(base, "logs") : join(CHILLSPWN_HOME, "llm-logs");
     mkdirSync(dir, { recursive: true });
-    const entry = {
+    const payloadBytes = Buffer.from(typeof payload === "string" ? payload : JSON.stringify(payload ?? null), "utf8");
+    let structuredPayload: unknown = payload;
+    if (typeof payload === "string") {
+      try { structuredPayload = JSON.parse(payload); } catch { structuredPayload = {}; }
+    }
+    const entry = sanitizeLlmLogEntry({
       ts: new Date().toISOString(),
       provider, auth, model, direction,
-      payload,
-      ...(extra || {}),
-    };
-    require("fs").appendFileSync(join(dir, "llm_raw.jsonl"), JSON.stringify(entry) + "\n");
+      payload: summarizeAnthropicPayload(structuredPayload, {
+        byteSize: payloadBytes.length,
+        sha256: sha256Bytes(payloadBytes),
+      }),
+      ...(redactDiagnosticValue(extra || {}) as Record<string, unknown>),
+    });
+    const output = join(dir, "llm_raw.jsonl");
+    require("fs").appendFileSync(output, JSON.stringify(entry) + "\n", { encoding: "utf8", mode: 0o600 });
+    chmodSync(output, 0o600);
   } catch { /* logging must never break a turn */ }
 }
 
@@ -567,7 +645,7 @@ function savePersistedSession(session: PersistedSession): void {
     // observe a half-written or doubled file ("Extra data" JSON corruption seen 2026-05-30).
     const target = sessionFilePath(session.id);
     const tmp = `${target}.tmp`;
-    writeFileSync(tmp, JSON.stringify(session, null, 2));
+    writeFileSync(tmp, JSON.stringify(session, null, 2), { encoding: "utf8", mode: 0o600 });
     require("fs").renameSync(tmp, target);
   } catch (e) {
     log("error", `Failed to save session ${session.id}`, e);
@@ -802,7 +880,7 @@ function buildClaudeArgs(persona: Persona): string[] {
     "--plugin-dir", CHILLSPWN_PLUGIN_DIR,
     // Grant access to the reviewed report template. Configured engagement roots
     // are appended below so custom deployments do not retain hard-coded paths.
-    "--add-dir", "/root/report-template",
+    "--add-dir", CHILLSPWN_REPORT_TEMPLATE_DIR,
     // Interactive session: standing ultracode (xhigh + dynamic-workflow
     // orchestration). The per-workflow auto-mode confirmation prompt is left
     // in place (skipWorkflowUsageWarning omitted) so spawning agents still
@@ -999,8 +1077,8 @@ function spawnClaude(
   try { mkdirSync(sessionLogDir, { recursive: true }); } catch {}
   const stdoutLogPath = sessionLogPath(sessionId, ".stdout.jsonl");
   const stderrLogPath = sessionLogPath(sessionId, ".stderr.log");
-  const stdoutFd = require("fs").openSync(stdoutLogPath, "w");
-  const stderrFd = require("fs").openSync(stderrLogPath, "w");
+  const stdoutFd = require("fs").openSync(stdoutLogPath, "w", 0o600);
+  const stderrFd = require("fs").openSync(stderrLogPath, "w", 0o600);
 
   // CRITICAL: stdout MUST go to a file (not a pipe) for true detachment.
   // Pipes are tied to the bun parent's FDs — when bun exits, claude gets
@@ -1459,10 +1537,53 @@ function buildGrokAcpBootstrap(persisted: PersistedSession, prompt: string): str
   ].filter(Boolean).join("\n\n");
 }
 
-/** One ACP turn for planning/preview flows that require a Promise<string>. */
-function callGrokAcpOAuth(prompt: string, model = "grok-4.5", cwd = process.cwd()): Promise<string> {
+/**
+ * One fenced, planning-only ACP turn. The optional cancellation signal is used
+ * by Command OS so pausing/cancelling a run also terminates the OAuth-backed
+ * Grok process tree instead of leaving an orphaned provider turn.
+ */
+function exactGrokAcpUsage(value: unknown): GrokOAuthTurnResult["usage"] | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const message = value as Record<string, any>;
+  const resultMeta = message.result?._meta;
+  const raw = resultMeta?.usage ?? message.result?.usage ?? message._meta?.usage ?? resultMeta;
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+  const number = (...names: string[]): number | undefined => {
+    for (const name of names) {
+      if (!Object.prototype.hasOwnProperty.call(raw, name)) continue;
+      const candidate = Number(raw[name]);
+      if (Number.isFinite(candidate) && candidate >= 0) return candidate;
+    }
+    return undefined;
+  };
+  const inputTokens = number("input_tokens", "inputTokens");
+  const outputTokens = number("output_tokens", "outputTokens");
+  const reportedTotal = number("total_tokens", "totalTokens");
+  const providerTokens = reportedTotal ?? (
+    inputTokens !== undefined && outputTokens !== undefined
+      ? inputTokens + outputTokens
+      : undefined
+  );
+  // Only accept an explicitly provider-reported actual/billed cost. Never
+  // derive money from a token count or local price table.
+  const estimatedCost = number("actual_cost", "actualCost", "billed_cost", "billedCost", "cost");
+  if (providerTokens === undefined && estimatedCost === undefined) return undefined;
+  return {
+    ...(inputTokens === undefined ? {} : { inputTokens }),
+    ...(outputTokens === undefined ? {} : { outputTokens }),
+    ...(providerTokens === undefined ? {} : { providerTokens }),
+    ...(estimatedCost === undefined ? {} : { estimatedCost }),
+  };
+}
+
+function callGrokAcpOAuthTurn(
+  prompt: string,
+  model = "grok-4.5",
+  cwd = process.cwd(),
+  signal?: AbortSignal,
+): Promise<GrokOAuthTurnResult> {
   return new Promise((resolve, reject) => {
-    const grokCommanderRuntime = prepareGrokCommanderRuntime("planner");
+    const grokCommanderRuntime = prepareGrokCommanderRuntime("planner", false);
     const env = buildGrokCommanderEnv(
       process.env,
       grokCommanderRuntime,
@@ -1476,6 +1597,7 @@ function callGrokAcpOAuth(prompt: string, model = "grok-4.5", cwd = process.cwd(
     }), { stdio: ["pipe", "pipe", "pipe"], cwd: grokCommanderRuntime.cwd, env });
     let id = 0, sessionId = "", text = "", buffer = "", settled = false;
     let promptResult: any = null;
+    let finalUsage: GrokOAuthTurnResult["usage"] | undefined;
     let runningPromptId: string | null = null;
     let drainTimer: ReturnType<typeof setTimeout> | null = null;
     let profileAttested = false;
@@ -1494,11 +1616,13 @@ function callGrokAcpOAuth(prompt: string, model = "grok-4.5", cwd = process.cwd(
       if (drainTimer) clearTimeout(drainTimer);
       drainTimer = null;
     };
+    let abortListener: (() => void) | null = null;
     const finish = (err?: Error) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
       clearDrain();
+      if (signal && abortListener) signal.removeEventListener("abort", abortListener);
       const finalText = text;
       void shutdownProcessTree(proc.pid, {
         requestGracefulStop: () => {
@@ -1519,10 +1643,17 @@ function callGrokAcpOAuth(prompt: string, model = "grok-4.5", cwd = process.cwd(
       }).catch((cleanupError: any) => {
         log("error", "Grok ACP planning process cleanup failed", { error: cleanupError?.message || String(cleanupError) });
       }).finally(() => {
-        err ? reject(err) : resolve(finalText);
+        err ? reject(err) : resolve({ text: finalText, ...(finalUsage ? { usage: finalUsage } : {}) });
       });
     };
     const timer = setTimeout(() => finish(new Error("Grok ACP planning call timed out")), 180_000);
+    abortListener = () => {
+      const error = new Error("Grok ACP planning call was cancelled");
+      error.name = "AbortError";
+      finish(error);
+    };
+    if (signal?.aborted) abortListener();
+    else if (signal) signal.addEventListener("abort", abortListener, { once: true });
     const write = (message: any) => {
       if (!writeWire(message)) finish(new Error("Grok ACP planning stdin closed"));
     };
@@ -1543,6 +1674,7 @@ function callGrokAcpOAuth(prompt: string, model = "grok-4.5", cwd = process.cwd(
       if (settled || !promptResult || runningPromptId) return;
       const result = promptResult;
       promptResult = null;
+      finalUsage = exactGrokAcpUsage(result);
       const outcome = classifyGrokStopReason(result.result?.stopReason);
       if (outcome === "completed") finish();
       else finish(new Error(`Grok ACP planning did not complete (${outcome})`));
@@ -1637,7 +1769,7 @@ function callGrokAcpOAuth(prompt: string, model = "grok-4.5", cwd = process.cwd(
             rpc("session/new", {
               cwd: grokCommanderRuntime.cwd,
               mcpServers: [],
-              _meta: { rules: GROK_PLANNING_ONLY_RULES },
+              _meta: { rules: buildGrokPlanningOnlyRules(GROK_COMMANDER_SOUL) },
             });
           } else if (method === "session/new") {
             sessionId = msg.result?.sessionId;
@@ -1651,6 +1783,7 @@ function callGrokAcpOAuth(prompt: string, model = "grok-4.5", cwd = process.cwd(
               msg.result,
               GROK_COMMANDER_GUARD,
               join(grokCommanderRuntime.grokHome, "hooks"),
+              GROK_COMMANDER_BUN,
             );
             if (!attestation.ok) finish(new Error(`Grok ACP planning boundary attestation failed: ${attestation.reason}`));
             else {
@@ -1698,6 +1831,15 @@ function callGrokAcpOAuth(prompt: string, model = "grok-4.5", cwd = process.cwd(
     });
     rpc("initialize", grokAcpInitializeParams());
   });
+}
+
+function callGrokAcpOAuth(
+  prompt: string,
+  model = "grok-4.5",
+  cwd = process.cwd(),
+  signal?: AbortSignal,
+): Promise<string> {
+  return callGrokAcpOAuthTurn(prompt, model, cwd, signal).then((result) => result.text);
 }
 
 function persistGrokToolEvent(session: LiveSession, update: any): void {
@@ -2510,6 +2652,7 @@ function spawnGrokAcp(
               data.result,
               GROK_COMMANDER_GUARD,
               join(grokCommanderRuntime!.grokHome, "hooks"),
+              GROK_COMMANDER_BUN,
             );
             if (!attestation.ok) {
               failTurn(`Grok ACP commander boundary attestation failed: ${attestation.reason}`);
@@ -2710,13 +2853,6 @@ function buildGrokSessionRules(persona: Persona, commanderBoundary: boolean): st
   return commanderBoundary ? buildGrokCommanderSystemPrompt() : buildOpenRouterSystemPrompt(persona);
 }
 
-const GROK_PLANNING_ONLY_RULES = [
-  "You are a planning-only Grok ACP caller inside ChillsPwn.",
-  "Return analysis or a structured plan from the supplied context.",
-  "Do not execute commands, edit/read files, call native subagents, or invoke specialist MCP tools.",
-  "If evidence is needed, identify the specialist that the ChillsPwn commander should delegate to.",
-].join("\n");
-
 // Observability (Task 2a): before an OpenRouter turn truncates its per-turn stdout
 // log with openSync("w"), archive the prior turn's bytes to a rotating .<ts>.bak so
 // post-mortems survive. The live log path + truncate semantics are unchanged, so the
@@ -2727,7 +2863,7 @@ function archiveOrStdoutLog(stdoutLogPath: string): void {
       const prev = readFileSync(stdoutLogPath);
       if (prev && prev.length > 0) {
         const ts = new Date().toISOString().replace(/[:.]/g, "-");
-        writeFileSync(`${stdoutLogPath}.${ts}.bak`, prev);
+        writeFileSync(`${stdoutLogPath}.${ts}.bak`, prev, { mode: 0o600 });
       }
     }
   } catch (e: any) {
@@ -2754,10 +2890,10 @@ function spawnOpenRouter(
   const stdoutLogPath = sessionLogPath(sessionId, ".stdout.jsonl");
   const stderrLogPath = sessionLogPath(sessionId, ".stderr.log");
   const systemFile = sessionLogPath(sessionId, ".system.txt");
-  try { writeFileSync(systemFile, buildOpenRouterSystemPrompt(persona)); } catch {}
+  try { writeFileSync(systemFile, buildOpenRouterSystemPrompt(persona), { encoding: "utf8", mode: 0o600 }); } catch {}
   archiveOrStdoutLog(stdoutLogPath);
-  const stdoutFd = require("fs").openSync(stdoutLogPath, "w");
-  const stderrFd = require("fs").openSync(stderrLogPath, "w");
+  const stdoutFd = require("fs").openSync(stdoutLogPath, "w", 0o600);
+  const stderrFd = require("fs").openSync(stderrLogPath, "w", 0o600);
 
   // Create or load persisted session, then record the user message BEFORE spawning so
   // the orchestrator (which seeds history from this file) sees the new prompt as the turn.
@@ -3435,8 +3571,29 @@ function interruptSession(sessionId: string, newPrompt: string | undefined, ws: 
 // ── Express app ────────────────────────────────────────────────────
 const app = express();
 app.use((_req, res, next) => {
+  res.setHeader(
+    "Content-Security-Policy",
+    [
+      "default-src 'self'",
+      "base-uri 'self'",
+      "object-src 'none'",
+      "frame-ancestors 'none'",
+      "form-action 'self'",
+      "script-src 'self'",
+      "style-src 'self' 'unsafe-inline'",
+      "img-src 'self' data: blob:",
+      "font-src 'self' data:",
+      "connect-src 'self' ws: wss:",
+      "media-src 'self' blob:",
+      "worker-src 'self' blob:",
+      "manifest-src 'self'",
+    ].join("; "),
+  );
   res.setHeader("Referrer-Policy", "no-referrer");
   res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Frame-Options", "DENY");
+  res.setHeader("Permissions-Policy", "camera=(), geolocation=(), microphone=(), payment=(), usb=()");
+  res.setHeader("Cross-Origin-Opener-Policy", "same-origin");
   next();
 });
 // IMPORTANT: raw body parser for /proxy must register BEFORE the json
@@ -3460,28 +3617,17 @@ app.use((req, res, next) => {
   next();
 });
 
+// Command OS V2 owns every production mutation. Historical unversioned reads
+// remain available for reconciliation, but legacy REST mutations and /proxy
+// fail closed unless an operator explicitly opens the compatibility window.
+app.use(createLegacyExecutionHttpGate({
+  enabled: SECURITY.enableLegacyExecutionApi,
+  audit: (event) => auditSecurity("legacy_execution_blocked", event),
+}));
+
 // Body parsers (run only for requests that passed auth above).
 app.use("/proxy", express.raw({ type: "*/*", limit: "50mb" }));
 app.use(express.json({ limit: "10mb" }));
-
-// ── Client-side log beacon (diagnostics) ──────────────────────────────────────
-// The iPad PWA's Safari console isn't reachable from the server, so the frontend
-// ships its own errors + lifecycle events here (window.onerror, unhandledrejection,
-// pageshow/visibilitychange, WS connect/close, resume reconnect, message count,
-// memory). Appended to client-logs.jsonl for post-mortem of the "blank screen on
-// resume" report. Best-effort; never throws.
-app.post("/api/client-log", (req, res) => {
-  try {
-    const entries = Array.isArray(req.body) ? req.body : [req.body];
-    const ip = (req.headers["x-forwarded-for"] as string) || req.socket.remoteAddress || "";
-    const ua = (req.headers["user-agent"] as string) || "";
-    const line = entries
-      .map((e) => JSON.stringify({ at: new Date().toISOString(), ip, ua, ...e }))
-      .join("\n") + "\n";
-    require("fs").appendFileSync(join(CHILLSPWN_HOME, "client-logs.jsonl"), line);
-  } catch {}
-  res.status(204).end();
-});
 
 // Serve built frontend in production.
 // index.html: no-store so an iOS PWA can never launch a STALE index that references a
@@ -3528,7 +3674,16 @@ if (existsSync(distDir)) {
 
 // Health check
 app.get("/api/health", (_, res) => {
-  res.json({ status: "ok", uptime: process.uptime(), sessions: liveSessions.size });
+  res.json({
+    status: "ok",
+    uptime: process.uptime(),
+    sessions: liveSessions.size,
+    journeys: ["autonomous", "guided"],
+    legacyExecution: {
+      enabled: SECURITY.enableLegacyExecutionApi,
+      mode: SECURITY.enableLegacyExecutionApi ? "compatibility-opt-in" : "read-only",
+    },
+  });
 });
 
 // Personas
@@ -4334,7 +4489,7 @@ function spawnClaudeAgentForCard(task: any, persona: Persona, cwd?: string): voi
   const sessionLogDir = resolve(CHILLSPWN_HOME, "session-logs");
   try { mkdirSync(sessionLogDir, { recursive: true }); } catch {}
   const stdoutLogPath = sessionLogPath(sessionId, ".stdout.jsonl");
-  const stdoutFd = require("fs").openSync(stdoutLogPath, "w");
+  const stdoutFd = require("fs").openSync(stdoutLogPath, "w", 0o600);
   const runCwd = cwd || process.cwd();
   const append = persona.appendSystemPrompt || `You are the ${persona.name} agent.`;
   const prompt = `Task: ${task.title}${task.body ? `\n\nDetails:\n${task.body}` : ""}\n\nYou are the "${persona.name}" agent. Complete this task autonomously with your tools, then end your reply with <<OBJECTIVE_COMPLETE>> on its own line followed by a concise result. If an operator decision is genuinely required, emit one valid <user-question> JSON block instead.`;
@@ -5067,6 +5222,404 @@ registerAssetRoutes(app, {
   env: () => process.env,
 });
 
+// ── Command OS V2.1 canonical application ─────────────────────────
+// During the compatibility window this router is mounted beside the legacy
+// APIs, but its mission/run/event/memory records are owned by one transactional
+// SQLite database. Readiness is derived from live policy/provider/MCP facts and
+// remains fail-closed until the durable coordinator is connected below.
+let commandOsApplication: CommandOsApplication | null = null;
+let commandOsMissionRuntime: MissionRuntimeEngine | null = null;
+let obsidianVaultWatcher: ObsidianVaultWatcher | null = null;
+let commandOsDurableBoundaryActive = false;
+
+/**
+ * Project only the specialist/tool bindings that the live MCP bridge can
+ * actually dispatch. The planning-only Grok commander receives this bounded
+ * inventory; it never receives a shell or an MCP connection of its own.
+ */
+function commandOsToolInventory(): CommandOsToolInventory[] {
+  const planningOnlySpecialists = AGENT_ROSTER.map((agent) => ({
+    agentId: agent.agentId,
+    role: agent.specialty,
+    description: agent.description,
+    mcpServer: "",
+    toolNames: [] as string[],
+    safetyBoundaries: agent.safetyBoundaries,
+  }));
+  try {
+    const bridge = getMcpBridge();
+    if (!bridge?.isEnabled() || !SECURITY.mcpArsenalStartServers) return planningOnlySpecialists;
+
+    const inventory: CommandOsToolInventory[] = [...planningOnlySpecialists];
+    for (const { spec, health } of bridge.listServers()) {
+      if (health.state !== "healthy" && health.state !== "configured") continue;
+      for (const assignedAgentId of spec.assignedAgents) {
+        const agent = getSpecialistAgent(assignedAgentId);
+        const view = bridge.toolsForSpecialist(assignedAgentId);
+        const serverView = view?.servers.find((server) => server.name === spec.name);
+        if (!agent || !view || !serverView) continue;
+        const toolNames = serverView.tools.filter((toolName) =>
+          view.availableTools.includes(toolName)
+          && spec.toolNames.includes(toolName)
+          && !agent.deniedTools.includes(toolName));
+        if (toolNames.length === 0) continue;
+        inventory.push({
+          agentId: agent.agentId,
+          role: agent.specialty,
+          description: agent.description,
+          mcpServer: spec.name,
+          toolNames,
+          safetyBoundaries: agent.safetyBoundaries,
+        });
+      }
+    }
+    return inventory;
+  } catch (error: any) {
+    log("warn", "Command OS specialist inventory is unavailable; autonomy remains fail-closed", {
+      error: String(error?.message || error).slice(0, 500),
+    });
+    return planningOnlySpecialists;
+  }
+}
+
+function commandOsProviderReadiness(): ProviderReadiness[] {
+  let grokHealth: ProviderReadiness["health"] = "unhealthy";
+  let grokAuthenticated = false;
+  let grokReason = "Grok OAuth or the isolated ACP commander boundary is unavailable";
+  try {
+    trustedGrokBin();
+    validateGrokCommanderAssets({
+      profile: GROK_COMMANDER_PROFILE,
+      pluginDir: GROK_COMMANDER_PLUGIN,
+      soul: GROK_COMMANDER_SOUL,
+      authPath: GROK_OAUTH_AUTH_PATH,
+    });
+    grokHealth = "healthy";
+    grokAuthenticated = true;
+    grokReason = "OAuth state and the isolated ACP commander assets passed local validation";
+  } catch (error: any) {
+    grokReason = String(error?.message || grokReason).replaceAll(resolve(process.env.HOME || "/var/lib/chillspwn"), "~").slice(0, 500);
+  }
+
+  const credentialProviders = readHermesCredentialProviderNames(resolve(HERMES_HOME, "auth.json"));
+  const orchestratorAvailable = existsSync(HERMES_PYTHON) && existsSync(ORCHESTRATOR_OR);
+  const codexConfigured = orchestratorAvailable
+    && hasHermesCredentialProvider(credentialProviders, "openai-codex");
+  const openRouterConfigured = orchestratorAvailable && (
+    resolveOpenRouterKey().length > 0
+    || hasHermesCredentialProvider(credentialProviders, "openrouter")
+  );
+  const geminiConfigured = orchestratorAvailable && (
+    Boolean(process.env.GEMINI_API_KEY?.trim())
+    || hasHermesCredentialProvider(credentialProviders, "gemini")
+  );
+  const claudeConfigured = existsSync(CLAUDE_BIN)
+    && existsSync(join(CLAUDE_STATE_DIR, ".credentials.json"))
+    && existsSync(CLAUDE_PROJECTS_DIR);
+  const legacyGateEnforced = SECURITY.enableOpenrouterRuntimeGating
+    && SECURITY.openrouterGateMode === "enforce";
+  const strongBoundary = commandOsDurableBoundaryActive
+    && SECURITY.enforceChillspwnDelegation
+    && SECURITY.enforceChillspwnNoHands
+    && !SECURITY.allowChillspwnDirectTools
+    && SECURITY.requireSpecialistAssignment;
+
+  return [
+    {
+      id: "grok-acp",
+      health: grokHealth,
+      authenticated: grokAuthenticated,
+      supportsGuided: grokAuthenticated,
+      enforcesAutonomousBoundary: grokAuthenticated && strongBoundary,
+      reportsExactTokenUsage: true,
+      reportsExactCostUsage: false,
+      reason: grokReason,
+    },
+    {
+      id: "codex-oauth",
+      health: codexConfigured ? "degraded" : "unhealthy",
+      authenticated: codexConfigured,
+      supportsGuided: codexConfigured,
+      enforcesAutonomousBoundary: codexConfigured && strongBoundary && legacyGateEnforced,
+      reportsExactTokenUsage: false,
+      reportsExactCostUsage: false,
+      reason: codexConfigured
+        ? "Local OAuth state is present; no live provider turn was performed by readiness"
+        : "Codex OAuth state or executable is unavailable",
+    },
+    {
+      id: "openrouter",
+      health: openRouterConfigured ? "degraded" : "unhealthy",
+      authenticated: openRouterConfigured,
+      supportsGuided: openRouterConfigured,
+      enforcesAutonomousBoundary: openRouterConfigured && strongBoundary && legacyGateEnforced,
+      reportsExactTokenUsage: false,
+      reportsExactCostUsage: false,
+      reason: openRouterConfigured
+        ? "An injected API credential is present; no network probe was performed by readiness"
+        : "No OpenRouter credential is configured",
+    },
+    {
+      id: "gemini",
+      health: geminiConfigured ? "degraded" : "unhealthy",
+      authenticated: geminiConfigured,
+      supportsGuided: geminiConfigured,
+      enforcesAutonomousBoundary: geminiConfigured && strongBoundary && legacyGateEnforced,
+      reportsExactTokenUsage: false,
+      reportsExactCostUsage: false,
+      reason: geminiConfigured
+        ? "An injected API credential is present; no network probe was performed by readiness"
+        : "No Gemini credential is configured",
+    },
+    {
+      id: "claude-oauth",
+      health: claudeConfigured ? "degraded" : "unhealthy",
+      authenticated: claudeConfigured,
+      supportsGuided: claudeConfigured,
+      enforcesAutonomousBoundary: false,
+      reportsExactTokenUsage: false,
+      reportsExactCostUsage: false,
+      reason: claudeConfigured
+        ? "The subscription CLI state is present; this legacy path is advisory for Command OS"
+        : "Claude subscription state or executable is unavailable",
+    },
+  ];
+}
+
+function commandOsMcpProjection(): {
+  readiness: RuntimeReadinessSnapshot["mcp"];
+  servers: McpServerProjection[];
+} {
+  const bridge = getMcpBridge();
+  if (!bridge) {
+    return {
+      readiness: {
+        enabled: false,
+        executionMode: "disabled",
+        startPermitted: false,
+        configuredServers: 0,
+        runnableServers: 0,
+        missingDependencies: 0,
+        missingSecrets: 0,
+      },
+      servers: [],
+    };
+  }
+  const records = bridge.listServers();
+  const health = records.map((record) => record.health);
+  const serverStatus = (state: string): McpServerProjection["status"] => {
+    if (state === "healthy") return "healthy";
+    if (state === "configured" || state === "starting") return "degraded";
+    if (state === "disabled" || state === "failed" || state === "stopped"
+      || state === "missing_dependency" || state === "missing_secret") return "offline";
+    return "unknown";
+  };
+  return {
+    readiness: {
+      enabled: SECURITY.enableMcpArsenal,
+      executionMode: bridge.mode,
+      startPermitted: SECURITY.mcpArsenalStartServers,
+      configuredServers: records.length,
+      runnableServers: health.filter((item) => item.state === "healthy" || item.state === "configured").length,
+      missingDependencies: health.filter((item) => item.state === "missing_dependency").length,
+      missingSecrets: health.filter((item) => item.state === "missing_secret").length,
+    },
+    servers: records.map(({ spec, health: serverHealth }) => ({
+      id: `mcp:${spec.name.replace(/[^A-Za-z0-9._-]+/gu, "-")}`,
+      name: spec.name,
+      transport: spec.runtime,
+      endpointRedacted: `local ${spec.runtime}`,
+      status: serverStatus(serverHealth.state),
+      capabilities: spec.toolNames,
+      policy: {
+        enabled: spec.enabled,
+        assignedAgents: spec.assignedAgents,
+        riskClass: spec.riskClass ?? "unspecified",
+        startPermitted: SECURITY.mcpArsenalStartServers,
+      },
+    })),
+  };
+}
+
+function commandOsRuntimeSnapshot(): RuntimeReadinessSnapshot {
+  const mcp = commandOsMcpProjection().readiness;
+  let secondBrain: RuntimeReadinessSnapshot["secondBrain"] = "unknown";
+  try {
+    secondBrain = commandOsApplication && getDatabaseHealth(commandOsApplication.database).healthy
+      ? "healthy"
+      : "unhealthy";
+  } catch {
+    secondBrain = "unhealthy";
+  }
+  return {
+    actionBoundaryActive: commandOsDurableBoundaryActive,
+    delegationEnforced: SECURITY.enableSpecialistAgentRouting && SECURITY.enforceChillspwnDelegation,
+    noHandsCommanderEnforced: SECURITY.enforceChillspwnNoHands,
+    directCommanderToolsDenied: !SECURITY.allowChillspwnDirectTools,
+    specialistAssignmentRequired: SECURITY.requireSpecialistAssignment,
+    specialistsConfigured: SECURITY.enableSpecialistAgentRouting ? AGENT_ROSTER.length : 0,
+    providers: commandOsProviderReadiness(),
+    mcp,
+    eventStream: commandOsApplication?.eventStream.isStarted ? "healthy" : "unhealthy",
+    secondBrain,
+    legacyExecutionEnabled: SECURITY.enableLegacyExecutionApi,
+  };
+}
+
+function commandOsRuntimeProjection(): RuntimeProjectionInput {
+  const readiness = commandOsRuntimeSnapshot();
+  const mcp = commandOsMcpProjection();
+  const agentStatus = !SECURITY.enableSpecialistAgentRouting
+    ? "offline" as const
+    : commandOsDurableBoundaryActive
+      ? "available" as const
+      : "degraded" as const;
+  return {
+    readiness,
+    agents: AGENT_ROSTER.map((agent) => ({
+      id: agent.agentId,
+      role: agent.specialty,
+      displayName: agent.displayName,
+      status: agentStatus,
+      providerPolicy: { defaultProvider: agent.defaultProvider },
+      toolPolicy: {
+        allowedTools: agent.allowedTools,
+        deniedTools: agent.deniedTools,
+        approvalRequiredTools: agent.approvalRequiredTools,
+      },
+      configuration: {
+        personaId: agent.personaId,
+        allowedMcpServers: agent.allowedMcpServers,
+        outputContract: agent.outputContract,
+        evidenceRequirements: agent.evidenceRequirements,
+        safetyBoundaries: agent.safetyBoundaries,
+        canProposeLessons: agent.canProposeTrainingLessons,
+        canApproveLessons: agent.canApproveTrainingLessons,
+      },
+      version: "2.1",
+      capabilities: agent.allowedTools.map((name) => ({
+        name,
+        source: "reviewed-roster",
+        enabled: true,
+      })),
+    })),
+    mcpServers: mcp.servers,
+  };
+}
+
+commandOsApplication = createCommandOsApplication({
+  databasePath: resolve(process.env.COMMAND_OS_DB_PATH || join(RUNTIME_DATA_DIR, "command-os-v2.sqlite")),
+  readinessProviders: () => createRuntimeReadinessProviders(commandOsRuntimeSnapshot),
+  runtimeProjection: commandOsRuntimeProjection,
+  resolveActor: () => "operator:local",
+  resolveEventSensitivity: () => "restricted",
+});
+app.use(commandOsApplication.router);
+const commandOsVaultRoot = resolve(
+  process.env.CHILLSPWN_VAULT_ROOT || join(CHILLSPWN_HOME, "brain-vaults"),
+);
+const commandOsVaultPathPolicy = new VaultPathPolicy(commandOsVaultRoot);
+const commandOsVaultBridge = new ObsidianVaultBridge(
+  commandOsApplication.database,
+  new MemoryRepository(commandOsApplication.database),
+  commandOsVaultPathPolicy,
+);
+obsidianVaultWatcher = new ObsidianVaultWatcher(
+  commandOsApplication.database,
+  commandOsVaultBridge,
+  {
+    actor: "operator:local",
+    onError: (_error, context) => log("warn", "Obsidian vault watcher degraded", {
+      connectionId: context.connectionId ?? "unknown",
+    }),
+  },
+);
+app.use(createSecondBrainRouter({
+  database: commandOsApplication.database,
+  resolveActor: () => "operator:local",
+  // The current deployment is an authenticated single-operator workspace. The
+  // access policy is explicit so the router never guesses scope or sensitivity.
+  resolveAccess: () => ({
+    maximumSensitivity: "restricted",
+    allowGlobal: true,
+    allEngagements: true,
+  }),
+  vaultAllowedRoot: commandOsVaultRoot,
+  vaultPathPolicy: commandOsVaultPathPolicy,
+  vaultBridge: commandOsVaultBridge,
+  onVaultConnectionChanged: () => obsidianVaultWatcher?.refreshConnections(),
+}));
+app.use(createGuidedCommanderRouter({
+  database: commandOsApplication.database,
+  resolveActor: () => "operator:local",
+  port: createGrokGuidedCommanderPort({
+    model: "grok-4.5",
+    callGrok: (prompt, signal) => callGrokAcpOAuth(
+      prompt,
+      "grok-4.5",
+      process.cwd(),
+      signal,
+    ),
+  }),
+  options: {
+    maximumMemorySensitivity: "private",
+    memoryContextBudget: 6_000,
+    memoryContextLimit: 8,
+    transcriptContextLimit: 24,
+  },
+}));
+
+const commandOsRuntimeAdapters = createCommandOsRuntimeAdapters({
+  database: commandOsApplication.database,
+  callGrok: (prompt, signal) => callGrokAcpOAuthTurn(prompt, "grok-4.5", process.cwd(), signal),
+  inventory: commandOsToolInventory,
+  executeMcp: async (input) => {
+    const bridge = getMcpBridge();
+    if (!bridge?.isEnabled() || !SECURITY.mcpArsenalStartServers) {
+      throw new Error("The enforced specialist MCP execution boundary is unavailable");
+    }
+    return bridge.execute(input);
+  },
+});
+commandOsMissionRuntime = createMissionRuntime({
+  database: commandOsApplication.database,
+  ...commandOsRuntimeAdapters,
+  workerId: `command-os:${os.hostname()}:${process.pid}`,
+});
+app.use(createMissionRuntimeV2Router({
+  runtime: commandOsMissionRuntime,
+  resolveActor: () => "operator:local",
+}));
+app.use(createOperationsRouter({
+  database: commandOsApplication.database,
+  resolveActor: () => ({ id: "operator:local", type: "admin" }),
+  // The host auth middleware already gates this single-operator deployment.
+  // Supplying scope explicitly keeps the operations module tenant-safe and
+  // avoids deriving authorization from user-controlled query parameters.
+  resolveAccess: () => ({
+    maximumSensitivity: "restricted",
+    allEngagements: true,
+    allowUnscopedSystemData: true,
+    allowGlobalKnowledge: true,
+    canReviewFindings: true,
+    canOverrideEvidenceGate: true,
+    canReviewLessons: true,
+  }),
+}));
+
+// This projection is deliberately fail-closed. It becomes true only when the
+// durable coordinator, strict no-hands policy, and a real executable specialist
+// inventory all exist. Provider OAuth alone is never advertised as autonomy.
+commandOsDurableBoundaryActive = Boolean(
+  commandOsMissionRuntime
+  && SECURITY.enableSpecialistAgentRouting
+  && SECURITY.enforceChillspwnDelegation
+  && SECURITY.enforceChillspwnNoHands
+  && !SECURITY.allowChillspwnDirectTools
+  && SECURITY.requireSpecialistAssignment
+  && commandOsToolInventory().some((binding) => Boolean(binding.mcpServer) && binding.toolNames.length > 0),
+);
+
 // ── Phase 7.1: chat ↔ agent-runtime integration (observe-only) ────────────────────────
 // Seam A creates/attaches an OBSERVE-ONLY AgentRun per chat session; the SessionObserver
 // (Seam B) tails the stdout JSONL the chat path already writes and records provider turns +
@@ -5348,6 +5901,7 @@ app.post("/api/runs/:id/start-observed-execution", (req, res) => {
 // Feature flags for the client (drives launcher visibility). Auth-gated (non-sensitive booleans).
 app.get("/api/runtime/flags", (_req, res) => {
   res.json({
+    legacyExecutionEnabled: SECURITY.enableLegacyExecutionApi,
     managedChatEnabled: SECURITY.enableRuntimeManagedChat,
     planningEnabled: SECURITY.chatAgentPlanning !== "off",
     requirePlanApproval: SECURITY.requirePlanApproval,
@@ -5571,7 +6125,9 @@ app.get("/api/logs/:name", (req, res) => {
   if (!allowed.includes(name)) return res.status(400).json({ error: "invalid log" });
   const path = name === "dashboard.log" ? LOG_FILE : join(LOG_DIR, name);
   if (!existsSync(path)) return res.json({ lines: [] });
-  const raw = execFileSync("tail", ["-n", "200", "--", path], { encoding: "utf-8" }).split("\n");
+  const raw = execFileSync("tail", ["-n", "200", "--", path], { encoding: "utf-8" })
+    .split("\n")
+    .map((line) => redactDiagnosticText(line, 16_000));
   // Filter out HTML/SVG/binary junk from old API error responses — only keep real log lines
   const lines = raw.filter((line: string) => {
     const trimmed = line.trim();
@@ -5646,114 +6202,91 @@ function readJsonl(path: string, onLine: (line: string, idx: number) => boolean 
   }
 }
 
-// Build a Splunk-style one-line summary for an event.
+function apiTokensFromUsage(value: unknown): ApiEventTokens | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const usage = value as Record<string, unknown>;
+  const number = (name: string): number | undefined => {
+    const candidate = usage[name];
+    return typeof candidate === "number" && Number.isFinite(candidate) && candidate >= 0
+      ? candidate
+      : undefined;
+  };
+  const tokens: ApiEventTokens = {
+    in: number("input_tokens"),
+    out: number("output_tokens"),
+    cacheRead: number("cache_read_input_tokens"),
+    cacheCreation: number("cache_creation_input_tokens"),
+  };
+  return Object.values(tokens).some((entry) => entry !== undefined) ? tokens : undefined;
+}
+
+// Build a content-free, Splunk-style one-line summary from a sanitized event.
 function summarizeApiEvent(ev: any): { summary: string; toolName?: string; model?: string; tokens?: ApiEventTokens; endpoint?: string; method?: string } {
   const t = ev.type;
+  const model = typeof ev.model === "string" ? ev.model : undefined;
+  const tokens = apiTokensFromUsage(ev.usage ?? ev.stream?.usage);
+  const digest = typeof ev.sha256 === "string" ? ev.sha256.slice(0, 12) : "unknown";
   if (t === "system") {
     if (ev.subtype === "init") {
-      // Proxy-captured request — show HTTP method + path + model
       if (ev.proxy) {
-        const path = (ev.upstream_url || "").replace(/^https?:\/\/[^/]+/, "").split("?")[0];
+        const endpoint = typeof ev.upstreamPath === "string" ? ev.upstreamPath : undefined;
         return {
-          summary: `→ ${ev.method || "?"} ${path}  model=${ev.model || "?"}`,
-          model: ev.model,
-          endpoint: path,
+          summary: `→ ${ev.method || "?"} ${endpoint || "?"}  model=${model || "?"}  body omitted`,
+          model,
+          endpoint,
           method: ev.method,
         };
       }
-      return { summary: `INIT  model=${ev.model || "?"}  cwd=${ev.cwd || "?"}`, model: ev.model };
+      return { summary: `INIT  model=${model || "?"}  content omitted`, model };
     }
     if (ev.subtype === "hook_started" || ev.subtype === "hook_response") {
-      return { summary: `${ev.subtype}  ${ev.hook_name || ev.hook_event || ""}` };
+      return { summary: `${ev.subtype}  ${ev.hookName || ""}  content omitted` };
     }
     if (ev.subtype === "thinking_tokens") {
-      return { summary: `thinking ~${ev.estimated_tokens || 0} tok` };
+      return { summary: `thinking ~${ev.estimatedTokens || 0} tok  content omitted` };
     }
-    return { summary: `system/${ev.subtype || "?"}` };
+    return { summary: `system/${ev.subtype || "?"}  content omitted` };
   }
-  // Proxy: streaming SSE event
   if (t === "sse_event") {
-    const p = ev.payload || {};
-    const u = p.usage || p.message?.usage;
-    const tokens: ApiEventTokens | undefined = u ? {
-      in: u.input_tokens,
-      out: u.output_tokens,
-      cacheRead: u.cache_read_input_tokens,
-      cacheCreation: u.cache_creation_input_tokens,
-    } : undefined;
-    // Highlight the most useful streaming events
-    if (ev.sse_type === "content_block_delta") {
-      const text = p.delta?.text || p.delta?.partial_json || "";
-      return { summary: `Δ ${String(text).slice(0, 160).replace(/\s+/g, " ")}` };
-    }
-    if (ev.sse_type === "message_start") {
-      return { summary: `message_start  model=${p.message?.model || "?"}`, model: p.message?.model, tokens };
-    }
-    if (ev.sse_type === "message_delta") {
-      return { summary: `message_delta  stop=${p.delta?.stop_reason || "?"}`, tokens };
-    }
-    return { summary: `sse:${ev.sse_type || "?"}`, tokens };
+    const streamType = ev.sseType || ev.stream?.type || "?";
+    const streamModel = ev.stream?.model || model;
+    const streamTokens = apiTokensFromUsage(ev.stream?.usage);
+    const deltaType = ev.stream?.deltaType ? `  delta=${ev.stream.deltaType}` : "";
+    return {
+      summary: `sse:${streamType}${deltaType}  content omitted  sha256=${digest}`,
+      model: streamModel,
+      tokens: streamTokens,
+    };
   }
-  // Proxy: error from fetch
   if (t === "error") {
-    return { summary: `✗ ERROR  ${ev.error || ""}` };
+    return { summary: `✗ ERROR  detail omitted  sha256=${ev.error?.sha256?.slice?.(0, 12) || digest}` };
   }
   if (t === "assistant") {
-    const msg = ev.message || {};
-    const content: any[] = msg.content || [];
-    const text = content.find((b) => b.type === "text")?.text;
-    const tu = content.find((b) => b.type === "tool_use");
-    const thinking = content.find((b) => b.type === "thinking");
-    const model = msg.model;
-    const u = msg.usage;
-    const tokens: ApiEventTokens | undefined = u ? {
-      in: u.input_tokens,
-      out: u.output_tokens,
-      cacheRead: u.cache_read_input_tokens,
-      cacheCreation: u.cache_creation_input_tokens,
-    } : undefined;
-    if (tu) {
-      // Best-effort one-arg preview (e.g. command, file_path, pattern)
-      const args = tu.input || {};
-      const previewKey = ["command", "file_path", "path", "pattern", "url", "query"].find((k) => args[k]);
-      const preview = previewKey ? String(args[previewKey]).slice(0, 80) : "";
-      return { summary: `▸ ${tu.name}(${preview})`, toolName: tu.name, model, tokens };
-    }
-    if (text) return { summary: text.slice(0, 200).replace(/\s+/g, " "), model, tokens };
-    if (thinking) return { summary: `thinking…`, model, tokens };
-    return { summary: `assistant`, model, tokens };
+    const blockTypes = Array.isArray(ev.contentTypes) ? ev.contentTypes.join(",") : "none";
+    const toolName = Array.isArray(ev.toolNames) ? ev.toolNames[0] : undefined;
+    return {
+      summary: `assistant  blocks=${blockTypes}  content omitted  sha256=${digest}`,
+      toolName,
+      model,
+      tokens,
+    };
   }
   if (t === "user") {
-    const msg = ev.message || {};
-    const content: any[] = msg.content || [];
-    const tr = content.find((b) => b.type === "tool_result");
-    if (tr) {
-      const body = typeof tr.content === "string" ? tr.content : JSON.stringify(tr.content);
-      return { summary: `◂ tool_result: ${body.slice(0, 200).replace(/\s+/g, " ")}`, toolName: tr.tool_use_id };
-    }
-    return { summary: `user` };
+    const blockTypes = Array.isArray(ev.contentTypes) ? ev.contentTypes.join(",") : "none";
+    return { summary: `user  blocks=${blockTypes}  content omitted  sha256=${digest}`, tokens };
   }
   if (t === "result") {
-    // Proxy result event uses different shape (status + duration)
     if (ev.status !== undefined) {
-      const u = ev.usage || {};
-      const tokens: ApiEventTokens | undefined = u && (u.input_tokens || u.output_tokens) ? {
-        in: u.input_tokens,
-        out: u.output_tokens,
-        cacheRead: u.cache_read_input_tokens,
-        cacheCreation: u.cache_creation_input_tokens,
-      } : undefined;
       return {
-        summary: `← ${ev.status}  ${ev.duration_ms || 0}ms  ${ev.response_bytes || 0}B  ${ev.is_stream ? "(stream)" : ""}`,
-        model: ev.model,
+        summary: `← ${ev.status}  ${ev.durationMs || 0}ms  ${ev.responseBytes || 0}B  ${ev.isStream ? "(stream)" : ""}  body omitted`,
+        model,
         tokens,
       };
     }
-    // CLI result event
-    const u = ev.usage || {};
-    return { summary: `RESULT  in=${u.input_tokens || 0}  out=${u.output_tokens || 0}  cost=$${(ev.total_cost_usd ?? 0).toFixed(4)}` };
+    const cost = typeof ev.totalCostUsd === "number" ? ev.totalCostUsd : 0;
+    return { summary: `RESULT  in=${tokens?.in || 0}  out=${tokens?.out || 0}  cost=$${cost.toFixed(4)}  content omitted`, tokens };
   }
-  return { summary: t || "?" };
+  return { summary: `${t || "?"}  content omitted  sha256=${digest}`, model, tokens };
 }
 
 // GET /api/api-events/sessions — list every captured session with rollup stats.
@@ -5769,6 +6302,7 @@ app.get("/api/api-events/sessions", (_, res) => {
     });
     const out = files.map((f) => {
       const path = join(SESSION_LOG_DIR, f);
+      chmodSync(path, 0o600);
       const stat = statSync(path);
       const id = f.replace(/\.stdout\.jsonl$/, "");
       let model: string | undefined;
@@ -5784,25 +6318,18 @@ app.get("/api/api-events/sessions", (_, res) => {
       try {
         readJsonl(path, (line) => {
           try {
-            const ev = JSON.parse(line);
+            const ev: any = sanitizeApiEvent(JSON.parse(line), line);
             lines++;
             if (ev.type === "system" && ev.subtype === "init") {
               model = ev.model;
-              cliSessionId = ev.session_id;
+              cliSessionId = ev.sessionId;
               if (ev.proxy) {
                 isProxy = true;
                 method = ev.method;
-                endpoint = (ev.upstream_url || "").replace(/^https?:\/\/[^/]+/, "").split("?")[0];
+                endpoint = ev.upstreamPath;
               }
             }
-            // Tokens can live in any of these shapes depending on source:
-            //   CLI stream-json  → ev.message.usage
-            //   Proxy SSE event  → ev.payload.message.usage  or  ev.payload.usage
-            //   Proxy result     → ev.usage (non-stream JSON response)
-            const u = ev.message?.usage
-                   || ev.payload?.message?.usage
-                   || ev.payload?.usage
-                   || (ev.type === "result" ? ev.usage : null);
+            const u = ev.usage || ev.stream?.usage;
             if (u) {
               totalInputTokens += u.input_tokens || 0;
               totalOutputTokens += u.output_tokens || 0;
@@ -5827,7 +6354,7 @@ app.get("/api/api-events/sessions", (_, res) => {
         totalInputTokens,
         totalOutputTokens,
         totalCacheRead,
-        totalCostUsd: lastResult?.total_cost_usd ?? null,
+        totalCostUsd: lastResult?.totalCostUsd ?? null,
         finalStatus: lastResult ? (lastResult.subtype || "completed") : "active",
       };
     });
@@ -5858,15 +6385,15 @@ app.get("/api/api-events", (req, res) => {
     const all: ApiEventSummary[] = [];
     readJsonl(path, (line, idx) => {
       try {
-        const ev = JSON.parse(line);
+        const ev: any = sanitizeApiEvent(JSON.parse(line), line);
         if (typeFilter && ev.type !== typeFilter) return;
-        if (q && !line.toLowerCase().includes(q)) return;
+        if (q && !JSON.stringify(ev).toLowerCase().includes(q)) return;
         const s = summarizeApiEvent(ev);
         if (endpointFilter && s.endpoint !== endpointFilter) return;
         all.push({
           session: sessionId,
           line: idx,
-          ts: ev.timestamp || ev.created_at || null,
+          ts: ev.timestamp || null,
           type: ev.type || "unknown",
           subtype: ev.subtype,
           model: s.model,
@@ -5911,14 +6438,15 @@ app.post("/api/api-events/:session/:line/ask", async (req, res) => {
   let event: any = null;
   readJsonl(path, (line, idx) => {
     if (idx === target) {
-      try { event = JSON.parse(line); } catch { event = { raw: line }; }
+      try { event = sanitizeApiEvent(JSON.parse(line), line); }
+      catch { event = sanitizeApiEvent({}, line); }
       return false;
     }
   });
   if (!event) return res.status(404).json({ error: "event not found" });
 
-  // Cap the event payload so we don't blow context budget on huge tool_result
-  // dumps (60k chars ≈ 15k tokens). The detail pane still shows the full JSON.
+  // The analyzer receives the same content-free projection as the detail and
+  // stream routes. Historical raw prompts/tool data never enter this subprocess.
   let eventStr = JSON.stringify(event, null, 2);
   const FULL_LEN = eventStr.length;
   if (eventStr.length > 60_000) {
@@ -5953,9 +6481,12 @@ ${eventStr}
 
   // Spawn claude -p in print mode with JSON output for clean parsing.
   // No tools, no permission prompts — we just want a text answer.
+  const requestedModel = typeof model === "string" && /^[A-Za-z0-9][A-Za-z0-9._:/+-]{0,127}$/u.test(model)
+    ? model
+    : "haiku";
   const args = [
     "-p", "--output-format", "json",
-    "--model", model || "haiku",
+    "--model", requestedModel,
     "--permission-mode", "default",
     "--disallowedTools", "Bash,Edit,Write,WebFetch,WebSearch,Task,Agent",
   ];
@@ -5979,7 +6510,11 @@ ${eventStr}
     if (exit !== 0) {
       return res.status(500).json({
         error: `claude -p exited ${exit}`,
-        stderr: stderr.slice(0, 2000),
+        diagnostic: {
+          bodyRetained: false,
+          byteSize: Buffer.byteLength(stderr, "utf8"),
+          sha256: sha256Bytes(Buffer.from(stderr, "utf8")),
+        },
       });
     }
 
@@ -5995,13 +6530,21 @@ ${eventStr}
     } catch {
       // Not JSON — fall back to raw stdout
     }
-    res.json({ answer, model: usedModel, usage });
+    const safeModel = typeof usedModel === "string" && /^[A-Za-z0-9][A-Za-z0-9._:/+-]{0,255}$/u.test(usedModel)
+      ? usedModel
+      : requestedModel;
+    res.json({
+      answer: redactDiagnosticText(answer, 128_000),
+      model: safeModel,
+      usage: apiTokensFromUsage(usage),
+    });
   } catch (e: any) {
-    res.status(500).json({ error: e.message || String(e) });
+    log("error", "API-event analysis failed", { error: e?.message || String(e), sessionId });
+    res.status(500).json({ error: "API-event analysis failed" });
   }
 });
 
-// GET /api/api-events/:session/:line — full raw event JSON (for the detail pane)
+// GET /api/api-events/:session/:line — content-free event metadata for the detail pane
 app.get("/api/api-events/:session/:line", (req, res) => {
   const sessionId = guardSessionId(res, req.params.session);
   if (!sessionId) return;
@@ -6012,7 +6555,8 @@ app.get("/api/api-events/:session/:line", (req, res) => {
   let found: any = null;
   readJsonl(path, (line, idx) => {
     if (idx === target) {
-      try { found = JSON.parse(line); } catch { found = { raw: line }; }
+      try { found = sanitizeApiEvent(JSON.parse(line), line); }
+      catch { found = sanitizeApiEvent({}, line); }
       return false;
     }
   });
@@ -6044,7 +6588,10 @@ app.get("/api/api-events/stream", (req, res) => {
   }
 
   const fs = require("fs");
+  const maximumReadBytes = 256 * 1024;
+  const maximumLineCharacters = 1024 * 1024;
   let buffer = "";
+  let droppingOversizedLine = false;
   let alive = true;
 
   const poll = setInterval(() => {
@@ -6052,26 +6599,36 @@ app.get("/api/api-events/stream", (req, res) => {
     try {
       if (!existsSync(path)) return;
       const stat = statSync(path);
+      if (stat.size < pos) {
+        pos = 0;
+        buffer = "";
+        droppingOversizedLine = false;
+      }
       if (stat.size <= pos) return;
       const fd = fs.openSync(path, "r");
-      const len = stat.size - pos;
+      const len = Math.min(stat.size - pos, maximumReadBytes);
       const chunk = Buffer.alloc(len);
       fs.readSync(fd, chunk, 0, len, pos);
       fs.closeSync(fd);
-      pos = stat.size;
+      pos += len;
       buffer += chunk.toString("utf-8");
       let nl: number;
       while ((nl = buffer.indexOf("\n")) >= 0) {
         const line = buffer.slice(0, nl).trim();
         buffer = buffer.slice(nl + 1);
+        if (droppingOversizedLine) {
+          droppingOversizedLine = false;
+          lineCounter++;
+          continue;
+        }
         if (!line) continue;
         try {
-          const ev = JSON.parse(line);
+          const ev: any = sanitizeApiEvent(JSON.parse(line), line);
           const s = summarizeApiEvent(ev);
           const summary: ApiEventSummary = {
             session: sessionId,
             line: lineCounter++,
-            ts: ev.timestamp || ev.created_at || null,
+            ts: ev.timestamp || null,
             type: ev.type || "unknown",
             subtype: ev.subtype,
             model: s.model,
@@ -6082,6 +6639,10 @@ app.get("/api/api-events/stream", (req, res) => {
           };
           res.write(`data: ${JSON.stringify({ summary, full: ev })}\n\n`);
         } catch {}
+      }
+      if (buffer.length > maximumLineCharacters) {
+        buffer = "";
+        droppingOversizedLine = true;
       }
     } catch (e: any) {
       // swallow — keep stream alive
@@ -6101,8 +6662,8 @@ app.get("/api/api-events/stream", (req, res) => {
 });
 
 // ── Anthropic API Proxy ─────────────────────────────────────────────
-// Point any Anthropic SDK or the `claude` CLI at this proxy to capture
-// the FULL raw request/response (not just stream-json):
+// Point an Anthropic SDK at this proxy to forward provider traffic while
+// recording content-free operational metadata:
 //
 //   export ANTHROPIC_BASE_URL=http://127.0.0.1:3131/proxy/anthropic
 //   export ANTHROPIC_API_KEY=sk-ant-...     # passed through unchanged
@@ -6112,48 +6673,84 @@ app.get("/api/api-events/stream", (req, res) => {
 // /api/api-events page picks it up automatically (prefix `proxy-` to
 // distinguish from CLI-spawned `s-*` files).
 //
-// We mask the API key in the captured log — every other byte of the
-// request and response (system prompt, messages, tools, usage, content
-// blocks, SSE streaming deltas) is preserved verbatim.
+// Prompt/response/tool bodies and credentials are never retained. Each entry
+// contains allowlisted lifecycle metadata, byte counts, and SHA-256 digests.
 const ANTHROPIC_UPSTREAM = "https://api.anthropic.com";
+const PROXY_RESPONSE_METADATA_LIMIT = 1024 * 1024;
+const PROXY_SSE_EVENT_LIMIT = 256 * 1024;
 
 // Catch-all proxy: any method, any path under /proxy/anthropic
 app.all("/proxy/anthropic/*", async (req, res) => {
   // Phase 1: outbound proxy gated by ENABLE_PROXY (default off).
   if (!SECURITY.enableProxy) {
-    auditSecurity("proxy_blocked", { path: req.path });
+    const pathBytes = Buffer.from(req.path, "utf8");
+    auditSecurity("proxy_blocked", {
+      method: req.method,
+      pathRetained: false,
+      pathBytes: pathBytes.length,
+      pathSha256: sha256Bytes(pathBytes),
+    });
     return res.status(403).json({ error: "proxy disabled (set ENABLE_PROXY=true to enable)" });
   }
   const startTime = Date.now();
   const reqId = randomUUID().slice(0, 12);
   let upstreamUrl: string;
+  let upstreamPath: string;
   let fwdHeaders: Headers;
   try {
     upstreamUrl = buildAnthropicUpstreamUrl(req.originalUrl, ANTHROPIC_UPSTREAM);
+    upstreamPath = new URL(upstreamUrl).pathname;
     fwdHeaders = buildAnthropicRequestHeaders(req.headers, SECURITY.token);
   } catch (e: any) {
-    auditSecurity("proxy_request_denied", { reason: String(e?.message || "invalid proxy request") });
-    return res.status(400).json({ error: String(e?.message || "invalid proxy request") });
+    auditSecurity("proxy_request_denied", { reason: "invalid_proxy_request" });
+    return res.status(400).json({ error: "invalid Anthropic proxy request" });
   }
 
-  // express.raw gave us a Buffer; capture it for the log
+  // express.raw gave us a Buffer. The body is forwarded, but only a bounded
+  // parse plus size/hash metadata is used for diagnostics.
   let bodyBytes: Buffer | undefined;
-  let parsedBody: any = null;
   if (req.method !== "GET" && req.method !== "HEAD" && req.body) {
     bodyBytes = req.body instanceof Buffer ? req.body : Buffer.from(req.body);
-    try { parsedBody = JSON.parse(bodyBytes.toString("utf-8")); } catch {}
   }
   if (bodyBytes && !fwdHeaders.get("content-type")) {
     return res.status(415).json({ error: "Anthropic proxy request bodies require Content-Type: application/json" });
   }
+  const requestBytes = bodyBytes ?? Buffer.alloc(0);
+  let parsedRequest: unknown = {};
+  if (requestBytes.length <= PROXY_RESPONSE_METADATA_LIMIT) {
+    try { parsedRequest = JSON.parse(requestBytes.toString("utf-8")); } catch {}
+  }
+  const requestSummary = summarizeAnthropicPayload(parsedRequest, {
+    byteSize: requestBytes.length,
+    sha256: sha256Bytes(requestBytes),
+  });
 
-  // Open the per-request JSONL log
+  // Open the per-request JSONL log without following or replacing an existing
+  // path. Every write passes through the strict event projection as a second
+  // line of defense against future call-site regressions.
   try { mkdirSync(SESSION_LOG_DIR, { recursive: true }); } catch {}
   const logPath = join(SESSION_LOG_DIR, `proxy-${reqId}.stdout.jsonl`);
   const fs = require("fs");
-  const logFd = fs.openSync(logPath, "w");
+  let logFd: number;
+  try {
+    logFd = fs.openSync(
+      logPath,
+      fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW,
+      0o600,
+    );
+    chmodSync(logPath, 0o600);
+  } catch {
+    return res.status(500).json({ error: "Could not initialize secure proxy diagnostics" });
+  }
+  let logClosed = false;
+  const closeLog = () => {
+    if (logClosed) return;
+    logClosed = true;
+    try { fs.closeSync(logFd); } catch {}
+  };
   const logWrite = (obj: any) => {
-    try { fs.writeSync(logFd, JSON.stringify(obj) + "\n"); } catch {}
+    if (logClosed) return;
+    try { fs.writeSync(logFd, JSON.stringify(sanitizeApiEvent(obj)) + "\n"); } catch {}
   };
 
   // Event 1 — INIT (mirrors the shape the CLI emits, plus proxy metadata)
@@ -6163,13 +6760,10 @@ app.all("/proxy/anthropic/*", async (req, res) => {
     session_id: reqId,
     proxy: true,
     method: req.method,
-    upstream_url: upstreamUrl,
-    model: parsedBody?.model || null,
-    request_headers: redactProxyHeaders(Object.fromEntries(fwdHeaders)),
-    request_body: parsedBody !== null
-      ? parsedBody
-      : (bodyBytes ? bodyBytes.toString("utf-8") : null),
-    request_body_bytes: bodyBytes?.length || 0,
+    upstream_path: upstreamPath,
+    model: requestSummary.model || null,
+    request_header_names: Array.from(fwdHeaders.keys()),
+    request: requestSummary,
     timestamp: new Date().toISOString(),
   });
 
@@ -6189,9 +6783,9 @@ app.all("/proxy/anthropic/*", async (req, res) => {
       duration_ms: Date.now() - startTime,
       timestamp: new Date().toISOString(),
     });
-    try { fs.closeSync(logFd); } catch {}
-    log("error", `Proxy fetch failed for ${upstreamUrl}`, { error: e.message });
-    if (!res.headersSent) res.status(502).json({ error: `Upstream fetch failed: ${e.message}` });
+    closeLog();
+    log("error", "Anthropic proxy fetch failed", { endpoint: upstreamPath, error: e?.message || String(e), reqId });
+    if (!res.headersSent) res.status(502).json({ error: "Anthropic upstream request failed" });
     return;
   }
 
@@ -6206,8 +6800,8 @@ app.all("/proxy/anthropic/*", async (req, res) => {
       duration_ms: Date.now() - startTime,
       timestamp: new Date().toISOString(),
     });
-    try { fs.closeSync(logFd); } catch {}
-    auditSecurity("proxy_response_denied", { reason: String(e?.message || "unsafe upstream response") });
+    closeLog();
+    auditSecurity("proxy_response_denied", { reason: "unsafe_upstream_content_type" });
     return res.status(502)
       .set({
         "Cache-Control": "private, no-store",
@@ -6229,55 +6823,91 @@ app.all("/proxy/anthropic/*", async (req, res) => {
       status: upstream.status,
       duration_ms: Date.now() - startTime,
       is_stream: false,
-      response_body: null,
+      response: summarizeAnthropicPayload({}, {
+        byteSize: 0,
+        sha256: sha256Bytes(Buffer.alloc(0)),
+      }),
       timestamp: new Date().toISOString(),
     });
-    try { fs.closeSync(logFd); } catch {}
+    closeLog();
     res.end();
     return;
   }
 
-  // Tee the stream: pipe bytes to the client AND capture for the log.
-  // For SSE, we additionally parse each event block as it streams so the
-  // detail pane can show individual content-block deltas / message events.
+  // Forward with backpressure. The full response is hashed, but non-SSE
+  // parsing retains at most one MiB and SSE retains at most one bounded event.
   const reader = upstream.body.getReader();
   const decoder = new TextDecoder();
-  const capturedChunks: Buffer[] = [];
-  let sseBuffer = "";
-  let totalBytes = 0;
+  const responseCapture = new BoundedByteCapture(isSSE ? 0 : PROXY_RESPONSE_METADATA_LIMIT);
+  const sseParser = isSSE ? new BoundedSseParser(PROXY_SSE_EVENT_LIMIT) : null;
+  let oversizedSseEvents = 0;
+  const logSsePayload = (payload: string) => {
+    if (!payload || payload === "[DONE]") return;
+    const payloadBytes = Buffer.from(payload, "utf8");
+    try {
+      const parsed = JSON.parse(payload);
+      const summary = summarizeAnthropicStreamEvent(parsed, {
+        byteSize: payloadBytes.length,
+        sha256: sha256Bytes(payloadBytes),
+      });
+      logWrite({
+        type: "sse_event",
+        sse_type: summary.type || "unknown",
+        payload: summary,
+        timestamp: new Date().toISOString(),
+      });
+    } catch {
+      logWrite({
+        type: "sse_event",
+        sse_type: "invalid_json",
+        payload: summarizeAnthropicStreamEvent({}, {
+          byteSize: payloadBytes.length,
+          sha256: sha256Bytes(payloadBytes),
+        }),
+        timestamp: new Date().toISOString(),
+      });
+    }
+  };
+  const writeResponseChunk = (value: Uint8Array): Promise<boolean> => {
+    if (res.destroyed || res.writableEnded) return Promise.resolve(false);
+    try {
+      if (res.write(value)) return Promise.resolve(true);
+    } catch {
+      return Promise.resolve(false);
+    }
+    return new Promise((resolveWrite) => {
+      const cleanup = () => {
+        res.off("drain", onDrain);
+        res.off("close", onClose);
+        res.off("error", onClose);
+      };
+      const onDrain = () => { cleanup(); resolveWrite(true); };
+      const onClose = () => { cleanup(); resolveWrite(false); };
+      res.once("drain", onDrain);
+      res.once("close", onClose);
+      res.once("error", onClose);
+    });
+  };
 
   try {
     while (true) {
       const { value, done } = await reader.read();
       if (done) break;
       if (!value) continue;
-      res.write(value);
-      capturedChunks.push(Buffer.from(value));
-      totalBytes += value.length;
-
-      if (isSSE) {
-        sseBuffer += decoder.decode(value, { stream: true });
-        let nl: number;
-        // Split on \n\n (SSE event delimiter)
-        while ((nl = sseBuffer.indexOf("\n\n")) >= 0) {
-          const block = sseBuffer.slice(0, nl);
-          sseBuffer = sseBuffer.slice(nl + 2);
-          // Parse data: lines (skip "event:" / comments)
-          const dataLine = block.split("\n").find((l) => l.startsWith("data:"));
-          if (!dataLine) continue;
-          const payload = dataLine.slice(5).trim();
-          if (!payload || payload === "[DONE]") continue;
-          try {
-            const obj = JSON.parse(payload);
-            logWrite({
-              type: "sse_event",
-              sse_type: obj.type || "unknown",
-              payload: obj,
-              timestamp: new Date().toISOString(),
-            });
-          } catch {}
-        }
+      responseCapture.push(value);
+      if (!await writeResponseChunk(value)) {
+        try { await reader.cancel(); } catch {}
+        break;
       }
+
+      if (sseParser) {
+        oversizedSseEvents += sseParser.push(decoder.decode(value, { stream: true }), logSsePayload);
+      }
+    }
+    if (sseParser) {
+      const finalText = decoder.decode();
+      if (finalText) oversizedSseEvents += sseParser.push(finalText, logSsePayload);
+      oversizedSseEvents += sseParser.finish(logSsePayload);
     }
   } catch (e: any) {
     logWrite({
@@ -6286,27 +6916,37 @@ app.all("/proxy/anthropic/*", async (req, res) => {
       timestamp: new Date().toISOString(),
     });
   }
-  res.end();
-
-  // Final result event — full response body for non-stream, byte count for stream
-  const fullBuf = Buffer.concat(capturedChunks);
-  let parsedResponse: any = null;
-  if (!isSSE) {
-    try { parsedResponse = JSON.parse(fullBuf.toString("utf-8")); } catch {}
+  if (oversizedSseEvents > 0) {
+    logWrite({
+      type: "error",
+      error: `discarded_oversized_sse_events:${oversizedSseEvents}`,
+      timestamp: new Date().toISOString(),
+    });
   }
+  if (!res.destroyed && !res.writableEnded) res.end();
+
+  const captured = responseCapture.finish();
+  let parsedResponse: any = null;
+  if (!isSSE && !captured.truncated) {
+    try { parsedResponse = JSON.parse(captured.bytes.toString("utf-8")); } catch {}
+  }
+  const responseSummary = summarizeAnthropicPayload(parsedResponse, {
+    byteSize: captured.byteSize,
+    sha256: captured.sha256,
+  });
   logWrite({
     type: "result",
     status: upstream.status,
     duration_ms: Date.now() - startTime,
     is_stream: isSSE,
-    response_bytes: totalBytes,
-    response_body: parsedResponse ?? (isSSE ? null : fullBuf.toString("utf-8").slice(0, 200_000)),
-    usage: parsedResponse?.usage || null,
-    model: parsedResponse?.model || parsedBody?.model || null,
+    response_bytes: captured.byteSize,
+    response: responseSummary,
+    usage: responseSummary.usage || null,
+    model: responseSummary.model || requestSummary.model || null,
     timestamp: new Date().toISOString(),
   });
-  try { fs.closeSync(logFd); } catch {}
-  log("info", `Proxied ${req.method} ${upstreamPath} → ${upstream.status} in ${Date.now() - startTime}ms (${totalBytes}B)`, { reqId });
+  closeLog();
+  log("info", `Proxied ${req.method} ${upstreamPath} → ${upstream.status} in ${Date.now() - startTime}ms (${captured.byteSize}B)`, { reqId });
 });
 
 // ── System Resources Monitor ─────────────────────────────────────────
@@ -6711,7 +7351,9 @@ app.put("/api/files/write", (req, res) => {
 const ENGAGEMENT_ROOTS = Array.from(new Set(SECURITY.allowedWorkspaceRoots.map((path) => resolve(path))))
   .map((path) => ({
     path,
-    source: path === "/root/htb/boxes" ? "htb" : (path.split("/").filter(Boolean).pop() || "engagement"),
+    source: path === "/var/lib/chillspwn/workspaces/htb/boxes"
+      ? "htb"
+      : (path.split("/").filter(Boolean).pop() || "engagement"),
   }));
 const ENGAGEMENT_ROOT_PATHS = ENGAGEMENT_ROOTS.map((root) => root.path);
 
@@ -7042,14 +7684,18 @@ function llmLogPathFor(engagement: string): string | null {
     const dashboardLog = join(CHILLSPWN_HOME, "llm-logs", "llm_raw.jsonl");
     if (!existsSync(dashboardLog)) return null;
     const resolved = resolveExistingWithinRoots([CHILLSPWN_HOME], dashboardLog, "dashboard LLM log", { rejectFinalSymlink: true });
-    return lstatSync(resolved).isFile() ? resolved : null;
+    if (!lstatSync(resolved).isFile()) return null;
+    chmodSync(resolved, 0o600);
+    return resolved;
   }
   const directory = engagementDirectoryByName(safe);
   if (!directory) return null;
   const logPath = join(directory, "logs", "llm_raw.jsonl");
   if (!existsSync(logPath)) return null;
   const resolved = resolveExistingWithinRoots([directory], logPath, "engagement LLM log", { rejectFinalSymlink: true });
-  return lstatSync(resolved).isFile() ? resolved : null;
+  if (!lstatSync(resolved).isFile()) return null;
+  chmodSync(resolved, 0o600);
+  return resolved;
 }
 
 app.get("/api/llm-logs/engagements", (_, res) => {
@@ -7068,6 +7714,7 @@ app.get("/api/llm-logs/engagements", (_, res) => {
           const p = resolveExistingWithinRoots([directory], candidate, "engagement LLM log", { rejectFinalSymlink: true });
           const st = lstatSync(p);
           if (!st.isFile()) continue;
+          chmodSync(p, 0o600);
           seen.add(name);
           const lines = Number(execFileSync("wc", ["-l", "--", p], { encoding: "utf-8", timeout: 2000 }).trim().split(/\s+/)[0]) || 0;
           out.push({ name, source: root.source, entries: lines, lastModified: st.mtime.toISOString() });
@@ -7081,6 +7728,7 @@ app.get("/api/llm-logs/engagements", (_, res) => {
       const safeDashboardLog = resolveExistingWithinRoots([CHILLSPWN_HOME], dashboardLog, "dashboard LLM log", { rejectFinalSymlink: true });
       const st = lstatSync(safeDashboardLog);
       if (!st.isFile()) throw new Error("dashboard LLM log is not a file");
+      chmodSync(safeDashboardLog, 0o600);
       const lines = Number(execFileSync("wc", ["-l", "--", safeDashboardLog], { encoding: "utf-8", timeout: 2000 }).trim().split(/\s+/)[0]) || 0;
       out.push({ name: "_dashboard", source: "dashboard-cwd", entries: lines, lastModified: st.mtime.toISOString() });
     } catch {}
@@ -7099,8 +7747,11 @@ app.get("/api/llm-logs", (req, res) => {
     const raw = execFileSync("tail", ["-n", String(limit), "--", p], { encoding: "utf-8", timeout: 5000, maxBuffer: 25 * 1024 * 1024 });
     const lines = raw.split("\n").filter((l) => l.trim()).reverse();
     const total = Number(execFileSync("wc", ["-l", "--", p], { encoding: "utf-8", timeout: 2000 }).trim().split(/\s+/)[0]) || lines.length;
-    const entries = lines.map((l) => { try { return JSON.parse(l); } catch { return { parseError: true, raw: l.slice(0, 500) }; } });
-    res.json({ engagement, path: p, total, entries });
+    const entries = lines.map((line) => {
+      try { return sanitizeLlmLogEntry(JSON.parse(line)); }
+      catch { return { parseError: true, ...sanitizeLlmLogEntry({ payload: line }) }; }
+    });
+    res.json({ engagement, total, entries });
   } catch (e: any) {
     res.status(500).json({ error: e.message, entries: [] });
   }
@@ -7194,7 +7845,7 @@ app.post("/api/engagements/:name/generate-report", (req, res) => {
   let assetsDir: string | null = null;
   try {
     assetsDir = ensureDirectoryWithinRoot(reportDir, "assets");
-    const templateAssets = "/root/report-template/assets";
+    const templateAssets = join(CHILLSPWN_REPORT_TEMPLATE_DIR, "assets");
     for (const f of ["Logo.svg", "smallLogo.png"]) {
       const src = join(templateAssets, f);
       const dst = join(assetsDir, f);
@@ -7358,7 +8009,7 @@ FIELD REQUIREMENTS:
 - Remediation must be an array of strings.
 
 STEP 3: IMMEDIATELY run this command (do NOT skip this):
-python3 /root/report-template/generate_report.py --data ${reportDataPath} --output ${reportOutputPath}
+python3 ${shellQuote(join(CHILLSPWN_REPORT_TEMPLATE_DIR, "generate_report.py"))} --data ${shellQuote(reportDataPath)} --output ${shellQuote(reportOutputPath)}
 
 STEP 4: Verify the report was created:
 ls -la ${reportOutputPath}
@@ -8729,7 +9380,7 @@ app.post("/api/osint/start", (req, res) => {
     if (existsSync(findingsPath)) {
       try {
         execFileSync(HERMES_PYTHON, [
-          "/root/report-template/generate_osint_report.py",
+          join(CHILLSPWN_REPORT_TEMPLATE_DIR, "generate_osint_report.py"),
           "--data", findingsPath,
           "--raw-dir", rawDir,
           "--output", htmlPath,
@@ -9093,6 +9744,15 @@ wss.on("connection", (ws) => {
       const msg = JSON.parse(raw.toString());
       if (!msg || typeof msg !== "object" || Array.isArray(msg)) {
         ws.send(JSON.stringify({ type: "error", message: "message must be a JSON object" }));
+        return;
+      }
+      const legacyMutation = legacyWebSocketMutation(msg.type);
+      if (!SECURITY.enableLegacyExecutionApi && legacyMutation) {
+        auditSecurity("legacy_execution_blocked", {
+          channel: "websocket",
+          operation: legacyMutation,
+        });
+        ws.send(JSON.stringify(legacyExecutionWebSocketError(legacyMutation)));
         return;
       }
       if (Object.prototype.hasOwnProperty.call(msg, "sessionId") && msg.sessionId != null) {
@@ -9748,7 +10408,7 @@ function spawnTerminal(ws: WebSocket): void {
   const proc = spawn("/usr/bin/script", ["-qc", "/bin/zsh", "/dev/null"], {
     stdio: ["pipe", "pipe", "pipe"],
     env: buildProviderChildEnv("terminal", process.env, { TERM: "xterm-256color", COLUMNS: "120", LINES: "40" }),
-    cwd: process.env.HOME || "/root",
+    cwd: process.env.HOME || "/var/lib/chillspwn",
   });
 
   termSessions.set(ws, proc);
@@ -9790,11 +10450,28 @@ if (!_startup.ok) {
   console.error(`\n[ChillsPwn] ${_startup.fatal}\n`);
   process.exit(1);
 }
+try {
+  commandOsApplication?.start();
+  obsidianVaultWatcher?.start();
+  const runtimeLifecycle = await commandOsMissionRuntime?.start();
+  log("info", "Command OS V2.1 canonical services started", {
+    database: "command-os-v2.sqlite",
+    eventStream: "ready",
+    autonomousBoundary: commandOsDurableBoundaryActive ? "enforced" : "blocked-until-coordinator-ready",
+    recoveredRuns: runtimeLifecycle?.recoveredRuns ?? 0,
+    scheduledRuns: runtimeLifecycle?.scheduledRuns ?? 0,
+  });
+} catch (error: any) {
+  log("error", "Command OS V2.1 failed to start", { error: String(error?.message || error) });
+  console.error("\n[ChillsPwn] Canonical Command OS services failed to start safely.\n");
+  process.exit(1);
+}
 auditSecurity("server_start", {
   bindHost: SECURITY.bindHost, port: SECURITY.port, authActive: SECURITY.authActive,
   enableTerminal: SECURITY.enableTerminal, enableProxy: SECURITY.enableProxy,
   enableFileWrite: SECURITY.enableFileWrite, enableSecurityTools: SECURITY.enableSecurityTools,
   enablePromptObfuscation: SECURITY.enablePromptObfuscation,
+  enableLegacyExecutionApi: SECURITY.enableLegacyExecutionApi,
 });
 httpServer.listen(SECURITY.port, SECURITY.bindHost, () => {
   log("info", `ChillsPwn dashboard running at http://${SECURITY.bindHost}:${SECURITY.port} (auth ${SECURITY.authActive ? "ON" : "OFF"})`);
@@ -9802,6 +10479,7 @@ httpServer.listen(SECURITY.port, SECURITY.bindHost, () => {
   log("info", `Sessions dir: ${SESSIONS_DIR}`);
   log("info", `Memories: ${MEMORIES_DIR}`);
   log("info", `Kanban: ${KANBAN_DB}`);
+  if (SECURITY.enableLegacyExecutionApi) {
   // ── AGENT BOARD: ensure schema + start the card-dispatch sweeper (idempotent). ──
   try { ensureBoardSchema(); } catch (e: any) { log("warn", "ensureBoardSchema failed", { error: e?.message }); }
   setInterval(dispatchPendingCards, 1500);
@@ -9875,4 +10553,47 @@ httpServer.listen(SECURITY.port, SECURITY.bindHost, () => {
   };
   archiveStalePlanCards();
   setInterval(archiveStalePlanCards, 3600_000);
+  } else {
+    log("info", "Legacy compatibility is read-only; chat/terminal execution, board dispatch, OSINT rehydration, and legacy startup writers are disabled");
+  }
 });
+
+let gracefulShutdownStarted = false;
+async function gracefulShutdown(signal: NodeJS.Signals): Promise<void> {
+  if (gracefulShutdownStarted) return;
+  gracefulShutdownStarted = true;
+  log("info", "Graceful shutdown started", { signal });
+  const hardStop = setTimeout(() => {
+    log("error", "Graceful shutdown deadline exceeded", { signal });
+    process.exit(1);
+  }, 10_000);
+
+  try {
+    // Stop workers and confirm child cleanup while the database remains open;
+    // then stop live delivery. Durable outbox rows remain replayable.
+    await commandOsMissionRuntime?.stop();
+    await obsidianVaultWatcher?.stop();
+    await commandOsApplication?.stop();
+    for (const client of wss.clients) {
+      try { client.close(1001, "server shutting down"); } catch {}
+    }
+    for (const process of termSessions.values()) {
+      try { process.kill("SIGTERM"); } catch {}
+    }
+    termSessions.clear();
+    await new Promise<void>((resolveClose) => {
+      if (!httpServer.listening) return resolveClose();
+      httpServer.close(() => resolveClose());
+    });
+    clearTimeout(hardStop);
+    log("info", "Graceful shutdown complete", { signal });
+    process.exit(0);
+  } catch (error: any) {
+    clearTimeout(hardStop);
+    log("error", "Graceful shutdown failed", { signal, error: String(error?.message || error) });
+    process.exit(1);
+  }
+}
+
+process.once("SIGINT", () => { void gracefulShutdown("SIGINT"); });
+process.once("SIGTERM", () => { void gracefulShutdown("SIGTERM"); });

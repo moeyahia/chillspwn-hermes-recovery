@@ -87,6 +87,7 @@ export function attestGrokCommanderHooks(
   value: unknown,
   guardPath: string,
   expectedSourceDir?: string,
+  bunPath = "/opt/chillspwn-runtime/bin/bun",
 ): GrokBoundaryAttestation {
   const hooks = extensionBody(value).hooks;
   if (!Array.isArray(hooks) || hooks.length !== 1) {
@@ -94,7 +95,7 @@ export function attestGrokCommanderHooks(
   }
   const hook = record(hooks[0]) || {};
   const command = String(hook.command || "");
-  const expectedCommand = `/root/.bun/bin/bun ${JSON.stringify(guardPath)}`;
+  const expectedCommand = `${JSON.stringify(bunPath)} ${JSON.stringify(guardPath)}`;
   const valid = hook.event === "pre_tool_use"
     && hook.handlerType === "command"
     && hook.disabled === false
