@@ -50,6 +50,9 @@ export function validateWorkerResult(raw: unknown): WorkerResultValidation {
   if (raw.artifacts !== undefined && !Array.isArray(raw.artifacts)) {
     errors.push("artifacts must be an array");
   }
+  if (raw.proposedAttackChains !== undefined && (!Array.isArray(raw.proposedAttackChains) || raw.proposedAttackChains.some((x) => !isObject(x)))) {
+    errors.push("proposedAttackChains must be an array of objects");
+  }
 
   let evidence: EvidenceItem[] = [];
   if (raw.evidence !== undefined) {
@@ -81,6 +84,7 @@ export function validateWorkerResult(raw: unknown): WorkerResultValidation {
       confidence: conf as number,
       assumptions: isStringArray(raw.assumptions) ? raw.assumptions : [],
       recommendedNextSteps: isStringArray(raw.recommendedNextSteps) ? raw.recommendedNextSteps : [],
+      proposedAttackChains: (Array.isArray(raw.proposedAttackChains) ? raw.proposedAttackChains : []) as JsonValue[],
     },
   };
 }
@@ -119,6 +123,7 @@ export function wrapWorkerResult(raw: unknown): { result: WorkerResult; wrapped:
       confidence: 0.3, // conservative — free-form wrapping is not trusted structure
       assumptions: [],
       recommendedNextSteps: [],
+      proposedAttackChains: [],
     },
     wrapped: true,
   };

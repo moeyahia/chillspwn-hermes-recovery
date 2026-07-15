@@ -19,13 +19,13 @@ import os
 import pkgutil
 import sys
 
-# #58 — prefer the VENDORED Hermes code (copied into the ChillsPwn tree, so the OpenRouter tools
-# no longer depend on the external /media/sf_hermes-agent mount being present). Fall back to the
-# upstream shared folder if the vendored copy is missing. Override with CHILLSPWN_HERMES_SRC.
-_VENDORED = "/root/.claude/chillspwn/vendor/hermes"
-_UPSTREAM = "/media/sf_hermes-agent"
-HERMES_SRC = os.environ.get("CHILLSPWN_HERMES_SRC") or (
-    _VENDORED if os.path.isdir(os.path.join(_VENDORED, "tools")) else _UPSTREAM)
+# Resolve Hermes only from an explicit deployment setting. Falling back to a private home or
+# shared-folder path can silently load the wrong source tree on a recovered host.
+HERMES_SRC = os.environ.get("CHILLSPWN_HERMES_SRC", "").strip()
+if not HERMES_SRC:
+    raise RuntimeError("CHILLSPWN_HERMES_SRC is required")
+if not os.path.isdir(os.path.join(HERMES_SRC, "tools")):
+    raise RuntimeError("CHILLSPWN_HERMES_SRC does not contain the Hermes tools package")
 if HERMES_SRC not in sys.path:
     sys.path.insert(0, HERMES_SRC)
 

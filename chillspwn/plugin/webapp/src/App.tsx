@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef, useCallback, lazy, Suspense } from "react";
 import GridSignal from "./components/GridSignal";
+import { resolveSessionHistoryState } from "./lib/sessionHistoryState";
 
 // Pages are code-split (React.lazy) so the initial mobile bundle stays small:
 // only the app shell loads up front, then the active page's chunk streams in.
@@ -132,7 +133,7 @@ const NAV_GROUPS: { title: string; ids: string[] }[] = [
 // ── Sessions in the nav (list + rename + delete) ──────────
 type NavSession = {
   id: string; persona: string; preview: string; title: string;
-  status: string; isLive: boolean; messageCount: number;
+  status: string; isLive: boolean; turnActive: boolean; messageCount: number;
   displayName?: string; kind?: string;   // Phase 19 — structured name + specialist/chat
 };
 
@@ -171,6 +172,7 @@ function SessionNavList({ sessions, activeId, onOpen, onNew, onRename, onDelete,
       {sessions.map((s) => {
         const label = (s.title || "").trim() || (s.displayName || "").trim() || s.preview || s.persona || "session";
         const isActive = s.id === activeId;
+        const runtimeLabel = s.turnActive ? "working" : s.isLive ? "ready" : "";
         if (editing === s.id) {
           const commit = () => { onRename(s.id, draft.trim()); setEditing(null); };
           return (
@@ -189,8 +191,16 @@ function SessionNavList({ sessions, activeId, onOpen, onNew, onRename, onDelete,
         return (
           <div key={s.id} className={`poc-sess ${isActive ? "on" : ""}`}>
             <span className="poc-sess-main" onClick={() => onOpen(s.id)}>
-              <span className={`poc-sess-dot ${s.isLive ? "live" : ""}`} />
+              <span
+                className={`poc-sess-dot ${s.turnActive ? "active" : s.isLive ? "ready" : ""}`}
+                title={s.turnActive ? "Turn in progress" : s.isLive ? "Session process ready" : "Session stopped"}
+              />
               <span className="poc-sess-label" title={label}>{label}</span>
+              {runtimeLabel && (
+                <span className={`poc-sess-state ${s.turnActive ? "active" : "ready"}`}>
+                  {runtimeLabel}
+                </span>
+              )}
             </span>
             {confirmDel === s.id ? (
               <span className="poc-sess-confirm">
@@ -520,7 +530,7 @@ export default function App() {
   const [zCounter, setZCounter] = useState(100);
   const [mobileTab, setMobileTab] = useState<string>("chat");
   const [hasLiveSession, setHasLiveSession] = useState(false);
-  const [resumeCliSession, setResumeCliSession] = useState<{ id: string; title: string; cwd: string } | null>(null);
+  const [resumeCliSession, setResumeCliSession] = useState<{ id: string; title: string } | null>(null);
 
   // ── Sessions in the nav ──
   // The session list lives in the navigation now (not inside the chat). App owns the list via
@@ -538,7 +548,13 @@ export default function App() {
 
   const refreshSessions = useCallback(() => {
     fetch("/api/sessions" + (showClosed ? "?includeClosed=true" : "")).then((r) => r.json()).then((d) => {
-      if (Array.isArray(d)) setNavSessions(d);
+      if (!Array.isArray(d)) return;
+      const normalized = d.map((session: NavSession) => ({
+        ...session,
+        ...resolveSessionHistoryState(session),
+      }));
+      setNavSessions(normalized);
+      setHasLiveSession(normalized.some((session: NavSession) => session.isLive));
     }).catch(() => {});
   }, [showClosed]);
 
@@ -928,13 +944,12 @@ export default function App() {
       case "engagements":
         return <EngagementsPage />;
       case "cli-sessions":
-        return <CliSessionsPage onResumeSession={(cliSessionId, title, cwd) => {
+        return <CliSessionsPage onResumeSession={(cliSessionId, title) => {
           // Set the resume state — passed as prop to ChatPage. Also keep window props
           // so the existing sendMessage logic that reads them on first send still works.
           (window as any).__resumeCliSessionId = cliSessionId;
           (window as any).__resumeCliTitle = title;
-          (window as any).__resumeCliCwd = cwd;
-          setResumeCliSession({ id: cliSessionId, title, cwd });
+          setResumeCliSession({ id: cliSessionId, title });
           navigateToChat();
         }} />;
       case "terminal":

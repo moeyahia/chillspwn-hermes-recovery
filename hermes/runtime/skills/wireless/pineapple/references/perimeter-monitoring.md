@@ -1,32 +1,34 @@
-# Perimeter Monitoring Pattern (2026-05-22)
+# Perimeter Monitoring Pattern
 
 ## Goal
-Detect new/unknown WiFi devices entering the physical perimeter without triggering on known home devices on Ghossein.
+
+Detect new wireless devices or access points inside an explicitly authorized physical perimeter while suppressing known infrastructure.
+
+## Configuration boundary
+
+Store the following outside Git with restrictive permissions:
+
+- approved SSIDs and BSSIDs;
+- personal or control-device MAC addresses;
+- scheduler delivery destinations;
+- Pineapple SSH destination and private-key path;
+- scan state and captured evidence.
+
+The monitor must stop when the required target or allowlist is unavailable. An empty allowlist must not silently mean "trust nothing" or "scan everything."
 
 ## Architecture
-- Separate scripts from existing `pineapple-monitor.sh` / `ghossein-defense.sh`
-- Two new scripts:
-  - `perimeter_whitelist.sh` — manages known devices (home APs + personal devices)
-  - `perimeter_monitor.sh` — enhanced passive recon using airodump-ng + OUI + basic device class fingerprinting
 
-## Key Techniques
-- Whitelist-first approach: all known home MACs are excluded before alerting
-- Device class guessing via vendor OUI (Apple → Phone/Tablet, Intel → Laptop, Espressif → IoT, etc.)
-- Uses only existing tools on the Pineapple (no bettercap)
-- Cron job runs every 10 minutes, delivers only on new detections
+- `pineapple-monitor.sh` reports newly observed clients and captures.
+- `network-defense.sh` checks the protected SSID against a configured BSSID allowlist.
+- A deployment-specific perimeter monitor may add passive device classification and deduplication.
+- Cron wrappers emit output only for real findings and return a non-zero status on configuration errors or timeouts.
 
-## Current Scripts
-- `/root/perimeter_whitelist.sh`
-- `/root/perimeter_monitor.sh`
+## Operational rules
 
-## Cron Job
-Job ID: `eba34f64a8ae` (Perimeter Monitor) — every 10m, model: grok-4.3
-
-## Limitations
-- No bettercap (opkg repositories unreachable)
-- Fingerprinting is heuristic only (vendor + basic patterns)
-- Does not perform active probing
-
-## Future Improvements
-- Add richer 802.11 capability parsing (HT/VHT, supported rates)
-- Consider bettercap if package feed becomes available
+1. Verify scope and radio/interface state before scanning.
+2. Apply the allowlist before reporting.
+3. Prefer passive collection; active frames require explicit authorization.
+4. Treat vendor/OUI classification as heuristic.
+5. Keep state outside the repository and mode `0600`.
+6. Never commit raw scan output, MAC addresses, probe requests, or packet captures.
+7. Report the last successful run, current reachability, and whether silence means no events or a failed monitor.

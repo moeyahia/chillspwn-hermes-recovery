@@ -22,7 +22,7 @@ Reuse (no logic duplicated):
 
 Usage:
     python3 council_conversation.py \
-        --engagement-dir /root/htb/boxes/silentium/ \
+        --engagement-dir /path/to/authorized-engagement/ \
         --briefing "RCE as www-data, stuck on privesc. Tried SUID/sudo/cron/kernel." \
         --laps 3 --per-turn-timeout 420
 """
@@ -38,7 +38,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import council_state                                   # shared global council state
 from council_summon import (                            # reuse — single source of truth
-    COUNCIL_MEMBERS, send_telegram, load_env, format_time,
+    COUNCIL_MEMBERS, build_lane_environment, send_telegram, load_env,
+    format_time, resolve_hermes_cli,
 )
 import council_lane_agent as la                         # reuse the in-process agentic loops
 
@@ -121,14 +122,23 @@ def speak_direct(member, system, user, task_id, opening, log, engagement_dir=Non
     mi = OPENING_MAX_ITERS if opening else REPLY_MAX_ITERS
     fwa = OPENING_FORCE_WRITE_AT if opening else REPLY_FORCE_WRITE_AT
     prov = member.get("provider")
+    lane_env = build_lane_environment(member)
     if prov == "claude-cli":
         # `claude -p` on the subscription (see run_claude_cli); investigates the engagement
         # dir live (or uses pre-fed evidence in fallback mode — do_turn inlines it then).
-        return la.run_claude_cli(member["model"], system, user, task_id, log,
-                                 cwd=engagement_dir)
+        return la.run_claude_cli(
+            member["model"], system, user, task_id, log,
+            cwd=engagement_dir, subprocess_env=lane_env,
+        )
     if prov == "anthropic":
-        return la.run_anthropic(member["model"], system, user, task_id, log, max_iters=mi)
-    return la.run_openrouter(member["model"], system, user, task_id, log, max_iters=mi, force_write_at=fwa)
+        return la.run_anthropic(
+            member["model"], system, user, task_id, log, max_iters=mi,
+            api_key=lane_env.get("ANTHROPIC_API_KEY"),
+        )
+    return la.run_openrouter(
+        member["model"], system, user, task_id, log, max_iters=mi,
+        force_write_at=fwa, api_key=lane_env.get("OPENROUTER_API_KEY"),
+    )
 
 
 def speak_hermes(member, system, user, engagement_dir, out_path, per_turn_timeout, log):
@@ -143,12 +153,12 @@ def speak_hermes(member, system, user, engagement_dir, out_path, per_turn_timeou
               f"IMPORTANT: Write ONLY your spoken message (the concise paragraph(s) ending with the "
               f"`MY VOTE:` line) to the file `{out_path}` using your file tool. Write nothing else to "
               f"that file, and do not ask questions — just investigate briefly if needed, then write.")
-    cmd = ["hermes", "chat", "-q", prompt, "--model", member["model"],
+    cmd = [resolve_hermes_cli(), "chat", "-q", prompt, "--model", member["model"],
            "--provider", member.get("provider", "openrouter"), "-t", "file,terminal", "--yolo", "-Q"]
     logf = out_path.with_suffix(".log.txt")
     with open(logf, "w") as lh:
         proc = subprocess.Popen(cmd, stdout=lh, stderr=subprocess.STDOUT, cwd=str(engagement_dir),
-                                env={**os.environ, "PAGER": "cat"}, start_new_session=True,
+                                env=build_lane_environment(member), start_new_session=True,
                                 stdin=subprocess.DEVNULL)
     try:
         proc.wait(timeout=per_turn_timeout)
@@ -216,11 +226,21 @@ def run_chair(chair, briefing, engagement_dir, full_transcript, council_dir, per
 
     def _chair_runner(model, system, user, task_id, log, max_iters=None):
         prov = chair["provider"]
+        lane_env = build_lane_environment(chair)
         if prov == "claude-cli":
-            return la.run_claude_cli(model, system, user, task_id, log, cwd=engagement_dir)
+            return la.run_claude_cli(
+                model, system, user, task_id, log, cwd=engagement_dir,
+                subprocess_env=lane_env,
+            )
         if prov == "anthropic":
-            return la.run_anthropic(model, system, user, task_id, log, max_iters=max_iters)
-        return la.run_openrouter(model, system, user, task_id, log, max_iters=max_iters)
+            return la.run_anthropic(
+                model, system, user, task_id, log, max_iters=max_iters,
+                api_key=lane_env.get("ANTHROPIC_API_KEY"),
+            )
+        return la.run_openrouter(
+            model, system, user, task_id, log, max_iters=max_iters,
+            api_key=lane_env.get("OPENROUTER_API_KEY"),
+        )
 
     if chair.get("mode") == "direct":
         prev = la.HTTP_TIMEOUT
@@ -251,8 +271,8 @@ def run_live(engagement_dir, briefing, laps, per_turn_timeout, chair_id, complet
     engagement_name = engagement_dir.name
 
     env = load_env()
-    bot_token = env.get("TELEGRAM_BOT_TOKEN", "")
-    chat_id = env.get("TELEGRAM_ALLOWED_USERS", "")
+    bot_token = os.environ.get("TELEGRAM_BOT_TOKEN", "") or env.get("TELEGRAM_BOT_TOKEN", "")
+    chat_id = os.environ.get("TELEGRAM_ALLOWED_USERS", "") or env.get("TELEGRAM_ALLOWED_USERS", "")
 
     aliases = la.load_aliases()
 

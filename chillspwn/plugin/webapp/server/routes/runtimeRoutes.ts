@@ -20,11 +20,14 @@ import { buildPlanPrompt } from "../runtime/Planner";
 import { isEvidenceKind } from "../runtime/types";
 import { validateWorkerResult, wrapWorkerResult } from "../runtime/WorkerContract";
 import { buildRunReport, runReportToMarkdown, buildEvidenceBundle } from "../runtime/RunReport";
+import { TrainingMemoryService } from "../runtime/TrainingMemoryService";
 
 export interface RuntimeRouteDeps {
   agentRuntime: AgentRuntime;
   auditLog: EventLog;
   memoryService: MemoryService;
+  /** Reusable attack-chain proposals emitted by workers (always stored as proposed). */
+  trainingMemory?: TrainingMemoryService;
   /** index.ts guardSeg — rejects path-traversal in :name/:id params (HTTP 400). */
   guardSeg: (res: Response, raw: unknown, label?: string) => boolean;
   /** index.ts logger. */
@@ -38,7 +41,7 @@ export interface RuntimeRouteDeps {
 }
 
 export function registerRuntimeRoutes(app: Express, deps: RuntimeRouteDeps): void {
-  const { agentRuntime, auditLog, memoryService, guardSeg, log } = deps;
+  const { agentRuntime, auditLog, memoryService, trainingMemory, guardSeg, log } = deps;
   const workerContractEnabled = deps.workerContractEnabled ?? (() => false);
   const liveMemoryEnabled = deps.liveMemoryEnabled ?? (() => true);
   const reportsEnabled = deps.reportsEnabled ?? (() => true);
@@ -301,14 +304,36 @@ export function registerRuntimeRoutes(app: Express, deps: RuntimeRouteDeps): voi
         wrapped = w.wrapped;
       }
       const rec = agentRuntime.recordWorkerResult(req.params.id, stepId, result);
-      return { ...rec, wrapped };
+      const proposedLessonIds: string[] = [];
+      const proposalErrors: string[] = [];
+      if (trainingMemory) {
+        for (const candidate of rec.result.proposedAttackChains ?? []) {
+          try {
+            const raw = (candidate && typeof candidate === "object" && !Array.isArray(candidate)) ? candidate as Record<string, unknown> : {};
+            const lesson = trainingMemory.proposeLesson({
+              ...raw,
+              kind: "attack_chain",
+              // Runtime-owned provenance overrides anything claimed by the worker.
+              sourceRunId: req.params.id,
+              sourceStepIds: stepId ? [stepId] : [],
+              evidenceIds: rec.evidenceIds,
+              sourceBoxOrLab: undefined,
+            });
+            proposedLessonIds.push(lesson.id);
+          } catch (e: any) {
+            proposalErrors.push(String(e?.message || e));
+          }
+        }
+      }
+      return { ...rec, wrapped, proposedLessonIds, proposalErrors };
     });
   });
 
   // ════════════════════════════════════════════════════════════════════════════
   // RUNTIME MEMORY (Phase 4) — provenance-backed memory with an approval flow.
   // Namespaced under /api/runtime-memory/* so it never collides with the legacy file
-  // memory (/api/memory → USER.md/MEMORY.md), which is left untouched.
+  // memory (/api/memory → broker-filtered USER.md/MEMORY.md), which is
+  // registered by LegacyMemoryBroker and is read-only at the whole-file API.
   // ════════════════════════════════════════════════════════════════════════════
   function memoryRoute(res: Response, fn: () => any): void {
     try {

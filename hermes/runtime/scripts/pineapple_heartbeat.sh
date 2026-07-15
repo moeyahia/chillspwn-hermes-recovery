@@ -1,14 +1,26 @@
 #!/bin/bash
 set -u
 
+MONITOR_SCRIPT="${PINEAPPLE_MONITOR_SCRIPT:-}"
+DEFENSE_SCRIPT="${PINEAPPLE_DEFENSE_SCRIPT:-}"
+
+if [ -z "$MONITOR_SCRIPT" ] || [ ! -x "$MONITOR_SCRIPT" ]; then
+  echo "PINEAPPLE_MONITOR_SCRIPT must name an executable monitor script." >&2
+  exit 2
+fi
+if [ -z "$DEFENSE_SCRIPT" ] || [ ! -x "$DEFENSE_SCRIPT" ]; then
+  echo "PINEAPPLE_DEFENSE_SCRIPT must name an executable defense script." >&2
+  exit 2
+fi
+
 TS="$(date '+%a %b %d %I:%M:%S %p %Z %Y')"
 TMP1="$(mktemp)"
 TMP2="$(mktemp)"
 trap 'rm -f "$TMP1" "$TMP2"' EXIT
 
 # Run monitors. Never let one failed check suppress the heartbeat.
-timeout 90 /root/pineapple_monitor.sh >"$TMP1" 2>&1 || true
-timeout 120 /root/ghossein_defense.sh >"$TMP2" 2>&1 || true
+timeout 90 "$MONITOR_SCRIPT" >"$TMP1" 2>&1 || true
+timeout 120 "$DEFENSE_SCRIPT" >"$TMP2" 2>&1 || true
 
 PINE_OUT="$(cat "$TMP1")"
 DEF_OUT="$(cat "$TMP2")"

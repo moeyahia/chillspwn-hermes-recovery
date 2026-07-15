@@ -17,6 +17,7 @@ describe("Phase 9 wrapWorkerResult (free-form fallback)", () => {
     expect(w.result.summary).toContain("open ports");
     expect(w.result.confidence).toBe(0.3);
     expect(w.result.evidence).toEqual([]);
+    expect(w.result.proposedAttackChains).toEqual([]);
     expect(w.result.status).toBe("complete");
   });
 

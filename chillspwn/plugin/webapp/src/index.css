@@ -2018,7 +2018,11 @@ button.glow-button, .hud-btn, .cyber-btn{
 .poc-sess.on{ background:#161c27; border-left-color:var(--acid); }
 .poc-sess-main{ display:flex; align-items:center; gap:8px; flex:1; min-width:0; cursor:pointer; }
 .poc-sess-dot{ width:6px; height:6px; border-radius:50%; background:var(--text-muted); flex:none; }
-.poc-sess-dot.live{ background:var(--neon-green); box-shadow:0 0 0 3px rgba(43,212,127,.16); }
+.poc-sess-dot.ready{ background:rgba(43,212,127,.72); box-shadow:0 0 0 2px rgba(43,212,127,.10); }
+.poc-sess-dot.active{ background:var(--neon-green); box-shadow:0 0 0 3px rgba(43,212,127,.16); animation:pulse-green 1.5s ease-in-out infinite; }
+.poc-sess-state{ flex:none; font-size:7px; line-height:1; letter-spacing:.08em; text-transform:uppercase; border-radius:5px; padding:2px 4px; }
+.poc-sess-state.ready{ color:rgba(43,212,127,.78); border:1px solid rgba(43,212,127,.18); }
+.poc-sess-state.active{ color:var(--neon-green); border:1px solid rgba(43,212,127,.32); background:rgba(43,212,127,.08); }
 .poc-sess-label{ font-size:12px; color:var(--text-dim); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 .poc-sess.on .poc-sess-label{ color:var(--acid); }
 .poc-sess-act{ background:none; border:0; color:var(--text-muted); cursor:pointer; font-size:12px;

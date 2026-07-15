@@ -10,8 +10,9 @@ Check the engagement run log first:
 
 ```bash
 python3 - <<'PY'
+import os
 from pathlib import Path
-c = Path('/root/htb/boxes/<box>/council')
+c = Path(os.environ['ENGAGEMENT_DIR']) / 'council'
 for p in sorted(c.glob('runner*.log')):
     print('\n==', p, '==')
     for line in p.read_text(errors='ignore').splitlines():

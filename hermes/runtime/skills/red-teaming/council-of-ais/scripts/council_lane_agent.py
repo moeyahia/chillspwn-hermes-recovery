@@ -12,7 +12,7 @@ streaming artifact; one-shot responses per turn make it impossible.
 
 Providers (direct, non-streaming):
   --provider openrouter : OpenAI tool format     (GLM/DeepSeek/Qwen, OpenRouter creds)
-  --provider anthropic  : Anthropic tool_use/tool_result (Claude, ANTHROPIC_API_KEY)
+  --provider anthropic  : legacy Anthropic API tool_use/tool_result (ANTHROPIC_API_KEY)
 
 Spawned exactly like the hermes lanes by council_summon.py, so the existing
 monitor/retry/Telegram machinery works unchanged (exit 0 with a written
@@ -55,8 +55,8 @@ CLAUDE_LIVE_TOOLS = os.environ.get("COUNCIL_CLAUDE_LIVE_TOOLS", "1") != "0"
 # Permission-bypass is refused under root, so when the council runs as root the lane
 # drops to this non-root service user (which owns the subscription creds). Production
 # already runs as this user, so the drop is skipped there.
-CHILLSPWN_USER = os.environ.get("COUNCIL_CLAUDE_USER", "chillspwn")
-CHILLSPWN_HOME = os.environ.get("COUNCIL_CLAUDE_HOME", "/home/chillspwn")
+CHILLSPWN_USER = os.environ.get("COUNCIL_CLAUDE_USER", "").strip()
+CHILLSPWN_HOME = os.environ.get("COUNCIL_CLAUDE_HOME", "").strip()
 # Tool-less fallback: pre-feed at most this many chars of engagement evidence.
 CLAUDE_CTX_BUDGET = 180_000
 CLAUDE_CTX_PER_FILE = 24_000
@@ -141,15 +141,12 @@ def strip_dsml_tool_markup(text):
 
 
 def load_key(name):
-    if os.environ.get(name):
-        return os.environ[name]
-    env = Path.home() / ".hermes" / ".env"
-    if env.exists():
-        for ln in env.read_text().splitlines():
-            ln = ln.strip()
-            if ln.startswith(name + "="):
-                return ln.split("=", 1)[1].strip()
-    return ""
+    """Return only a credential explicitly injected into this lane.
+
+    The orchestrator may read its protected env file, but the worker must not
+    reopen that file and regain unrelated service/provider secrets.
+    """
+    return os.environ.get(name, "").strip()
 
 
 SYSTEM_TEMPLATE = """You are {name}, an elite penetration tester summoned to a council of AI hackers because the lead pentester is STUCK and needs fresh eyes.
@@ -223,7 +220,7 @@ CHAIR_TEMPLATE = """You are {name}, CHAIRING a council of six elite AI penetrati
 Your job is to deliver the council's SINGLE final recommendation: the one plan the operator should execute next. Decisions:
 - Weigh the ARGUMENTS and EVIDENCE, not the raw vote count — a lone member with a decisive file-backed insight can outweigh a popular guess.
 - Resolve the disagreements: state which contested points the evidence settles and how.
-- Preserve genuine dissent as a recorded risk (the council's blind-spot insurance — remember Logging: 5/6 agreed on a path that failed live).
+- Preserve genuine dissent as a recorded risk; a strong majority can still agree on a path that fails live validation.
 You have REAL tools; you MAY run a few tool calls to confirm one decisive detail, then STOP and write the verdict.
 
 When done, respond with ONLY this markdown (and NO further tool calls):
@@ -250,10 +247,13 @@ Be specific — exact CVEs, versions, file paths. This verdict IS the council's 
 
 
 def load_aliases():
-    """Compact alias map (alias=real_tool ...) from the arsenal, for prompt injection.
-    Returns '' if unavailable so the lane still runs (just without alias guidance)."""
+    """Load an optional alias map; clean Kali hosts use native commands normally."""
     try:
-        amd = Path("/opt/chillspwn-bin/ALIASES.md").read_text()
+        alias_path = Path(os.environ.get(
+            "COUNCIL_ALIASES_FILE",
+            "/opt/chillspwn-bin/ALIASES.md",
+        ))
+        amd = alias_path.read_text()
         if "## Compact" in amd:
             tail = amd.split("## Compact", 1)[1]
             if "```" in tail:
@@ -267,22 +267,11 @@ def load_aliases():
 
 
 ALIAS_BLOCK = (
-    "\n\n## OPERATOR ENVIRONMENT — ALIAS NAMES ARE THE ONLY NAMES THAT WORK (CRITICAL)\n"
-    "This host exposes every standard pentest tool ONLY through its UPPERCASE alias wrapper in "
-    "/opt/chillspwn-bin (on $PATH). On this machine the raw tool names DO NOT EXIST as commands and "
-    "the operator does NOT recognize them — if you write `nmap`, `nxc`, `evil-winrm`, `smbmap`, "
-    "`hashcat`, `impacket-*`, etc., the operator cannot understand or run it and your assessment is "
-    "useless to them. The alias IS the tool's name here.\n"
-    "ABSOLUTE RULES:\n"
-    "1. Use the ALIAS everywhere — inside ```bash``` blocks, inline `code`, AND in your prose/"
-    "explanations. Never write a raw tool name anywhere in your output.\n"
-    "2. When you would naturally name a tool in a sentence, name the ALIAS instead. "
-    "Right: 'enumerate shares with MAP'. Wrong: 'enumerate shares with smbmap'.\n"
-    "3. Flags and arguments are IDENTICAL — only the command name changes "
-    "(`SURFACE -sC -sV <ip>`, not `nmap -sC -sV <ip>`).\n"
-    "4. Before you finish, re-scan your assessment and replace ANY raw tool name you find with its "
-    "alias from the map below. Zero raw tool names is the requirement.\n"
-    "Alias map (alias=real_tool — translate every real_tool you would mention into its alias):\n{aliases}"
+    "\n\n## OPTIONAL OPERATOR ALIAS WRAPPERS\n"
+    "Native Kali command names are valid and are the portable default. This deployment also "
+    "advertises convenience aliases; use one only when it helps the local operator, and never "
+    "assume `/opt/chillspwn-bin` or any wrapper exists on another host. Flags and arguments remain "
+    "those of the canonical command. Alias map (alias=canonical command):\n{aliases}"
 )
 
 
@@ -385,8 +374,9 @@ def http_post(url, headers, body):
 
 
 # ── OpenRouter loop (OpenAI tool format) ───────────────────────────────────
-def run_openrouter(model, system, user, task_id, log, max_iters=MAX_ITERS, force_write_at=FORCE_WRITE_AT):
-    key = load_key("OPENROUTER_API_KEY")
+def run_openrouter(model, system, user, task_id, log, max_iters=MAX_ITERS,
+                   force_write_at=FORCE_WRITE_AT, api_key=None):
+    key = (api_key or load_key("OPENROUTER_API_KEY")).strip()
     if not key:
         raise RuntimeError("OPENROUTER_API_KEY missing")
     headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json",
@@ -459,8 +449,9 @@ def run_openrouter(model, system, user, task_id, log, max_iters=MAX_ITERS, force
 
 
 # ── Anthropic loop (tool_use / tool_result blocks) ─────────────────────────
-def run_anthropic(model, system, user, task_id, log, max_iters=MAX_ITERS, force_write_at=None):
-    key = load_key("ANTHROPIC_API_KEY")
+def run_anthropic(model, system, user, task_id, log, max_iters=MAX_ITERS,
+                  force_write_at=None, api_key=None):
+    key = (api_key or load_key("ANTHROPIC_API_KEY")).strip()
     if not key:
         raise RuntimeError("ANTHROPIC_API_KEY missing")
     headers = {"x-api-key": key, "anthropic-version": "2023-06-01", "Content-Type": "application/json"}
@@ -494,15 +485,24 @@ def run_anthropic(model, system, user, task_id, log, max_iters=MAX_ITERS, force_
 # own agentic loop; its final stdout IS the assessment. If live_tools is False it instead
 # runs `--tools ""` on pre-fed evidence (see curate_engagement_context / main()).
 def run_claude_cli(model, system, user, task_id, log, max_iters=None, force_write_at=None,
-                   cwd=None, live_tools=None):
+                   cwd=None, live_tools=None, subprocess_env=None):
     if live_tools is None:
         live_tools = CLAUDE_LIVE_TOOLS
     prompt = f"{system}\n\n{user}"
-    # HARD subscription guard: never let an inherited ANTHROPIC_API_KEY / AUTH_TOKEN
-    # flip `claude` to metered API billing. Strip them for this child only.
-    env = {k: v for k, v in os.environ.items()
-           if k not in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")}
-    env["PAGER"] = "cat"
+    # HARD subscription guard: build this child from the same provider-specific
+    # allowlist as classic Council lanes. Never let an inherited Anthropic API
+    # variable flip `claude` to metered API billing.
+    from council_summon import build_lane_environment
+    source_env = os.environ if subprocess_env is None else subprocess_env
+    env = build_lane_environment(
+        {"provider": "claude-cli", "mode": "direct"},
+        source_env=source_env,
+        file_env={},
+    )
+    for name in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_TOKEN"):
+        env.pop(name, None)
+    chillspwn_user = env.get("COUNCIL_CLAUDE_USER", CHILLSPWN_USER).strip()
+    chillspwn_home = env.get("COUNCIL_CLAUDE_HOME", CHILLSPWN_HOME).strip()
     claude_cmd = ["claude", "-p", prompt, "--model", model, "--output-format", "text"]
     if live_tools:
         claude_cmd += ["--permission-mode", "bypassPermissions"]   # headless tool use
@@ -512,10 +512,16 @@ def run_claude_cli(model, system, user, task_id, log, max_iters=None, force_writ
     # user that owns the subscription creds. `env -u` guarantees the API key is unset in
     # claude's env regardless of what runuser preserves, so billing stays on the plan.
     if live_tools and os.geteuid() == 0:
-        cmd = (["runuser", "-u", CHILLSPWN_USER, "--",
+        if not chillspwn_user or not chillspwn_home:
+            raise RuntimeError(
+                "COUNCIL_CLAUDE_USER and COUNCIL_CLAUDE_HOME are required for a root-launched Claude lane"
+            )
+        cmd = (["runuser", "-u", chillspwn_user, "--",
                 "env", "-u", "ANTHROPIC_API_KEY", "-u", "ANTHROPIC_AUTH_TOKEN",
-                "HOME=" + CHILLSPWN_HOME, "PAGER=cat"] + claude_cmd)
-        as_user = CHILLSPWN_USER
+                "-u", "ANTHROPIC_TOKEN", "HOME=" + chillspwn_home,
+                "USER=" + chillspwn_user, "LOGNAME=" + chillspwn_user,
+                "PAGER=cat"] + claude_cmd)
+        as_user = chillspwn_user
     else:
         cmd = claude_cmd
         as_user = "self"

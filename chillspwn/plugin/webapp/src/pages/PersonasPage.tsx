@@ -10,6 +10,7 @@ interface PersonaDetail {
   soul: string;
   soulPath: string | null;
   isSymlink: boolean;
+  soulReadOnly: boolean;
 }
 
 interface PersonaSummary {
@@ -25,10 +26,6 @@ export default function PersonasPage() {
   const [personas, setPersonas] = useState<PersonaSummary[]>([]);
   const [selected, setSelected] = useState<string | null>(null);
   const [detail, setDetail] = useState<PersonaDetail | null>(null);
-  const [editingSoul, setEditingSoul] = useState(false);
-  const [soulDraft, setSoulDraft] = useState("");
-  const [saving, setSaving] = useState(false);
-  const [saveStatus, setSaveStatus] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
@@ -44,40 +41,10 @@ export default function PersonasPage() {
   const loadDetail = (name: string) => {
     setSelected(name);
     setDetail(null);
-    setEditingSoul(false);
-    setSaveStatus(null);
     fetch(`/api/personas/${encodeURIComponent(name)}`)
       .then((r) => r.json())
-      .then((data) => {
-        setDetail(data);
-        setSoulDraft(data.soul || "");
-      })
+      .then((data) => setDetail(data))
       .catch(() => {});
-  };
-
-  const saveSoul = async () => {
-    if (!selected || !detail) return;
-    setSaving(true);
-    setSaveStatus(null);
-    try {
-      const resp = await fetch(`/api/personas/${encodeURIComponent(selected)}/soul`, {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ content: soulDraft }),
-      });
-      if (resp.ok) {
-        const data = await resp.json();
-        setSaveStatus(`Saved to ${data.path}`);
-        setDetail({ ...detail, soul: soulDraft });
-        setEditingSoul(false);
-      } else {
-        const err = await resp.json();
-        setSaveStatus(`Error: ${err.error}`);
-      }
-    } catch (e: any) {
-      setSaveStatus(`Error: ${e.message}`);
-    }
-    setSaving(false);
   };
 
   if (loading) {
@@ -194,62 +161,19 @@ export default function PersonasPage() {
                   </p>
                   {detail.isSymlink && (
                     <p className="text-[10px] mt-0.5" style={{ color: "var(--neon-amber)" }}>
-                      Shared with Hermes — edits apply to both agents
+                      Reviewed definition shared with Hermes; runtime editing is disabled
                     </p>
                   )}
                 </div>
-                <div className="flex gap-2">
-                  {detail.soul && !editingSoul && (
-                    <button
-                      onClick={() => { setEditingSoul(true); setSoulDraft(detail.soul); setSaveStatus(null); }}
-                      className="px-3 py-1 text-xs rounded"
-                      style={{
-                        border: "1px solid var(--neon-green)",
-                        color: "var(--neon-green)",
-                        background: "rgba(43,212,127,0.05)",
-                      }}
-                    >
-                      Edit
-                    </button>
-                  )}
-                  {editingSoul && (
-                    <>
-                      <button
-                        onClick={() => { setEditingSoul(false); setSaveStatus(null); }}
-                        className="px-3 py-1 text-xs rounded"
-                        style={{ border: "1px solid var(--border-bright)", color: "var(--text-dim)" }}
-                      >
-                        Cancel
-                      </button>
-                      <button
-                        onClick={saveSoul}
-                        disabled={saving}
-                        className="px-3 py-1 text-xs rounded"
-                        style={{
-                          background: "var(--neon-green)",
-                          color: "#000",
-                          opacity: saving ? 0.5 : 1,
-                        }}
-                      >
-                        {saving ? "Saving..." : "Save"}
-                      </button>
-                    </>
-                  )}
-                </div>
+                {detail.soulReadOnly && (
+                  <span
+                    className="px-2 py-1 text-[10px] uppercase tracking-wider rounded"
+                    style={{ border: "1px solid var(--border-bright)", color: "var(--text-dim)" }}
+                  >
+                    Reviewed policy · read-only
+                  </span>
+                )}
               </div>
-
-              {saveStatus && (
-                <div
-                  className="px-4 py-2 text-xs"
-                  style={{
-                    borderBottom: "1px solid var(--border-color)",
-                    color: saveStatus.startsWith("Error") ? "var(--neon-red)" : "var(--neon-green)",
-                    background: saveStatus.startsWith("Error") ? "rgba(255,0,64,0.05)" : "rgba(43,212,127,0.05)",
-                  }}
-                >
-                  {saveStatus}
-                </div>
-              )}
 
               <div className="p-4">
                 {!detail.soul && (
@@ -257,27 +181,13 @@ export default function PersonasPage() {
                     This persona has no SOUL file. It uses Claude Code's default behavior.
                   </p>
                 )}
-                {detail.soul && !editingSoul && (
+                {detail.soul && (
                   <pre
                     className="text-xs font-cyber leading-relaxed whitespace-pre-wrap overflow-y-auto max-h-96"
                     style={{ color: "var(--text-primary)" }}
                   >
                     {detail.soul}
                   </pre>
-                )}
-                {editingSoul && (
-                  <textarea
-                    value={soulDraft}
-                    onChange={(e) => setSoulDraft(e.target.value)}
-                    className="w-full text-xs font-cyber leading-relaxed rounded p-3 glow-input"
-                    style={{
-                      background: "var(--bg-primary)",
-                      border: "1px solid var(--border-color)",
-                      color: "var(--text-primary)",
-                      minHeight: "400px",
-                      resize: "vertical",
-                    }}
-                  />
                 )}
               </div>
 

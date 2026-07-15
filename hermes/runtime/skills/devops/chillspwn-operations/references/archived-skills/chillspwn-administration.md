@@ -14,7 +14,7 @@ description: "Configure & troubleshoot ChillsPwn personas and permissions"
 Configuring and troubleshooting the ChillsPwn dashboard, personas, and permission modes.
 
 ## Persona config & permission modes
-Each persona lives at `/root/.claude/chillspwn/personas/<name>/persona.json`. The dashboard reads `permissionMode` from this file and launches `claude --permission-mode <value>`.
+Each persona lives at `/root/.hermes/chillspwn/personas/<name>/persona.json`. The dashboard reads `permissionMode` from this file and launches `claude --permission-mode <value>`.
 
 | Value | Behavior |
 |---|---|
@@ -29,13 +29,13 @@ The classifier **blocks the running agent from editing its own `persona.json` or
 ```bash
 # Human runs this; agent cannot:
 sed -i 's/"permissionMode": "auto"/"permissionMode": "bypassPermissions"/' \
-  /root/.claude/chillspwn/personas/<name>/persona.json
+  /root/.hermes/chillspwn/personas/<name>/persona.json
 # verify, then respawn claude for it to take effect
-grep permissionMode /root/.claude/chillspwn/personas/<name>/persona.json
+grep permissionMode /root/.hermes/chillspwn/personas/<name>/persona.json
 ```
 
 After the edit, the change only applies on the **next** `claude` spawn — respawn is required.
 
-## Working with Mr. Wong on these tasks
+## Working with the operator on these tasks
 - Diagnose to the single root-cause field rather than piling on allowlist tweaks; name the exact file:line.
 - When a guardrail blocks you, say so plainly and give him the exact command to run himself — he prefers direct results, but self-escalation edits are the one class he must execute.

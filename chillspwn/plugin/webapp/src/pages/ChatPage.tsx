@@ -1,6 +1,7 @@
 import { useState, useRef, useEffect, useCallback, lazy, Suspense, startTransition, memo } from "react";
 import type { CSSProperties } from "react";
 import { copyToClipboard } from "../lib/clipboard";
+import { resolveSessionHistoryState } from "../lib/sessionHistoryState";
 import { CyberDropdown } from "../components/CyberDropdown";
 const TerminalPage = lazy(() => import("./TerminalPage"));
 
@@ -39,7 +40,8 @@ interface SessionInfo {
   id: string;
   persona: string;
   preview: string;
-  running: boolean;
+  isLive: boolean;
+  turnActive: boolean;
   created_at: number;
   messageCount: number;
   totalInputTokens: number;
@@ -92,7 +94,7 @@ interface ChatProps {
   personaModel?: string;
   permissionMode: string;
   onLiveSessionChange?: (hasLive: boolean) => void;
-  resumeCliSession?: { id: string; title: string; cwd: string } | null;
+  resumeCliSession?: { id: string; title: string } | null;
   onResumeConsumed?: () => void;
   // ── Nav-driven sessions ──
   // The session list now lives in the app navigation. The nav commands this chat via
@@ -563,10 +565,12 @@ export default function ChatPage({ persona, personaProvider, personaModel, permi
               // With windowing the visible user-count is partial; trust hasMore as a
               // signal that older turns exist (drives followup-vs-spawn).
               setTurnCount(data.hasMore ? Math.max(userMsgCount, 1) : userMsgCount);
-              setCurrentSessionLive(!!data.isLive); // authoritative liveness from server
+              const runtimeState = resolveSessionHistoryState(data);
+              setCurrentSessionLive(runtimeState.isLive);
+              setIsStreaming(runtimeState.turnActive);
               (window as any).__restoreContextSummary = data.contextSummary;
               (window as any).__restorePersona = data.persona;
-              (window as any).__restoreIsLive = data.isLive;
+              (window as any).__restoreIsLive = runtimeState.isLive;
               // Re-derive provider/model on restore: the server's in-memory provider override is
               // lost on refresh, so trust the persisted session model — and when the session has
               // neither (the default chat never persists a provider), fall back to the active
@@ -580,7 +584,7 @@ export default function ChatPage({ persona, personaProvider, personaModel, permi
                     ? deriveProviderFromModel(data.model)
                     : ((personaProvider as any) || "anthropic")
               );
-              if (data.isLive) {
+              if (runtimeState.isLive) {
                 ws.send(JSON.stringify({ type: "load_session", sessionId: data.sessionId }));
               }
             }
@@ -824,7 +828,26 @@ export default function ChatPage({ persona, personaProvider, personaModel, permi
 
     // -- Turn lifecycle / queue / interrupt acknowledgements --
     if (msg.type === "turn_state") {
+      const stateSessionId = msg.sessionId || currentSessionRef.current;
+      if (stateSessionId) {
+        setSessions((prev) => prev.map((session) => session.id === stateSessionId
+          ? {
+              ...session,
+              isLive: typeof msg.isLive === "boolean" ? msg.isLive : session.isLive,
+              turnActive: !!msg.turnActive,
+            }
+          : session));
+        setBusySessions((prev) => {
+          const hasState = prev.has(stateSessionId);
+          if (!!msg.turnActive === hasState) return prev;
+          const next = new Set(prev);
+          if (msg.turnActive) next.add(stateSessionId);
+          else next.delete(stateSessionId);
+          return next;
+        });
+      }
       if (msg.sessionId && msg.sessionId !== currentSessionRef.current) return;
+      if (typeof msg.isLive === "boolean") setCurrentSessionLive(msg.isLive);
       setIsStreaming(!!msg.turnActive);
       return;
     }
@@ -842,6 +865,12 @@ export default function ChatPage({ persona, personaProvider, personaModel, permi
     if (msg.type === "provider_switched") {
       if (msg.sessionId && msg.sessionId !== currentSessionRef.current) return;
       setCurrentSessionLive(false); // force the next send to spawn (resurrect) on the new backend
+      setIsStreaming(false);
+      if (msg.sessionId) {
+        setSessions((prev) => prev.map((session) => session.id === msg.sessionId
+          ? { ...session, isLive: false, turnActive: false }
+          : session));
+      }
       setMessages((prev) => [
         ...prev,
         {
@@ -881,6 +910,9 @@ export default function ChatPage({ persona, personaProvider, personaModel, permi
             next.add(eventSessionId);
             return next;
           });
+          setSessions((prev) => prev.map((session) => session.id === eventSessionId
+            ? { ...session, turnActive: true }
+            : session));
         }
         if (data.type === "result") {
           setBusySessions(prev => {
@@ -889,6 +921,9 @@ export default function ChatPage({ persona, personaProvider, personaModel, permi
             next.delete(eventSessionId);
             return next;
           });
+          setSessions((prev) => prev.map((session) => session.id === eventSessionId
+            ? { ...session, turnActive: false }
+            : session));
         }
         return; // Don't render in current view
       }
@@ -1047,6 +1082,18 @@ export default function ChatPage({ persona, personaProvider, personaModel, permi
       if (data.type === "result") {
         flushReveal();  // reveal any still-queued command/output bubbles before the turn closes
         setIsStreaming(false);
+        const resultSessionId = msg.sessionId || currentSessionRef.current;
+        if (resultSessionId) {
+          setSessions((prev) => prev.map((session) => session.id === resultSessionId
+            ? { ...session, turnActive: false }
+            : session));
+          setBusySessions((prev) => {
+            if (!prev.has(resultSessionId)) return prev;
+            const next = new Set(prev);
+            next.delete(resultSessionId);
+            return next;
+          });
+        }
         // Finalize any bubbles still flagged as streaming (the consolidated
         // assistant event usually does this; this is the safety net).
         setMessages(prev => prev.some(m => m.streaming || m.toolInputPartial)
@@ -1134,21 +1181,31 @@ export default function ChatPage({ persona, personaProvider, personaModel, permi
 
     // -- Session list response --
     if (msg.type === "session_list") {
-      const mapped = (msg.sessions || []).map((s: any) => ({
-        id: s.id,
-        persona: s.persona,
-        preview: s.preview || "",
-        running: s.status === "running",
-        created_at: new Date(s.createdAt).getTime(),
-        messageCount: s.messageCount || 0,
-        totalInputTokens: s.totalInputTokens || 0,
-        totalOutputTokens: s.totalOutputTokens || 0,
-        totalCacheRead: s.totalCacheRead || 0,
-        model: s.model || "",
-        title: s.title || "",
-      }));
+      const mapped = (msg.sessions || []).map((s: any) => {
+        const runtimeState = resolveSessionHistoryState(s);
+        return {
+          id: s.id,
+          persona: s.persona,
+          preview: s.preview || "",
+          isLive: runtimeState.isLive,
+          turnActive: runtimeState.turnActive,
+          created_at: new Date(s.createdAt).getTime(),
+          messageCount: s.messageCount || 0,
+          totalInputTokens: s.totalInputTokens || 0,
+          totalOutputTokens: s.totalOutputTokens || 0,
+          totalCacheRead: s.totalCacheRead || 0,
+          model: s.model || "",
+          title: s.title || "",
+        };
+      });
       setSessions(mapped);
-      onLiveSessionChange?.(mapped.some((s: SessionInfo) => s.running));
+      setBusySessions(new Set(mapped.filter((session: SessionInfo) => session.turnActive).map((session: SessionInfo) => session.id)));
+      const currentRuntime = mapped.find((session: SessionInfo) => session.id === currentSessionRef.current);
+      if (currentRuntime) {
+        setCurrentSessionLive(currentRuntime.isLive);
+        setIsStreaming(currentRuntime.turnActive);
+      }
+      onLiveSessionChange?.(mapped.some((s: SessionInfo) => s.isLive));
     }
 
     // -- Session history response --
@@ -1190,9 +1247,25 @@ export default function ChatPage({ persona, personaProvider, personaModel, permi
       // partial, so trust the server's total when it indicates more exists.
       const userCount = history.filter((m: Message) => m.role === "user").length;
       setTurnCount(msg.hasMore ? Math.max(userCount, 1) : userCount);
-      // Track liveness from server's authoritative answer
-      const sessionIsLive = msg.status === "running";
+      // A provider process may stay live between turns (notably Grok ACP).
+      // Liveness controls follow-up routing; only turnActive controls the
+      // generating/interrupt UI.
+      const { isLive: sessionIsLive, turnActive: sessionTurnActive } = resolveSessionHistoryState(msg);
       setCurrentSessionLive(sessionIsLive);
+      setIsStreaming(sessionTurnActive);
+      if (msg.sessionId) {
+        setSessions((prev) => prev.map((session) => session.id === msg.sessionId
+          ? { ...session, isLive: sessionIsLive, turnActive: sessionTurnActive }
+          : session));
+        setBusySessions((prev) => {
+          const hasState = prev.has(msg.sessionId);
+          if (sessionTurnActive === hasState) return prev;
+          const next = new Set(prev);
+          if (sessionTurnActive) next.add(msg.sessionId);
+          else next.delete(msg.sessionId);
+          return next;
+        });
+      }
       // Re-derive the provider chip from the persisted model so a refresh /
       // session-switch keeps the right backend label (override map is in-memory).
       if (msg.model) setActiveModel(msg.model);
@@ -1202,7 +1275,6 @@ export default function ChatPage({ persona, personaProvider, personaModel, permi
           : deriveProviderFromModel(msg.model)
       );
       if (sessionIsLive) {
-        setIsStreaming(true);
         onLiveSessionChange?.(true);
       }
     }
@@ -1233,6 +1305,9 @@ export default function ChatPage({ persona, personaProvider, personaModel, permi
         setCurrentSessionLive(false);
       }
       if (endedId) {
+        setSessions((prev) => prev.map((session) => session.id === endedId
+          ? { ...session, isLive: false, turnActive: false }
+          : session));
         setBusySessions(prev => {
           if (!prev.has(endedId)) return prev;
           const next = new Set(prev);
@@ -1251,7 +1326,19 @@ export default function ChatPage({ persona, personaProvider, personaModel, permi
 
     // -- Error --
     if (msg.type === "error") {
-      setIsStreaming(false);
+      const errorSessionId = msg.sessionId;
+      if (!errorSessionId || errorSessionId === currentSessionRef.current) setIsStreaming(false);
+      if (errorSessionId) {
+        setSessions((prev) => prev.map((session) => session.id === errorSessionId
+          ? { ...session, turnActive: false }
+          : session));
+        setBusySessions((prev) => {
+          if (!prev.has(errorSessionId)) return prev;
+          const next = new Set(prev);
+          next.delete(errorSessionId);
+          return next;
+        });
+      }
       // If the error references a specific session that's not live anymore
       // (e.g. user typed after the claude subprocess already exited), DON'T
       // clear the chat — preserve the history. Just mark the session as
@@ -1264,8 +1351,9 @@ export default function ChatPage({ persona, personaProvider, personaModel, permi
       if (orphanId && notFound) {
         // Mark session as not-running (instead of removing) so the sidebar reflects reality
         setSessions((prev) => prev.map((s) =>
-          s.id === orphanId ? { ...s, running: false } : s
+          s.id === orphanId ? { ...s, isLive: false, turnActive: false } : s
         ));
+        if (currentSessionRef.current === orphanId) setCurrentSessionLive(false);
         // Only show the notice for the currently-viewed session
         if (currentSessionRef.current === orphanId) {
           setMessages((prev) => [
@@ -1341,7 +1429,8 @@ export default function ChatPage({ persona, personaProvider, personaModel, permi
           id,
           persona,
           preview: "(empty — type a message to start)",
-          running: false,
+          isLive: false,
+          turnActive: false,
           created_at: Date.now(),
           messageCount: 0,
           totalInputTokens: 0,
@@ -1442,6 +1531,9 @@ export default function ChatPage({ persona, personaProvider, personaModel, permi
     };
     setMessages((prev) => [...prev, userMsg]);
     setIsStreaming(true);
+    setSessions((prev) => prev.map((session) => session.id === sid
+      ? { ...session, isLive: true, turnActive: true }
+      : session));
     onLiveSessionChange?.(true);
 
     // Decide between "chat" (spawn new) vs "followup" (inject into live).
@@ -1454,11 +1546,9 @@ export default function ChatPage({ persona, personaProvider, personaModel, permi
     if (shouldSpawnNew) {
       // Check if we're resuming a CLI session
       const resumeId = (window as any).__resumeCliSessionId;
-      const resumeCwd = (window as any).__resumeCliCwd;
       if (resumeId) {
         delete (window as any).__resumeCliSessionId;
         delete (window as any).__resumeCliTitle;
-        delete (window as any).__resumeCliCwd;
       }
 
       // If respawning a dead session, embed the recent conversation as context
@@ -1493,12 +1583,12 @@ export default function ChatPage({ persona, personaProvider, personaModel, permi
           persona,
           permissionMode: chatPermissionMode,
           prompt: finalPrompt,
-          ...(resumeId ? { resumeCliSessionId: resumeId, resumeCliCwd: resumeCwd } : {}),
+          ...(resumeId ? { resumeCliSessionId: resumeId } : {}),
         })
       );
       // Mark this session as live now — a spawn was just kicked off
       setCurrentSessionLive(true);
-      setSessions((prev) => prev.map((s) => s.id === sid ? { ...s, running: true } : s));
+      setSessions((prev) => prev.map((s) => s.id === sid ? { ...s, isLive: true, turnActive: true } : s));
       // Refresh the session list shortly after — the server creates the persisted
       // session file when claude is spawned, so the sidebar entry appears on next list.
       const refresh = () => wsRef.current?.send(JSON.stringify({ type: "list_sessions" }));
@@ -1545,6 +1635,9 @@ export default function ChatPage({ persona, personaProvider, personaModel, permi
     };
     setMessages((prev) => [...prev, userMsg]);
     setIsStreaming(true);
+    setSessions((prev) => prev.map((session) => session.id === currentSession
+      ? { ...session, isLive: true, turnActive: true }
+      : session));
 
     wsRef.current.send(
       JSON.stringify({
@@ -1630,7 +1723,7 @@ export default function ChatPage({ persona, personaProvider, personaModel, permi
     }
 
     const sessionInfo = sessions.find((s) => s.id === sid);
-    if (!sessionInfo?.running) {
+    if (!sessionInfo?.isLive) {
       // Session is already stopped — skip the memory check
       afterStop?.();
       return;
@@ -1643,19 +1736,20 @@ export default function ChatPage({ persona, personaProvider, personaModel, permi
         {
           id: `close-${Date.now()}`,
           role: "system",
-          content: "🔒 Closing session — checking for memory-worthy facts to persist before shutdown...",
+          content: "🔒 Closing session — preparing a box-agnostic reusable attack-chain candidate before shutdown...",
           timestamp: Date.now(),
         },
       ]);
     }
 
-    // Memory-check prompt (same text the old Stop hook used)
+    // Provider-independent learning handoff. Raw target state stays in engagement evidence;
+    // the post-session reviewer turns only a generalized chain into reusable memory.
     const memoryPrompt =
-      "Before this session closes, check if any new facts were learned that should be persisted. " +
-      "If the user shared new preferences, if we discovered new credentials/attack paths, or if " +
-      "important lessons were learned, use the Edit tool to append them to ~/.hermes/memories/USER.md " +
-      "(for preferences, separated by §) or ~/.hermes/memories/MEMORY.md (for facts, separated by §). " +
-      "These memories are shared with Hermes. If nothing notable was learned, just say 'No facts to persist.'";
+      "Before this session closes, preserve reusable learning without writing target facts to global MEMORY.md. " +
+      "Keep all box names, IPs/domains, users, credentials, hashes, flags, and target-specific paths in the engagement evidence/report only. " +
+      "If a repeatable attack chain succeeded, emit one <attack-chain-candidate> block containing: a technique-oriented title; prerequisites/signals; ordered steps; exact command templates with <TARGET_HOST>, <DOMAIN>, <USER_REF>, and <LHOST> placeholders; validation checkpoints; failure recovery/cleanup; tools; and helpful official/tool/advisory/general-research references. " +
+      "Do not include an HTB/box name or URL, a box walkthrough, or any target-specific value. The provider-independent post-session learner will save it as an on-demand playbook. " +
+      "Only a new operator preference/correction belongs in USER.md. If no reusable chain was learned, say 'No reusable attack chain to persist.'";
 
     closeAfterMemoryRef.current = sid;
     postCloseActionRef.current = afterStop || null;
@@ -1909,6 +2003,16 @@ export default function ChatPage({ persona, personaProvider, personaModel, permi
     color: color || "var(--text-bright, #d7e6f5)",
   });
 
+  const providerDisplay = activeProvider === "openrouter"
+    ? ((activeModel.includes("/") ? activeModel.split("/")[1] : activeModel) || "OpenRouter")
+    : activeProvider === "openai-codex"
+      ? `Codex${activeModel ? " · " + activeModel : ""}`
+      : activeProvider === "gemini"
+        ? `Gemini${activeModel ? " · " + activeModel : ""}`
+        : activeProvider === "xai-grok"
+          ? `Grok ACP${activeModel ? " · " + activeModel : ""}`
+          : "Anthropic";
+
   // ── Render ──
   return (
     <div className="flex h-full">
@@ -1980,11 +2084,11 @@ export default function ChatPage({ persona, personaProvider, personaModel, permi
                 onClick={() => switchSession(s.id)}
               >
                 <div className="flex items-center gap-1.5 mb-0.5">
-                  {(s.running || busySessions.has(s.id)) && (
+                  {(s.turnActive || busySessions.has(s.id) || s.isLive) && (
                     <span
-                      className="pulse-dot w-1.5 h-1.5 rounded-full shrink-0"
-                      style={{ background: "var(--neon-green)" }}
-                      title="Session is currently running"
+                      className={`${s.turnActive || busySessions.has(s.id) ? "pulse-dot " : ""}w-1.5 h-1.5 rounded-full shrink-0`}
+                      style={{ background: s.turnActive || busySessions.has(s.id) ? "var(--neon-green)" : "rgba(43,212,127,.72)" }}
+                      title={s.turnActive || busySessions.has(s.id) ? "Turn in progress" : "Session process ready"}
                     />
                   )}
                   <span
@@ -2074,8 +2178,12 @@ export default function ChatPage({ persona, personaProvider, personaModel, permi
               <span style={{ fontFamily: "var(--font-display)", fontSize: 14, fontWeight: 700, color: "var(--text-primary)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", minWidth: 0 }}>
                 {(sessions.find((s) => s.id === currentSession)?.title || "").trim() || sessions.find((s) => s.id === currentSession)?.persona || persona}
               </span>
-              {currentSessionLive && (
-                <span className="pulse-dot" style={{ width: 7, height: 7, borderRadius: "50%", background: "var(--neon-green)", flexShrink: 0 }} title="Live session" />
+              {(isStreaming || currentSessionLive) && (
+                <span
+                  className={isStreaming ? "pulse-dot" : ""}
+                  style={{ width: 7, height: 7, borderRadius: "50%", background: isStreaming ? "var(--neon-green)" : "rgba(43,212,127,.72)", boxShadow: isStreaming ? undefined : "0 0 0 2px rgba(43,212,127,.10)", flexShrink: 0 }}
+                  title={isStreaming ? "Turn in progress" : "Session process ready"}
+                />
               )}
             </div>
             <div style={{ fontSize: 11, marginTop: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
@@ -2084,15 +2192,7 @@ export default function ChatPage({ persona, personaProvider, personaModel, permi
                 ? "reconnecting…"
                 : isStreaming
                   ? `${persona} is typing…`
-                  : (activeProvider === "openrouter"
-                      ? ((activeModel.includes("/") ? activeModel.split("/")[1] : activeModel) || "OpenRouter")
-                      : activeProvider === "openai-codex"
-                        ? `Codex${activeModel ? " · " + activeModel : ""}`
-                        : activeProvider === "gemini"
-                          ? `Gemini${activeModel ? " · " + activeModel : ""}`
-                          : activeProvider === "xai-grok"
-                            ? `Grok ACP${activeModel ? " · " + activeModel : ""}`
-                          : "Anthropic")}
+                  : `${currentSessionLive ? "Ready · " : ""}${providerDisplay}`}
             </div>
           </div>
           {/* streaming → single Stop control */}
@@ -2134,7 +2234,7 @@ export default function ChatPage({ persona, personaProvider, personaModel, permi
                       <button style={menuItemStyle(false)} onClick={() => { handleNewSession(); setShowHeaderMenu(false); }}>
                         + New session
                       </button>
-                      {sessions.find((s) => s.id === currentSession)?.running && (
+                      {sessions.find((s) => s.id === currentSession)?.isLive && (
                         <button style={menuItemStyle(false, "#b07cff")} onClick={() => { handleCloseSession(); setShowHeaderMenu(false); }}>
                           🔒 Close session
                         </button>
@@ -2227,7 +2327,7 @@ export default function ChatPage({ persona, personaProvider, personaModel, permi
 
                   // Check if session is live — if so, send followup; if dead, start a new claude process
                   const session = sessions.find(s => s.id === currentSession);
-                  if (session?.running) {
+                  if (session?.isLive) {
                     handleSendFollowUp("Continue where we left off.");
                   } else {
                     // Dead session — spawn a new claude process with context summary
@@ -2783,7 +2883,7 @@ export default function ChatPage({ persona, personaProvider, personaModel, permi
       {/* Custom delete confirmation modal */}
       {confirmDelete && (() => {
         const target = sessions.find((s) => s.id === confirmDelete);
-        const isLive = target?.running;
+        const isLive = target?.isLive;
         const doDelete = () => {
           const sid = confirmDelete!;
           // OPTIMISTIC LOCAL REMOVAL — the session disappears from the sidebar
@@ -2939,7 +3039,7 @@ export default function ChatPage({ persona, personaProvider, personaModel, permi
               ) : filePreview.name.toLowerCase().endsWith(".html") ? (
                 <iframe
                   srcDoc={filePreview.content}
-                  sandbox="allow-same-origin"
+                  sandbox=""
                   style={{ width: "100%", height: "100%", border: "none", background: "#fff" }}
                   title={filePreview.name}
                 />
@@ -3052,13 +3152,10 @@ function parseUserQuestions(text: string): { cleanText: string; questions: UserQ
 
 // ── Code Block with action buttons ─────────────────────
 
-// ── ChillsPwn arsenal: alias → real tool name, applied ONLY to displayed code ──
-// The living value (storage, conversation, LLM prompts) stays in aliases; this swaps
-// to the real command name purely for on-screen readability, and only at a command
-// position (line start or just after a shell operator) so arguments, comments, and
-// prose are never mis-translated. Source of truth = the arsenal in /opt/chillspwn-bin.
-// Full canonical set — generated from /opt/chillspwn-bin (97 wrappers). Keep in sync
-// with /opt/chillspwn-bin/ALIASES.md (regenerate that, then mirror here).
+// ── Legacy ChillsPwn aliases: alias → native command, display compatibility only ──
+// Older transcripts can contain optional uppercase wrapper names. Translate those
+// at command positions so a clean host shows the portable Kali-native command.
+// This never mutates stored conversation data and does not require the wrappers.
 const ALIAS_TO_REAL: Record<string, string> = {
   AD: "bloodyAD", ASREP: "impacket-GetNPUsers", AUDIT: "nikto", BATCH: "dnsrecon",
   BROWSE: "gobuster", CARVE: "binwalk", CHAIN: "proxychains4", CHILD: "impacket-raiseChild",

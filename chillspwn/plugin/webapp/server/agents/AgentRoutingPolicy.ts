@@ -35,7 +35,7 @@ export class AgentRoutingPolicy {
   /**
    * (0) Phase 18 — HARD no-hands commander. BEFORE the specialist-tool name check, deny a commander
    * actor any execution-surface tool (terminal/execute_code/process/mcp_execute) or specialist tool,
-   * and name the specialist to route to. This is what closes the gap the PingPong session exposed:
+   * and name the specialist to route to. This closes the gap a prior authorized-lab session exposed:
    * `terminal` was previously a "coordination tool" and slipped through `chillspwnDirectTool`.
    * Inert for non-commander actors and when the flag is off. `command` is the shell/code text (used
    * only to pick the recommended specialist).

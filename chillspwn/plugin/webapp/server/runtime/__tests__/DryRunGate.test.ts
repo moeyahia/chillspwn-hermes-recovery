@@ -89,6 +89,14 @@ describe("Phase 8.1 verified-memory planning context", () => {
     s.proposeMemory({ type: "hypothesis", content: "maybe", scope: "engagement", sourceAgentRunId: "r" });
     expect(buildVerifiedMemoryContext(s.listMemoryItems())).toBe("");
   });
+  test("filters legacy target-specific verified records before context injection", () => {
+    const legacy = {
+      id: "legacy", type: "finding", scope: "global", content: "scan 10.10.10.10",
+      status: "verified", timestamp: new Date().toISOString(), confidence: 1,
+    } as any;
+    expect(buildVerifiedMemoryContext([legacy])).toBe("");
+    expect(buildVerifiedMemoryContext([{ ...legacy, content: "curl https://victim.example as user=administrator" }])).toBe("");
+  });
 });
 
 import { classifyTool, decideTool } from "../ToolPolicy";

@@ -2,8 +2,15 @@
 """Dry-run what happens on RESUME of the cleaned session: load ledger + reconstruct().
 With _distilled_upto=1318 there should be ZERO old msgs to distill (no API call) and the
 last 16 kept raw. Proves the installed ledger is used and the backlog isn't re-processed."""
+import os
+import sys
+
 import orchestrator_openrouter as O
-SF = "/root/.claude/chillspwn/sessions/s-1780173556310.json"
+
+SF = os.environ.get("CHILLSPWN_TEST_SESSION_FILE", "").strip()
+if not SF or not os.path.isfile(SF):
+    print("CHILLSPWN_TEST_SESSION_FILE must name a readable test-session file", file=sys.stderr)
+    raise SystemExit(2)
 
 # Instrument distill so we can PROVE it is/ isn't called (no real API call wanted here).
 calls = {"n": 0}

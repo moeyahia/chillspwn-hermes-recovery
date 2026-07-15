@@ -1,17 +1,16 @@
 #!/usr/bin/env python3
-"""MCP server exposing the ChillsPwn agent-board tools to claude (native MCP).
+"""MCP server exposing the ChillsPwn agent-board tools to an orchestrator (native MCP).
 
 Registered via `claude mcp add` — NEVER in buildClaudeArgs (the claude path stays frozen). Talks to the
 dashboard over localhost HTTP (127.0.0.1:3131), so every kanban write funnels through the dashboard's
-single writer (no SQLITE_BUSY race). Gives the CLAUDE-side orchestrator (e.g. ChillsPwn-on-Claude) the
-same plan/delegate/gather loop the OpenRouter orchestrator has.
+single writer (no SQLITE_BUSY race). Gives every supported orchestrator the same
+plan/delegate/gather loop.
 
-Self-planning (agent="self") routes to the orchestrator's OWN Backlog/Plan column and tags the card with
-the model the orchestrator is running (Claude). Delegated cards (agent="<other>") run on the target
-agent's OWN provider config — never overridden.
+Self-planning (agent="self") routes to the orchestrator's OWN Backlog/Plan column and is never
+dispatched. It records intent only; the orchestrator must delegate executable work to a different
+named specialist. Delegated cards run on the target agent's OWN provider config — never overridden.
 
-Run with the hermes venv python (FastMCP needs pydantic v2):
-  /root/hermes-venv/bin/python board_mcp_server.py
+Run with the configured Hermes virtual-environment Python (FastMCP needs pydantic v2).
 """
 import os
 import json
@@ -21,15 +20,17 @@ from mcp.server.fastmcp import FastMCP
 
 DASH = os.environ.get("CHILLSPWN_DASHBOARD_URL", "http://127.0.0.1:3131")
 ORCH = os.environ.get("CHILLSPWN_OR_PERSONA", "ChillsPwn")
-PERSONAS_DIR = os.environ.get("CHILLSPWN_PERSONAS_DIR", "/root/.claude/chillspwn/personas")
+PERSONAS_DIR = os.environ.get("CHILLSPWN_PERSONAS_DIR", "").strip()
 
 
 def _orch_model() -> str:
-    """The claude model the orchestrator persona is configured with (for the plan card's label)."""
+    """The orchestrator model configured for the plan card's label."""
     env = os.environ.get("CHILLSPWN_ORCH_MODEL")
     if env:
         return env
     try:
+        if not PERSONAS_DIR:
+            return "claude-opus-4-8"
         for name in os.listdir(PERSONAS_DIR):
             pj = os.path.join(PERSONAS_DIR, name, "persona.json")
             if os.path.isfile(pj):
@@ -69,38 +70,51 @@ def board_list() -> str:
 
 @mcp.tool()
 def board_create_task(agent: str, title: str, body: str, engagement: str = "") -> str:
-    """Create a board card. Use agent="self" to add a step to YOUR OWN Backlog/Plan column (the card shows
-    the model you are planning with and is NOT executed by an agent — you work it yourself). Use
+    """Create a board card. Use agent="self" only to record a planning step in YOUR OWN Backlog/Plan
+    column. A self card is never executed and never authorizes you to work it yourself. Use
     agent="<other-persona>" to DELEGATE a self-contained task to a specialist agent column; that agent runs
     it on its OWN provider + tools. The body must be complete — a delegated agent cannot ask you back.
     Returns the card_id."""
+    agent = str(agent or "").strip()
+    title = str(title or "").strip()
     if not agent or not title:
         return json.dumps({"error": "board_create_task needs agent + title"})
-    is_self = agent in ("self", "__plan__", "backlog", "plan") or agent == ORCH
+    agent_key = agent.casefold()
+    is_self = agent_key in ("self", "__plan__", "backlog", "plan", ORCH.strip().casefold())
     if is_self:
         agent = ORCH
     payload = {"title": title, "body": body or "", "assignee": agent, "engagement": engagement or "", "createdBy": "orchestrator"}
     if is_self:
-        payload["provider"] = "anthropic"     # this orchestrator runs on the Claude backend
-        payload["model"] = _orch_model()       # the plan card shows the Claude model you are planning with
+        payload["provider"] = os.environ.get("CHILLSPWN_ORCH_PROVIDER", "anthropic")
+        payload["model"] = _orch_model()
+        payload["planningOnly"] = True
     r = _http("POST", "/api/kanban", payload)
     if r.get("error"):
         return json.dumps({"error": r["error"]})
-    return json.dumps({"ok": True, "card_id": r.get("id"), "agent": agent, "dispatched": r.get("dispatched")})
+    return json.dumps({
+        "ok": True,
+        "card_id": r.get("id"),
+        "agent": agent,
+        "dispatched": r.get("dispatched"),
+        "planning_only": is_self,
+    })
 
 
 @mcp.tool()
 def board_await(card_ids: list, timeout: int = 600) -> str:
-    """Block until the given board cards finish (done/failed), then return each card's result + the tools it
-    used. Use to GATHER a parallel fan-out before planning the next wave. Always returns by the timeout
-    (stragglers come back with status 'timeout')."""
+    """Block until the given board cards reach a terminal state (done/failed/blocked), then return each
+    card's result + the tools it used. A blocked card is terminal for this wait: return it immediately so
+    the orchestrator can inspect the blocker and plan a recovery wave. Each call is capped at a 120-second
+    heartbeat window. Non-terminal cards return their latest status, partial result, and observed tools at
+    the heartbeat so the orchestrator can report progress or plan the next wait."""
     if isinstance(card_ids, str):
         card_ids = [c.strip() for c in card_ids.split(",") if c.strip()]
     if not card_ids:
         return json.dumps({"error": "board_await needs card_ids"})
-    timeout = min(int(timeout or 600), 900)
+    timeout = min(int(timeout or 600), 120)
     deadline = time.time() + timeout
     results = {}
+    latest = {}
     while time.time() < deadline and len(results) < len(card_ids):
         for cid in card_ids:
             if cid in results:
@@ -108,13 +122,31 @@ def board_await(card_ids: list, timeout: int = 600) -> str:
             c = _http("GET", f"/api/kanban/card/{cid}")
             if c.get("error"):
                 continue
-            if c.get("status") in ("done", "failed"):
+            latest[cid] = c
+            if c.get("status") in ("done", "failed", "blocked"):
                 results[cid] = {"status": c.get("status"), "result": str(c.get("result") or c.get("error") or "")[:6000],
                                 "tools": [t.get("name") for t in (c.get("tools") or []) if isinstance(t, dict)]}
         if len(results) < len(card_ids):
             time.sleep(2)
     for cid in card_ids:
-        results.setdefault(cid, {"status": "timeout", "result": "(still running when board_await timed out)", "tools": []})
+        if cid in results:
+            continue
+        c = latest.get(cid)
+        if c:
+            status = str(c.get("status") or "unknown")
+            results[cid] = {
+                "status": status,
+                "result": str(c.get("result") or c.get("error") or f"(still {status} at board_await heartbeat)")[:6000],
+                "tools": [t.get("name") for t in (c.get("tools") or []) if isinstance(t, dict)],
+                "heartbeat_timeout": True,
+            }
+        else:
+            results[cid] = {
+                "status": "timeout",
+                "result": "(no card state available at board_await heartbeat)",
+                "tools": [],
+                "heartbeat_timeout": True,
+            }
     return json.dumps({"ok": True, "results": results})
 
 

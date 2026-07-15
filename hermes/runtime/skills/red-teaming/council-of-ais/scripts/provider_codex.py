@@ -15,7 +15,7 @@ import json
 import os
 
 CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex"
-_HERMES_VENDOR = "/root/.claude/chillspwn/vendor/hermes"
+_HERMES_VENDOR = os.environ.get("CHILLSPWN_HERMES_SRC", "").strip()
 DEFAULT_CODEX_MODEL = "gpt-5.5"
 
 # Bound every codex HTTP op so a stalled / half-closed stream can't wedge a turn forever. The shared
@@ -44,13 +44,15 @@ def _acct_from_jwt(access_token: str) -> str:
 
 def _codex_auth():
     """Return (access_token, account_id). PRIMARY source = the Hermes credential_pool in
-    /root/.hermes/auth.json — that is the store Hermes writes/refreshes on login, and the
+    the configured Hermes home `auth.json` — that is the store Hermes writes/refreshes on login, and the
     FRESHEST entry (by last_refresh) is the valid one (the single-use refresh chain means older
     copies, incl. ~/.codex/auth.json, get server-side invalidated). Falls back to the Codex CLI
     store, then the legacy providers block."""
     # 1) Hermes credential_pool — freshest openai-codex entry wins
+    hermes_home = os.path.expanduser(os.environ.get("HERMES_HOME", "~/.hermes"))
+    codex_home = os.path.expanduser(os.environ.get("CODEX_HOME", "~/.codex"))
     try:
-        d = json.load(open("/root/.hermes/auth.json"))
+        d = json.load(open(os.path.join(hermes_home, "auth.json")))
         pool = (d.get("credential_pool") or {}).get("openai-codex") or []
         entries = [e for e in pool if isinstance(e, dict) and e.get("access_token")]
         entries.sort(key=lambda e: e.get("last_refresh") or "", reverse=True)
@@ -60,7 +62,7 @@ def _codex_auth():
     except Exception:
         pass
     # 2) Codex CLI store
-    for path in ("/root/.codex/auth.json", os.path.expanduser("~/.codex/auth.json")):
+    for path in (os.path.join(codex_home, "auth.json"),):
         try:
             d = json.load(open(path))
             tk = d.get("tokens") or {}
@@ -110,6 +112,8 @@ class CodexProvider:
     def _get_client(self):
         if self._client is None:
             import sys
+            if not _HERMES_VENDOR:
+                raise RuntimeError("CHILLSPWN_HERMES_SRC is required for the Codex provider")
             if _HERMES_VENDOR not in sys.path:
                 sys.path.insert(0, _HERMES_VENDOR)
             import openai  # noqa
@@ -125,6 +129,8 @@ class CodexProvider:
         """Run one codex turn and return a CHAT-COMPLETIONS-shaped response dict, so the
         orchestrator loop's parse_choice / Path-A logic is identical to the OpenRouter path."""
         import sys
+        if not _HERMES_VENDOR:
+            raise RuntimeError("CHILLSPWN_HERMES_SRC is required for the Codex provider")
         if _HERMES_VENDOR not in sys.path:
             sys.path.insert(0, _HERMES_VENDOR)
         from agent.codex_responses_adapter import (

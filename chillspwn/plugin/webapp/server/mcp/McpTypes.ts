@@ -37,6 +37,8 @@ export interface McpServerSpec {
   command?: string;
   args?: string[];
   cwd?: string;
+  /** Present when a configured start command failed immutable-executable validation. */
+  startError?: string;
   /** Extra non-secret env for the spawned server (e.g. MCP_TRANSPORT=stdio). */
   env?: Record<string, string>;
   /** Tool names this server exposes (from the manifest; refreshed by a live tools/list when healthy). */

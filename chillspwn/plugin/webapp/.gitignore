@@ -2,8 +2,8 @@
 # ChillsPwn webapp .gitignore
 # Goal: track ONLY source. Never commit secrets, CTF loot, auth material,
 # logs, build outputs, caches, backups, archives, or generated artifacts.
-# Added for the agent-runtime work (Phase 1). Conservative by design — when
-# in doubt, exclude.
+# Keep source and intentionally sanitized examples only. Runtime and engagement
+# data belong outside the repository, even when Git would otherwise accept them.
 # ──────────────────────────────────────────────────────────────────────────
 
 # ── Dependencies / build outputs ──
@@ -13,8 +13,13 @@ dist-revamp/
 dist-*/
 build/
 coverage/
+htmlcov/
 .vite/
-android/
+android/.gradle/
+android/build/
+android/app/build/
+android/app/src/main/assets/
+android/capacitor-cordova-android-plugins/build/
 *.tsbuildinfo
 
 # ── Logs & runtime data ──
@@ -44,11 +49,13 @@ chillspwn-agent-runtime-phase-*.zip
 .env
 .env.*
 !.env.example
+!.env.*.example
 auth.json
-*auth*.json
+**/auth.json
 *.token
-*token*
-*secret*
+*.secret
+.secrets/
+secrets.local.*
 *.credentials.json
 .credentials.json
 
@@ -60,6 +67,8 @@ auth.json
 *.key
 *.p12
 *.pfx
+*.crt
+*.cer
 *.pcap
 *.pcapng
 
@@ -75,7 +84,16 @@ CVE-*.py
 [0-9][0-9][0-9][0-9][0-9].py
 [0-9][0-9][0-9][0-9][0-9].sh
 [0-9][0-9][0-9][0-9][0-9].txt
+/[0-9][0-9][0-9][0-9][0-9].php
 dacledit-*.bak
+/scans/
+/ferox-*.state
+/ligolo-ng.history
+/ligolo-ng.yaml
+/ligolo-selfcerts/
+/out_success.txt
+/nimbus_writeup.md
+/)*
 
 # ── Generated / local databases & conversation logs ──
 conversation.mcp
@@ -87,9 +105,13 @@ conversation.mcp
 *.sqlite3
 *.sqlite-journal
 
-# ── Caches & runtime state ── (NB: bun.lock / package-lock.json are tracked source)
+# ── Caches & runtime state ── (bun.lock is tracked source)
 .cache/
 *.cache
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
 .tmp/
 tmp/
 *.pid
@@ -114,5 +136,6 @@ Thumbs.db
 .idea/
 .vscode/
 *.swp
+*.swo
 __pycache__/
 *.pyc

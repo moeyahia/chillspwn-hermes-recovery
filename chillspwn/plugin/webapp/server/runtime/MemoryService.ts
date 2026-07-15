@@ -13,7 +13,9 @@
  *   - Hypotheses are never treated as verified until explicitly approved.
  *   - project/global scope requires real provenance (a run/session/evidence link).
  *
- * Separate from the legacy USER.md/MEMORY.md file memory, which is untouched.
+ * Separate from the legacy USER.md/MEMORY.md file projection. The HTTP and
+ * provider-context boundaries validate that projection with the same reusable
+ * content rules before accepting or injecting it.
  */
 
 import {
@@ -27,6 +29,21 @@ import {
 } from "./types";
 import { MemoryStore, type MemoryQuery } from "./MemoryStore";
 import { EventLog } from "./EventLog";
+import {
+  findRejectableSecrets,
+  findReusableContentIdentifiers,
+  redactLessonText,
+} from "./AttackLesson";
+
+export function reusableMemoryViolations(content: string): string[] {
+  const errors: string[] = [];
+  const secrets = findRejectableSecrets(content ?? "");
+  if (secrets.length) errors.push(`target-specific secret(s): ${secrets.join(", ")}`);
+  const targets = findReusableContentIdentifiers(content ?? "");
+  if (targets.length) errors.push(`target-specific identifier(s): ${targets.join(", ")}`);
+  if (redactLessonText(content ?? "") !== (content ?? "")) errors.push("credential or token material");
+  return errors;
+}
 
 /** What a caller submits to proposeMemory (no id/status/timestamp). */
 export interface MemoryProposalInput {
@@ -102,6 +119,10 @@ export class MemoryService {
     if (p.type === "tool_observation" && !(p.sourceToolName || p.sourceToolCallId || p.sourceEvidenceId)) {
       errors.push("type 'tool_observation' requires sourceToolName, sourceToolCallId, or sourceEvidenceId");
     }
+    if (p.scope === "project" || p.scope === "global") {
+      const unsafe = reusableMemoryViolations(p.content ?? "");
+      if (unsafe.length) errors.push(`reusable memory must be target-agnostic and secret-free (${unsafe.join("; ")})`);
+    }
 
     return errors.length ? { valid: false, errors } : { valid: true };
   }
@@ -140,6 +161,10 @@ export class MemoryService {
     const item = this.requireItem(id);
     if (item.status !== "unverified") {
       throw new MemoryError(`memory ${id} is '${item.status}', only an unverified proposal can be approved`);
+    }
+    const unsafe = reusableMemoryViolations(item.content);
+    if (unsafe.length) {
+      throw new MemoryError(`memory ${id} cannot be approved: ${unsafe.join("; ")}; keep raw target state in evidence`);
     }
     const updated = this.store.update(id, { status: "verified", resolvedAt: nowIso(), resolvedBy: opts.resolvedBy })!;
     this.audit("memory_written", updated);
@@ -183,7 +208,8 @@ export class MemoryService {
    * unverified hypotheses, rejected items, or stale items.
    */
   getRelevantVerifiedMemory(query: Omit<MemoryQuery, "status"> = {}): MemoryItem[] {
-    return this.store.list({ ...query, status: "verified" });
+    return this.store.list({ ...query, status: "verified" })
+      .filter((item) => reusableMemoryViolations(item.content).length === 0);
   }
 
   /**
@@ -246,6 +272,7 @@ export function buildVerifiedMemoryContext(items: MemoryItem[], opts: { max?: nu
     .filter((m) => m.scope !== "session") // session scope = run-specific, not reusable context
     .filter((m) => m.type !== "hypothesis") // 8.2: a hypothesis is NOT a fact, even when verified —
     //                                          it must never appear under "you may TRUST these"
+    .filter((m) => reusableMemoryViolations(m.content).length === 0)
     .slice(0, max);
   if (!usable.length) return "";
   return [

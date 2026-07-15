@@ -3,8 +3,9 @@
  *
  * In-memory by design. The AgentRuns themselves are durable (AgentRunStore on disk), so on
  * a server restart this map is empty but can be REBUILT from the store via `rebuildFrom`
- * (it re-attaches still-`executing`, source="chat" runs to their sessionId). Until rebuilt,
- * a chat turn after a restart simply creates a fresh observe-only run — never an error.
+ * (it re-attaches still-`executing`, source="chat", mode="observe" runs to their sessionId).
+ * Until rebuilt, a chat turn after a restart simply creates a fresh observe-only run — never
+ * an error. Managed runs are intentionally excluded because their lifecycle is runtime-owned.
  */
 
 import type { ProviderKind } from "./types";
@@ -28,6 +29,7 @@ export interface RunLister {
     objective: string;
     status: string;
     source?: string;
+    mode?: string;
   }>;
 }
 
@@ -68,13 +70,13 @@ export class SessionRunMap {
 
   /**
    * Repopulate from the AgentRunStore after a restart: re-attach every still-`executing`,
-   * source="chat" run to its sessionId. Returns how many were re-attached.
+   * source="chat", mode="observe" run to its sessionId. Returns how many were re-attached.
    */
   rebuildFrom(store: RunLister): number {
     let n = 0;
     try {
       for (const r of store.listRuns()) {
-        if (r.source === "chat" && r.status === "executing" && r.sessionId && !this.map.has(r.sessionId)) {
+        if (r.source === "chat" && r.mode === "observe" && r.status === "executing" && r.sessionId && !this.map.has(r.sessionId)) {
           this.set(r.sessionId, {
             runId: r.id,
             provider: r.providerKind,

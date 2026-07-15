@@ -20,7 +20,7 @@ describe("security config — secure defaults", () => {
     expect(isLoopbackHost("::1")).toBe(true);
     expect(isLoopbackHost("localhost")).toBe(true);
     expect(isLoopbackHost("0.0.0.0")).toBe(false);
-    expect(isLoopbackHost("100.92.5.83")).toBe(false);
+    expect(isLoopbackHost("198.51.100.83")).toBe(false);
   });
 
   test("exposing the bind flips `exposed` and activates auth", () => {
@@ -38,7 +38,7 @@ describe("security config — secure defaults", () => {
   });
 
   test("ALLOWED_WORKSPACE_ROOTS parses colon/comma lists, defaults otherwise", () => {
-    expect(loadSecurityConfig({}).allowedWorkspaceRoots.length).toBeGreaterThan(0);
+    expect(loadSecurityConfig({}).allowedWorkspaceRoots).toEqual(["/root/htb/boxes", "/root/engagements"]);
     const cfg = loadSecurityConfig({ ALLOWED_WORKSPACE_ROOTS: "/a:/b,/c" });
     expect(cfg.allowedWorkspaceRoots).toEqual(["/a", "/b", "/c"]);
   });

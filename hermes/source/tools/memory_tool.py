@@ -27,6 +27,8 @@ import json
 import logging
 import os
 import re
+import subprocess
+import sys
 import tempfile
 from contextlib import contextmanager
 from pathlib import Path
@@ -57,6 +59,101 @@ def get_memory_dir() -> Path:
     return get_hermes_home() / "memories"
 
 ENTRY_DELIMITER = "\n§\n"
+
+_CHILLSPWN_GUARD_VALUES = {"1", "true", "yes", "on", "required", "enforced"}
+
+
+def chillspwn_memory_guard_enabled() -> bool:
+    """Return whether ChillsPwn requires its mediated memory boundary.
+
+    The upstream Hermes memory behavior remains unchanged unless the recovery
+    service explicitly enables this guard. In guarded deployments, model-facing
+    mutations must go through ``chillspwn_mem.py`` so the strict reusable-content
+    policy, additive-only rule, backups, and audit trail cannot be bypassed via
+    the built-in ``memory`` tool.
+    """
+    return os.environ.get("CHILLSPWN_MEMORY_GUARD", "").strip().lower() in _CHILLSPWN_GUARD_VALUES
+
+
+def _chillspwn_memory_cli() -> Path:
+    configured = os.environ.get("CHILLSPWN_MEM_CLI", "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    return get_hermes_home() / "skills" / "red-teaming" / "council-of-ais" / "scripts" / "chillspwn_mem.py"
+
+
+def _chillspwn_python() -> str:
+    return os.environ.get("HERMES_PYTHON", "").strip() or sys.executable
+
+
+def _guard_failure(message: str) -> Dict[str, Any]:
+    """Return a fail-closed result without exposing subprocess output."""
+    return {
+        "success": False,
+        "error": (
+            "ChillsPwn memory guard blocked this operation: " + message + ". "
+            "Use the validated ChillsPwn memory writer; do not edit memory files directly."
+        ),
+    }
+
+
+def _run_chillspwn_memory_cli(args: List[str], input_text: str = "") -> Dict[str, Any]:
+    """Run the validated writer/read path and normalize its JSON response.
+
+    Content is supplied on stdin, not argv, so a memory value does not appear in
+    process listings and cannot exceed ARG_MAX. Any missing helper, malformed
+    response, timeout, or non-zero result fails closed.
+    """
+    cli = _chillspwn_memory_cli()
+    python = _chillspwn_python()
+    if not cli.is_file():
+        return _guard_failure("validated memory helper is unavailable")
+    if not os.path.isabs(python) or not os.path.isfile(python) or not os.access(python, os.X_OK):
+        return _guard_failure("configured Python executable is unavailable")
+    try:
+        proc = subprocess.run(
+            [python, str(cli), *args],
+            input=input_text,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return _guard_failure("validated memory helper could not be executed")
+    try:
+        result = json.loads((proc.stdout or "").strip())
+    except (TypeError, json.JSONDecodeError):
+        return _guard_failure("validated memory helper returned an invalid response")
+    if not isinstance(result, dict):
+        return _guard_failure("validated memory helper returned an invalid response")
+    ok = bool(result.get("ok") is True or result.get("success") is True)
+    if proc.returncode != 0 or not ok:
+        # Violation category labels are safe; never propagate raw stderr or
+        # untrusted helper output through the model-facing tool response.
+        categories = result.get("violations")
+        suffix = ""
+        if isinstance(categories, list) and all(isinstance(v, str) for v in categories):
+            suffix = ": " + ", ".join(sorted(set(categories)))
+        return _guard_failure("reusable-content validation failed" + suffix)
+    normalized = dict(result)
+    normalized["success"] = True
+    normalized.pop("ok", None)
+    return normalized
+
+
+def _guarded_safe_entries(target: str) -> List[str]:
+    """Read only policy-clean entries for a guarded system-prompt snapshot."""
+    result = _run_chillspwn_memory_cli(
+        ["safe-read", "--target", target, "--format", "json"]
+    )
+    if not result.get("success"):
+        logger.error("ChillsPwn memory safe-read failed closed for target=%s", target)
+        return []
+    content = result.get("content", "")
+    if not isinstance(content, str) or not content.strip():
+        return []
+    return [entry.strip() for entry in content.split(ENTRY_DELIMITER) if entry.strip()]
 
 
 # ---------------------------------------------------------------------------
@@ -115,21 +212,38 @@ class MemoryStore:
         Tool responses always reflect this live state.
     """
 
-    def __init__(self, memory_char_limit: int = 2200, user_char_limit: int = 1375):
+    def __init__(
+        self,
+        memory_char_limit: int = 2200,
+        user_char_limit: int = 1375,
+        mediated_writer: bool = False,
+    ):
         self.memory_entries: List[str] = []
         self.user_entries: List[str] = []
         self.memory_char_limit = memory_char_limit
         self.user_char_limit = user_char_limit
+        # Only the validated ChillsPwn writer constructs a mediated store. The
+        # ordinary Hermes agent receives a read-only view when the deployment
+        # guard is enabled; its public memory tool delegates writes to the
+        # validated helper instead.
+        self._mediated_writer = bool(mediated_writer)
         # Frozen snapshot for system prompt -- set once at load_from_disk()
         self._system_prompt_snapshot: Dict[str, str] = {"memory": "", "user": ""}
 
     def load_from_disk(self):
         """Load entries from MEMORY.md and USER.md, capture system prompt snapshot."""
         mem_dir = get_memory_dir()
-        mem_dir.mkdir(parents=True, exist_ok=True)
 
-        self.memory_entries = self._read_file(mem_dir / "MEMORY.md")
-        self.user_entries = self._read_file(mem_dir / "USER.md")
+        if chillspwn_memory_guard_enabled() and not self._mediated_writer:
+            # Legacy/externally modified entries are never injected merely
+            # because they exist on disk. A missing or failed validator yields
+            # an empty snapshot, not an unsafe fallback read.
+            self.memory_entries = _guarded_safe_entries("memory")
+            self.user_entries = _guarded_safe_entries("user")
+        else:
+            mem_dir.mkdir(parents=True, exist_ok=True)
+            self.memory_entries = self._read_file(mem_dir / "MEMORY.md")
+            self.user_entries = self._read_file(mem_dir / "USER.md")
 
         # Deduplicate entries (preserves order, keeps first occurrence)
         self.memory_entries = list(dict.fromkeys(self.memory_entries))
@@ -223,6 +337,8 @@ class MemoryStore:
 
     def add(self, target: str, content: str) -> Dict[str, Any]:
         """Append a new entry. Returns error if it would exceed the char limit."""
+        if chillspwn_memory_guard_enabled() and not self._mediated_writer:
+            return _guard_failure("direct MemoryStore mutation is disabled")
         content = content.strip()
         if not content:
             return {"success": False, "error": "Content cannot be empty."}
@@ -268,6 +384,8 @@ class MemoryStore:
 
     def replace(self, target: str, old_text: str, new_content: str) -> Dict[str, Any]:
         """Find entry containing old_text substring, replace it with new_content."""
+        if chillspwn_memory_guard_enabled() and not self._mediated_writer:
+            return _guard_failure("direct MemoryStore mutation is disabled")
         old_text = old_text.strip()
         new_content = new_content.strip()
         if not old_text:
@@ -326,6 +444,8 @@ class MemoryStore:
 
     def remove(self, target: str, old_text: str) -> Dict[str, Any]:
         """Remove the entry containing old_text substring."""
+        if chillspwn_memory_guard_enabled() and not self._mediated_writer:
+            return _guard_failure("direct MemoryStore mutation is disabled")
         old_text = old_text.strip()
         if not old_text:
             return {"success": False, "error": "old_text cannot be empty."}
@@ -480,6 +600,30 @@ def memory_tool(
     if target not in {"memory", "user"}:
         return tool_error(f"Invalid target '{target}'. Use 'memory' or 'user'.", success=False)
 
+    if chillspwn_memory_guard_enabled():
+        if action != "add":
+            return json.dumps(
+                _guard_failure(
+                    "model-facing replace/remove operations are disabled; "
+                    "curation is an operator-only workflow"
+                ),
+                ensure_ascii=False,
+            )
+        if not content:
+            return tool_error("Content is required for 'add' action.", success=False)
+        result = _run_chillspwn_memory_cli(
+            [
+                "add",
+                "--target",
+                target,
+                "--stdin",
+                "--actor",
+                "hermes-memory-tool",
+            ],
+            input_text=content,
+        )
+        return json.dumps(result, ensure_ascii=False)
+
     if action == "add":
         if not content:
             return tool_error("Content is required for 'add' action.", success=False)
@@ -534,7 +678,8 @@ MEMORY_SCHEMA = {
         "- 'user': who the user is -- name, role, preferences, communication style, pet peeves\n"
         "- 'memory': your notes -- environment facts, project conventions, tool quirks, lessons learned\n\n"
         "ACTIONS: add (new entry), replace (update existing -- old_text identifies it), "
-        "remove (delete -- old_text identifies it).\n\n"
+        "remove (delete -- old_text identifies it). A deployment policy may restrict this "
+        "to additive writes and reserve replace/remove for an operator curator.\n\n"
         "SKIP: trivial/obvious info, things easily re-discovered, raw data dumps, and temporary task state."
     ),
     "parameters": {

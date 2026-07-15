@@ -23,7 +23,7 @@ Constants: `IAC=255,DONT=254,DO=253,WONT=252,WILL=251,SB=250,SE=240,NEW_ENVIRON=
 - A second NEW_ENVIRON subnegotiation must not resend the environment payload.
 
 ## In-memory transport
-Build the Python source locally, syntax-test it, then compare direct base64, gzip+base64, and zlib+base64 transports. On Orion, gzip+base64 was shortest. Execute from the include query through a compact quote-free PHP payload such as `system(base64_decode(end($_GET)))`; this avoids putting the large command in the logged Cookie header. Marker-wrap output, then best-effort `unlink(__FILE__)` and `rmdir(dirname(__FILE__))` before the end marker. Never persist the query payload or cookies in evidence.
+Build the Python source locally, syntax-test it, then compare direct base64, gzip+base64, and zlib+base64 transports; choose the shortest verified representation for the target. Execute from the include query through a compact quote-free PHP payload such as `system(base64_decode(end($_GET)))`; this avoids putting the large command in the logged Cookie header. Marker-wrap output, then best-effort `unlink(__FILE__)` and `rmdir(dirname(__FILE__))` before the end marker. Never persist the query payload or cookies in evidence.
 
 ## Header gate
 Measure the exact prepared writer and include requests. Require single header line <=6000 bytes, request line <=4096, and request line plus headers <=8192. Abort before exploit POSTs if either fails.
@@ -48,4 +48,4 @@ Store the evidence directory mode 0700 and artifacts 0600. Persist no CSRF or Co
 - each flag accepted only as exactly 32 hex immediately after its expected `stat` path line.
 Cleanup remains best-effort unless independently verified; do not send another request solely to check it.
 
-Validated on HTB Orion: writer max header 1056 bytes, include max header 256 bytes, include head 3443 bytes; one TCP connection, one payload, one command; root identity and both flags returned; socket closed; no persistence.
+Validation record: capture writer/include header bounds, response size, connection and payload counts, authorized proof markers, socket closure, and confirmation that no persistence remains. Keep engagement identifiers and target outcomes only in the engagement evidence store.

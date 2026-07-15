@@ -69,7 +69,7 @@ export function registerGateRoutes(app: Express, deps: GateRouteDeps): void {
       } else if (policy.isCommanderActor(run.persona)) {
         // Phase 18 — HARD no-hands commander: deny the execution surface (terminal/execute_code/
         // process/mcp_execute) + any specialist tool, and name the specialist to route to. This is
-        // the fix for the PingPong gap (terminal used to slip through as a "coordination tool").
+        // the fix for the historical direct-execution gap (terminal used to slip through as a "coordination tool").
         const nh = policy.commanderNoHands(run.persona, toolName, cmd);
         if (nh.action === "deny") {
           log("warn", "18 no-hands commander deny", { persona: run.persona, toolName, recommend: nh.recommendedSpecialist?.agentId, reason: nh.reason });

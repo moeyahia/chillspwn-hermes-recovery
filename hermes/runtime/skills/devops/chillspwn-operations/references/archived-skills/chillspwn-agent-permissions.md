@@ -38,7 +38,7 @@ The auto-mode classifier deliberately **blocks the agent from editing its own pe
 
 Correct behavior when you hit it:
 1. **Stop. Do not** try the same edit via a different tool (Write, python, sed, jq) — that's the same prohibited action in disguise.
-2. Hand the change to the **operator** as a ready-to-paste command (prefer jq per Mr. Wong's preference; back up + `|= unique` dedupe; Python only if jq absent).
+2. Hand the change to the **operator** as a ready-to-paste command (prefer jq per the operator's preference; back up + `|= unique` dedupe; Python only if jq absent).
 3. Offer to **verify read-only** afterward — reading the allowlist back is allowed; writing/installing as part of the widening chain is not.
 
 Note: `|= unique` re-sorts and dedupes the whole array, so adding N entries to a list with a pre-existing duplicate can land at less than `old+N` — expected, not data loss.

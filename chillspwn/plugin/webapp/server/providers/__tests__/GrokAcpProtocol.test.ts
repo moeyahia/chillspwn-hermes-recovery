@@ -4,12 +4,17 @@ import {
   acpNotification,
   buildGrokAgentArgs,
   classifyGrokStopReason,
+  extractGrokToolInvocation,
   extractGrokToolOutput,
   grokAcpInitializeParams,
   isAcpClientRequest,
   isFinalGrokToolUpdate,
+  isMeaningfulGrokAcpActivity,
+  isNoisyGrokMaintenanceMessage,
   permissionCancelledResponse,
   permissionSelectedResponse,
+  questionAcceptedResponse,
+  questionCancelledResponse,
   selectPermissionOption,
   unsupportedAcpMethodResponse,
   type AcpPermissionOption,
@@ -32,6 +37,26 @@ describe("Grok ACP process and initialize parameters", () => {
       "--reasoning-effort",
       "high",
       "--always-approve",
+      "stdio",
+    ]);
+    expect(buildGrokAgentArgs("grok-4.5", {
+      alwaysApprove: false,
+      noLeader: true,
+      agentProfile: "/profiles/commander.md",
+      pluginDirs: ["/plugins/boundary", "/plugins/audit"],
+    })).toEqual([
+      "agent",
+      "-m",
+      "grok-4.5",
+      "--reasoning-effort",
+      "high",
+      "--no-leader",
+      "--agent-profile",
+      "/profiles/commander.md",
+      "--plugin-dir",
+      "/plugins/boundary",
+      "--plugin-dir",
+      "/plugins/audit",
       "stdio",
     ]);
   });
@@ -69,6 +94,19 @@ describe("Grok ACP JSON-RPC routing", () => {
       error: { code: -32601, message: "Method not found: terminal/create" },
     });
   });
+
+  test("counts only turn-relevant traffic as watchdog activity", () => {
+    const pending = new Map<number, string>([[4, "session/prompt"]]);
+
+    expect(isMeaningfulGrokAcpActivity({ method: "session/update", params: {} }, pending)).toBe(true);
+    expect(isMeaningfulGrokAcpActivity({ id: "permission-1", method: "session/request_permission" }, pending)).toBe(true);
+    expect(isMeaningfulGrokAcpActivity({ id: 4, result: { stopReason: "end_turn" } }, pending)).toBe(true);
+
+    expect(isMeaningfulGrokAcpActivity({ id: "skills-reload", result: { reloaded: 1 } }, pending)).toBe(false);
+    expect(isMeaningfulGrokAcpActivity({ method: "_x.ai/models/update", params: {} }, pending)).toBe(false);
+    expect(isMeaningfulGrokAcpActivity({ id: 99, result: {} }, pending)).toBe(false);
+    expect(isMeaningfulGrokAcpActivity("not-json", pending)).toBe(false);
+  });
 });
 
 describe("Grok ACP permissions", () => {
@@ -102,6 +140,31 @@ describe("Grok ACP permissions", () => {
       id: "permission-2",
       result: { outcome: { outcome: "cancelled" } },
     });
+  });
+});
+
+describe("Grok native user questions", () => {
+  test("builds the response envelopes accepted by Grok Build", () => {
+    expect(questionAcceptedResponse(0, { "Pick one": "Alpha" })).toEqual({
+      jsonrpc: "2.0",
+      id: 0,
+      result: { outcome: "accepted", answers: { "Pick one": "Alpha" } },
+    });
+    expect(questionCancelledResponse("question-1")).toEqual({
+      jsonrpc: "2.0",
+      id: "question-1",
+      result: { outcome: "cancelled" },
+    });
+  });
+});
+
+describe("Grok ACP raw-audit filtering", () => {
+  test("suppresses only known high-volume maintenance messages", () => {
+    expect(isNoisyGrokMaintenanceMessage({ id: "skills-reload", result: { reloaded: 519 } })).toBe(true);
+    expect(isNoisyGrokMaintenanceMessage({ method: "_x.ai/models/update", params: {} })).toBe(true);
+    expect(isNoisyGrokMaintenanceMessage({ method: "session/update", params: { update: { sessionUpdate: "available_commands_update" } } })).toBe(true);
+    expect(isNoisyGrokMaintenanceMessage({ method: "session/update", params: { update: { sessionUpdate: "agent_message_chunk" } } })).toBe(false);
+    expect(isNoisyGrokMaintenanceMessage({ method: "_x.ai/ask_user_question", id: 0 })).toBe(false);
   });
 });
 
@@ -171,10 +234,89 @@ describe("Grok ACP tool output", () => {
     ).toBe("error\n");
   });
 
+  test("extracts Grok MCP OkayOutput and ErrorOutput envelopes", () => {
+    expect(
+      extractGrokToolOutput({
+        status: "completed",
+        rawOutput: {
+          type: "MCP",
+          tool_name: "board_await",
+          server_name: "chillspwn-board",
+          output: { OkayOutput: '{"ok":true,"results":{"card-1":{"status":"done"}}}' },
+        },
+      }),
+    ).toBe('{"ok":true,"results":{"card-1":{"status":"done"}}}');
+
+    expect(
+      extractGrokToolOutput({
+        status: "failed",
+        rawOutput: {
+          type: "MCP",
+          tool_name: "board_await",
+          server_name: "chillspwn-board",
+          output: { ErrorOutput: { message: "board service unavailable" } },
+        },
+      }),
+    ).toBe("board service unavailable");
+  });
+
   test("handles malformed and cyclic values without throwing", () => {
     const cyclic: Record<string, unknown> = {};
     cyclic.content = cyclic;
     expect(extractGrokToolOutput({ status: "completed", content: cyclic })).toBe("");
     expect(extractGrokToolOutput(null)).toBe("");
+  });
+});
+
+describe("Grok ACP live board tool progress", () => {
+  test("extracts a native tool name and useful command detail", () => {
+    expect(
+      extractGrokToolInvocation({
+        sessionUpdate: "tool_call",
+        title: "run_terminal_command",
+        rawInput: { command: "nmap -sV 10.10.10.10", description: "enumerate services" },
+        _meta: { "x.ai/tool": { name: "run_terminal_command" } },
+      }),
+    ).toEqual({
+      name: "run_terminal_command",
+      input: { command: "nmap -sV 10.10.10.10", description: "enumerate services" },
+      detail: "nmap -sV 10.10.10.10",
+      kind: "tool",
+    });
+  });
+
+  test("unwraps Grok's MCP use_tool envelope for a meaningful timeline", () => {
+    expect(
+      extractGrokToolInvocation({
+        sessionUpdate: "tool_call",
+        title: "use_tool",
+        rawInput: {
+          tool_name: "chillspwn-board__board_await",
+          tool_input: { card_ids: ["card-1"], timeout: 60 },
+        },
+        _meta: { "x.ai/tool": { name: "use_tool" } },
+      }),
+    ).toEqual({
+      name: "chillspwn-board__board_await",
+      input: { card_ids: ["card-1"], timeout: 60 },
+      detail: '{"card_ids":["card-1"],"timeout":60}',
+      kind: "tool",
+    });
+  });
+
+  test("classifies namespaced use_skill calls as skill progress", () => {
+    expect(
+      extractGrokToolInvocation({
+        title: "use_tool",
+        rawInput: {
+          tool_name: "specialist-tools__use_skill",
+          tool_input: { skill: "windows-privesc" },
+        },
+      }),
+    ).toMatchObject({
+      name: "specialist-tools__use_skill",
+      detail: "windows-privesc",
+      kind: "skill",
+    });
   });
 });

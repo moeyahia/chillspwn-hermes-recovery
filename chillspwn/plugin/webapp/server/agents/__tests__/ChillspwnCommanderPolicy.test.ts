@@ -32,6 +32,12 @@ describe("Phase 18 — no-hands commander core denials", () => {
   test("process is also a blocked execution tool", () => {
     expect(deny("process").action).toBe("deny");
   });
+  test("mutations, private delegation, and research tools are blocked", () => {
+    for (const tool of ["write_file", "patch", "delegate_task", "remember", "skill_manage", "web_search", "web_extract"]) {
+      expect(deny(tool).action).toBe("deny");
+      expect(COMMANDER_BLOCKED_EXEC_TOOLS.has(tool)).toBe(true);
+    }
+  });
 });
 
 describe("Phase 18 — blocked commands route to the right specialist (Part 6)", () => {
@@ -43,8 +49,8 @@ describe("Phase 18 — blocked commands route to the right specialist (Part 6)",
     }
   });
   test("5. nmap → ReconScout", () => {
-    expect(deny("terminal", "nmap -sCV 10.129.245.56").recommendedSpecialist?.agentId).toBe("ReconScout");
-    expect(deny("terminal", "masscan -p1-65535 10.129.245.56").recommendedSpecialist?.agentId).toBe("ReconScout");
+    expect(deny("terminal", "nmap -sCV 192.0.2.25").recommendedSpecialist?.agentId).toBe("ReconScout");
+    expect(deny("terminal", "masscan -p1-65535 192.0.2.25").recommendedSpecialist?.agentId).toBe("ReconScout");
   });
   test("6. ffuf/gobuster → WebBreaker", () => {
     expect(deny("terminal", "ffuf -w w -u http://x/FUZZ").recommendedSpecialist?.agentId).toBe("WebBreaker");
@@ -125,13 +131,13 @@ describe("Phase 18 — specialists unaffected (Parts 15, 16)", () => {
 
 describe("Phase 18 — HTB mission detection (Part 4) + rollback + coordination-safe", () => {
   test("17. HTB mission prompt detected as managed specialist mission", () => {
-    expect(isManagedMissionPrompt("Let's pwn the HTB box PingPong at 10.129.245.56, get user+root flag")).toBe(true);
+    expect(isManagedMissionPrompt("Assess the authorized lab target at 192.0.2.25 and retrieve its proof files")).toBe(true);
     expect(isManagedMissionPrompt("Hack The Box authorized lab engagement")).toBe(true);
     expect(isManagedMissionPrompt("what's the weather like today?")).toBe(false);
     expect(isManagedMissionPrompt("help me write a python script to parse CSV")).toBe(false);
   });
   test("coordination tools allowed for the commander (plan/route/synthesize)", () => {
-    for (const t of ["board_create_task", "delegate_task", "read_file", "write_file", "search_files", "recall_conversation", "remember", "use_skill", "web_search", "board_await"]) {
+    for (const t of ["board_create_task", "board_update", "board_list", "read_file", "search_files", "recall_conversation", "use_skill", "board_await"]) {
       expect(commanderMayUseTool("chillspwn", t, NO_HANDS)).toBe(true);
     }
   });

@@ -6,7 +6,7 @@
 import { existsSync, readFileSync } from "fs";
 import { join, extname } from "path";
 
-const ROOT = "/root/.claude/plugins/chillspwn/webapp/dist-revamp";
+const ROOT = join(process.env.CHILLSPWN_PLUGIN_DIR || "/opt/chillspwn/plugin", "webapp/dist-revamp");
 const UPSTREAM = "127.0.0.1:3131";
 const PORT = 3142;
 const MIME: Record<string, string> = {

@@ -14,7 +14,7 @@ description: "Diagnose/fix ChillsPwn persona permission modes"
 How the ChillsPwn dashboard decides what the spawned `claude` process is allowed to do, and how to debug "my allowlist isn't working" symptoms.
 
 ## Where the setting lives
-`/root/.claude/chillspwn/personas/<persona-name>/persona.json` → field `permissionMode`.
+`/root/.hermes/chillspwn/personas/<persona-name>/persona.json` → field `permissionMode`.
 The dashboard reads this and spawns `claude --permission-mode <value>`. Per-persona, so check the SPECIFIC persona that's running (e.g. `chillspwn`), not a global config.
 
 ## permissionMode values
@@ -30,9 +30,9 @@ If commands keep getting blocked/erroring AND you've added allow rules that do n
 Fix (must be run by the user — see guardrail below):
 ```bash
 sed -i 's/"permissionMode": "auto"/"permissionMode": "bypassPermissions"/' \
-  /root/.claude/chillspwn/personas/<persona>/persona.json
+  /root/.hermes/chillspwn/personas/<persona>/persona.json
 # verify
-grep permissionMode /root/.claude/chillspwn/personas/<persona>/persona.json
+grep permissionMode /root/.hermes/chillspwn/personas/<persona>/persona.json
 ```
 Then respawn the claude process for it to take effect.
 

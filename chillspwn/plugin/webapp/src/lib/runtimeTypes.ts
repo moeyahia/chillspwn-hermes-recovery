@@ -154,6 +154,7 @@ export interface WorkerResult {
   confidence: number;
   assumptions: string[];
   recommendedNextSteps: string[];
+  proposedAttackChains?: Record<string, unknown>[];
 }
 
 export interface WorkerResultRecord {

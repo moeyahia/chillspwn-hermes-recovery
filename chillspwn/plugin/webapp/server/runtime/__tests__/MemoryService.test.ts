@@ -18,7 +18,7 @@ beforeEach(() => {
 afterEach(() => { try { rmSync(dir, { recursive: true, force: true }); } catch {} });
 
 const sessionPref: MemoryProposalInput = {
-  type: "user_preference", content: "Mr. Wong prefers Telegram alerts", scope: "session",
+  type: "user_preference", content: "the operator prefers Telegram alerts", scope: "session",
   sourceSessionId: "s1", confidence: 0.9,
 };
 
@@ -46,6 +46,30 @@ describe("memory proposal creation + validation", () => {
     // with provenance it's allowed (but still unverified)
     const ok = svc.proposeMemory({ type: "finding", content: "x", scope: "global", sourceAgentRunId: "run_1" });
     expect(ok.status).toBe("unverified");
+  });
+
+  test("reusable scopes reject target identity and secrets", () => {
+    expect(() => svc.proposeMemory({
+      type: "finding", content: "target 10.10.10.10 password=secret-value", scope: "global", sourceAgentRunId: "run_1",
+    })).toThrow(/target-agnostic and secret-free/);
+    for (const content of [
+      "curl https://victim.example/admin",
+      "login user=administrator",
+      "Use username alice with smbclient",
+      "target named orion exposed SMB",
+      "password is demo-passphrase",
+      "password demo-passphrase",
+      "credential alice:demo-passphrase",
+      "login with alice and demo-passphrase",
+      "token was demo-token-value",
+      "use token demo-token-value",
+      "secret is demo-secret-value",
+      "the target machine CredSmith exposed SMB",
+    ]) {
+      expect(() => svc.proposeMemory({
+        type: "finding", content, scope: "project", sourceAgentRunId: "run_1",
+      })).toThrow(/target-agnostic and secret-free/);
+    }
   });
 
   test("tool_observation requires a tool/evidence link", () => {
@@ -83,6 +107,14 @@ describe("approval flow", () => {
     const item = svc.proposeMemory(sessionPref);
     svc.approveMemory(item.id);
     expect(() => svc.approveMemory(item.id)).toThrow(/only an unverified/);
+  });
+
+  test("approval quarantines target-specific engagement proposals", () => {
+    const item = svc.proposeMemory({
+      type: "engagement_fact", content: "host 10.10.10.10 accepted administrator", scope: "engagement", sourceAgentRunId: "run_1",
+    });
+    expect(() => svc.approveMemory(item.id)).toThrow(/keep raw target state in evidence/);
+    expect(svc.getMemory(item.id)?.status).toBe("unverified");
   });
 
   test("markStale retires a verified item", () => {

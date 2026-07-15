@@ -1,15 +1,16 @@
 import type { CapacitorConfig } from '@capacitor/cli';
 
+const serverUrl = process.env.CAPACITOR_SERVER_URL?.trim();
+
 const config: CapacitorConfig = {
   appId: 'com.chillspwn.app',
   appName: 'ChillsPwn',
   webDir: 'dist',
-  server: {
-    // Point to the Kali VM's Tailscale IP
-    url: 'https://kali-vps.tail6f91d3.ts.net',
-  },
+  // Omit `server` for a normal packaged build. Set CAPACITOR_SERVER_URL only
+  // during intentional live-reload development against a trusted HTTPS host.
+  ...(serverUrl ? { server: { url: serverUrl } } : {}),
   android: {
-    allowMixedContent: true,
+    allowMixedContent: process.env.CAPACITOR_ALLOW_MIXED_CONTENT === 'true',
   },
 };
 

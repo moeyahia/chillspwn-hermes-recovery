@@ -1,12 +1,10 @@
 {
   "name": "chillspwn",
   "version": "1.0.0",
-  "description": "Autonomous pentesting agent with SOUL identity, persistent memory, CVE research, kanban task board, and multi-persona web dashboard — powered by Claude Code",
+  "description": "Local-first multi-provider security-testing commander with delegated specialists, persistent memory, Mission Board, and operator dashboard",
   "author": {
-    "name": "chillspwn",
-    "email": "moeyahia@hotmail.com"
+    "name": "chillspwn"
   },
-  "license": "MIT",
   "keywords": [
     "pentesting",
     "autonomous-agent",

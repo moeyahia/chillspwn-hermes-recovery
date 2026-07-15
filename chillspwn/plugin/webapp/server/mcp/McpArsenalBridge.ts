@@ -23,6 +23,8 @@ export interface BridgeConfig {
   startServers: boolean;
   defaultTimeoutMs: number;
   maxOutputBytes: number;
+  /** Test-only owner injection; production omits this and requires UID 0. */
+  trustedOwnerUid?: number;
 }
 
 export interface SpecialistToolView {
@@ -35,7 +37,7 @@ export interface SpecialistToolView {
 export class McpArsenalBridge {
   readonly registry: McpServerRegistry;
   constructor(private cfg: BridgeConfig) {
-    this.registry = new McpServerRegistry(cfg.configPath, cfg.manifestPath);
+    this.registry = new McpServerRegistry(cfg.configPath, cfg.manifestPath, cfg.trustedOwnerUid);
   }
 
   get mode() { return this.cfg.mode; }
@@ -90,7 +92,7 @@ export class McpArsenalBridge {
     const spec = this.registry.get(input.mcpServer);
     if (!spec) return fin({ error: `MCP server '${input.mcpServer}' not in arsenal config` });
     if (!spec.assignedAgents.map((a) => a.toLowerCase()).includes(input.specialistAgentId.toLowerCase())) return fin({ error: `server '${input.mcpServer}' is not assigned to ${input.specialistAgentId}` });
-    if (spec.toolNames.length && !spec.toolNames.includes(input.toolName)) return fin({ error: `'${input.toolName}' is not a tool of '${input.mcpServer}'` });
+    if (!spec.toolNames.includes(input.toolName)) return fin({ error: `'${input.toolName}' is not a declared tool of '${input.mcpServer}'` });
 
     // DRY-RUN: record what WOULD happen, execute nothing.
     if (this.isDryRun()) {

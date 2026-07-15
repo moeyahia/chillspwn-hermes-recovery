@@ -5,6 +5,7 @@ interface CliSession {
   sessionId: string;
   project: string;
   cwd: string;
+  resumable: boolean;
   title: string;
   preview: string;
   messageCount: number;
@@ -30,7 +31,7 @@ function formatSize(bytes: number): string {
   return `${(bytes / 1024 / 1024).toFixed(1)}M`;
 }
 
-export default function CliSessionsPage({ onResumeSession }: { onResumeSession?: (sessionId: string, title: string, cwd: string) => void }) {
+export default function CliSessionsPage({ onResumeSession }: { onResumeSession?: (sessionId: string, title: string) => void }) {
   const [sessions, setSessions] = useState<CliSession[]>([]);
   const [loading, setLoading] = useState(true);
   const [selected, setSelected] = useState<CliSession | null>(null);
@@ -192,16 +193,19 @@ export default function CliSessionsPage({ onResumeSession }: { onResumeSession?:
             <div style={{ display: "flex", gap: 6, flexShrink: 0 }}>
               {onResumeSession && (
                 <button
-                  onClick={() => onResumeSession(selected.sessionId, selected.title, selected.cwd)}
+                  onClick={() => onResumeSession(selected.sessionId, selected.title)}
+                  disabled={!selected.resumable}
+                  title={selected.resumable ? "Resume this trusted CLI session" : "This session's working directory is unavailable or outside configured workspaces"}
                   style={{
                     fontSize: 9, padding: "4px 12px", borderRadius: 4,
                     border: "1px solid rgba(182,242,58,0.3)",
                     background: "rgba(182,242,58,0.1)",
                     color: "var(--jarvis-blue)",
-                    cursor: "pointer", fontWeight: 600,
+                    cursor: selected.resumable ? "pointer" : "not-allowed", fontWeight: 600,
+                    opacity: selected.resumable ? 1 : 0.45,
                   }}
                 >
-                  Resume in COMMS
+                  {selected.resumable ? "Resume in COMMS" : "Resume unavailable"}
                 </button>
               )}
               <button

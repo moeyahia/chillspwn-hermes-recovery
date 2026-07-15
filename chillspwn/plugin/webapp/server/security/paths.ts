@@ -10,7 +10,8 @@
  *     level; callers that need symlink-real-path safety can pass realpath'd roots).
  */
 
-import { resolve, sep, isAbsolute } from "path";
+import { existsSync, lstatSync, realpathSync } from "fs";
+import { basename, dirname, resolve, sep, isAbsolute } from "path";
 
 /** Thrown on a rejected/escaping path. Routes map this to HTTP 400. */
 export class PathSecurityError extends Error {
@@ -89,4 +90,57 @@ export function resolveWithinRoots(roots: string[], userPath: string, label = "p
     if (isWithinRoot(root, resolved)) return resolved;
   }
   throw new PathSecurityError(`${label} is outside all allowed roots`);
+}
+
+function existingRealRoots(roots: string[]): string[] {
+  return roots
+    .filter((root) => existsSync(root))
+    .map((root) => realpathSync(root));
+}
+
+/**
+ * Resolve an existing filesystem object, follow its ancestors, and verify the
+ * real path remains under a real allowed root. This closes lexical containment
+ * bypasses where an in-root symlink points to a secret outside the root.
+ */
+export function resolveExistingWithinRoots(
+  roots: string[],
+  userPath: string,
+  label = "path",
+  options: { rejectFinalSymlink?: boolean } = {},
+): string {
+  const lexical = resolveWithinRoots(roots, userPath, label);
+  if (!existsSync(lexical)) throw new PathSecurityError(`${label} does not exist`);
+  if (options.rejectFinalSymlink && lstatSync(lexical).isSymbolicLink()) {
+    throw new PathSecurityError(`${label} must not be a symbolic link`);
+  }
+  const real = realpathSync(lexical);
+  if (!existingRealRoots(roots).some((root) => isWithinRoot(root, real))) {
+    throw new PathSecurityError(`${label} resolves outside all allowed roots`);
+  }
+  return real;
+}
+
+/**
+ * Resolve a write target without following a final symlink. The existing real
+ * parent must be inside an allowed real root; existing targets must be regular
+ * non-symlink files. Callers should write a new O_NOFOLLOW temporary file in
+ * this returned parent and atomically rename it over the target.
+ */
+export function resolveWriteTargetWithinRoots(roots: string[], userPath: string, label = "path"): string {
+  const lexical = resolveWithinRoots(roots, userPath, label);
+  const lexicalParent = dirname(lexical);
+  if (!existsSync(lexicalParent)) throw new PathSecurityError(`${label} parent does not exist`);
+  const realParent = realpathSync(lexicalParent);
+  if (!existingRealRoots(roots).some((root) => isWithinRoot(root, realParent))) {
+    throw new PathSecurityError(`${label} parent resolves outside all allowed roots`);
+  }
+  if (existsSync(lexical)) {
+    const stat = lstatSync(lexical);
+    if (stat.isSymbolicLink()) throw new PathSecurityError(`${label} must not be a symbolic link`);
+    if (!stat.isFile()) throw new PathSecurityError(`${label} is not a regular file`);
+    const real = realpathSync(lexical);
+    if (!isWithinRoot(realParent, real)) throw new PathSecurityError(`${label} resolves outside its parent`);
+  }
+  return resolve(realParent, basename(lexical));
 }

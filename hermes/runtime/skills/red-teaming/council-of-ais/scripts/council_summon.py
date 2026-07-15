@@ -17,7 +17,7 @@ Monitors progress and sends real-time Telegram updates as each model submits.
 
 Usage:
     python3 council_summon.py \
-        --engagement-dir /root/htb/boxes/silentium/ \
+        --engagement-dir /path/to/authorized-engagement/ \
         --briefing "We have RCE as www-data but can't escalate. Tried SUID, sudo, cron." \
         --timeout 1800
 
@@ -36,6 +36,7 @@ Requirements:
 import argparse
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -102,15 +103,9 @@ COUNCIL_MEMBERS = [
     {
         "id": "grok",
         "display_name": "Grok 4.3",
-        # TEMPORARY (operator request): route Grok via OpenRouter instead of xAI OAuth.
-        # To revert to the OAuth lane, restore the three commented lines below and drop
-        # the two OpenRouter lines (model/provider) + the "mode".
-        #   "model": "grok-4.20-reasoning",   # xAI-native slug (hermes OAuth lane)
-        #   "provider": "xai-oauth",
-        #   (no "mode" → spawns `hermes chat` on the xAI subscription)
-        "model": "x-ai/grok-4.3",          # OpenRouter slug (tool-capable, 1M ctx)
-        "provider": "openrouter",
-        "mode": "direct",                  # direct OpenRouter API (non-streaming → no stall)
+        "model": "grok-4.20-reasoning",   # xAI-native slug through Hermes Responses transport
+        "provider": "xai-oauth",          # SuperGrok OAuth; no OpenRouter/API-credit fallback
+        # No direct mode: `hermes chat` owns OAuth token refresh and provider transport.
         "emoji": "🟡",
     },
 ]
@@ -119,17 +114,133 @@ COUNCIL_MEMBERS = [
 # Telegram Integration
 # ──────────────────────────────────────────────────────────────────────
 
-def load_env():
-    """Load environment variables from ~/.hermes/.env"""
-    env_path = Path.home() / ".hermes" / ".env"
+def load_env(source_env=None):
+    """Load the operator env file without exporting it wholesale to a lane."""
+    source = os.environ if source_env is None else source_env
+    home = str(source.get("HOME", "") or "").strip()
+    env_path = (
+        Path(home).expanduser() / ".hermes" / ".env"
+        if home else Path.home() / ".hermes" / ".env"
+    )
     env_vars = {}
-    if env_path.exists():
-        for line in env_path.read_text().splitlines():
-            line = line.strip()
-            if line and not line.startswith("#") and "=" in line:
-                key, _, value = line.partition("=")
-                env_vars[key.strip()] = value.strip()
+    try:
+        lines = env_path.read_text().splitlines()
+    except (OSError, UnicodeError):
+        lines = []
+    for line in lines:
+        line = line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            key, _, value = line.partition("=")
+            env_vars[key.strip()] = value.strip()
     return env_vars
+
+
+# Council children are untrusted model-execution boundaries.  Keep this list
+# deliberately small: operational secrets such as DASHBOARD_TOKEN, Telegram
+# credentials, GitHub/cloud credentials, SSH agents, and unrelated provider
+# keys must never be inherited merely because the dashboard has them.
+_LANE_BASE_ENV_KEYS = (
+    "HOME", "USER", "LOGNAME", "SHELL", "PATH",
+    "LANG", "LC_ALL", "LC_CTYPE", "TZ", "TERM", "TMPDIR",
+    "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE",
+    "PYTHONUNBUFFERED",
+)
+_LANE_BOUNDARY_ENV_KEYS = (
+    "CHILLSPWN_MEMORY_GUARD",
+    "CHILLSPWN_MEM_CLI",
+    "CHILLSPWN_MEMORY_SOCKET",
+)
+_LANE_WEB_TOOL_ENV_KEYS = (
+    # Council tools currently register the Firecrawl backend explicitly. These
+    # are shared tool credentials, not inference-provider fallbacks.
+    "FIRECRAWL_API_KEY",
+    "FIRECRAWL_API_URL",
+)
+
+
+def build_lane_environment(member, source_env=None, file_env=None):
+    """Return the least-privilege environment for one Council member.
+
+    Values may come from the protected service environment or ``~/.hermes/.env``,
+    but only names explicitly selected for this provider are copied.  OAuth
+    homes can be split per provider with ``COUNCIL_CODEX_HERMES_HOME`` and
+    ``COUNCIL_XAI_HERMES_HOME``; ``HERMES_HOME`` remains a compatibility
+    fallback for existing installations.
+    """
+    source = dict(os.environ if source_env is None else source_env)
+    stored = load_env(source) if file_env is None else dict(file_env)
+
+    def setting(name):
+        value = source.get(name)
+        if value is None or not str(value).strip():
+            value = stored.get(name)
+        return str(value).strip() if value is not None else ""
+
+    lane_env = {"PAGER": "cat"}
+    for name in _LANE_BASE_ENV_KEYS:
+        value = setting(name)
+        if value:
+            lane_env[name] = value
+    lane_env.setdefault("PATH", os.defpath)
+    if "HOME" not in lane_env and source_env is None:
+        lane_env["HOME"] = str(Path.home())
+
+    for name in _LANE_BOUNDARY_ENV_KEYS:
+        value = setting(name)
+        if value:
+            lane_env[name] = value
+
+    provider = str(member.get("provider", "openrouter")).strip().lower()
+    mode = str(member.get("mode", "hermes")).strip().lower()
+
+    if mode == "direct" and provider in {"openrouter", "anthropic"}:
+        for name in _LANE_WEB_TOOL_ENV_KEYS:
+            value = setting(name)
+            if value:
+                lane_env[name] = value
+
+    if mode == "direct":
+        # The standalone worker imports Hermes' tool registry from this exact
+        # tree. It does not need the rest of the dashboard/service environment.
+        for name in ("CHILLSPWN_HERMES_SRC", "COUNCIL_ALIASES_FILE"):
+            value = setting(name)
+            if value:
+                lane_env[name] = value
+
+    if provider == "openrouter":
+        value = setting("OPENROUTER_API_KEY")
+        if value:
+            lane_env["OPENROUTER_API_KEY"] = value
+    elif provider == "anthropic":
+        value = setting("ANTHROPIC_API_KEY")
+        if value:
+            lane_env["ANTHROPIC_API_KEY"] = value
+    elif provider == "claude-cli":
+        # Subscription auth is file/OAuth based. Never pass Anthropic API-key
+        # variables, which can silently switch Claude Code to metered billing.
+        for name in (
+            "CLAUDE_CONFIG_DIR",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "COUNCIL_CLAUDE_USER",
+            "COUNCIL_CLAUDE_HOME",
+            "COUNCIL_CLAUDE_LIVE_TOOLS",
+        ):
+            value = setting(name)
+            if value:
+                lane_env[name] = value
+    elif provider == "openai-codex":
+        hermes_home = setting("COUNCIL_CODEX_HERMES_HOME") or setting("HERMES_HOME")
+        if hermes_home:
+            lane_env["HERMES_HOME"] = hermes_home
+        codex_home = setting("CODEX_HOME")
+        if codex_home:
+            lane_env["CODEX_HOME"] = codex_home
+    elif provider == "xai-oauth":
+        hermes_home = setting("COUNCIL_XAI_HERMES_HOME") or setting("HERMES_HOME")
+        if hermes_home:
+            lane_env["HERMES_HOME"] = hermes_home
+
+    return lane_env
 
 
 def send_telegram(bot_token, chat_id, message):
@@ -175,12 +286,15 @@ def build_prompt(member, briefing, engagement_dir, output_file):
             "Be specific — name CVEs, versions, file paths. Don't repeat what was tried."
         )
 
-    # Load the arsenal alias map (compact one-line form) from ALIASES.md so the
-    # council replies using the operator's alias wrappers. Falls back to empty if
-    # the file is missing — the {{ALIASES}} token must never survive into the prompt.
+    # Optional convenience aliases. A clean Kali host is expected to use native
+    # command names; absence of this file must not alter or weaken the prompt.
     aliases = ""
     try:
-        amd = Path("/opt/chillspwn-bin/ALIASES.md").read_text()
+        alias_path = Path(os.environ.get(
+            "COUNCIL_ALIASES_FILE",
+            "/opt/chillspwn-bin/ALIASES.md",
+        ))
+        amd = alias_path.read_text()
         # The compact block is the fenced code block after the "Compact" heading.
         if "## Compact" in amd:
             tail = amd.split("## Compact", 1)[1]
@@ -198,7 +312,17 @@ def build_prompt(member, briefing, engagement_dir, output_file):
     prompt = prompt.replace("{{ENGAGEMENT_DIR}}", str(engagement_dir))
     prompt = prompt.replace("{{OUTPUT_FILE}}", str(output_file))
     prompt = prompt.replace("{{MODEL_DISPLAY_NAME}}", member["display_name"])
-    prompt = prompt.replace("{{ALIASES}}", aliases)
+    alias_guidance = ""
+    if aliases:
+        alias_guidance = (
+            "## Optional operator alias wrappers\n\n"
+            "Native Kali command names are valid and portable. This deployment also exposes "
+            "optional convenience aliases; use them only when helpful and never assume they "
+            "exist on another host. Alias map (alias=canonical command):\n\n"
+            f"```text\n{aliases}\n```"
+        )
+    prompt = prompt.replace("{{ALIAS_GUIDANCE}}", alias_guidance)
+    prompt = prompt.replace("{{ALIASES}}", aliases)  # backward-compatible custom templates
     prompt = prompt.replace("{{BRIEFING}}", briefing)
     prompt = prompt.replace("{{ENGAGEMENT_DIR}}", str(engagement_dir))
 
@@ -214,6 +338,65 @@ def build_prompt(member, briefing, engagement_dir, output_file):
 # Agent Spawner
 # ──────────────────────────────────────────────────────────────────────
 
+def _validated_executable(candidate, label):
+    """Resolve and validate an executable without relying on an interactive PATH."""
+    candidate = os.path.expanduser(str(candidate or "").strip())
+    if not candidate:
+        raise RuntimeError(f"{label} executable is not configured")
+    if os.sep in candidate:
+        path = Path(candidate)
+        if path.is_file() and os.access(path, os.X_OK):
+            return str(path.resolve())
+    else:
+        found = shutil.which(candidate)
+        if found and os.access(found, os.X_OK):
+            return str(Path(found).resolve())
+    raise RuntimeError(f"{label} executable is missing or not executable: {candidate}")
+
+
+def resolve_council_python():
+    return _validated_executable(
+        os.environ.get("HERMES_PYTHON") or sys.executable,
+        "HERMES_PYTHON",
+    )
+
+
+def resolve_hermes_cli():
+    configured = os.environ.get("HERMES_CLI", "").strip()
+    if configured:
+        return _validated_executable(configured, "HERMES_CLI")
+    sibling = Path(resolve_council_python()).with_name("hermes")
+    if sibling.is_file() and os.access(sibling, os.X_OK):
+        return str(sibling.resolve())
+    return _validated_executable("hermes", "HERMES_CLI")
+
+
+def build_agent_command(member, prompt, engagement_dir, briefing=None, output_file=None):
+    """Construct and validate a lane command without starting a provider call."""
+    if member.get("mode") == "direct":
+        worker = str(Path(__file__).parent / "council_lane_agent.py")
+        if not Path(worker).is_file():
+            raise RuntimeError(f"council lane worker is missing: {worker}")
+        return [
+            resolve_council_python(), worker,
+            "--provider", member.get("provider", "openrouter"),
+            "--model", member["model"],
+            "--engagement-dir", str(engagement_dir),
+            "--briefing", briefing or "",
+            "--output", str(output_file),
+            "--display-name", member["display_name"],
+        ]
+    return [
+        resolve_hermes_cli(), "chat",
+        "-q", prompt,
+        "--model", member["model"],
+        "--provider", member.get("provider", "openrouter"),
+        "-t", "file,terminal",
+        "--yolo",
+        "-Q",
+    ]
+
+
 def spawn_agent(member, prompt, engagement_dir, log_file, briefing=None, output_file=None):
     """Spawn a council lane.
 
@@ -223,28 +406,10 @@ def spawn_agent(member, prompt, engagement_dir, log_file, briefing=None, output_
     otherwise → `hermes chat` as before. Used for the OAuth lanes (GPT-5.5/Grok),
       which are reliable on Hermes and ride their subscriptions (no OpenRouter credits).
     """
+    cmd = build_agent_command(member, prompt, engagement_dir, briefing, output_file)
     if member.get("mode") == "direct":
-        worker = str(Path(__file__).parent / "council_lane_agent.py")
-        cmd = [
-            "python3", worker,
-            "--provider", member.get("provider", "openrouter"),
-            "--model", member["model"],
-            "--engagement-dir", str(engagement_dir),
-            "--briefing", briefing or "",
-            "--output", str(output_file),
-            "--display-name", member["display_name"],
-        ]
         print(f"  {member['emoji']} Spawning {member['display_name']} (DIRECT {member.get('provider')}:{member['model']})")
     else:
-        cmd = [
-            "hermes", "chat",
-            "-q", prompt,
-            "--model", member["model"],
-            "--provider", member.get("provider", "openrouter"),
-            "-t", "file,terminal",
-            "--yolo",
-            "-Q",  # Quiet mode — suppress banner/spinner
-        ]
         print(f"  {member['emoji']} Spawning {member['display_name']} ({member.get('provider', 'openrouter')}:{member['model']})")
 
     with open(log_file, "w") as log:
@@ -253,7 +418,7 @@ def spawn_agent(member, prompt, engagement_dir, log_file, briefing=None, output_
             stdout=log,
             stderr=subprocess.STDOUT,
             cwd=str(engagement_dir),
-            env={**os.environ, "PAGER": "cat"},
+            env=build_lane_environment(member),
             # Put each lane in its own process group so it survives if the
             # parent council process is killed or its tty closes.
             start_new_session=True,
@@ -527,7 +692,7 @@ def main():
     parser.add_argument(
         "--engagement-dir", "-d",
         required=True,
-        help="Path to the engagement directory (e.g., /root/htb/boxes/silentium/)"
+        help="Path to the authorized engagement directory"
     )
     parser.add_argument(
         "--briefing", "-b",
@@ -603,8 +768,8 @@ def main():
 
     # Load env vars for Telegram
     env = load_env()
-    bot_token = env.get("TELEGRAM_BOT_TOKEN", "")
-    chat_id = env.get("TELEGRAM_ALLOWED_USERS", "")
+    bot_token = os.environ.get("TELEGRAM_BOT_TOKEN", "") or env.get("TELEGRAM_BOT_TOKEN", "")
+    chat_id = os.environ.get("TELEGRAM_ALLOWED_USERS", "") or env.get("TELEGRAM_ALLOWED_USERS", "")
 
     if not bot_token or not chat_id:
         print("[!] Warning: TELEGRAM_BOT_TOKEN or TELEGRAM_ALLOWED_USERS not set.")
@@ -673,10 +838,10 @@ def main():
             print(f"     Provider: {m.get('provider', 'openrouter')}")
             print(f"     Output: {output_file}")
             if m.get("mode") == "direct":
-                print(f"     CMD:    python3 council_lane_agent.py --provider {m.get('provider')} "
+                print(f"     CMD:    {resolve_council_python()} council_lane_agent.py --provider {m.get('provider')} "
                       f"--model {m['model']} --engagement-dir <dir> --output {output_file.name}  (DIRECT, non-streaming)")
             else:
-                print(f"     CMD:    hermes chat -q '...' --model {m['model']} "
+                print(f"     CMD:    {resolve_hermes_cli()} chat -q '...' --model {m['model']} "
                       f"--provider {m.get('provider', 'openrouter')} -t file,terminal --yolo -Q  (HERMES)")
             print()
         print("[DRY RUN] No agents spawned. Exiting.")

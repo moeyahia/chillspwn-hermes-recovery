@@ -1,83 +1,77 @@
-# ChillsPwn systemd service recipe
+# ChillsPwn systemd Service Pattern
 
-Session context: user asked to start the ChillsPwn application and ensure it starts on every machine restart. The working solution was to run it under systemd rather than a terminal background process.
+This reference describes a conventional deployment without encoding the current server's account, home directory, log path, or private endpoint.
 
-## Known paths
+## Filesystem layout
 
-- App root: `/root/.claude/plugins/chillspwn/webapp`
-- Server entrypoint: `server/index.ts`
-- Bun binary: `/root/.bun/bin/bun`
-- Durable log: `/root/.claude/chillspwn/logs/dashboard.log`
-- Service unit: `/etc/systemd/system/chillspwn.service`
-- Local URL: `http://localhost:3131`
-- Tailscale/mobile URL: `http://100.123.130.61:3131`
-- Health endpoint: `/api/health`
+- application: `/opt/chillspwn/webapp`
+- protected environment: `/etc/chillspwn/chillspwn.env`
+- service unit: `/etc/systemd/system/chillspwn.service`
+- logs: journald, unless the deployment explicitly configures a protected state directory
 
-## Important runtime note
+These paths are recommendations for a fresh install. On an existing server, inspect `systemctl cat chillspwn.service` and preserve its reviewed layout.
 
-Always start with `bun run --no-hot server/index.ts`. The `--no-hot` flag is important because Bun hot reload can kill detached Claude subprocesses spawned by the dashboard.
+## Environment file
 
-## Known-good unit
+Create the environment file mode `0600`, owned by root. Define deployment-specific bind and integration values there. Do not add it to Git.
+
+```dotenv
+NODE_ENV=production
+HOST=127.0.0.1
+PORT=3131
+```
+
+The loopback value is safe for a host-local deployment. To expose the dashboard, use an authenticated reverse proxy or verified private overlay; do not commit its address.
+
+## Unit
 
 ```ini
 [Unit]
 Description=ChillsPwn Dashboard
-After=network-online.target tailscaled.service
+After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-User=root
-WorkingDirectory=/root/.claude/plugins/chillspwn/webapp
-Environment=PATH=/root/.bun/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-Environment=NODE_ENV=production
-ExecStart=/root/.bun/bin/bun run --no-hot server/index.ts
+User=chillspwn
+Group=chillspwn
+WorkingDirectory=/opt/chillspwn/webapp
+EnvironmentFile=/etc/chillspwn/chillspwn.env
+ExecStart=/usr/local/bin/bun run --no-hot server/index.ts
 Restart=always
 RestartSec=5
 KillSignal=SIGTERM
 TimeoutStopSec=20
-StandardOutput=append:/root/.claude/chillspwn/logs/dashboard.log
-StandardError=append:/root/.claude/chillspwn/logs/dashboard.log
+NoNewPrivileges=true
+PrivateTmp=true
 
 [Install]
 WantedBy=multi-user.target
 ```
 
-## Deployment sequence
+The `--no-hot` flag preserves detached or supervised agent subprocesses. Confirm it remains the application's documented production mode before deployment.
+
+## Deployment and verification
 
 ```bash
-mkdir -p /root/.claude/chillspwn/logs
-pkill -f 'bun.*server/index.ts' || true
-
-# write /etc/systemd/system/chillspwn.service with the unit above
 systemctl daemon-reload
-systemctl enable chillspwn.service
-systemctl restart chillspwn.service
-```
-
-## Verification sequence
-
-```bash
+systemctl enable --now chillspwn.service
 systemctl is-enabled chillspwn.service
 systemctl is-active chillspwn.service
-pgrep -af 'bun.*server/index.ts'
-curl -fsS http://localhost:3131/api/health
-curl -fsS --connect-timeout 3 http://100.123.130.61:3131/api/health
-ss -ltnp '( sport = :3131 )'
+systemctl status chillspwn.service --no-pager -l
+systemctl show chillspwn.service -p MainPID -p ExecMainStatus
+ss -ltnp
 ```
 
-Expected good indicators from the original install:
+Set health URLs from the deployed configuration instead of recording them here:
 
-- `systemctl is-enabled` → `enabled`
-- `systemctl is-active` → `active`
-- health JSON like `{"status":"ok","uptime":...,"sessions":0}`
-- listener on `0.0.0.0:3131` owned by `bun`
+```bash
+: "${CHILLSPWN_LOCAL_HEALTH_URL:?set the local health URL}"
+curl -fsS --max-time 5 "$CHILLSPWN_LOCAL_HEALTH_URL"
 
-## Reporting style for Mr. Wong
+if [ -n "${CHILLSPWN_PRIVATE_HEALTH_URL:-}" ]; then
+  curl -fsS --connect-timeout 3 --max-time 5 "$CHILLSPWN_PRIVATE_HEALTH_URL"
+fi
+```
 
-Return concrete status, not setup instructions. Example:
-
-- `chillspwn.service`: active + enabled
-- local health: OK
-- Tailscale health: OK
-- access URLs: local and Tailscale/mobile
+Expected evidence is an enabled and active unit, a nonzero main PID, a successful application health response, and the intended listener. Do not print protected environment values while reporting that evidence.

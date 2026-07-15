@@ -1,31 +1,82 @@
 [extend]
 useDefault = true
 
+# Every exception is an exact, reviewed fixture/reference/source file. Do not
+# broaden these to directories: new files must pass the default rules.
 [[allowlists]]
-description = "Reviewed upstream tests and documentation containing deliberately fake credentials"
+description = "Reviewed upstream test fixtures containing deliberately fake credentials"
 paths = [
-  '''^hermes/source/tests/''',
-  '''^hermes/source/website/docs/''',
-  '''^hermes/source/optional-skills/''',
+  '''^hermes/source/tests/agent/test_copilot_acp_client\.py$''',
+  '''^hermes/source/tests/agent/test_redact\.py$''',
+  '''^hermes/source/tests/cli/test_quick_commands\.py$''',
+  '''^hermes/source/tests/gateway/test_agent_cache\.py$''',
+  '''^hermes/source/tests/gateway/test_weixin\.py$''',
+  '''^hermes/source/tests/hermes_cli/test_arcee_provider\.py$''',
+  '''^hermes/source/tests/hermes_cli/test_auth_commands\.py$''',
+  '''^hermes/source/tests/hermes_cli/test_auth_nous_provider\.py$''',
+  '''^hermes/source/tests/hermes_cli/test_config\.py$''',
+  '''^hermes/source/tests/hermes_cli/test_debug\.py$''',
+  '''^hermes/source/tests/hermes_cli/test_non_ascii_credential\.py$''',
+  '''^hermes/source/tests/hermes_cli/test_ollama_cloud_auth\.py$''',
+  '''^hermes/source/tests/hermes_cli/test_status\.py$''',
+  '''^hermes/source/tests/hermes_cli/test_tencent_tokenhub_provider\.py$''',
+  '''^hermes/source/tests/hermes_cli/test_xiaomi_provider\.py$''',
+  '''^hermes/source/tests/run_agent/test_413_compression\.py$''',
+  '''^hermes/source/tests/run_agent/test_anthropic_third_party_oauth_guard\.py$''',
+  '''^hermes/source/tests/run_agent/test_compression_feasibility\.py$''',
+  '''^hermes/source/tests/run_agent/test_init_fallback_on_exhausted_pool\.py$''',
+  '''^hermes/source/tests/run_agent/test_invalid_context_length_warning\.py$''',
+  '''^hermes/source/tests/run_agent/test_memory_provider_init\.py$''',
+  '''^hermes/source/tests/run_agent/test_plugin_context_engine_init\.py$''',
+  '''^hermes/source/tests/run_agent/test_primary_runtime_restore\.py$''',
+  '''^hermes/source/tests/run_agent/test_run_agent\.py$''',
+  '''^hermes/source/tests/run_agent/test_tool_call_guardrail_runtime\.py$''',
+  '''^hermes/source/tests/skills/test_google_workspace_api\.py$''',
+  '''^hermes/source/tests/skills/test_openclaw_migration_hardening\.py$''',
+  '''^hermes/source/tests/stress/test_atypical_scenarios\.py$''',
+  '''^hermes/source/tests/test_honcho_client_config\.py$''',
+  '''^hermes/source/tests/tools/test_credential_pool_env_fallback\.py$''',
+  '''^hermes/source/tests/tools/test_homeassistant_tool\.py$''',
+  '''^hermes/source/tests/tools/test_mcp_tool\.py$''',
+  '''^hermes/source/tests/tools/test_terminal_output_transform_hook\.py$''',
 ]
 
 [[allowlists]]
-description = "Reviewed upstream credential parsers, public OAuth client constants, and redaction patterns"
+description = "Reviewed upstream documentation and examples with public/fake token-shaped values"
+paths = [
+  '''^hermes/source/optional-skills/mlops/training/unsloth/references/llms-full\.md$''',
+  '''^hermes/source/optional-skills/mlops/training/unsloth/references/llms-txt\.md$''',
+  '''^hermes/source/optional-skills/productivity/telephony/scripts/telephony\.py$''',
+  '''^hermes/source/website/docs/guides/tips\.md$''',
+  '''^hermes/source/website/docs/user-guide/features/api-server\.md$''',
+  '''^hermes/source/website/docs/user-guide/features/voice-mode\.md$''',
+  '''^hermes/source/website/docs/user-guide/messaging/discord\.md$''',
+  '''^hermes/source/website/docs/user-guide/messaging/index\.md$''',
+  '''^hermes/source/website/docs/user-guide/messaging/matrix\.md$''',
+  '''^hermes/source/website/docs/user-guide/messaging/mattermost\.md$''',
+  '''^hermes/source/website/docs/user-guide/messaging/open-webui\.md$''',
+  '''^hermes/source/website/docs/user-guide/messaging/wecom-callback\.md$''',
+  '''^hermes/source/website/docs/user-guide/security\.md$''',
+]
+
+[[allowlists]]
+description = "Reviewed upstream credential parsers, public OAuth constants, and redaction patterns"
 paths = [
   '''^hermes/source/agent/(anthropic_adapter|google_oauth|redact)\.py$''',
   '''^hermes/source/hermes_cli/(auth|copilot_auth)\.py$''',
 ]
 
 [[allowlists]]
-description = "Reviewed security-training examples containing placeholder tokens and detection regexes"
+description = "Reviewed security-training placeholders and secret-detection patterns"
 paths = [
   '''^chillspwn/plugin/skills/(hunt-graphql|hunt-grpc|hunt-idor|hunt-k8s|hunt-misc|hunt-sqli|vmware-vcenter-attack)/SKILL\.md$''',
-  '''^chillspwn/plugin/skills/offensive-osint/(references|scripts)/''',
+  '''^chillspwn/plugin/skills/offensive-osint/references/(helpers-and-automation|probes-and-wordlists|secret-patterns)\.md$''',
+  '''^chillspwn/plugin/skills/offensive-osint/scripts/secret_scan\.py$''',
   '''^hermes/runtime/skills/pentest-engagement-ops/references/kali-toolchain-audit-and-reporting\.md$''',
 ]
 
 [[allowlists]]
-description = "Reviewed Chillspwn redaction unit-test fixtures"
+description = "Reviewed ChillsPwn redaction unit-test fixtures"
 paths = [
   '''^chillspwn/plugin/webapp/server/runtime/__tests__/RunReport\.test\.ts$''',
 ]

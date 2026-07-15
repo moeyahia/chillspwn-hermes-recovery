@@ -20,7 +20,7 @@ ChillsPwn runs `claude -p ... --permission-mode auto`. Bash calls are matched ag
 
 ## Do NOT edit your own allowlist — hand it to the operator
 - Editing `settings.json` (or installing tooling as a setup step for it) is blocked by the classifier as **self-modification / auto-mode bypass**. This is intended and correct. Do not look for a workaround tool (Write/sed/python/jq) — STOP and hand the edit to the operator.
-- Give the operator a clean, copy-paste command. Mr. Wong prefers **jq over python** (see [[user-preferences]]): back up, then dedupe, e.g.
+- Give the operator a clean, copy-paste command. the operator prefers **jq over python** (see [[user-preferences]]): back up, then dedupe, e.g.
   ```bash
   cp ~/.claude/settings.json ~/.claude/settings.json.bak.$(date +%s) && \
   jq '.permissions.allow += ["Bash(tshark:*)"] | .permissions.allow |= unique' \

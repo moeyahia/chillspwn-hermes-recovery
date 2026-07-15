@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from "react";
+import { engagementReportViewUrl } from "../lib/reportNavigation";
 
 // ── Types ─────────────────────────────────────────────────
 
@@ -762,8 +763,9 @@ export default function EngagementsPage() {
               {selected.hasReport && (
                 <button
                   onClick={() => {
-                    // Open report in new tab for printing
-                    window.open(`/api/engagements/${encodeURIComponent(selected.name)}/report`, "_blank");
+                    // Open the hardened passive report view; the browser's print
+                    // dialog can produce a PDF without treating JSON as a document.
+                    window.open(engagementReportViewUrl(selected.name), "_blank", "noopener,noreferrer");
                   }}
                   style={{
                     fontSize: 10,
@@ -775,7 +777,7 @@ export default function EngagementsPage() {
                     cursor: "pointer",
                   }}
                 >
-                  Export PDF
+                  Open Printable Report
                 </button>
               )}
 
@@ -1076,10 +1078,7 @@ export default function EngagementsPage() {
               <div style={{ display: "flex", gap: 6 }}>
                 <button
                   onClick={() => {
-                    // Open in new tab for PDF export
-                    const blob = new Blob([reportHtml], { type: "text/html" });
-                    const url = URL.createObjectURL(blob);
-                    window.open(url, "_blank");
+                    if (selected) window.open(engagementReportViewUrl(selected.name), "_blank", "noopener,noreferrer");
                   }}
                   style={{
                     fontSize: 10,
@@ -1210,7 +1209,7 @@ export default function EngagementsPage() {
             <div style={{ flex: 1, overflow: "hidden" }}>
               <iframe
                 srcDoc={reportHtml}
-                sandbox="allow-same-origin"
+                sandbox=""
                 style={{
                   width: "100%",
                   height: "100%",
@@ -1303,7 +1302,7 @@ export default function EngagementsPage() {
               ) : viewingFile.match(/\.(html|htm)$/i) ? (
                 <iframe
                   srcDoc={fileContent || ""}
-                  sandbox="allow-same-origin"
+                  sandbox=""
                   style={{
                     width: "100%",
                     height: "100%",

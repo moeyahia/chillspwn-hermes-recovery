@@ -4,9 +4,9 @@
  * Background (the gap this closes): the Phase-15 AgentRoutingPolicy only blocked ChillsPwn from
  * calling *specialist tool names* (quick_scan/ffuf_dir/hashcat/…). But the actual attacks run through
  * `terminal` / `execute_code` / `process` / `mcp_execute`, which were classified as "commander
- * coordination tools" and therefore ALLOWED. In the PingPong HTB chat session ChillsPwn ran 418
- * `terminal` + 367 `execute_code` actions (Kerberos abuse, Certipy, DCSync, LDAP, SOCKS pivots) and
- * only ~77 delegations. Chat sessions also bypass the managed-run gate entirely.
+ * coordination tools" and therefore ALLOWED. A prior authorized-lab engagement showed extensive
+ * direct execution across the terminal/code surface with comparatively little delegation. Chat
+ * sessions also bypassed the managed-run gate entirely.
  *
  * This policy makes the Commander-in-Chief truly hands-off: it may PLAN, ROUTE, SUPERVISE, APPROVE,
  * and SYNTHESIZE, but it may NOT directly run the execution surface or any specialist tool. When a
@@ -28,23 +28,21 @@ export const COMMANDER_PERSONAS: ReadonlySet<string> = new Set([
 
 /**
  * The EXECUTION surface a commander may never touch directly. These are the tools attacks actually
- * run through (the PingPong ledger proved it). `mcp_execute` is the MCP-bridge execution tool.
+ * run through (the historical engagement ledger proved it). `mcp_execute` is the MCP-bridge execution tool.
  *
- * Deliberately NOT blocked (coordination-safe): read_file, write_file, patch, search_files (plans /
- * synthesis / report drafts are local documents that cannot launch an attack once the execution
- * tools below are denied), board_*, delegate_task, recall_conversation, remember, use_skill,
- * skill_manage, web_search, web_extract.
+ * Coordination-safe tools are deliberately narrow: board operations plus read-only context/skill
+ * lookup. File mutations, private/native delegation, research execution, and memory/skill writes
+ * must be routed through a visible Mission Board specialist card.
  */
 export const COMMANDER_BLOCKED_EXEC_TOOLS: ReadonlySet<string> = new Set([
   "terminal", "execute_code", "process", "mcp_execute",
+  "write_file", "patch", "delegate_task", "remember", "skill_manage", "web_search", "web_extract",
 ]);
 
 /** Explicit coordination allowlist (for documentation / strict-mode callers / the validator). */
 export const COMMANDER_COORDINATION_TOOLS: ReadonlySet<string> = new Set([
-  "board_create_task", "board_update", "board_await", "board_list", "delegate_task",
-  "read_file", "write_file", "patch", "search_files",
-  "recall_conversation", "remember", "use_skill", "skill_manage",
-  "web_search", "web_extract",
+  "board_create_task", "board_update", "board_await", "board_list",
+  "read_file", "search_files", "recall_conversation", "use_skill",
 ]);
 
 export interface CommanderPolicyConfig {
@@ -196,4 +194,3 @@ export function isManagedMissionPrompt(text: string | null | undefined): boolean
   if (!text) return false;
   return HTB_SIGNALS.some((re) => re.test(text));
 }
-

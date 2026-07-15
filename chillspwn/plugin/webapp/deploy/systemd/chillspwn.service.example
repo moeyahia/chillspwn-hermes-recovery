@@ -1,0 +1,21 @@
+[Unit]
+Description=ChillsPwn dashboard and agent runtime
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=chillspwn
+Group=chillspwn
+WorkingDirectory=/opt/chillspwn
+Environment=HOME=/home/chillspwn
+Environment=PATH=/home/chillspwn/.bun/bin:/usr/local/bin:/usr/bin:/bin
+EnvironmentFile=-/etc/chillspwn/chillspwn.env
+ExecStart=/usr/bin/env bun run --no-hot server/index.ts
+Restart=always
+RestartSec=5
+UMask=0077
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

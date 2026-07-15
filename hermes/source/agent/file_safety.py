@@ -7,6 +7,13 @@ from pathlib import Path
 from typing import Optional
 
 
+_CHILLSPWN_GUARD_VALUES = {"1", "true", "yes", "on", "required", "enforced"}
+
+
+def _chillspwn_memory_guard_enabled() -> bool:
+    return os.environ.get("CHILLSPWN_MEMORY_GUARD", "").strip().lower() in _CHILLSPWN_GUARD_VALUES
+
+
 def _hermes_home_path() -> Path:
     """Resolve the active HERMES_HOME (profile-aware) without circular imports."""
     try:
@@ -19,45 +26,54 @@ def _hermes_home_path() -> Path:
 def build_write_denied_paths(home: str) -> set[str]:
     """Return exact sensitive paths that must never be written."""
     hermes_home = _hermes_home_path()
+    protected = [
+        os.path.join(home, ".ssh", "authorized_keys"),
+        os.path.join(home, ".ssh", "id_rsa"),
+        os.path.join(home, ".ssh", "id_ed25519"),
+        os.path.join(home, ".ssh", "config"),
+        str(hermes_home / ".env"),
+        os.path.join(home, ".bashrc"),
+        os.path.join(home, ".zshrc"),
+        os.path.join(home, ".profile"),
+        os.path.join(home, ".bash_profile"),
+        os.path.join(home, ".zprofile"),
+        os.path.join(home, ".netrc"),
+        os.path.join(home, ".pgpass"),
+        os.path.join(home, ".npmrc"),
+        os.path.join(home, ".pypirc"),
+        "/etc/sudoers",
+        "/etc/passwd",
+        "/etc/shadow",
+    ]
+    if _chillspwn_memory_guard_enabled():
+        # Agent file tools and ACP filesystem shims may read safe context but
+        # must never write around the validated memory mediator.
+        protected.append(str(hermes_home / "memories"))
     return {
         os.path.realpath(p)
-        for p in [
-            os.path.join(home, ".ssh", "authorized_keys"),
-            os.path.join(home, ".ssh", "id_rsa"),
-            os.path.join(home, ".ssh", "id_ed25519"),
-            os.path.join(home, ".ssh", "config"),
-            str(hermes_home / ".env"),
-            os.path.join(home, ".bashrc"),
-            os.path.join(home, ".zshrc"),
-            os.path.join(home, ".profile"),
-            os.path.join(home, ".bash_profile"),
-            os.path.join(home, ".zprofile"),
-            os.path.join(home, ".netrc"),
-            os.path.join(home, ".pgpass"),
-            os.path.join(home, ".npmrc"),
-            os.path.join(home, ".pypirc"),
-            "/etc/sudoers",
-            "/etc/passwd",
-            "/etc/shadow",
-        ]
+        for p in protected
     }
 
 
 def build_write_denied_prefixes(home: str) -> list[str]:
     """Return sensitive directory prefixes that must never be written."""
+    hermes_home = _hermes_home_path()
+    protected = [
+        os.path.join(home, ".ssh"),
+        os.path.join(home, ".aws"),
+        os.path.join(home, ".gnupg"),
+        os.path.join(home, ".kube"),
+        "/etc/sudoers.d",
+        "/etc/systemd",
+        os.path.join(home, ".docker"),
+        os.path.join(home, ".azure"),
+        os.path.join(home, ".config", "gh"),
+    ]
+    if _chillspwn_memory_guard_enabled():
+        protected.append(str(hermes_home / "memories"))
     return [
         os.path.realpath(p) + os.sep
-        for p in [
-            os.path.join(home, ".ssh"),
-            os.path.join(home, ".aws"),
-            os.path.join(home, ".gnupg"),
-            os.path.join(home, ".kube"),
-            "/etc/sudoers.d",
-            "/etc/systemd",
-            os.path.join(home, ".docker"),
-            os.path.join(home, ".azure"),
-            os.path.join(home, ".config", "gh"),
-        ]
+        for p in protected
     ]
 
 
@@ -94,6 +110,18 @@ def get_read_block_error(path: str) -> Optional[str]:
     """Return an error message when a read targets internal Hermes cache files."""
     resolved = Path(path).expanduser().resolve()
     hermes_home = _hermes_home_path().resolve()
+    if _chillspwn_memory_guard_enabled():
+        memories = hermes_home / "memories"
+        try:
+            resolved.relative_to(memories)
+        except ValueError:
+            pass
+        else:
+            return (
+                f"Access denied: {path} is protected reusable memory. "
+                "Use the configured chillspwn_mem.py safe-read command; "
+                "never read raw memory files directly."
+            )
     blocked_dirs = [
         hermes_home / "skills" / ".hub" / "index-cache",
         hermes_home / "skills" / ".hub",

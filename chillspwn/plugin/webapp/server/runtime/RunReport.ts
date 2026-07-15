@@ -38,6 +38,11 @@ export function redactSecrets(text: string): string {
     // bearer / api keys / long hex/base64 secrets
     .replace(/\b(sk-[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{10,})\b/g, "[REDACTED-KEY]")
     .replace(/\b(Authorization|Bearer|api[_-]?key|token|password|passwd|secret)\b\s*[:=]\s*\S+/gi, "$1: [REDACTED]")
+    .replace(/\b((?:password|passwd|passphrase)\s+(?:is|was|equals?))\s+(?!<(?:PASSWORD|SECRET|TOKEN|CREDENTIAL)>)(?:"[^"]+"|'[^']+'|`[^`]+`|\S+)/gi, "$1 [REDACTED]")
+    .replace(/\b((?:token|secret|api[_ -]?key)\s+(?:is|was|equals?))\s+(?!<(?:PASSWORD|SECRET|TOKEN|CREDENTIAL)>)(?:"[^"]+"|'[^']+'|`[^`]+`|\S+)/gi, "$1 [REDACTED]")
+    .replace(/\b((?:password|passwd|passphrase)|use\s+(?:the\s+)?(?:token|secret))\s+(?!<(?:PASSWORD|SECRET|TOKEN|CREDENTIAL)>)(?!(?:authentication|field|hash|length|manager|placeholder|policy|prompt|reset|spraying)\b)(?:"[^"]+"|'[^']+'|`[^`]+`|\S+)/gi, "$1 [REDACTED]")
+    .replace(/\b(credentials?\s*(?:(?:is|was)\s+|[:=]\s*)?)(?!<(?:CREDENTIAL|USER_REF)>)([A-Za-z][A-Za-z0-9._$-]{1,31}):(?!<(?:PASSWORD|SECRET)>)[^\s,;]+/gi, "$1[REDACTED-CREDENTIAL]")
+    .replace(/\b(login\s+(?:with|as)\s+[^\s,;]+\s+(?:and|using|with\s+(?:password|secret))\s+)(?!<(?:PASSWORD|SECRET|TOKEN)>)[^\s,;]+/gi, "$1[REDACTED]")
     .replace(/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g, "[REDACTED-PRIVATE-KEY]");
 }
 

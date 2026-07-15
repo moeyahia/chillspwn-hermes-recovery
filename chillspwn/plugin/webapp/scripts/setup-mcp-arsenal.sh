@@ -30,6 +30,10 @@ for a in "$@"; do
   esac
 done
 [ -z "$PROFILE" ] && PROFILE="core"
+if [ "$DRY_RUN" = 0 ] && [ "$EUID" -ne 0 ]; then
+  echo "Refusing mutable MCP arsenal setup as a non-root user; rerun the reviewed command with sudo." >&2
+  exit 1
+fi
 
 # Profile → MCP server names (least-privilege; docker images NOT pre-built unless selected).
 profile_servers() {
@@ -97,7 +101,7 @@ if [ "$WRITE_CONFIG" = 1 ]; then
   CFG="$VENDOR/.mcp.arsenal.json"
   echo; echo "── merging profile '$PROFILE' into active MCP config → $CFG (DISABLED-by-default; env templates only, no secrets)"
   if { [ -e "$CFG" ] && [ ! -w "$CFG" ]; } || { [ ! -e "$CFG" ] && [ ! -w "$(dirname "$CFG")" ]; }; then
-    echo "    ✗ cannot write $CFG (permission). Run as the owner of $VENDOR, or: sudo chown \$USER $VENDOR"
+    echo "    ✗ cannot write $CFG (permission). Keep the arsenal root-owned and rerun with sudo."
   else
   export PROF="$PROFILE"
   python3 - "$MANIFEST" "$SERVERS" "$CFG" <<'PY'
@@ -123,9 +127,16 @@ for s in m["servers"]:
          "disabledReason":("requires API keys/credentials — set then enable" if needs_secret and not have_secret else "disabled by default — enable explicitly")}
   if n in CMD: entry.update(CMD[n])
   existing["mcpServers"][n]=entry; added+=1
-json.dump(existing,open(cfgpath,"w"),indent=2)
+tmp=f"{cfgpath}.new-{os.getpid()}"
+with open(tmp,"w",encoding="utf-8") as handle:
+  json.dump(existing,handle,indent=2)
+  handle.write("\n")
+os.chmod(tmp,0o644)
+os.replace(tmp,cfgpath)
 print(f"    merged {added} server(s); config now has {len(existing['mcpServers'])} total (all enabled:false)")
 PY
+  chown root:root "$CFG"
+  chmod 0644 "$CFG"
   fi
 fi
 

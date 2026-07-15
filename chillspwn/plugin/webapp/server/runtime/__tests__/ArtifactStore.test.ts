@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import { createHash } from "crypto";
-import { ArtifactStore, isSafeArtifactId, safeFilename } from "../ArtifactStore";
+import { ArtifactStore, artifactDownloadHeaders, isSafeArtifactId, safeFilename } from "../ArtifactStore";
 
 let dir: string;
 let store: ArtifactStore;
@@ -33,6 +33,20 @@ describe("Phase 12 ArtifactStore", () => {
   test("safeFilename strips path components", () => {
     expect(safeFilename("../../evil.sh")).not.toContain("/");
     expect(safeFilename("a/b/c.txt")).toBe("a_b_c.txt");
+  });
+
+  test("active-content artifacts are forced to download as inert bytes", () => {
+    const headers = artifactDownloadHeaders({
+      filename: "payload\r\nX-Evil: yes.svg",
+      size: 42,
+      sha256: "a".repeat(64),
+    });
+    expect(headers["Content-Type"]).toBe("application/octet-stream");
+    expect(headers["Content-Disposition"]).toStartWith("attachment;");
+    expect(headers["Content-Disposition"]).not.toContain("\r");
+    expect(headers["Content-Disposition"]).not.toContain("\n");
+    expect(headers["X-Content-Type-Options"]).toBe("nosniff");
+    expect(headers["Content-Security-Policy"]).toContain("default-src 'none'");
   });
 
   test("list filters by runId", () => {
