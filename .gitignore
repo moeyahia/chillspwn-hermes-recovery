@@ -61,7 +61,6 @@
 **/id_ed25519*
 **/.grok/
 **/.codex/
-**/conversations/
 **/sessions/
 **/session-logs/
 **/shell_snapshots/

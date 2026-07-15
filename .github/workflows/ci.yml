@@ -81,6 +81,9 @@ jobs:
             scripts/verify-snapshot.sh \
             chillspwn/plugin/webapp/scripts/setup-mcp-arsenal.sh \
             chillspwn/plugin/webapp/scripts/setup-security-assets.sh
+          find chillspwn/plugin/webapp/scripts/command-os-v2 \
+            -maxdepth 1 -type f -name '*.sh' -print0 \
+            | xargs -0 -n1 bash -n
 
       - name: Install ChillsPwn dependencies
         working-directory: chillspwn/plugin/webapp
@@ -119,6 +122,14 @@ jobs:
       - name: Validate production bundle budgets
         working-directory: chillspwn/plugin/webapp
         run: bun run performance:bundle
+
+      - name: Validate canonical database and event runtime budgets
+        working-directory: chillspwn/plugin/webapp
+        run: bun run performance:runtime
+
+      - name: Validate representative mission comparisons
+        working-directory: chillspwn/plugin/webapp
+        run: bun run performance:missions
 
       - name: Install Playwright Chromium
         working-directory: chillspwn/plugin/webapp
