@@ -1,5 +1,10 @@
 # ChillsPwn Agent Runtime — Architecture & Modes (Phases 1–14)
 
+> **Historical scope:** this document records the Phase 1–14 runtime design. It does not
+> describe the later specialist army, session lifecycle, MCP arsenal, or Grok ACP commander
+> boundary. Use `architecture.md`, `integrations.md`, and the top-level `SECURITY.md` for the
+> current repository-wide view.
+
 The agent runtime turns the dashboard from a chat front-end into a supervised agent-execution
 platform. It owns plans, tool policy, approvals, evidence, memory provenance, worker results,
 final reports, and artifacts — while leaving the **Claude path 100% frozen**.

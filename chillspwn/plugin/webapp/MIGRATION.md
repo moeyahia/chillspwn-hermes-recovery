@@ -1,13 +1,35 @@
-# Migration / setup notes — Phases 1 → 14.1
+# Historical migration ledger — Phases 1 → 18
 
-> **Reading order / current state.** The blockquotes below are **historical, per-phase** notes
+> **Do not use this file as the recovery or deployment runbook.** It preserves historical,
+> per-phase implementation notes, old branch/commit names, and patch procedures through Phase 18.
+> The combined recovery repository already contains the selected deployed source/runtime files;
+> applying an old patch again can duplicate or regress current behavior. Use the root `RECOVERY.md`
+> and the maintained webapp documentation for a current restore.
+>
+> **Reading order / historical context.** The blockquotes below are **historical, per-phase** notes
 > (each describes that phase at the time). Where an early note says something like
 > "`orchestrator_openrouter.py` was NOT modified" or "board-first prompt remains active", it
 > describes the state **as of that phase** — it is superseded by the **Phase 8–14** and
-> **Phase 8–14.1** sections at the END of this file, which describe the current branch capability.
-> **Deployed today = Phase 7.5.1** (no OpenRouter gating). The Phase 8–14 branch adds gating,
-> **off by default**. For the authoritative enforcement model see `SECURITY.md` and
-> `docs/AGENT-RUNTIME.md`.
+> later sections in this ledger. This file is **not a statement of the current deployment**;
+> the repository now also contains Phase 19 lifecycle, memory, and Grok ACP boundary work. For the
+> maintained system view and integration boundaries, see `README.md`, `docs/architecture.md`,
+> `docs/integrations.md`, and `SECURITY.md`.
+
+## Maintained recovery-path mapping
+
+Do not translate the historical commands below literally. The maintained integrated recovery layout is:
+
+| Historical phase path or action | Current recovery contract |
+|---|---|
+| `~/.claude/chillspwn` runtime/persona state | `CHILLSPWN_STATE_DIR` (default: the `chillspwn` child of `HERMES_HOME`) and `CHILLSPWN_PERSONAS_DIR`; integrated units use `/root/.hermes/chillspwn` |
+| Service-readable `.env` | Root-owned mode-`0600` systemd EnvironmentFiles; `chillspwn` cannot reopen them |
+| Direct model access to `$HERMES_HOME/memories` | Root-only memory plus `chillspwn-memory.service` validated `add`/`safe-read` broker |
+| `grok` found through `PATH` | Root-owned absolute `/opt/chillspwn/bin/grok` |
+| Installer-owned `~/.grok/auth.json` | Refreshable `/root/.hermes/auth/grok/auth.json` owned by the service identity |
+| Phase patch application | Reviewed source is retained directly and installed by the root `scripts/restore.sh` |
+| One dashboard service | `chillspwn-memory.service`, `chillspwn.service`, and `hermes-gateway.service` |
+
+Before a maintained deployment, run `bun run check` from the webapp and the root snapshot/config validation described in `RECOVERY.md`. `bun run check` includes `check:server-entry`, which parses and bundles the production composition root even though that file is not yet included in strict TypeScript checking.
 
 > **Phase 6 (refactor + cleanup) — NO behavior change, NO API change, additive structure:**
 > - The Phase 2–5 runtime route HANDLERS (`/api/runs*`, `/api/runtime-memory*`,
@@ -55,12 +77,12 @@
 >   actually exist. Provenance is **not yet referentially verified** — deferred to a later phase.
 
 
-> **Phase 4 (memory provenance + worker contract) — additive; legacy memory untouched:**
+> **Phase 4 (memory provenance + worker contract) — additive; legacy projection retained:**
 > - **New REST** (auth-gated), namespaced to avoid the legacy file memory:
 >   `POST /api/runtime-memory/propose`, `GET /api/runtime-memory/{proposals,items}`,
 >   `GET /api/runtime-memory/:id`, `POST /api/runtime-memory/:id/{approve,reject,stale}`,
 >   and `POST /api/runs/:id/worker-result`.
-> - **Legacy `/api/memory` (USER.md/MEMORY.md) is unchanged** — the new provenance memory
+> - **Legacy `/api/memory` (USER.md/MEMORY.md) remains compatible but is now validated** — the new provenance memory
 >   lives separately under `~/.claude/chillspwn/runtime/memory/items.json`.
 > - **Safety:** model output never auto-becomes trusted memory. `proposeMemory` always
 >   stores an **unverified** item; **`approveMemory` is the only path to `verified`**.
@@ -139,8 +161,9 @@
 
 
 > **Phase 1.1 (corrective) — behavior notes (no new env vars, no storage changes):**
-> - **File browser is now scoped** to `ALLOWED_WORKSPACE_ROOTS` (default `/root/htb`,
->   `/root/engagements`, `/root/.hermes/memories`, `/root/report-template`). The old broad
+> - **File browser is now scoped** to `ALLOWED_WORKSPACE_ROOTS` (the historical Phase 1
+>   defaults included `/root/htb`, `/root/engagements`, reusable memory, and the report template;
+>   the maintained default is now only `/root/htb/boxes` and `/root/engagements`). The old broad
 >   `/root` allowance is gone. If you relied on browsing another path under `/root`, add it
 >   to `ALLOWED_WORKSPACE_ROOTS` (colon/comma-separated).
 > - **Council briefings/assessments are now plain by default** (the l33tspeak mandate is
@@ -177,7 +200,7 @@ ENABLE_FILE_WRITE=false
 ENABLE_SECURITY_TOOLS=false
 REQUIRE_APPROVAL_FOR_TERMINAL=true   # recorded; enforced in Phase 3
 REQUIRE_APPROVAL_FOR_FILE_WRITE=true # recorded; enforced in Phase 3
-ALLOWED_WORKSPACE_ROOTS=/root/htb:/root/engagements:/root/.hermes/memories:/root/report-template
+ALLOWED_WORKSPACE_ROOTS=/root/htb/boxes:/root/engagements
 ENABLE_PROMPT_OBFUSCATION=false   # legacy; leave off
 ENABLE_CHAT_AGENT_RUNS=false      # Phase 7.1: chat → observe-only AgentRun in the cockpit
 CHAT_AGENT_MODE=observe           # observe only (7.1/7.2)
@@ -656,27 +679,15 @@ assets in /opt are not tracked, delete if desired. Claude path untouched through
 # Phase 18 — Hard Delegation Enforcement / ChillsPwn No-Hands Commander (DEPLOYED)
 ChillsPwn (Commander-in-Chief) may NOT directly run the execution surface (`terminal`/`execute_code`/
 `process`/`mcp_execute`) or any specialist tool — in **chat AND managed** runs. It is denied + routed
-to the right specialist. Closes the gap proven by the PingPong session (828 direct executions).
+to the right specialist. Closes a direct-execution gap proven by a prior authorized-lab engagement.
 
 **Two enforcement points (both required):**
 1. **TypeScript gate (managed runs)** — in-repo: `server/agents/ChillspwnCommanderPolicy.ts`,
    `gateRoutes.ts`, `agentRoster.ts` (GENERIC_TOOLS + SessionRunner exec tools), `config.ts`/`index.ts`
    (`ENFORCE_CHILLSPWN_NO_HANDS`, default true). Deployed by the normal server restart.
-2. **Orchestrator (chat sessions)** — OUT of repo:
-   `~/.hermes/skills/red-teaming/council-of-ais/scripts/orchestrator_openrouter.py`. Captured as a
-   reproducible patch artifact: **`integration/phase18-no-hands-orchestrator.patch`** (purely additive,
-   89 lines). This is the Phase 18.1 packaging fix — without it a fresh checkout deploys only enforcement
-   point #1.
-
-**Apply the orchestrator patch on a fresh deploy:**
-```
-cd ~/.hermes/skills/red-teaming/council-of-ais/scripts
-cp orchestrator_openrouter.py orchestrator_openrouter.py.pre-phase18.bak     # rollback ref
-patch -p1 --dry-run < <webapp>/integration/phase18-no-hands-orchestrator.patch   # verify first
-patch -p1         < <webapp>/integration/phase18-no-hands-orchestrator.patch   # apply
-python3 -m py_compile orchestrator_openrouter.py                               # must compile
-```
-Spawned fresh per chat turn → no service restart needed for the orchestrator change.
+2. **Orchestrator (chat sessions)** — retained by the outer recovery repository at
+   `hermes/runtime/skills/red-teaming/council-of-ais/scripts/orchestrator_openrouter.py` and installed
+   by the exact-sync restore. No secondary patch step is required.
 
 **Confirm flag active:** `grep ENFORCE_CHILLSPWN_NO_HANDS /root/.hermes/.env` → `=true`; or
 `GET /api/agents/enforcement` → `"enforceChillspwnNoHands":true`.
@@ -686,7 +697,6 @@ Spawned fresh per chat turn → no service restart needed for the orchestrator c
 `execute_code→SessionRunner`; `board_create_task`/`read_file` → allow. Ledger:
 `bun scripts/analyze-session-ledger.ts <ledger> --actor chillspwn`.
 
-**Rollback:** (emergency) `ENFORCE_CHILLSPWN_NO_HANDS=false` + restart — DO NOT leave false. (full)
-`patch -R -p1 < integration/phase18-no-hands-orchestrator.patch`; restore SOUL/.env `*.pre-phase18.bak`;
-`git checkout` pre-Phase-18 commit; restart. SOUL source artifact:
+**Rollback:** (emergency) `ENFORCE_CHILLSPWN_NO_HANDS=false` + restart — DO NOT leave false. For a
+full rollback, restore a reviewed private recovery tag as one coherent snapshot. SOUL source artifact:
 `server/agents/personas/phase18-no-hands-soul-section.md`. Claude path untouched throughout.
