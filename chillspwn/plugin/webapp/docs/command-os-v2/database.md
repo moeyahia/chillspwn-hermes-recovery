@@ -15,12 +15,31 @@ The Command OS database uses `better-sqlite3`, WAL, foreign keys, a bounded busy
 
 `schema_migrations` records ordered migration ID, checksum, and application time. A checksum change after application is a fatal error. Migrations run transactionally where SQLite permits and are idempotent on repeated startup.
 
+The current candidate schema is 9. Migration 9,
+`guided_decision_single_pending_boundary`, handles legacy runs containing more
+than one pending Guided decision fail-closed: all ambiguous decisions are
+cancelled, affected nonterminal work is blocked and unfenced, and a partial
+unique index then permits at most one pending decision per run. Completed
+decision history remains unconstrained.
+
+The portable schema-8→9 rehearsal uses only a generated temporary database:
+
+```bash
+bun run test:rehearsal:schema9:safety
+bun run test:rehearsal:schema9
+```
+
+See
+[`schema-9-guided-decision-rehearsal.md`](schema-9-guided-decision-rehearsal.md)
+for measured evidence and explicit non-production limits.
+
 ## Operational checks
 
 - startup quick/integrity check;
 - foreign key check;
 - migration status;
 - WAL checkpoint health;
+- owner-fenced `runtime_continuations` for durable commit-to-next-work replay;
 - writable storage and backup destination;
 - prepared query latency sampling;
 - periodic online backup and verified restore rehearsal.

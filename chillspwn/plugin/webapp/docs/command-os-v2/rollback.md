@@ -53,6 +53,98 @@ Use this path only when the prior release supports the current canonical schema.
 Do not use `git reset`, a mutable worktree, or an unrecorded build as a release
 rollback mechanism.
 
+## Mandatory schema-8 expand/contract bridge
+
+The follow-up Context selection and branch/snapshot state are additive migration
+8. The migration runner intentionally rejects an unknown higher schema, so the
+retained schema-7 release **cannot** be used as an application-only rollback
+after any process has opened and migrated the canonical database to schema 8.
+
+> [!CAUTION]
+> The 2026-07-15 bridge under
+> `/root/chillspwn-schema8-rehearsal/20260715T143836Z` is **superseded and
+> unusable**. It contains an older migration-008 checksum that predates the
+> branch/snapshot tables. Production remains on schema 7. Do not promote that
+> archive, execute its historical commands, or compare a current database to
+> its checksum.
+
+Promotion of a schema-8 feature release therefore requires two immutable
+releases in this order:
+
+1. Build a **compatibility bridge** from the exact currently deployed
+   application behavior, adding only
+   `server/db/migrations/008_follow_up_context.ts` and its ordered registration
+   in `server/db/migrations/index.ts`. The bridge must not expose or call the
+   follow-up feature.
+2. Record the bridge source/build identity and the SHA-256 of migration 8. Run
+   the normal build, type checks, database tests, and health checks against that
+   artifact.
+3. On an isolated copy of the current schema-7 database, start the bridge,
+   verify that exactly migration 8 is applied, restart the bridge, and verify
+   that no migration is reapplied. Confirm SQLite integrity, foreign keys, WAL,
+   mission reads, event streaming, and current production journeys.
+4. Immediately before the real bridge promotion, stop or drain writers as the
+   deployment runbook requires and create a restricted, checksummed schema-7
+   backup. This backup is the only rollback path during the bridge bake window.
+5. Promote the bridge, observe migration 8 and application health, then keep it
+   serving for the recorded bake period. If it fails, stop writers and restore
+   both the schema-7 application and its matching verified database backup; do
+   not attempt to delete a migration row or reverse the table in place.
+6. Promote the full feature candidate only after the bridge is accepted. The
+   promotion must make the schema-8 bridge—not the old schema-7 release—the
+   retained `plugin.previous` target.
+7. Rehearse candidate → bridge → candidate against an isolated schema-8 copy.
+   A fast application rollback is then safe because both artifacts know the
+   exact migration-8 name and checksum.
+
+`server/db/__tests__/database.test.ts` contains the isolated
+`schema-eight expand bridge` rehearsal. It proves schema 7 → 8 expansion,
+idempotent bridge restart, preserved canonical reads and database health, and
+the expected fail-closed behavior of a schema-7 migration set. It is database
+evidence, not permission to skip the immutable service-artifact rehearsal
+above.
+
+The historical immutable service-artifact rehearsal completed on 2026-07-15
+without touching production and remains evidence only for the obsolete
+migration/artifact pair. It is not acceptance evidence for the current
+migration 008. See
+[`schema-8-bridge-rehearsal.md`](schema-8-bridge-rehearsal.md) for the prominent
+supersession notice and historical measurements.
+
+The current-checksum isolated replacement rehearsal passed on 2026-07-15. It
+started from the exact live schema-7 release, constructed a bridge with only
+the final migration 008 and its ordered registration, exercised the exact
+schema-9 candidate, restored the verified schema-8 backup, and migrated forward
+again. Idempotent restarts, compatibility refusal, integrity, health, clean
+shutdown, and unchanged production identity all passed. See
+[`schema-7-to-9-release-rehearsal.md`](schema-7-to-9-release-rehearsal.md).
+
+Before promotion, repeat that complete gate from the final reviewed commit and
+record the new source, migration, tree, archive, and database checksums. Only
+the resulting reviewed bridge may be considered for an explicitly approved
+maintenance-window bake.
+
+## Schema-9 Guided-decision boundary
+
+Migration 9 adds the one-pending-Guided-decision partial unique index and
+normalizes any ambiguous schema-8 rows fail-closed. The migration runner rejects
+unknown higher versions, so a schema-8 application must not be selected as an
+application-only rollback target after the canonical database reaches schema 9.
+
+Before any approved schema-9 cutover, retain a verified pre-migration schema-8
+backup and an immutable schema-9-compatible application. A rollback to a
+schema-8 application requires stopping all writers and restoring that matching
+pre-migration database image after preserving the schema-9 database and
+sidecars for reconciliation. Never remove migration 9's row or index in place:
+that would reintroduce ambiguous authority without restoring the cancelled
+decision and blocked-work state transactionally.
+
+The disposable rehearsal in
+[`schema-9-guided-decision-rehearsal.md`](schema-9-guided-decision-rehearsal.md)
+proves the database transition and compatibility refusal on synthetic data. It
+does not replace immutable artifact, service startup, backup-retention, or
+maintenance-window evidence for an actual promotion.
+
 ## Database rollback
 
 If the prior release cannot read the current schema, keep both services stopped:

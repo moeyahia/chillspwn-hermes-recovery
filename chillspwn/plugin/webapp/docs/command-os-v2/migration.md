@@ -4,6 +4,41 @@ The implemented migration is backup-first, resumable, hash-addressed, idempotent
 
 Implementation entry point: `server/migration/cli.ts`.
 
+## Canonical schema versus legacy-data migration
+
+This document primarily covers importing legacy files into canonical tables.
+The canonical schema has its own ordered, checksummed runner at
+`server/db/migrations/runner.ts`; the current candidate ends at migration 9.
+`bun run db:migrate -- --db PATH` creates an online backup before applying any
+missing canonical migrations. Do not confuse that schema operation with
+`db:migrate:legacy`, which discovers and imports the allowlisted sources below.
+
+Migration 9's schema-8→9 behavior is exercised without deployment state by:
+
+```bash
+bun run test:rehearsal:schema9:safety
+bun run test:rehearsal:schema9
+```
+
+The rehearsal accepts no caller-supplied database path and deletes its random
+temporary workspace. It does not authorize a production migration; use the
+deployment and rollback gates for any canonical cutover.
+
+The complete immutable-artifact path from the exact live schema-7 release
+through the current schema-8 bridge and schema-9 candidate is exercised by:
+
+```bash
+bun run test:rehearsal:schema7-to-schema9:safety
+bun run test:rehearsal:schema7-to-schema9
+```
+
+The 2026-07-15 isolated run passed backup, rollback, idempotent restart,
+fail-closed higher-schema, application health, integrity, and production
+non-interference checks. See
+[`schema-7-to-9-release-rehearsal.md`](schema-7-to-9-release-rehearsal.md).
+It is review evidence, not cutover authorization, and must be repeated from the
+final reviewed commit before promotion.
+
 ## Supported inputs
 
 Discovery is allowlist-based and accepts only:

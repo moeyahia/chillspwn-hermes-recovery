@@ -16,7 +16,11 @@ Design documents are not proof that a feature passed acceptance. Start with the 
 - [Accessibility evidence](accessibility.md) — automated coverage and required manual verification.
 - [Security review](security.md) — implemented controls, verified deployment findings, and unresolved risks.
 - [Deployment guide](deployment.md) — candidate promotion gates and the current live/candidate distinction.
+- [Platform support](platform-support.md) — web and Android packaging boundaries and validation commands.
 - [Rollback guide](rollback.md) — application, database, migration, and vault recovery boundaries.
+- [Schema-8 bridge rehearsal](schema-8-bridge-rehearsal.md) — supersession status and the required fresh final-checksum compatibility rehearsal. The prior bridge artifact/commands are unusable and must not be executed.
+- [Schema-7 to schema-9 release rehearsal](schema-7-to-9-release-rehearsal.md) — current-checksum immutable bridge/candidate, backup, rollback, restart, integrity, and production non-interference evidence.
+- [Schema-9 Guided boundary rehearsal](schema-9-guided-decision-rehearsal.md) — disposable schema-8→9 database evidence for fail-closed duplicate cleanup, exact pending-decision uniqueness, backup integrity, idempotence, and rollback compatibility.
 
 ## Product and interaction model
 
@@ -31,9 +35,11 @@ Design documents are not proof that a feature passed acceptance. Start with the 
 
 - [Baseline current-state audit](current-state-audit.md) — a pre-implementation characterization snapshot, not the current completion status.
 - [Architecture map](architecture-map.md)
+- [Architecture decision records](adr/README.md)
 - [Domain model](domain-model.md)
 - [Canonical database](database.md)
 - [Event model](event-model.md)
+- [API contract](api-contract.md)
 - [Run supervisor](run-supervisor.md)
 - [Learning system](learning-system.md)
 - [Second Brain](second-brain.md)

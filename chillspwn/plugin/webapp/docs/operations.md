@@ -2,9 +2,12 @@
 
 ## Health and readiness
 
-`GET /api/health` confirms that the HTTP process is alive. It does not prove that personas, the Mission Board schema, provider CLIs, OAuth sessions, report tooling, MCP servers, or engagement paths are ready.
+`GET /api/health` confirms that the HTTP process is alive. It does not prove that personas, the Mission Board schema, provider CLIs, live OAuth sessions, report tooling, MCP servers, specialist routes, or engagement paths are ready.
 
-Perform an integration readiness review after every deployment and credential change. A future readiness endpoint should report dependency names and states without reading or returning credential values.
+Perform an integration readiness review after every deployment and credential change. Launch
+readiness must use live, non-secret provider/MCP attestations and must fail closed when a required
+journey executor or specialist route is not callable. The UI may report dependency names, state,
+reason, and remediation, but must never read back or return credential values.
 
 The hardened deployment consists of two cooperating application units:
 
@@ -86,10 +89,19 @@ Detached OSINT snapshots and worker logs live under `CHILLSPWN_STATE_DIR/osint-j
 
 ## Provider operations
 
-- **Claude:** verify CLI authentication and distinguish observe-only UI state from enforceable runtime controls.
-- **OpenRouter:** verify key availability without printing it; roll out gating in dry-run first.
-- **Codex/Gemini:** verify the external Hermes orchestrator and its authentication.
-- **Grok ACP:** verify OAuth file permissions, isolated runtime assets, hook/MCP attestation, and Mission Board delegation before starting an engagement.
+- **Claude:** treat native CLI compatibility as advisory unless the selected journey's exact scope,
+  tool, and decision boundary can be enforced; never expose it as a third journey.
+- **OpenRouter:** verify credential availability without printing it and require the managed,
+  fail-closed gate before consequential journey execution.
+- **Codex/Gemini:** verify the external Hermes orchestrator, authentication, specialist routing, and
+  policy-enforcement compatibility.
+- **Grok ACP:** require a live OAuth/ACP readiness probe in addition to file permissions; verify the
+  isolated runtime assets, hook/MCP attestation, and Mission Board delegation before launch. A local
+  executable or readable auth file alone is not proof of a healthy provider.
+
+Provider selection remains secondary and policy-driven. Operators create only Autonomous or Guided
+missions; an unavailable or non-enforceable provider is excluded or blocks preflight rather than
+silently degrading the journey contract.
 
 ## Reusable memory
 

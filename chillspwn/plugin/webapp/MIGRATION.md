@@ -1,4 +1,4 @@
-# Historical migration ledger — Phases 1 → 18
+# Historical migration ledger — predecessor Phases 1 → 18
 
 > **Do not use this file as the recovery or deployment runbook.** It preserves historical,
 > per-phase implementation notes, old branch/commit names, and patch procedures through Phase 18.
@@ -14,6 +14,11 @@
 > the repository now also contains Phase 19 lifecycle, memory, and Grok ACP boundary work. For the
 > maintained system view and integration boundaries, see `README.md`, `docs/architecture.md`,
 > `docs/integrations.md`, and `SECURITY.md`.
+>
+> **Journey boundary:** every `chat`, `observe`, `preview`, `managed`, provider-mode, Agent Cockpit,
+> or plan-approval instruction below is a historical record. Do not enable it for a normal Command OS
+> deployment. The maintained product has exactly two user-facing journeys—**Autonomous** and
+> **Guided**—and compatibility mutations are disabled by `ENABLE_LEGACY_EXECUTION_API=false`.
 
 ## Maintained recovery-path mapping
 
@@ -23,11 +28,11 @@ Do not translate the historical commands below literally. The maintained integra
 |---|---|
 | `~/.claude/chillspwn` runtime/persona state | `CHILLSPWN_STATE_DIR` (default: the `chillspwn` child of `HERMES_HOME`) and `CHILLSPWN_PERSONAS_DIR`; integrated units use `/root/.hermes/chillspwn` |
 | Service-readable `.env` | Root-owned mode-`0600` systemd EnvironmentFiles; `chillspwn` cannot reopen them |
-| Direct model access to `$HERMES_HOME/memories` | Root-only memory plus `chillspwn-memory.service` validated `add`/`safe-read` broker |
+| Direct model access to `$HERMES_HOME/memories` | Canonical, policy-scoped Second Brain records in `COMMAND_OS_DB_PATH`; Obsidian notes are synchronized projections under `CHILLSPWN_VAULT_ROOT` |
 | `grok` found through `PATH` | Root-owned absolute `/opt/chillspwn/bin/grok` |
 | Installer-owned `~/.grok/auth.json` | Refreshable `/root/.hermes/auth/grok/auth.json` owned by the service identity |
 | Phase patch application | Reviewed source is retained directly and installed by the root `scripts/restore.sh` |
-| One dashboard service | `chillspwn-memory.service`, `chillspwn.service`, and `hermes-gateway.service` |
+| Pre-Command-OS service graph | `chillspwn.service` and `hermes-gateway.service`; no root memory-broker service is part of the supported graph |
 
 Before a maintained deployment, run `bun run check` from the webapp and the root snapshot/config validation described in `RECOVERY.md`. `bun run check` includes `check:server-entry`, which parses and bundles the production composition root even though that file is not yet included in strict TypeScript checking.
 
@@ -177,7 +182,7 @@ Phase 1 is **additive** and **flag-gated**. No storage format changed. The live 
 running unchanged until you choose to restart it with the new env. This file tells you
 exactly what to do.
 
-## TL;DR
+## Historical Phase 1 TL;DR (do not use for a current deployment)
 
 - New code defaults are **secure** (loopback bind, features off). If you restart the live
   service with **no env changes**, remote/iPad access and terminal/proxy/file-write will be
@@ -186,9 +191,11 @@ exactly what to do.
 - Nothing was deleted. Rollback is `git checkout main` (baseline commit) + restart, or set
   the legacy env values (below).
 
-## 1. New environment variables
+## Historical Phase 1/7 environment variables (rollback archaeology only)
 
-See `.env.example` for the full annotated list. Summary:
+The predecessor snapshot used the variables below. They are retained as historical evidence, not a
+current configuration recipe. Current deployments must use `.env.example`, keep
+`ENABLE_LEGACY_EXECUTION_API=false`, and create work only through Autonomous or Guided contracts.
 
 ```
 CHILLSPWN_BIND=127.0.0.1          # default; set to 0.0.0.0 / tailscale IP to expose
@@ -202,19 +209,13 @@ REQUIRE_APPROVAL_FOR_TERMINAL=true   # recorded; enforced in Phase 3
 REQUIRE_APPROVAL_FOR_FILE_WRITE=true # recorded; enforced in Phase 3
 ALLOWED_WORKSPACE_ROOTS=/root/htb/boxes:/root/engagements
 ENABLE_PROMPT_OBFUSCATION=false   # legacy; leave off
-ENABLE_CHAT_AGENT_RUNS=false      # Phase 7.1: chat → observe-only AgentRun in the cockpit
-CHAT_AGENT_MODE=observe           # observe only (7.1/7.2)
-CHAT_AGENT_PLANNING=off           # off | preview (7.2 advisory plan preview)
-CHAT_AGENT_PLANNING_MODEL=z-ai/glm-5.1   # OpenRouter slug for the preview / managed plan call
-CHAT_AGENT_FORCE_PLAN=false       # never force plan-first chat
-ENABLE_RUNTIME_MANAGED_CHAT=false # Phase 7.4: managed-run launcher (NO execution yet)
-REQUIRE_PLAN_APPROVAL=true        # managed runs hold at awaiting_plan_approval
+ENABLE_LEGACY_EXECUTION_API=false # keep retired chat/runtime mutations disabled
 ```
 
 The systemd unit already loads `/root/.hermes/.env` (`EnvironmentFile=-/root/.hermes/.env`),
 so add the variables there.
 
-### Phase 7.1 — Chat Runtime Integration (observe-only)
+### Historical Phase 7.1 — Chat Runtime Integration (retired)
 
 Set `ENABLE_CHAT_AGENT_RUNS=true` (and restart) to make a normal chat turn ALSO create an
 **observe-only** AgentRun that appears in the Agent Cockpit. What it does and does NOT do:
@@ -235,7 +236,7 @@ Set `ENABLE_CHAT_AGENT_RUNS=true` (and restart) to make a normal chat turn ALSO 
   the durable AgentRunStore (still-`executing`, `source=chat` runs are re-attached). A chat
   turn after a restart with no rebuildable run simply creates a fresh observe-only run.
 
-### Phase 7.2 — Advisory plan preview (manual, NOT enforced)
+### Historical Phase 7.2 — Advisory plan preview (retired)
 
 Set `CHAT_AGENT_PLANNING=preview` (default `off`) to enable a **manual** "Generate plan
 preview" button in the Agent Cockpit for observe-only chat runs.
@@ -257,7 +258,7 @@ preview" button in the Agent Cockpit for observe-only chat runs.
 - **API key:** requires `OPENROUTER_API_KEY` in the environment (already present in the live
   `.env`).
 
-### Phase 7.4 — Runtime-managed run launcher (NO execution)
+### Historical Phase 7.4 — Runtime-managed run launcher (retired)
 
 Set `ENABLE_RUNTIME_MANAGED_CHAT=true` (default off) to show a **"Start runtime-managed run"**
 button in the Agent Cockpit. It opens an objective modal; on submit, `POST /api/runs/managed-chat`:
@@ -279,7 +280,7 @@ launcher is hidden client-side when the flag is off, and `POST /api/runs/managed
 403. Endpoints: `POST /api/runs/managed-chat`, `GET /api/runtime/flags`; plan approve/reject
 reuse `POST /api/runs/:id/approve|reject`. Requires `OPENROUTER_API_KEY`.
 
-### Phase 7.5 — Managed observed execution (Option A complete; observe-only)
+### Historical Phase 7.5 — Managed observed execution (retired)
 
 After a managed plan is approved (run `executing`), the cockpit shows **"Start observed
 execution"**. Clicking it (`POST /api/runs/:id/start-observed-execution`) launches the real

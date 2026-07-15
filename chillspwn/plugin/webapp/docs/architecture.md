@@ -30,7 +30,11 @@ flowchart LR
 
 ## Browser application
 
-`index.html` loads `src/main.tsx`, which mounts `src/App.tsx`. The app lazy-loads pages for chat, Mission Board, agent cockpit, reports, logs, settings, files, system state, and specialized workflows.
+`index.html` loads `src/main.tsx`, which mounts the small `src/App.tsx` composition root. The
+query-aware router lazy-loads the Command Center, mission portfolio and workspace, Autonomous Live
+Operations, Guided Workspace, Decisions, Intelligence, Agents, Second Brain, Learning,
+Observability, Reports, and System surfaces. Conversation is contextual to a mission; it is not the
+owner of execution state.
 
 During development, Vite listens on port 3132 and proxies `/api` and `/ws` to the Bun server on port 3131. In a production build, the Bun server serves `dist/` and the API from the same origin.
 
@@ -63,17 +67,22 @@ sequenceDiagram
   participant B as Mission Board
   participant S as Specialist
 
-  O->>UI: Submit objective
-  UI->>R: Create or observe run
-  R->>C: Plan/coordinate under configured boundary
+  O->>UI: Select Autonomous or Guided
+  UI->>R: Create mission and versioned journey contract
+  R->>C: Plan/coordinate under journey boundary
   C->>B: Create assigned task
   B->>S: Dispatch specialist work
   S->>B: Return result and evidence
   B->>C: Awaited result
-  R->>UI: Events, approvals, evidence, final report
+  R->>UI: Events, decisions, evidence, completion review
 ```
 
-The exact enforcement boundary depends on the provider path. Grok commander ACP uses an isolated profile, an attested tool surface, and a fail-closed pre-tool guard. Other provider paths may be managed, gated, or observe-only as documented in `SECURITY.md` and the runtime flags.
+There are exactly two user-facing journeys. Autonomous executes only through a provider path that
+can enforce its signed contract and must recover in-contract or safe-stop. Guided permits only the
+exact represented step covered by the current operator decision. Provider selection is secondary,
+policy-driven, and inspectable. Grok commander ACP additionally uses an isolated profile, live
+readiness attestation, a constrained tool surface, and a fail-closed pre-tool guard. An advisory or
+observe-only compatibility substrate is never represented as an enforceable journey executor.
 
 ## Persistence
 

@@ -42,8 +42,8 @@ This section summarizes the maintained current branch. Later phase-numbered sect
 |---|---|
 | Runtime-owned `/api/runs` tools | Enforced allow/deny/approval lifecycle; results require approved, step-bound calls. |
 | Managed OpenRouter/Codex | Gateable when the retained orchestrator integration and `ENABLE_OPENROUTER_RUNTIME_GATING` are active. `enforce` fails closed; `dry-run` records without blocking. |
-| Normal OpenRouter chat | Observe-only unless launched through the managed gated path. |
-| Claude CLI chat | Observe-only for native CLI tools; the dashboard does not claim it can block Claude-owned execution. |
+| Retired OpenRouter compatibility chat | Rollback-only and observe-only. It is not an Autonomous or Guided journey and cannot be used as an enforceable executor. |
+| Retired Claude CLI compatibility chat | Rollback-only and observe-only for native CLI tools. It is not an Autonomous or Guided journey and cannot be used as an enforceable executor. |
 | Grok ACP commander | Enforced coordination-only boundary: Mission Board and conversation recall only. Native execution, Grok subagents/tasks, and unapproved MCP tools are denied. |
 | Grok ACP specialist | Scoped specialist execution under its persona/tool contract; it is not the ChillsPwn commander. |
 | Grok planning/preview | Tool-free; any permission request is denied and interactive questions fail explicitly. |
@@ -110,52 +110,21 @@ Rules enforced at startup (`server/security/config.ts` → `validateStartup`):
 | `ENABLE_PROXY` | `false` | `/proxy/anthropic/*` outbound passthrough. |
 | `ENABLE_FILE_WRITE` | `false` | `PUT /api/files/write` (arbitrary-path writes). |
 | `ENABLE_SECURITY_TOOLS` | `false` | Offensive tooling via terminal-class tools (Phase 3 enforcement). |
-| `ENABLE_CHAT_AGENT_RUNS` | `false` | Phase 7.1: attach an **observe-only** AgentRun to live chat (see below). |
+| `ENABLE_LEGACY_EXECUTION_API` | `false` | Time-bounded rollback access to retired unversioned chat/runtime mutations. Never a Command OS journey. |
 
 A blocked feature returns a clear `403`/terminal notice and records a `security_event` in
 the audit log. These default OFF in code so a fresh clone is secure; the **live deployment
 re-enables what it needs via `.env`** (see `MIGRATION.md`).
 
-### Observe-only vs enforced (Phase 7.1)
+### Deprecated compatibility runtime (rollback only)
 
-The agent-runtime enforces tool policy (allow / deny / approval) **only** for runtime-owned
-runs created via `/api/runs` (`mode=managed`). When `ENABLE_CHAT_AGENT_RUNS=true`, a chat
-session also gets an AgentRun, but it is **`mode=observe` / observe-only**: the
-`SessionObserver` reads the chat's existing stdout log and *classifies* each tool call —
-recording the policy decision that **would** apply — but it **does not and cannot block,
-gate, or alter** the live `claude -p` / orchestrator turn. This is an honesty boundary: the
-frozen `claude -p` tools are observable, not enforceable. Observed events are recorded as
-`tool_observed` with `enforced: false` and are rendered in the cockpit under a distinct
-*"Observe-only classifications (live chat — NOT enforced)"* section, never as enforced
-`ToolCall`s. The observer is read-only and fail-safe: it never throws into the chat path and
-never touches `spawnClaude` / CLI args / stream-json / session resume / the orchestrator.
-
-**Plan preview (Phase 7.2) is advisory, never enforced.** With `CHAT_AGENT_PLANNING=preview`,
-a chat run may carry a `planPreview` — an advisory plan generated on demand. It lives in its
-own `AgentRun.planPreview` field (never the managed `steps` array), creates no PlanSteps /
-ToolCalls / approvals, and never flips the run from `observe` to `managed`. The cockpit labels
-it `PREVIEW` / `NOT ENFORCED`; the live chat is unaffected and is NOT following it. There are
-three enforcement tiers, always visually distinct in the cockpit: **MANAGED** (runtime-owned
-`/api/runs`, enforceable) · **PREVIEW** (advisory chat plan, not enforced) · **OBSERVE-ONLY**
-(live-chat tool classifications, not enforced).
-
-**Runtime-managed chat launcher (Phase 7.4, `ENABLE_RUNTIME_MANAGED_CHAT`, default off).** A
-managed chat run (`mode=managed`) goes through the real plan lifecycle and **real plan
-approval** (the run holds at `awaiting_plan_approval` until an operator approves). Phase 7.4
-deliberately **does not execute**: approving the plan advances the lifecycle but runs no
-`claude -p`, no orchestrator, and gates no tools. Tool-execution enforcement is a later phase
-and — per the Phase 7.3 design — will **never** be real for `claude -p` (the CLI owns its own
-tools). The plan-generation call is strict (no preview coercion): an invalid plan fails the run
-cleanly rather than executing a malformed plan.
-
-**Managed observed execution (Phase 7.5) is observe-only.** `POST /api/runs/:id/start-observed-
-execution` launches the provider via an isolated wrapper (a closed no-op stub WebSocket for
-Claude — `spawnClaude` only does `new Set([ws])` and `broadcastToSession` is `readyState`-
-guarded, so the stub is never invoked; headless `spawnOpenRouter(…, null)` for OR). For Claude
-the observer **classifies** tool calls (`enforced=false`) but **cannot block** them — the
-cockpit labels this *NOT ENFORCED*. No managed plan is injected into Claude's prompt. Real
-allow/deny/approval enforcement on the OR/Codex path is a separately-approved later phase
-(7.6); runtime-owned `/api/runs` tool calls remain fully enforced.
+Command OS has exactly two user-facing journeys: **Autonomous** and **Guided**. Historical
+`observe`, `preview`, `managed`, provider-chat, Agent Cockpit, and plan-approval modes are not
+supported product journeys and are not part of normal configuration. Their source remains only
+for a controlled rollback window behind `ENABLE_LEGACY_EXECUTION_API=false` and the legacy
+execution gate. Enabling that switch is a degraded-state emergency action that must be approved,
+time-boxed, audited, and reversed after recovery. It must never be used to bypass the signed
+Autonomous contract, Guided exact-step decision, specialist ownership, or canonical database.
 
 ## Path-traversal hardening
 
@@ -245,11 +214,12 @@ the `runtime/events.jsonl` child of `CHILLSPWN_STATE_DIR` (`server/runtime/Event
 - **Audit:** `tool_requested`, `tool_approved`, `tool_rejected`, `approval_requested`,
   `approval_resolved`, `tool_result`, `evidence_stored` are all written to the EventLog.
 
-### Enforced vs observe-only — read this
+### Historical Phase 7/8 enforcement comparison (rollback reference only)
 
 > **Historical checkpoint.** This table records the Phase 7/8 transition that motivated the later
-> gate. It is retained for design provenance, not as the current recovery state. Consult the current
-> enforcement matrix above before enabling a provider path.
+> gate. It is retained for design provenance, not as the current recovery state. The listed chat
+> paths are disabled behind the rollback-only legacy execution gate and are not supported Command OS
+> journeys. Consult the current enforcement matrix above before evaluating a provider substrate.
 
 | Path | Status |
 |---|---|
@@ -258,16 +228,17 @@ the `runtime/events.jsonl` child of `CHILLSPWN_STATE_DIR` (`server/runtime/Event
 | **Managed OpenRouter / Codex (Phase 8 design)** | **GATEABLE.** With the retained orchestrator integration + `ENABLE_OPENROUTER_RUNTIME_GATING=true`: `off` disables gating; `dry-run` records without blocking; `enforce` performs real allow/deny/approval and fails closed if the runtime gate is unreachable. |
 | **Normal chat — OpenRouter** | **OBSERVE-ONLY** (not a managed gated run) — same as `claude -p`: classified, never blocked. |
 
-This split is deliberate: it avoids a false sense of protection over the frozen Claude path, while
-making OpenRouter/Codex genuinely enforceable (that path owns its tool execution in Python).
+This historical split avoided a false sense of protection over the frozen Claude path while the
+managed OpenRouter/Codex substrate owned tool execution in Python. Command OS now exposes only
+Autonomous and Guided; a substrate that cannot enforce the chosen journey contract is ineligible for
+consequential execution.
 
 ## Known gaps (deferred to later phases by design)
 
 - The Anthropic proxy still logs request/response bodies; redaction tightening is a
   follow-up. It is now `403` by default (`ENABLE_PROXY=false`).
-- **Live (non-managed) chat** tool calls — both `claude -p` and OpenRouter — are
-  **classified/audited only**, not gated. Real enforcement applies to **managed OpenRouter/Codex
-  runs** (Phase 8, off by default) and `/api/runs`; Claude is never gated.
+- The retired non-managed chat compatibility paths remain classified/audited only if an operator
+  temporarily enables the rollback gate. They are never eligible Autonomous or Guided executors.
 - `server/index.ts` remains an approximately 9.3k-line legacy composition root executed directly by
   Bun and excluded from strict checking. Runtime, provider, agent, route, MCP, and security modules
   have been split out and are strictly type-checked through `tsconfig.server.json`; reducing the
@@ -275,9 +246,12 @@ making OpenRouter/Codex genuinely enforceable (that path owns its tool execution
 
 ---
 
-## Phases 8–14 security posture
+## Historical Phases 8–14 security posture
 
-- **Claude stays observe-only.** No phase changes `claude -p` / `spawnClaude` / Claude tool
+The following bullets document the predecessor runtime and do not add user-facing journeys or
+current launch options. Retained compatibility code remains default-off and rollback-only.
+
+- **Claude stayed observe-only.** No historical phase changed `claude -p` / `spawnClaude` / Claude tool
   handling. Claude tool calls are recorded as `tool_observed` with `enforced:false`; the cockpit
   label helpers are unit-tested to never print "ENFORCED" for an observe-only event.
 - **OR gating fails closed.** When `OPENROUTER_GATE_MODE=enforce` and the runtime gate is
@@ -339,7 +313,8 @@ making OpenRouter/Codex genuinely enforceable (that path owns its tool execution
 ## Phase 16 — MCP Arsenal Bridge governance
 
 - **MCPs are NOT attached to Claude.** No `--mcp-config`, no `.claude.json` change, no `spawnClaude`
-  change. Claude stays observe-only. MCP execution is wired into the OR/Codex/runtime path only.
+  change. The retired Claude compatibility substrate remains observe-only. MCP execution is wired
+  only through a journey-compatible, policy-enforced specialist path.
 - **No global exposure.** Tools reach a specialist ONLY through its allowlist (`agentMcpMap.ts`) + the
   bridge. There is no arbitrary UI execution — only `POST /api/mcp/execute`, which runs the full chain:
   run/step/specialist checks → AgentRoutingPolicy → ToolPolicy/approval gate → MCP health → execute.

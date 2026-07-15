@@ -1,9 +1,14 @@
-# ChillsPwn Agent Runtime — Architecture & Modes (Phases 1–14)
+# ChillsPwn Agent Runtime — Historical Predecessor Modes (Phases 1–14)
 
 > **Historical scope:** this document records the Phase 1–14 runtime design. It does not
 > describe the later specialist army, session lifecycle, MCP arsenal, or Grok ACP commander
 > boundary. Use `architecture.md`, `integrations.md`, and the top-level `SECURITY.md` for the
 > current repository-wide view.
+>
+> Command OS has exactly two user-facing journeys: **Autonomous** and **Guided**. Every mode in
+> this document is retired compatibility terminology, not a supported product choice. Compatibility
+> mutations remain default-off behind `ENABLE_LEGACY_EXECUTION_API` and exist only for a bounded
+> rollback window.
 
 The agent runtime turns the dashboard from a chat front-end into a supervised agent-execution
 platform. It owns plans, tool policy, approvals, evidence, memory provenance, worker results,
@@ -16,7 +21,7 @@ handling, Claude output parsing, and the existing normal Chat behavior. Claude t
 **observed, never enforced** — Claude runs under its own CLI permissions; the runtime cannot
 gate them without changing Claude's permission/hook surface (a separate future approval).
 
-## The six run modes
+## Retired internal compatibility modes
 
 | Mode | What it is | Plan enforced | Tool policy enforced | Approvals enforced | Evidence | Cockpit role |
 |------|-----------|---------------|----------------------|--------------------|----------|--------------|
@@ -27,9 +32,11 @@ gate them without changing Claude's permission/hook surface (a separate future a
 | **Managed OpenRouter (gated)** | Managed run, OR orchestrator consults the runtime tool-gate before each tool | **yes** | **YES (enforce mode)** | **YES** | enforced tool calls + results | full control room |
 | **Runtime-owned API run** | `POST /api/runs` lifecycle, no chat | **yes** | **YES** | **YES** | enforced | full control room |
 
-**The enforcement boundary:** only the OpenRouter/Codex path and the runtime-owned API path can
-*enforce* tool policy, because `orchestrator_openrouter.py` owns tool execution in Python and can
-wait on the runtime's decision. Claude is always observe-only for tools.
+**Historical enforcement boundary:** only the OpenRouter/Codex path and runtime-owned API path could
+enforce tool policy because `orchestrator_openrouter.py` owned tool execution in Python and could
+wait on the runtime's decision. In Command OS, provider selection is secondary and policy-driven:
+a substrate that cannot enforce the selected Autonomous contract or exact Guided decision cannot
+perform consequential execution.
 
 ## Component map
 
@@ -58,7 +65,7 @@ wait on the runtime's decision. Claude is always observe-only for tools.
 - **Cockpit (Phase 13)** — run search/filter, unambiguous labels, approvals, evidence drawer,
   report/artifact export.
 
-## Where Claude observe-only is enforced in code
+## Historical Claude observe-only implementation
 
 `spawnClaude` is called with a closed stub websocket; `broadcastToSession` is readyState-guarded
 so nothing is sent. The observer records `tool_observed` events with `enforced:false`. The cockpit
