@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { parseRunRecovery } from "../../domain/schemas/operations";
+import { parseRecoveryMutation, parseRunRecovery } from "../../domain/schemas/operations";
 
 function projection() {
   return {
@@ -7,9 +7,13 @@ function projection() {
     recoveryRequired: true,
     run: {
       id: "run-1", missionId: "mission-1", missionName: "Authorized lab", journey: "guided", status: "blocked",
+      version: 7,
       statusReason: "Timeout recovery needs a decision", currentStepId: "step-1", currentOwnerId: "agent-1",
       nextAction: "Review the alternative", leaseExpiresAt: null,
     },
+    boundary: { planId: "plan-1", planVersion: 1, stepId: "step-1", assignmentId: "assignment-1", agentId: "agent-1", actionKind: "provider_turn" },
+    reassignmentCandidates: [{ agentId: "agent-2", displayName: "Recon Two", status: "available", capabilities: ["network.recon"] }],
+    providerCandidates: [{ providerId: "alternate-oauth", status: "healthy", supportsGuided: true, enforcesAutonomousBoundary: true, reportsExactTokenUsage: true, reportsExactCostUsage: true }],
     detection: {
       summary: "Timeout recovery needs a decision", category: "timeout",
       evidence: [{ id: "event-1", eventType: "run.recovery_started", summary: "Recovery started", occurredAt: "2026-07-15T10:00:00.000Z", sequence: 4 }],
@@ -24,7 +28,7 @@ function projection() {
       kind: "guided_decision", summary: "Review one bounded alternative", basis: "The first action timed out",
       impact: { time: "No execution while stopped", cost: "No additional cost while stopped", scope: "Exact-step boundary remains" },
     },
-    guidedDecision: { id: "decision-1", stepId: "step-1", rationale: "Use another approach", riskClass: "low", expiresAt: "2026-07-16T10:00:00.000Z" },
+    guidedDecision: { id: "decision-1", stepId: "step-1", actionFingerprint: "f".repeat(64), rationale: "Use another approach", riskClass: "low", expiresAt: "2026-07-16T10:00:00.000Z" },
     failedAttemptMemories: [{ kind: "lesson", id: "lesson-1", title: "Avoid identical retry", status: "verified", confidence: 0.9, failureCategory: "timeout" }],
     actions: [
       { kind: "resume", label: "Resume from checkpoint", available: true, reason: "Supported by the runtime", command: "resume" },
@@ -47,7 +51,34 @@ describe("Recovery Panel boundary schema", () => {
 
   test("rejects a backend command that is not explicitly supported", () => {
     const invalid = projection();
-    invalid.actions[1] = { ...invalid.actions[1], available: true, command: "replan" as never };
+    invalid.actions[1] = { ...invalid.actions[1], available: true, command: "force" as never };
     expect(() => parseRunRecovery(invalid)).toThrow(/command is invalid/);
+  });
+
+  test("accepts the exact replacement assignment returned by an enforced mutation", () => {
+    const parsed = parseRecoveryMutation({
+      schemaVersion: "2.1",
+      mutation: {
+        kind: "reassign",
+        eventId: "event-reassign",
+        checkpointId: "checkpoint-reassign",
+        continuationId: null,
+        agentId: "agent-2",
+        providerId: null,
+        providerRouteVersion: null,
+      },
+      run: {
+        id: "run-1",
+        journey: "autonomous",
+        status: "blocked",
+        version: 8,
+        planId: "plan-1",
+        planVersion: 1,
+        stepId: "step-1",
+        assignmentId: "assignment-replacement",
+      },
+    });
+    expect(parsed.mutation.kind).toBe("reassign");
+    expect(parsed.run.assignmentId).toBe("assignment-replacement");
   });
 });

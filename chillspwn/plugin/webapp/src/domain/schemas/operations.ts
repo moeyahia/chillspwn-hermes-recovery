@@ -1,8 +1,10 @@
 import type {
-  AgentAssignment, AgentCapability, AgentRecord, ArtifactRecord, EvaluationRecord, EventRecord,
-  EvaluationComparison, EvaluationComparisonMetric,
-  EvidenceRecord, FindingRecord, HealthStatus, LessonRecord, LessonUsageRecord, LogRecord,
-  McpRecord, MissionReference, OperationsPage, PolicyRecord, ProviderRecord, RunRecoveryRecord,
+  ActionRecord, AgentAssignment, AgentCapability, AgentRecord, ArtifactRecord, EvaluationRecord, EventRecord,
+  EvaluationBudget, EvaluationBudgetMetric, EvaluationComparison, EvaluationComparisonMetric,
+  EvidenceRecord, FindingRecord, FollowUpRunRecord, HealthStatus, LessonRecord, LessonUsageRecord, LogRecord,
+  AdministrativeApprovalReviewRecord, DecisionInboxRecord,
+  McpRecord, MissionReference, OperationsPage, PolicyRecord, ProviderRecord, RecoveryMutationRecord, RunRecoveryRecord,
+  TraceDetailRecord, TraceRecord, TraceSummaryRecord,
 } from "../types/operations";
 import { array, boolean, nonEmpty, nullableNumber, nullableString, number, object, schema, string } from "./common";
 
@@ -82,6 +84,155 @@ function parseAssignment(value: unknown): AgentAssignment {
 
 export function parseAgentAssignments(payload: unknown): OperationsPage<AgentAssignment> { return page(payload, parseAssignment); }
 
+function safeDecisionDeepLink(value: unknown): string {
+  const link = nonEmpty(value, "decision.deepLink");
+  if (!link.startsWith("/") || link.startsWith("//") || link.includes("\\")) {
+    throw new Error("decision deep link is invalid");
+  }
+  return link;
+}
+
+function parseDecisionInboxRecord(value: unknown): DecisionInboxRecord {
+  const item = object(value, "decision inbox record");
+  const allowedKinds = new Set(["guided_decision", "autonomous_contract", "autonomous_exception", "administrative_approval"] as const);
+  const kind = nonEmpty(item.kind, "decision.kind") as DecisionInboxRecord["kind"];
+  if (!allowedKinds.has(kind)) throw new Error("decision inbox kind is invalid");
+  const missionValue = item.mission === null ? null : object(item.mission, "decision.mission");
+  const missionRecord = missionValue ? {
+    ...mission(missionValue, "decision.mission"),
+    engagementId: nullableString(missionValue.engagementId, "decision.mission.engagementId"),
+  } : null;
+  const runValue = item.run === null ? null : object(item.run, "decision.run");
+  const journey = runValue?.journey;
+  if (runValue && journey !== "autonomous" && journey !== "guided") {
+    throw new Error("decision run journey is invalid");
+  }
+  const runRecord = runValue ? {
+    id: nonEmpty(runValue.id, "decision.run.id"),
+    status: nonEmpty(runValue.status, "decision.run.status"),
+    journey: journey as "autonomous" | "guided",
+  } : null;
+  const base = {
+    id: nonEmpty(item.id, "decision.id"),
+    mission: missionRecord,
+    run: runRecord,
+    status: nonEmpty(item.status, "decision.status"),
+    title: nonEmpty(item.title, "decision.title"),
+    summary: string(item.summary, "decision.summary"),
+    createdAt: nonEmpty(item.createdAt, "decision.createdAt"),
+    resolvedAt: nullableString(item.resolvedAt, "decision.resolvedAt"),
+    expiresAt: nullableString(item.expiresAt, "decision.expiresAt"),
+    deepLink: safeDecisionDeepLink(item.deepLink),
+  };
+  if (kind === "guided_decision") {
+    if (!missionRecord || !runRecord || runRecord.journey !== "guided") throw new Error("Guided decision scope is invalid");
+    if (!new Set(["pending", "approved", "manual", "alternative", "rejected", "expired", "cancelled"]).has(base.status)) {
+      throw new Error("Guided decision status is invalid");
+    }
+    const exact = object(item.exactStep, "decision.exactStep");
+    return {
+      ...base, kind, mission: missionRecord, run: { ...runRecord, journey: "guided" },
+      exactStep: {
+        stepId: nonEmpty(exact.stepId, "decision.exactStep.stepId"),
+        actionFingerprint: nonEmpty(exact.actionFingerprint, "decision.exactStep.actionFingerprint"),
+        requestedParameters: exact.requestedParameters ?? {},
+        rationale: string(exact.rationale, "decision.exactStep.rationale"),
+        riskClass: nonEmpty(exact.riskClass, "decision.exactStep.riskClass"),
+        reversibility: string(exact.reversibility, "decision.exactStep.reversibility"),
+        decisionActor: nullableString(exact.decisionActor, "decision.exactStep.decisionActor"),
+        decisionReason: nullableString(exact.decisionReason, "decision.exactStep.decisionReason"),
+      },
+    };
+  }
+  if (kind === "autonomous_contract") {
+    if (!missionRecord) throw new Error("Autonomous contract mission is missing");
+    const contract = object(item.contract, "decision.contract");
+    const state = nonEmpty(contract.state, "decision.contract.state");
+    if (!new Set(["draft", "confirmed", "superseded", "revoked"]).has(state)) throw new Error("contract state is invalid");
+    const contractVersion = number(contract.version, "decision.contract.version");
+    const contractHash = nonEmpty(contract.hash, "decision.contract.hash");
+    if (!Number.isSafeInteger(contractVersion) || contractVersion < 1 || contractHash.length < 32) {
+      throw new Error("contract identity is invalid");
+    }
+    return {
+      ...base, kind, mission: missionRecord,
+      contract: {
+        version: contractVersion,
+        hash: contractHash,
+        state: state as "draft" | "confirmed" | "superseded" | "revoked",
+        confirmedBy: nullableString(contract.confirmedBy, "decision.contract.confirmedBy"),
+        confirmedAt: nullableString(contract.confirmedAt, "decision.contract.confirmedAt"),
+      },
+    };
+  }
+  if (kind === "autonomous_exception") {
+    if (!missionRecord || !runRecord || runRecord.journey !== "autonomous") throw new Error("Autonomous exception scope is invalid");
+    const exception = object(item.exception, "decision.exception");
+    const phase = nonEmpty(exception.phase, "decision.exception.phase");
+    if (phase !== "active" && phase !== "post_run") throw new Error("exception phase is invalid");
+    const sequence = number(exception.sequence, "decision.exception.sequence");
+    if (!Number.isSafeInteger(sequence) || sequence < 1) throw new Error("exception sequence is invalid");
+    return {
+      ...base, kind, mission: missionRecord, run: { ...runRecord, journey: "autonomous" },
+      exception: {
+        eventType: nonEmpty(exception.eventType, "decision.exception.eventType"),
+        sequence,
+        phase,
+        code: nullableString(exception.code, "decision.exception.code"),
+        category: nullableString(exception.category, "decision.exception.category"),
+        traceId: nullableString(exception.traceId, "decision.exception.traceId"),
+        details: exception.details ?? {},
+      },
+    };
+  }
+  const approval = object(item.approval, "decision.approval");
+  if (!new Set(["pending", "approved", "rejected", "expired", "cancelled"]).has(base.status)) {
+    throw new Error("administrative approval status is invalid");
+  }
+  return {
+    ...base, kind,
+    approval: {
+      approvalType: nonEmpty(approval.approvalType, "decision.approval.approvalType"),
+      requestedBy: nonEmpty(approval.requestedBy, "decision.approval.requestedBy"),
+      policyRule: nullableString(approval.policyRule, "decision.approval.policyRule"),
+      request: approval.request ?? {},
+      decidedBy: nullableString(approval.decidedBy, "decision.approval.decidedBy"),
+      reviewAvailable: boolean(approval.reviewAvailable, "decision.approval.reviewAvailable"),
+      reviewUnavailableReason: nullableString(approval.reviewUnavailableReason, "decision.approval.reviewUnavailableReason"),
+    },
+  };
+}
+
+export function parseDecisionInboxPage(payload: unknown): OperationsPage<DecisionInboxRecord> {
+  return page(payload, parseDecisionInboxRecord);
+}
+
+export function parseAdministrativeApprovalReview(payload: unknown): AdministrativeApprovalReviewRecord {
+  const root = object(payload, "administrative approval review");
+  schema(root);
+  const approval = object(root.approval, "administrative approval review.approval");
+  const status = nonEmpty(approval.status, "approval.status");
+  if (status !== "approved" && status !== "rejected") throw new Error("administrative review status is invalid");
+  if (approval.runtimeStateChanged !== false || approval.autonomousActionUnblocked !== false) {
+    throw new Error("administrative review must not mutate runtime authority");
+  }
+  return {
+    schemaVersion: "2.1",
+    approval: {
+      id: nonEmpty(approval.id, "approval.id"),
+      missionId: nullableString(approval.missionId, "approval.missionId"),
+      runId: nullableString(approval.runId, "approval.runId"),
+      approvalType: nonEmpty(approval.approvalType, "approval.approvalType"),
+      status,
+      decidedBy: nonEmpty(approval.decidedBy, "approval.decidedBy"),
+      decidedAt: nonEmpty(approval.decidedAt, "approval.decidedAt"),
+      decisionReason: string(approval.decisionReason, "approval.decisionReason"),
+      runtimeStateChanged: false,
+      autonomousActionUnblocked: false,
+    },
+  };
+}
+
 export function parseRunRecovery(payload: unknown): RunRecoveryRecord {
   const root = object(payload, "run recovery"); schema(root);
   const run = object(root.run, "run recovery.run");
@@ -89,6 +240,7 @@ export function parseRunRecovery(payload: unknown): RunRecoveryRecord {
     ? run.journey
     : (() => { throw new Error("recovery journey is invalid"); })();
   const detection = object(root.detection, "run recovery.detection");
+  const boundaryValue = root.boundary === null ? null : object(root.boundary, "run recovery.boundary");
   const checkpointValue = root.checkpoint === null ? null : object(root.checkpoint, "run recovery.checkpoint");
   const attempts = object(root.attempts, "run recovery.attempts");
   const proposal = object(root.proposedRecovery, "run recovery.proposedRecovery");
@@ -104,12 +256,43 @@ export function parseRunRecovery(payload: unknown): RunRecoveryRecord {
     run: {
       id: nonEmpty(run.id, "run.id"), missionId: nonEmpty(run.missionId, "run.missionId"),
       missionName: nonEmpty(run.missionName, "run.missionName"), journey,
-      status: nonEmpty(run.status, "run.status"), statusReason: nullableString(run.statusReason, "run.statusReason"),
+      status: nonEmpty(run.status, "run.status"), version: number(run.version, "run.version"),
+      statusReason: nullableString(run.statusReason, "run.statusReason"),
       currentStepId: nullableString(run.currentStepId, "run.currentStepId"),
       currentOwnerId: nullableString(run.currentOwnerId, "run.currentOwnerId"),
       nextAction: nullableString(run.nextAction, "run.nextAction"),
       leaseExpiresAt: nullableString(run.leaseExpiresAt, "run.leaseExpiresAt"),
     },
+    boundary: boundaryValue ? {
+      planId: nonEmpty(boundaryValue.planId, "boundary.planId"),
+      planVersion: number(boundaryValue.planVersion, "boundary.planVersion"),
+      stepId: nonEmpty(boundaryValue.stepId, "boundary.stepId"),
+      assignmentId: nonEmpty(boundaryValue.assignmentId, "boundary.assignmentId"),
+      agentId: nonEmpty(boundaryValue.agentId, "boundary.agentId"),
+      actionKind: nullableString(boundaryValue.actionKind, "boundary.actionKind"),
+    } : null,
+    reassignmentCandidates: array(root.reassignmentCandidates, "reassignmentCandidates").map((value) => {
+      const item = object(value, "reassignment candidate");
+      if (item.status !== "available") throw new Error("reassignment candidate status is invalid");
+      return {
+        agentId: nonEmpty(item.agentId, "candidate.agentId"),
+        displayName: nonEmpty(item.displayName, "candidate.displayName"),
+        status: "available" as const,
+        capabilities: array(item.capabilities, "candidate.capabilities").map((capability) => nonEmpty(capability, "candidate.capability")),
+      };
+    }),
+    providerCandidates: array(root.providerCandidates, "providerCandidates").map((value) => {
+      const item = object(value, "provider candidate");
+      if (item.status !== "healthy") throw new Error("provider candidate status is invalid");
+      return {
+        providerId: nonEmpty(item.providerId, "provider.providerId"),
+        status: "healthy" as const,
+        supportsGuided: boolean(item.supportsGuided, "provider.supportsGuided"),
+        enforcesAutonomousBoundary: boolean(item.enforcesAutonomousBoundary, "provider.enforcesAutonomousBoundary"),
+        reportsExactTokenUsage: boolean(item.reportsExactTokenUsage, "provider.reportsExactTokenUsage"),
+        reportsExactCostUsage: boolean(item.reportsExactCostUsage, "provider.reportsExactCostUsage"),
+      };
+    }),
     detection: {
       summary: string(detection.summary, "detection.summary"),
       category: nullableString(detection.category, "detection.category"),
@@ -164,6 +347,7 @@ export function parseRunRecovery(payload: unknown): RunRecoveryRecord {
     },
     guidedDecision: decisionValue ? {
       id: nonEmpty(decisionValue.id, "guidedDecision.id"), stepId: nonEmpty(decisionValue.stepId, "guidedDecision.stepId"),
+      actionFingerprint: nonEmpty(decisionValue.actionFingerprint, "guidedDecision.actionFingerprint"),
       rationale: string(decisionValue.rationale, "guidedDecision.rationale"),
       riskClass: nonEmpty(decisionValue.riskClass, "guidedDecision.riskClass"),
       expiresAt: nonEmpty(decisionValue.expiresAt, "guidedDecision.expiresAt"),
@@ -179,11 +363,89 @@ export function parseRunRecovery(payload: unknown): RunRecoveryRecord {
       const item = object(value, "recovery action");
       const kind = nonEmpty(item.kind, "recovery action.kind") as RunRecoveryRecord["actions"][number]["kind"];
       if (!actionKinds.has(kind)) throw new Error("recovery action kind is invalid");
-      const command = item.command === null || item.command === "resume" || item.command === "cancel"
+      const command = item.command === null || item.command === "resume" || item.command === "replan" ||
+        item.command === "reassign" || item.command === "change_provider" || item.command === "cancel"
         ? item.command : (() => { throw new Error("recovery action command is invalid"); })();
       return { kind, label: nonEmpty(item.label, "recovery action.label"),
         available: boolean(item.available, "recovery action.available"), reason: string(item.reason, "recovery action.reason"), command };
     }),
+  };
+}
+
+export function parseRecoveryMutation(payload: unknown): RecoveryMutationRecord {
+  const root = object(payload, "recovery mutation");
+  schema(root);
+  const mutation = object(root.mutation, "recovery mutation.mutation");
+  const kind = nonEmpty(mutation.kind, "mutation.kind");
+  if (kind !== "replan" && kind !== "reassign" && kind !== "change_provider") {
+    throw new Error("recovery mutation kind is invalid");
+  }
+  const run = object(root.run, "recovery mutation.run");
+  const journey = run.journey === "autonomous" || run.journey === "guided"
+    ? run.journey
+    : (() => { throw new Error("recovery mutation journey is invalid"); })();
+  return {
+    schemaVersion: "2.1",
+    mutation: {
+      kind,
+      eventId: nonEmpty(mutation.eventId, "mutation.eventId"),
+      checkpointId: nonEmpty(mutation.checkpointId, "mutation.checkpointId"),
+      continuationId: nullableString(mutation.continuationId, "mutation.continuationId"),
+      agentId: nullableString(mutation.agentId, "mutation.agentId"),
+      providerId: nullableString(mutation.providerId, "mutation.providerId"),
+      providerRouteVersion: nullableNumber(mutation.providerRouteVersion, "mutation.providerRouteVersion"),
+    },
+    run: {
+      id: nonEmpty(run.id, "run.id"),
+      journey,
+      status: nonEmpty(run.status, "run.status"),
+      version: number(run.version, "run.version"),
+      planId: nonEmpty(run.planId, "run.planId"),
+      planVersion: number(run.planVersion, "run.planVersion"),
+      stepId: nonEmpty(run.stepId, "run.stepId"),
+      assignmentId: nonEmpty(run.assignmentId, "run.assignmentId"),
+    },
+  };
+}
+
+export function parseFollowUpRun(payload: unknown): FollowUpRunRecord {
+  const root = object(payload, "follow-up run");
+  schema(root);
+  const run = object(root.run, "follow-up run.run");
+  const journey = run.journey === "autonomous" || run.journey === "guided"
+    ? run.journey
+    : (() => { throw new Error("follow-up run journey is invalid"); })();
+  if (run.status !== "planning") throw new Error("follow-up run status is invalid");
+  const nextUrl = nonEmpty(root.nextUrl, "follow-up run.nextUrl");
+  if (!nextUrl.startsWith("/missions/") || nextUrl.startsWith("//") || nextUrl.includes("\\")) {
+    throw new Error("follow-up run next URL is invalid");
+  }
+  return {
+    schemaVersion: "2.1",
+    sourceRunId: nonEmpty(root.sourceRunId, "follow-up run.sourceRunId"),
+    run: {
+      id: nonEmpty(run.id, "follow-up run.id"),
+      missionId: nonEmpty(run.missionId, "follow-up run.missionId"),
+      missionName: nonEmpty(run.missionName, "follow-up run.missionName"),
+      journey,
+      status: "planning",
+      statusReason: string(run.statusReason, "follow-up run.statusReason"),
+      nextAction: string(run.nextAction, "follow-up run.nextAction"),
+      createdAt: nonEmpty(run.createdAt, "follow-up run.createdAt"),
+    },
+    selectedLessons: array(root.selectedLessons, "follow-up run.selectedLessons").map((value, index) => {
+      const item = object(value, `follow-up run.selectedLessons[${index}]`);
+      if (item.selectionState !== "eligible_for_planning") {
+        throw new Error("follow-up lesson selection state is invalid");
+      }
+      return {
+        id: nonEmpty(item.id, "selected lesson.id"),
+        nodeId: nonEmpty(item.nodeId, "selected lesson.nodeId"),
+        statement: string(item.statement, "selected lesson.statement"),
+        selectionState: "eligible_for_planning" as const,
+      };
+    }),
+    nextUrl,
   };
 }
 
@@ -228,6 +490,34 @@ export function parseArtifact(value: unknown): ArtifactRecord {
 }
 export function parseArtifactPage(payload: unknown): OperationsPage<ArtifactRecord> { return page(payload, parseArtifact); }
 
+export function parseAction(value: unknown): ActionRecord {
+  const item = object(value, "action");
+  const step = item.step === null ? null : object(item.step, "action.step");
+  const correlation = object(item.correlation, "action.correlation");
+  const journey = item.journey === "autonomous" || item.journey === "guided"
+    ? item.journey
+    : (() => { throw new Error("action journey is invalid"); })();
+  const statuses = new Set<ActionRecord["status"]>(["queued", "running", "succeeded", "failed", "cancelled", "timed_out", "denied"]);
+  const status = nonEmpty(item.status, "action.status") as ActionRecord["status"];
+  if (!statuses.has(status)) throw new Error("action status is invalid");
+  return {
+    id: nonEmpty(item.id, "action.id"), mission: mission(item.mission),
+    runId: nonEmpty(item.runId, "action.runId"), journey,
+    step: step ? { id: nonEmpty(step.id, "action.step.id"), phase: string(step.phase, "action.step.phase"), title: string(step.title, "action.step.title") } : null,
+    agentId: nullableString(item.agentId, "action.agentId"),
+    actionType: nonEmpty(item.actionType, "action.actionType"), actionClass: nonEmpty(item.actionClass, "action.actionClass"),
+    target: nullableString(item.target, "action.target"), status,
+    intentSummary: string(item.intentSummary, "action.intentSummary"), resultSummary: nullableString(item.resultSummary, "action.resultSummary"),
+    errorCategory: nullableString(item.errorCategory, "action.errorCategory"), retryCount: number(item.retryCount, "action.retryCount"),
+    guidedDecisionId: nullableString(item.guidedDecisionId, "action.guidedDecisionId"), contractId: nullableString(item.contractId, "action.contractId"),
+    contextPackId: nullableString(item.contextPackId, "action.contextPackId"),
+    correlation: { traceId: nullableString(correlation.traceId, "action.traceId"), spanId: nullableString(correlation.spanId, "action.spanId") },
+    startedAt: nullableString(item.startedAt, "action.startedAt"), endedAt: nullableString(item.endedAt, "action.endedAt"),
+    createdAt: nonEmpty(item.createdAt, "action.createdAt"), updatedAt: nonEmpty(item.updatedAt, "action.updatedAt"),
+  };
+}
+export function parseActionPage(payload: unknown): OperationsPage<ActionRecord> { return page(payload, parseAction); }
+
 export function parseEventPage(payload: unknown): OperationsPage<EventRecord> {
   return page(payload, (value) => { const item = object(value, "event"); const actor = object(item.actor, "event.actor"); const correlation = object(item.correlation, "event.correlation");
     const journey = item.journey === null ? null : item.journey === "autonomous" || item.journey === "guided" ? item.journey : (() => { throw new Error("event journey is invalid"); })();
@@ -237,6 +527,71 @@ export function parseEventPage(payload: unknown): OperationsPage<EventRecord> {
 
 export function parseLogPage(payload: unknown): OperationsPage<LogRecord> {
   return page(payload, (value) => { const item = object(value, "log"); const correlation = object(item.correlation, "log.correlation"); return { id: nonEmpty(item.id, "log.id"), occurredAt: nonEmpty(item.occurredAt, "occurredAt"), severity: nonEmpty(item.severity, "severity"), domain: nonEmpty(item.domain, "domain"), message: string(item.message, "message"), attributes: item.attributes ?? {}, mission: item.mission === null ? null : mission(item.mission), runId: nullableString(item.runId, "runId"), stepId: nullableString(item.stepId, "stepId"), actionId: nullableString(item.actionId, "actionId"), correlation: { traceId: nullableString(correlation.traceId, "traceId"), spanId: nullableString(correlation.spanId, "spanId") }, sensitivity: nonEmpty(item.sensitivity, "sensitivity") }; });
+}
+
+function parseTraceSummary(value: unknown): TraceSummaryRecord {
+  const item = object(value, "trace summary");
+  const counts = object(item.counts, "trace summary.counts");
+  const status = item.status === "active" || item.status === "completed" || item.status === "failed"
+    ? item.status
+    : (() => { throw new Error("trace status is invalid"); })();
+  const journey = item.journey === null
+    ? null
+    : item.journey === "autonomous" || item.journey === "guided"
+      ? item.journey
+      : (() => { throw new Error("trace journey is invalid"); })();
+  return {
+    id: nonEmpty(item.id, "trace.id"), traceId: nonEmpty(item.traceId, "trace.traceId"), status,
+    summary: string(item.summary, "trace.summary"),
+    mission: item.mission === null ? null : mission(item.mission, "trace.mission"),
+    missionCount: number(item.missionCount, "trace.missionCount"),
+    runId: nullableString(item.runId, "trace.runId"), runCount: number(item.runCount, "trace.runCount"),
+    journey, startedAt: nonEmpty(item.startedAt, "trace.startedAt"), endedAt: nonEmpty(item.endedAt, "trace.endedAt"),
+    durationMs: number(item.durationMs, "trace.durationMs"),
+    counts: {
+      events: number(counts.events, "trace.counts.events"), logs: number(counts.logs, "trace.counts.logs"),
+      actions: number(counts.actions, "trace.counts.actions"), toolCalls: number(counts.toolCalls, "trace.counts.toolCalls"),
+      errors: number(counts.errors, "trace.counts.errors"),
+    },
+  };
+}
+
+function parseTraceRecord(value: unknown): TraceRecord {
+  const item = object(value, "trace record");
+  const correlation = object(item.correlation, "trace record.correlation");
+  const kinds = new Set<TraceRecord["kind"]>(["event", "log", "action", "tool_call"]);
+  const kind = nonEmpty(item.kind, "trace record.kind") as TraceRecord["kind"];
+  if (!kinds.has(kind)) throw new Error("trace record kind is invalid");
+  return {
+    id: nonEmpty(item.id, "trace record.id"), sourceId: nonEmpty(item.sourceId, "trace record.sourceId"), kind,
+    title: string(item.title, "trace record.title"), summary: string(item.summary, "trace record.summary"),
+    status: nonEmpty(item.status, "trace record.status"),
+    mission: item.mission === null ? null : mission(item.mission, "trace record.mission"),
+    runId: nullableString(item.runId, "trace record.runId"), stepId: nullableString(item.stepId, "trace record.stepId"),
+    actionId: nullableString(item.actionId, "trace record.actionId"), agentId: nullableString(item.agentId, "trace record.agentId"),
+    startedAt: nonEmpty(item.startedAt, "trace record.startedAt"), endedAt: nonEmpty(item.endedAt, "trace record.endedAt"),
+    durationMs: number(item.durationMs, "trace record.durationMs"),
+    correlation: {
+      traceId: nonEmpty(correlation.traceId, "trace record.traceId"),
+      spanId: nullableString(correlation.spanId, "trace record.spanId"),
+      parentSpanId: nullableString(correlation.parentSpanId, "trace record.parentSpanId"),
+    },
+    raw: item.raw ?? {},
+  };
+}
+
+export function parseTracePage(payload: unknown): OperationsPage<TraceSummaryRecord> {
+  return page(payload, parseTraceSummary);
+}
+
+export function parseTraceDetail(payload: unknown): TraceDetailRecord {
+  const root = object(payload, "trace detail");
+  schema(root);
+  return {
+    schemaVersion: "2.1",
+    trace: parseTraceSummary(root.trace),
+    records: page(root.records, parseTraceRecord),
+  };
 }
 
 export function parseHealthPage(payload: unknown): OperationsPage<HealthStatus> { return page(payload, health); }
@@ -301,8 +656,48 @@ function evaluationComparison(value: unknown): EvaluationComparison {
   };
 }
 
+function evaluationBudget(value: unknown): EvaluationBudget {
+  const item = object(value, "evaluation budget");
+  const keys = new Set<EvaluationBudgetMetric["key"]>(["wallClockMs", "providerTokens", "estimatedCost", "toolCalls", "retries", "replans"]);
+  const units = new Set<EvaluationBudgetMetric["unit"]>(["milliseconds", "count", "cost"]);
+  const limitStatuses = new Set<EvaluationBudgetMetric["limitStatus"]>(["configured", "not_configured"]);
+  const usageStatuses = new Set<EvaluationBudgetMetric["usageStatus"]>(["recorded_exact", "recorded_estimate", "unknown"]);
+  const statuses = new Set<EvaluationBudgetMetric["status"]>(["within_limit", "limit_reached", "limit_exceeded", "not_configured", "unknown_usage"]);
+  const limitSources = new Set<NonNullable<EvaluationBudgetMetric["limitSource"]>>(["terminal_run_budget"]);
+  const usageSources = new Set<NonNullable<EvaluationBudgetMetric["usageSource"]>>(["terminal_run", "run_evaluation", "canonical_records"]);
+  return {
+    metrics: array(item.metrics, "evaluation budget metrics").map((value) => {
+      const metric = object(value, "evaluation budget metric");
+      const key = nonEmpty(metric.key, "budget metric key") as EvaluationBudgetMetric["key"];
+      const unit = nonEmpty(metric.unit, "budget metric unit") as EvaluationBudgetMetric["unit"];
+      const limitStatus = nonEmpty(metric.limitStatus, "budget limit status") as EvaluationBudgetMetric["limitStatus"];
+      const usageStatus = nonEmpty(metric.usageStatus, "budget usage status") as EvaluationBudgetMetric["usageStatus"];
+      const status = nonEmpty(metric.status, "budget status") as EvaluationBudgetMetric["status"];
+      const limitSource = nullableString(metric.limitSource, "budget limit source") as EvaluationBudgetMetric["limitSource"];
+      const usageSource = nullableString(metric.usageSource, "budget usage source") as EvaluationBudgetMetric["usageSource"];
+      if (!keys.has(key) || !units.has(unit) || !limitStatuses.has(limitStatus) || !usageStatuses.has(usageStatus) || !statuses.has(status)) {
+        throw new Error("evaluation budget metric is invalid");
+      }
+      if (limitSource !== null && !limitSources.has(limitSource)) throw new Error("evaluation budget limit source is invalid");
+      if (usageSource !== null && !usageSources.has(usageSource)) throw new Error("evaluation budget usage source is invalid");
+      return {
+        key,
+        label: nonEmpty(metric.label, "budget metric label"),
+        unit,
+        limit: nullableNumber(metric.limit, "budget metric limit"),
+        usage: nullableNumber(metric.usage, "budget metric usage"),
+        limitStatus,
+        usageStatus,
+        status,
+        limitSource,
+        usageSource,
+      };
+    }),
+  };
+}
+
 export function parseEvaluationPage(payload: unknown): OperationsPage<EvaluationRecord> {
-  return page(payload, (value) => { const item = object(value, "evaluation"); const run = object(item.run, "evaluation.run"); const journey = item.journey === "autonomous" || item.journey === "guided" ? item.journey : (() => { throw new Error("evaluation journey invalid"); })(); return { id: nonEmpty(item.id, "evaluation.id"), mission: mission(item.mission), run: { id: nonEmpty(run.id, "run.id"), status: nonEmpty(run.status, "run.status") }, journey, scores: item.scores ?? {}, metrics: item.metrics ?? {}, retrospective: string(item.retrospective, "retrospective"), evidenceCoverage: nullableNumber(item.evidenceCoverage, "evidenceCoverage"), createdBy: nonEmpty(item.createdBy, "createdBy"), createdAt: nonEmpty(item.createdAt, "createdAt"), comparison: evaluationComparison(item.comparison) }; });
+  return page(payload, (value) => { const item = object(value, "evaluation"); const run = object(item.run, "evaluation.run"); const journey = item.journey === "autonomous" || item.journey === "guided" ? item.journey : (() => { throw new Error("evaluation journey invalid"); })(); return { id: nonEmpty(item.id, "evaluation.id"), mission: mission(item.mission), run: { id: nonEmpty(run.id, "run.id"), status: nonEmpty(run.status, "run.status") }, journey, scores: item.scores ?? {}, metrics: item.metrics ?? {}, retrospective: string(item.retrospective, "retrospective"), evidenceCoverage: nullableNumber(item.evidenceCoverage, "evidenceCoverage"), createdBy: nonEmpty(item.createdBy, "createdBy"), createdAt: nonEmpty(item.createdAt, "createdAt"), budget: evaluationBudget(item.budget), comparison: evaluationComparison(item.comparison) }; });
 }
 
 export function parseLesson(value: unknown): LessonRecord {

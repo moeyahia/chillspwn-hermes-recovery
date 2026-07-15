@@ -1,8 +1,14 @@
 import { describe, expect, test } from "bun:test";
 import { queryPath } from "../../data/api/operations";
-import { parseEvidencePage, parseFindingReview, parseProviderPage } from "../../domain/schemas/operations";
+import { parseActionPage, parseEvidencePage, parseFindingReview, parseProviderPage } from "../../domain/schemas/operations";
+import { parseMemoryContextPackPage } from "../../domain/schemas/brain";
 import { parseDecisionMutation, parseDecisions, parseMissionRuntime, parsePlans, parseRunMutation } from "../../domain/schemas/runtimeV2";
-import { parseAutonomousMissionPreflight } from "../../domain/schemas/commandOs";
+import {
+  parseAutonomousBranchContext,
+  parseAutonomousBranchPreflight,
+  parseAutonomousBranchResult,
+  parseAutonomousMissionPreflight,
+} from "../../domain/schemas/commandOs";
 
 const run = {
   id: "run-1", missionId: "mission-1", missionName: "Authorized mission", objective: "Verify target",
@@ -13,6 +19,58 @@ const run = {
 };
 
 describe("Command OS operational response contracts", () => {
+  test("parses immutable Autonomous branch lineage, versioned readiness, and the new-run result", () => {
+    const request = {
+      journey: "autonomous", launch: true, title: "Authorized branch", objective: "Validate the lab",
+      successCriteria: ["Evidence retained"],
+      authorization: { allowedTargets: ["lab.internal"], prohibitedTargets: [], authorizationConfirmed: true },
+      contract: {
+        allowedActionClasses: ["reconnaissance"], prohibitedActionClasses: [], destructivePolicy: "prohibited",
+        evidenceRequirements: [], timeBudgetMinutes: 30, retryBudget: 2, replanBudget: 1, concurrencyLimit: 1,
+        evidenceStorageBudgetBytes: 1024, artifactStorageBudgetBytes: 2048,
+        notificationPolicy: "in_app_only", reportingFormat: "command_os_json",
+        dataHandlingPolicy: "local_private", retentionPolicy: "operator_managed",
+        providerPolicy: "automatic_enforcing_only", toolPolicy: "contract_allowlist",
+        specialistAgentIds: ["agent-recon"], memoryScopes: ["verified_lessons"], contextNodeIds: [],
+        safeStopConditions: ["Scope conflict"], deliverables: ["Report"],
+      },
+    };
+    const context = parseAutonomousBranchContext({
+      schemaVersion: "2.1",
+      mission: { id: "mission-1", name: "Authorized branch", version: 3 },
+      sourceRun: { id: "run-1", status: "blocked", statusReason: "Paused by operator: review", version: 4, safeToBranch: true, safeToBranchReason: "No in-flight action" },
+      contract: { id: "contract-1", version: 1, state: "confirmed", hash: "a".repeat(64) },
+      request,
+      history: [{ id: "contract-1", version: 1, state: "confirmed", hash: "a".repeat(64), sourceContractId: null, confirmedBy: "operator", confirmedAt: "2026-07-15T12:00:00.000Z", createdAt: "2026-07-15T12:00:00.000Z" }],
+    });
+    expect(context.sourceRun).toMatchObject({ safeToBranch: true, version: 4 });
+    expect(context.history[0]?.hash).toBe("a".repeat(64));
+
+    const preflight = parseAutonomousBranchPreflight({
+      schemaVersion: "2.1", mode: "contract_amendment", sourceRunId: "run-1", sourceRunVersion: 4,
+      safeToBranch: true, safeToBranchReason: "No in-flight action",
+      contract: { id: "contract-2", version: 2, state: "draft", hash: "b".repeat(64), sourceContractId: "contract-1" },
+      request,
+      preflight: {
+        schemaVersion: "2.1", contract: { version: 2, hash: "b".repeat(64) },
+        readiness: { status: "ready", score: 100, checks: [] },
+        context: { candidates: [], selectedNodeIds: [], invalidSelectedNodeIds: [] },
+        execution: { providers: [], tools: [], team: { candidates: [], selectedAgentIds: ["agent-recon"], invalidSelectedAgentIds: [], recommendedAgentIds: [], effectiveAgentIds: ["agent-recon"] } },
+        policySummary: { provider: "Enforcing", tools: "Allowlist", notifications: "In app", reporting: "JSON", retention: "Operator", storage: "Bounded" },
+      },
+    });
+    expect(preflight.contract).toMatchObject({ state: "draft", version: 2 });
+
+    const result = parseAutonomousBranchResult({
+      schemaVersion: "2.1", sourceRunId: "run-1", branchMode: "contract_amendment",
+      run: { id: "run-2", missionId: "mission-1", journey: "autonomous", status: "planning", contractId: "contract-2", createdAt: "2026-07-15T12:01:00.000Z" },
+      contract: { id: "contract-2", version: 2, state: "confirmed", hash: "b".repeat(64) },
+      nextUrl: "/missions/mission-1/runs/run-2",
+    });
+    expect(result).toMatchObject({ run: { status: "planning" }, contract: { state: "confirmed" } });
+    expect(() => parseAutonomousBranchResult({ ...result, nextUrl: "//evil.example" })).toThrow("URL");
+  });
+
   test("parses a real Autonomous contract digest and selectable context preview", () => {
     const parsed = parseAutonomousMissionPreflight({
       schemaVersion: "2.1",
@@ -27,6 +85,30 @@ describe("Command OS operational response contracts", () => {
         }],
         selectedNodeIds: ["mem-preference"], invalidSelectedNodeIds: [],
       },
+      execution: {
+        providers: [{
+          id: "xai-grok-oauth", status: "healthy", authenticated: true,
+          enforcesAutonomousBoundary: true, reportsExactTokenUsage: true,
+          reportsExactCostUsage: true, compatible: true,
+          reason: "OAuth and contract boundary verified", checkedAt: "2026-07-15T12:00:00.000Z",
+        }],
+        tools: [{
+          id: "mcp:nmap", name: "nmap", status: "healthy", capabilities: ["nmap"],
+          assignedAgentIds: ["agent-recon"], enabled: true, startPermitted: true,
+          riskClass: "medium", checkedAt: "2026-07-15T12:00:00.000Z",
+        }],
+        team: {
+          candidates: [{
+            id: "agent-recon", displayName: "Recon specialist", role: "reconnaissance",
+            status: "available", capabilities: ["nmap"], runnableTools: ["nmap"],
+            mcpServerIds: ["mcp:nmap"], providerPolicy: { defaultProvider: "xai-grok-oauth" },
+            toolPolicy: { allowedTools: ["nmap"], deniedTools: [], approvalRequiredTools: [] },
+            compatible: true, incompatibilityReasons: [], lastHeartbeatAt: "2026-07-15T12:00:00.000Z",
+          }],
+          selectedAgentIds: ["agent-recon"], invalidSelectedAgentIds: [],
+          recommendedAgentIds: ["agent-recon"], effectiveAgentIds: ["agent-recon"],
+        },
+      },
       policySummary: {
         provider: "Enforcing only", tools: "Contract allowlist", notifications: "In-app",
         reporting: "Command OS JSON", retention: "Operator managed", storage: "Bounded",
@@ -34,6 +116,7 @@ describe("Command OS operational response contracts", () => {
     });
     expect(parsed.contract.hash).toBe("a".repeat(64));
     expect(parsed.context.candidates[0]?.lifecycleStatus).toBe("confirmed");
+    expect(parsed.execution.team.effectiveAgentIds).toEqual(["agent-recon"]);
     expect(() => parseAutonomousMissionPreflight({
       ...parsed,
       contract: { version: 1, hash: "not-a-digest" },
@@ -61,6 +144,28 @@ describe("Command OS operational response contracts", () => {
 
   test("encodes only supplied URL values without losing special characters", () => {
     expect(queryPath("/api/v2/observability/logs", { query: "provider error", traceId: "trace:1", cursor: undefined })).toBe("/api/v2/observability/logs?query=provider+error&traceId=trace%3A1");
+  });
+
+  test("parses action-level and planning-level memory transparency projections", () => {
+    const actions = parseActionPage({ schemaVersion: "2.1", nextCursor: null, items: [{
+      id: "action-1", mission: { id: "mission-1", name: "Authorized mission" }, runId: "run-1",
+      journey: "autonomous", step: { id: "step-1", phase: "Recon", title: "Map target" }, agentId: "recon",
+      actionType: "scan", actionClass: "reconnaissance", target: "10.0.0.1", status: "succeeded",
+      intentSummary: "Map the approved target", resultSummary: "One unique service retained", errorCategory: null,
+      retryCount: 0, guidedDecisionId: null, contractId: "contract-1", contextPackId: "ctx-action-1",
+      correlation: { traceId: "trace-1", spanId: "span-1" }, startedAt: "2026-07-15T12:00:00.000Z",
+      endedAt: "2026-07-15T12:00:01.000Z", createdAt: "2026-07-15T12:00:00.000Z", updatedAt: "2026-07-15T12:00:01.000Z",
+    }] });
+    expect(actions.items[0]).toMatchObject({ id: "action-1", contextPackId: "ctx-action-1", step: { phase: "Recon" } });
+
+    const packs = parseMemoryContextPackPage({ schemaVersion: "2.1", totalReturned: 1, items: [{
+      id: "ctx-plan-1", missionId: "mission-1", runId: "run-1", journey: "autonomous",
+      purpose: "Build the autonomous mission plan (lessons)", contextBudget: 2_000,
+      createdBy: "grok-acp-planner", createdAt: "2026-07-15T12:00:00.000Z",
+      retrievedItemCount: 3, usedItemCount: 1, correctedItemCount: 0,
+    }] });
+    expect(packs.items[0]).toMatchObject({ id: "ctx-plan-1", usedItemCount: 1, retrievedItemCount: 3 });
+    expect(() => parseActionPage({ schemaVersion: "2.1", nextCursor: null, items: [{ ...actions.items[0], status: "invented" }] })).toThrow("status");
   });
 });
 

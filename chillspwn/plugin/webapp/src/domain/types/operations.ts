@@ -11,6 +11,104 @@ export interface OperationsPage<T> {
 export interface MissionReference { id: string; name: string }
 export interface Correlation { traceId: string | null; spanId: string | null; contextPackId?: string | null }
 
+export type DecisionInboxKind =
+  | "guided_decision"
+  | "autonomous_contract"
+  | "autonomous_exception"
+  | "administrative_approval";
+
+interface DecisionInboxBase {
+  id: string;
+  kind: DecisionInboxKind;
+  mission: (MissionReference & { engagementId: string | null }) | null;
+  run: { id: string; status: string; journey: "autonomous" | "guided" } | null;
+  status: string;
+  title: string;
+  summary: string;
+  createdAt: string;
+  resolvedAt: string | null;
+  expiresAt: string | null;
+  deepLink: string;
+}
+
+export interface GuidedDecisionInboxRecord extends DecisionInboxBase {
+  kind: "guided_decision";
+  mission: MissionReference & { engagementId: string | null };
+  run: { id: string; status: string; journey: "guided" };
+  exactStep: {
+    stepId: string;
+    actionFingerprint: string;
+    requestedParameters: unknown;
+    rationale: string;
+    riskClass: string;
+    reversibility: string;
+    decisionActor: string | null;
+    decisionReason: string | null;
+  };
+}
+
+export interface AutonomousContractInboxRecord extends DecisionInboxBase {
+  kind: "autonomous_contract";
+  mission: MissionReference & { engagementId: string | null };
+  contract: {
+    version: number;
+    hash: string;
+    state: "draft" | "confirmed" | "superseded" | "revoked";
+    confirmedBy: string | null;
+    confirmedAt: string | null;
+  };
+}
+
+export interface AutonomousExceptionInboxRecord extends DecisionInboxBase {
+  kind: "autonomous_exception";
+  mission: MissionReference & { engagementId: string | null };
+  run: { id: string; status: string; journey: "autonomous" };
+  exception: {
+    eventType: string;
+    sequence: number;
+    phase: "active" | "post_run";
+    code: string | null;
+    category: string | null;
+    traceId: string | null;
+    details: unknown;
+  };
+}
+
+export interface AdministrativeApprovalInboxRecord extends DecisionInboxBase {
+  kind: "administrative_approval";
+  approval: {
+    approvalType: string;
+    requestedBy: string;
+    policyRule: string | null;
+    request: unknown;
+    decidedBy: string | null;
+    reviewAvailable: boolean;
+    reviewUnavailableReason: string | null;
+  };
+}
+
+export type DecisionInboxRecord =
+  | GuidedDecisionInboxRecord
+  | AutonomousContractInboxRecord
+  | AutonomousExceptionInboxRecord
+  | AdministrativeApprovalInboxRecord;
+
+export interface AdministrativeApprovalReviewRecord {
+  schemaVersion: "2.1";
+  approval: {
+    id: string;
+    missionId: string | null;
+    runId: string | null;
+    approvalType: string;
+    status: "approved" | "rejected";
+    decidedBy: string;
+    decidedAt: string;
+    decisionReason: string;
+    runtimeStateChanged: false;
+    autonomousActionUnblocked: false;
+  };
+}
+
 export interface AgentRecord {
   id: string;
   role: string;
@@ -42,16 +140,39 @@ export interface AgentAssignment {
 
 export type RecoveryActionKind = "resume" | "replan" | "reassign" | "change_provider" | "terminate";
 export interface RecoveryActionAvailability {
-  kind: RecoveryActionKind; label: string; available: boolean; reason: string; command: "resume" | "cancel" | null;
+  kind: RecoveryActionKind; label: string; available: boolean; reason: string;
+  command: "resume" | "replan" | "reassign" | "change_provider" | "cancel" | null;
+}
+export interface RecoveryMutationRecord {
+  schemaVersion: "2.1";
+  mutation: {
+    kind: "replan" | "reassign" | "change_provider";
+    eventId: string; checkpointId: string; continuationId: string | null;
+    agentId: string | null; providerId: string | null; providerRouteVersion: number | null;
+  };
+  run: {
+    id: string; journey: "autonomous" | "guided"; status: string; version: number;
+    planId: string; planVersion: number; stepId: string; assignmentId: string;
+  };
 }
 export interface RunRecoveryRecord {
   schemaVersion: "2.1";
   recoveryRequired: boolean;
   run: {
-    id: string; missionId: string; missionName: string; journey: "autonomous" | "guided"; status: string;
+    id: string; missionId: string; missionName: string; journey: "autonomous" | "guided"; status: string; version: number;
     statusReason: string | null; currentStepId: string | null; currentOwnerId: string | null;
     nextAction: string | null; leaseExpiresAt: string | null;
   };
+  boundary: {
+    planId: string; planVersion: number; stepId: string; assignmentId: string; agentId: string; actionKind: string | null;
+  } | null;
+  reassignmentCandidates: Array<{
+    agentId: string; displayName: string; status: "available"; capabilities: string[];
+  }>;
+  providerCandidates: Array<{
+    providerId: string; status: "healthy"; supportsGuided: boolean; enforcesAutonomousBoundary: boolean;
+    reportsExactTokenUsage: boolean; reportsExactCostUsage: boolean;
+  }>;
   detection: {
     summary: string; category: string | null;
     evidence: Array<{ id: string; eventType: string; summary: string; occurredAt: string; sequence: number }>;
@@ -73,12 +194,25 @@ export interface RunRecoveryRecord {
     kind: "automatic_recovery" | "guided_decision" | "operator_resume" | "safe_stop" | "failed_safely" | "none";
     summary: string; basis: string; impact: { time: string; cost: string; scope: string };
   };
-  guidedDecision: { id: string; stepId: string; rationale: string; riskClass: string; expiresAt: string } | null;
+  guidedDecision: { id: string; stepId: string; actionFingerprint: string; rationale: string; riskClass: string; expiresAt: string } | null;
   failedAttemptMemories: Array<{
     kind: "memory" | "lesson"; id: string; title: string; status: string;
     confidence: number | null; failureCategory: string | null;
   }>;
   actions: RecoveryActionAvailability[];
+}
+
+export interface FollowUpRunRecord {
+  schemaVersion: "2.1";
+  sourceRunId: string;
+  run: {
+    id: string; missionId: string; missionName: string; journey: "autonomous" | "guided";
+    status: "planning"; statusReason: string; nextAction: string; createdAt: string;
+  };
+  selectedLessons: Array<{
+    id: string; nodeId: string; statement: string; selectionState: "eligible_for_planning";
+  }>;
+  nextUrl: string;
 }
 
 export interface EvidenceRecord {
@@ -105,6 +239,31 @@ export interface ArtifactRecord {
   evaluation: { id: string; evidenceCoverage: number | null } | null; contextPackIds: string[]; createdAt: string;
 }
 
+export interface ActionRecord {
+  id: string;
+  mission: MissionReference;
+  runId: string;
+  journey: "autonomous" | "guided";
+  step: { id: string; phase: string; title: string } | null;
+  agentId: string | null;
+  actionType: string;
+  actionClass: string;
+  target: string | null;
+  status: "queued" | "running" | "succeeded" | "failed" | "cancelled" | "timed_out" | "denied";
+  intentSummary: string;
+  resultSummary: string | null;
+  errorCategory: string | null;
+  retryCount: number;
+  guidedDecisionId: string | null;
+  contractId: string | null;
+  contextPackId: string | null;
+  correlation: { traceId: string | null; spanId: string | null };
+  startedAt: string | null;
+  endedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface EventRecord {
   id: string; occurredAt: string; eventType: string; mission: MissionReference | null; runId: string | null;
   sequence: number | null; actor: { type: string; id: string | null }; summary: string; payload: unknown;
@@ -118,6 +277,27 @@ export interface LogRecord {
   correlation: Correlation; sensitivity: string;
 }
 
+export type TraceStatus = "active" | "completed" | "failed";
+export type TraceRecordKind = "event" | "log" | "action" | "tool_call";
+export interface TraceSummaryRecord {
+  id: string; traceId: string; status: TraceStatus; summary: string;
+  mission: MissionReference | null; missionCount: number; runId: string | null; runCount: number;
+  journey: "autonomous" | "guided" | null; startedAt: string; endedAt: string; durationMs: number;
+  counts: { events: number; logs: number; actions: number; toolCalls: number; errors: number };
+}
+export interface TraceRecord {
+  id: string; sourceId: string; kind: TraceRecordKind; title: string; summary: string; status: string;
+  mission: MissionReference | null; runId: string | null; stepId: string | null; actionId: string | null;
+  agentId: string | null; startedAt: string; endedAt: string; durationMs: number;
+  correlation: { traceId: string; spanId: string | null; parentSpanId: string | null };
+  raw: unknown;
+}
+export interface TraceDetailRecord {
+  schemaVersion: "2.1";
+  trace: TraceSummaryRecord;
+  records: OperationsPage<TraceRecord>;
+}
+
 export interface HealthStatus {
   id?: string; componentType?: string; componentId?: string; status: string; metrics: unknown;
   message: string | null; capturedAt: string;
@@ -126,8 +306,24 @@ export interface HealthStatus {
 export interface EvaluationRecord {
   id: string; mission: MissionReference; run: { id: string; status: string }; journey: "autonomous" | "guided";
   scores: unknown; metrics: unknown; retrospective: string; evidenceCoverage: number | null; createdBy: string; createdAt: string;
+  budget: EvaluationBudget;
   comparison: EvaluationComparison;
 }
+
+export type EvaluationBudgetKey = "wallClockMs" | "providerTokens" | "estimatedCost" | "toolCalls" | "retries" | "replans";
+export interface EvaluationBudgetMetric {
+  key: EvaluationBudgetKey;
+  label: string;
+  unit: "milliseconds" | "count" | "cost";
+  limit: number | null;
+  usage: number | null;
+  limitStatus: "configured" | "not_configured";
+  usageStatus: "recorded_exact" | "recorded_estimate" | "unknown";
+  status: "within_limit" | "limit_reached" | "limit_exceeded" | "not_configured" | "unknown_usage";
+  limitSource: "terminal_run_budget" | null;
+  usageSource: "terminal_run" | "run_evaluation" | "canonical_records" | null;
+}
+export interface EvaluationBudget { metrics: EvaluationBudgetMetric[] }
 
 export interface EvaluationComparisonMetric {
   key: string; label: string; unit: "ratio" | "milliseconds" | "count" | "cost";

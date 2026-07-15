@@ -4,6 +4,21 @@ import { CommandRuntimeError } from "./types";
 
 const SECRET_KEY = /(?:^|[_-])(api[_-]?key|auth|authorization|bearer|credential|password|private[_-]?key|secret|session|token)(?:$|[_-])/iu;
 
+function repairablePlanError(
+  code: "invalid_plan" | "invalid_plan_dependency" | "invalid_plan_step_count",
+  message: string,
+  validationField: string,
+  validationRule: string,
+  humanMessage = "The planning provider returned a malformed bounded plan. No action was created.",
+): CommandRuntimeError {
+  return new CommandRuntimeError(422, code, message, {
+    humanMessage,
+    category: "invalid_input",
+    details: { validationField, validationRule },
+    remediation: "Regenerate the bounded plan using only the documented schema and authorized values.",
+  });
+}
+
 function text(value: unknown, field: string, maximum = 2_000): string {
   if (typeof value !== "string" || !value.trim()) {
     throw new CommandRuntimeError(422, "invalid_plan", `${field} is required`, {
@@ -15,30 +30,57 @@ function text(value: unknown, field: string, maximum = 2_000): string {
   }
   const normalized = value.trim();
   if (normalized.length > maximum) {
-    throw new CommandRuntimeError(422, "invalid_plan", `${field} exceeds ${maximum} characters`, {
-      humanMessage: "The planning provider returned an oversized plan field.",
-      category: "invalid_input",
-    });
+    throw repairablePlanError(
+      "invalid_plan",
+      `${field} exceeds ${maximum} characters`,
+      field,
+      `maximum_${maximum}_characters`,
+      "The planning provider returned an oversized plan field.",
+    );
   }
   return normalized;
 }
 
 function assertJsonSafe(value: unknown, path = "arguments", depth = 0): void {
   if (depth > 12) {
-    throw new CommandRuntimeError(422, "invalid_plan", `${path} is too deeply nested`);
+    throw repairablePlanError(
+      "invalid_plan",
+      `${path} is too deeply nested`,
+      path,
+      "maximum_json_depth_12",
+    );
   }
   if (value === null || typeof value === "string" || typeof value === "boolean") return;
   if (typeof value === "number") {
-    if (!Number.isFinite(value)) throw new CommandRuntimeError(422, "invalid_plan", `${path} contains a non-finite number`);
+    if (!Number.isFinite(value)) {
+      throw repairablePlanError(
+        "invalid_plan",
+        `${path} contains a non-finite number`,
+        path,
+        "finite_json_number",
+      );
+    }
     return;
   }
   if (Array.isArray(value)) {
-    if (value.length > 500) throw new CommandRuntimeError(422, "invalid_plan", `${path} contains too many items`);
+    if (value.length > 500) {
+      throw repairablePlanError(
+        "invalid_plan",
+        `${path} contains too many items`,
+        path,
+        "maximum_json_array_items_500",
+      );
+    }
     value.forEach((item, index) => assertJsonSafe(item, `${path}[${index}]`, depth + 1));
     return;
   }
   if (!value || typeof value !== "object") {
-    throw new CommandRuntimeError(422, "invalid_plan", `${path} is not JSON serializable`);
+    throw repairablePlanError(
+      "invalid_plan",
+      `${path} is not JSON serializable`,
+      path,
+      "json_serializable_value",
+    );
   }
   for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
     if (SECRET_KEY.test(key)) {
@@ -54,14 +96,29 @@ function assertJsonSafe(value: unknown, path = "arguments", depth = 0): void {
 
 function validateAction(value: PlannedAction, index: number): PlannedAction {
   if (!value || typeof value !== "object") {
-    throw new CommandRuntimeError(422, "invalid_plan", `steps[${index}].action is required`);
+    throw repairablePlanError(
+      "invalid_plan",
+      `steps[${index}].action is required`,
+      `steps[${index}].action`,
+      "required_object",
+    );
   }
   const kind = value.kind;
   if (kind !== "tool" && kind !== "provider_turn" && kind !== "replan" && kind !== "delegation" && kind !== "manual") {
-    throw new CommandRuntimeError(422, "invalid_plan", `steps[${index}].action.kind is invalid`);
+    throw repairablePlanError(
+      "invalid_plan",
+      `steps[${index}].action.kind is invalid`,
+      `steps[${index}].action.kind`,
+      "allowed_action_kind",
+    );
   }
   if (!value.arguments || typeof value.arguments !== "object" || Array.isArray(value.arguments)) {
-    throw new CommandRuntimeError(422, "invalid_plan", `steps[${index}].action.arguments must be an object`);
+    throw repairablePlanError(
+      "invalid_plan",
+      `steps[${index}].action.arguments must be an object`,
+      `steps[${index}].action.arguments`,
+      "required_json_object",
+    );
   }
   assertJsonSafe(value.arguments, `steps[${index}].action.arguments`);
   return {
@@ -78,10 +135,20 @@ function validateAction(value: PlannedAction, index: number): PlannedAction {
 
 function validateStep(value: PlannedStep, index: number, count: number): PlannedStep {
   if (!value || typeof value !== "object") {
-    throw new CommandRuntimeError(422, "invalid_plan", `steps[${index}] must be an object`);
+    throw repairablePlanError(
+      "invalid_plan",
+      `steps[${index}] must be an object`,
+      `steps[${index}]`,
+      "required_object",
+    );
   }
   if (!(["low", "medium", "high", "critical"] as const).includes(value.riskClass)) {
-    throw new CommandRuntimeError(422, "invalid_plan", `steps[${index}].riskClass is invalid`);
+    throw repairablePlanError(
+      "invalid_plan",
+      `steps[${index}].riskClass is invalid`,
+      `steps[${index}].riskClass`,
+      "allowed_risk_class",
+    );
   }
   if (value.dependencyOrdinals !== undefined && !Array.isArray(value.dependencyOrdinals)) {
     throw new CommandRuntimeError(422, "invalid_plan", `steps[${index}].dependencyOrdinals must be an array`, {
@@ -104,6 +171,10 @@ function validateStep(value: PlannedStep, index: number, count: number): Planned
         {
           humanMessage: "The proposed plan contains a dependency cycle or invalid step reference.",
           category: "invalid_input",
+          details: {
+            validationField: `steps[${index}].dependencyOrdinals`,
+            validationRule: "array_of_prior_step_ordinals",
+          },
           remediation: "Return an ordered acyclic plan whose dependencies refer only to earlier steps.",
         },
       );
@@ -134,7 +205,12 @@ export function validateMissionPlanDraft(
   journey?: Journey,
 ): MissionPlanDraft {
   if (!value || typeof value !== "object" || !Array.isArray(value.steps)) {
-    throw new CommandRuntimeError(422, "invalid_plan", "The planning provider did not return a step list");
+    throw repairablePlanError(
+      "invalid_plan",
+      "The planning provider did not return a step list",
+      "steps",
+      "required_array",
+    );
   }
   if (value.steps.length < 1 || value.steps.length > maximumSteps) {
     throw new CommandRuntimeError(
@@ -144,6 +220,10 @@ export function validateMissionPlanDraft(
       {
         humanMessage: "The proposed plan is empty or exceeds the bounded step limit.",
         category: "invalid_input",
+        details: {
+          validationField: "steps",
+          validationRule: "bounded_nonempty_array",
+        },
       },
     );
   }

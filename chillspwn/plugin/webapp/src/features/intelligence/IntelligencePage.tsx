@@ -20,8 +20,23 @@ function EvidenceView({ selectedId }: { selectedId?: string }) {
   const list = useQuery(`evidence:${filters.key}`, (signal) => operationsApi.evidence(filters.values, signal));
   const detail = useQuery(`evidence-detail:${selectedId ?? "none"}`, (signal) => selectedId ? operationsApi.evidenceDetail(selectedId, signal) : Promise.resolve(undefined));
   return <><FilterForm filters={filters}><SelectFilter filters={filters} name="verificationState" label="Verification" options={["unverified", "verified", "disputed", "rejected"].map((value) => ({ value, label: value }))} /></FilterForm>
+    <EvidenceRunExportControl runId={filters.values.runId || detail.data?.runId || undefined} />
     <IntelligenceLayout list={<QueryBoundary data={list.data?.items} error={list.error} isLoading={list.isLoading} onRetry={list.refresh} emptyTitle="No evidence retained" emptyDescription="Evidence will appear after an authorized action produces a hashed record.">{(items) => <><EvidenceTable items={items} selectedId={selectedId} /><CursorControls cursor={filters.values.cursor} nextCursor={list.data?.nextCursor ?? null} onChange={(cursor) => filters.set({ cursor }, { resetCursor: false, replace: false })} /></>}</QueryBoundary>} detail={<EvidenceDetail item={detail.data} loading={detail.isLoading && Boolean(selectedId)} error={detail.error} onRetry={detail.refresh} />} />
   </>;
+}
+
+const EXACT_RUN_ID = /^[A-Za-z0-9._:@/-]{1,200}$/u;
+
+export function EvidenceRunExportControl({ runId }: { runId?: string }) {
+  const exactRunId = runId?.trim();
+  if (!exactRunId || !EXACT_RUN_ID.test(exactRunId)) return null;
+  return <Card aria-label="Exact run evidence export">
+    <div className="os-card-heading">
+      <div><p className="os-eyebrow">Exact run scope</p><h2>Bounded evidence metadata export</h2></div>
+      <a className="os-button os-button--secondary" href={operationsApi.evidenceRunExportUrl(exactRunId)}>Export evidence metadata</a>
+    </div>
+    <p className="os-muted">Run <span className="os-mono">{exactRunId}</span> is the exact export boundary. The server re-checks authorization and sensitivity, bounds the record count and size, and excludes raw evidence content and storage paths.</p>
+  </Card>;
 }
 
 function EvidenceTable({ items, selectedId }: { items: EvidenceRecord[]; selectedId?: string }) {
@@ -58,6 +73,26 @@ function ArtifactView({ selectedId }: { selectedId?: string }) {
   return <><FilterForm filters={filters} searchKey="artifactType" searchLabel="Artifact type" /><IntelligenceLayout list={<QueryBoundary data={list.data?.items} error={list.error} isLoading={list.isLoading} onRetry={list.refresh} emptyTitle="No artifacts produced" emptyDescription="Reports, captures, and exports will appear after durable creation.">{(items) => <><div className="os-table-wrap"><table className="os-data-table"><thead><tr><th>Artifact</th><th>Mission</th><th>Size</th><th>Storage</th><th>Created</th></tr></thead><tbody>{items.map((item) => <tr key={item.id} className={item.id === selectedId ? "is-selected" : undefined}><th scope="row"><AppLink href={`/intelligence/artifacts/${encodeURIComponent(item.id)}`}>{item.artifactType}</AppLink><small>{item.mediaType}</small></th><td>{item.mission.name}</td><td>{new Intl.NumberFormat(undefined, { notation: "compact", style: "unit", unit: "byte" }).format(item.byteSize)}</td><td><StatusPill status={item.storage.available ? "available" : "unavailable"}>{item.storage.scheme}</StatusPill></td><td>{formatTime(item.createdAt)}</td></tr>)}</tbody></table></div><CursorControls cursor={filters.values.cursor} nextCursor={list.data?.nextCursor ?? null} onChange={(cursor) => filters.set({ cursor }, { resetCursor: false, replace: false })} /></>}</QueryBoundary>} detail={<ArtifactDetail item={detail.data} loading={detail.isLoading && Boolean(selectedId)} error={detail.error} onRetry={detail.refresh} />} /></>;
 }
 
-function ArtifactDetail({ item, loading, error, onRetry }: { item?: ArtifactRecord; loading: boolean; error?: Error; onRetry: () => void }) { if (loading) return <LoadingPanel label="Loading artifact metadata" />; if (error && !item) return <ErrorPanel error={error} onRetry={onRetry} />; if (!item) return <Card><p className="os-muted">Select an artifact to inspect its hash, provenance-safe storage projection, and evaluation link.</p></Card>; return <Card><div className="os-card-heading"><h2>{item.artifactType}</h2><StatusPill status={item.storage.available ? "available" : "unavailable"} /></div><KeyValueGrid items={[{ label: "Mission", value: item.mission.name }, { label: "Media type", value: item.mediaType }, { label: "Byte size", value: item.byteSize.toLocaleString() }, { label: "Hash", value: <span className="os-mono">{item.contentHash}</span> }]} /><JsonDetails label="Artifact metadata" value={item.metadata} /></Card>; }
+export function supportsVerifiedArtifactDownload(item: Pick<ArtifactRecord, "artifactType" | "storage">): boolean {
+  return item.artifactType === "obsidian_attachment"
+    && item.storage.scheme === "vault-attachment"
+    && item.storage.available;
+}
+
+export function ArtifactDetail({ item, loading, error, onRetry }: { item?: ArtifactRecord; loading: boolean; error?: Error; onRetry: () => void }) {
+  if (loading) return <LoadingPanel label="Loading artifact metadata" />;
+  if (error && !item) return <ErrorPanel error={error} onRetry={onRetry} />;
+  if (!item) return <Card><p className="os-muted">Select an artifact to inspect its hash, provenance-safe storage projection, and evaluation link.</p></Card>;
+  const supportsDownload = supportsVerifiedArtifactDownload(item);
+  return <Card>
+    <div className="os-card-heading"><h2>{item.artifactType}</h2><StatusPill status={supportsDownload ? "verified_delivery" : "metadata_only"}>{supportsDownload ? "Verified delivery" : "Metadata only"}</StatusPill></div>
+    <KeyValueGrid items={[{ label: "Mission", value: item.mission.name }, { label: "Media type", value: item.mediaType }, { label: "Byte size", value: item.byteSize.toLocaleString() }, { label: "Storage scheme", value: item.storage.scheme }, { label: "Hash", value: <span className="os-mono">{item.contentHash}</span> }]} />
+    <JsonDetails label="Artifact metadata" value={item.metadata} />
+    {supportsDownload ? <>
+      <div className="os-completion-actions"><a className="os-button os-button--primary" href={operationsApi.artifactDownloadUrl(item.id)}>Download verified content</a></div>
+      <p className="os-muted">The server will re-check mission scope, sensitivity, vault permission, file containment, byte size, and SHA-256 before returning an inert attachment.</p>
+    </> : <p className="os-muted">Artifact content remains metadata-only. Storage scheme <span className="os-mono">{item.storage.scheme}</span> has no approved canonical content-delivery adapter.</p>}
+  </Card>;
+}
 
 function IntelligenceLayout({ list, detail }: { list: React.ReactNode; detail: React.ReactNode }) { return <div className="os-master-detail"><section>{list}</section><aside className="os-detail-panel">{detail}</aside></div>; }

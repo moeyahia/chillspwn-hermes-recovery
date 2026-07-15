@@ -29,6 +29,11 @@ export interface FleetAgentProjection {
   readonly toolPolicy: Readonly<Record<string, unknown>>;
   readonly configuration: Readonly<Record<string, unknown>>;
   readonly version: string;
+  /**
+   * A heartbeat emitted by the actual specialist worker. Control-plane roster,
+   * provider, or MCP projections must leave this absent/null.
+   */
+  readonly lastHeartbeatAt?: string | null;
   readonly capabilities: readonly {
     readonly name: string;
     readonly source: string;
@@ -177,7 +182,7 @@ export class RuntimeProjectionService {
           tool_policy_json = excluded.tool_policy_json,
           configuration_json = excluded.configuration_json,
           version = excluded.version,
-          last_heartbeat_at = excluded.last_heartbeat_at,
+          last_heartbeat_at = COALESCE(excluded.last_heartbeat_at, agents.last_heartbeat_at),
           updated_at = excluded.updated_at
       `);
       const removeCapabilities = this.database.prepare(
@@ -196,7 +201,12 @@ export class RuntimeProjectionService {
         const id = identifier(agent.id, "agent ID");
         if (agentIds.has(id)) throw new Error(`Duplicate projected agent: ${id}`);
         agentIds.add(id);
-        const heartbeat = agent.status === "offline" ? null : projectedAt;
+        const heartbeat = agent.lastHeartbeatAt == null
+          ? null
+          : new Date(agent.lastHeartbeatAt).toISOString();
+        if (agent.lastHeartbeatAt != null && !Number.isFinite(Date.parse(agent.lastHeartbeatAt))) {
+          throw new Error(`Agent heartbeat is invalid: ${id}`);
+        }
         upsertAgent.run(
           id,
           text(agent.role, "agent role"),
@@ -210,7 +220,10 @@ export class RuntimeProjectionService {
           projectedAt,
           projectedAt,
         );
-        const sources = new Set(agent.capabilities.map((capability) => text(capability.source, "capability source", 100)));
+        const sources = new Set([
+          "live-route-attestation",
+          ...agent.capabilities.map((capability) => text(capability.source, "capability source", 100)),
+        ]);
         for (const source of sources) removeCapabilities.run(id, source);
         for (const capability of agent.capabilities) {
           insertCapability.run(
@@ -285,8 +298,14 @@ export class RuntimeProjectionService {
           provider.health,
           json({
             authenticated: provider.authenticated,
+            callable: provider.callable,
+            attestedAt: provider.attestedAt ?? null,
+            expiresAt: provider.expiresAt ?? null,
+            circuitState: provider.circuitState ?? null,
             supportsGuided: provider.supportsGuided,
             enforcesAutonomousBoundary: provider.enforcesAutonomousBoundary,
+            reportsExactTokenUsage: provider.reportsExactTokenUsage,
+            reportsExactCostUsage: provider.reportsExactCostUsage,
           }),
           provider.reason ? text(provider.reason, "provider health reason", 1_000) : componentMessage(id, provider.health),
           projectedAt,

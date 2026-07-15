@@ -1,4 +1,8 @@
-export { ObsidianVaultBridge } from "./ObsidianVaultBridge";
+export {
+  ObsidianVaultBridge,
+  VaultBulkExportAbortError,
+  VaultBulkExportPolicyError,
+} from "./ObsidianVaultBridge";
 export { parseObsidianNote, renderObsidianNote, vaultRelativePath } from "./ObsidianMarkdown";
 export { obsidianDeepLink } from "./ObsidianDeepLink";
 export { ObsidianVaultWatcher } from "./ObsidianVaultWatcher";

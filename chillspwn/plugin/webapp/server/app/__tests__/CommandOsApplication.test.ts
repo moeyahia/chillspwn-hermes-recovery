@@ -76,5 +76,17 @@ describe("CommandOsApplication", () => {
     const body = await overview.json() as any;
     expect(body.schemaVersion).toBe("2.1");
     expect(body.readiness.status).toBe("blocked");
+
+    const openApiResponse = await fetch(`http://127.0.0.1:${address.port}/api/v2/openapi.json`);
+    expect(openApiResponse.status).toBe(200);
+    const openApi = await openApiResponse.json() as any;
+    expect(openApi.openapi).toBe("3.1.0");
+    expect(openApi.components.schemas.Journey.enum).toEqual(["autonomous", "guided"]);
+
+    const eventContractResponse = await fetch(`http://127.0.0.1:${address.port}/api/v2/contracts/events`);
+    expect(eventContractResponse.status).toBe(200);
+    const eventContract = await eventContractResponse.json() as any;
+    expect(eventContract.schemaVersion).toBe("2.1");
+    expect(eventContract.resume.replayEndpoint).toBe("/api/v2/events/replay");
   });
 });

@@ -14,6 +14,12 @@ import type { McpServerSpec, McpToolResult, McpHealthResult } from "./McpTypes";
 import { getAgent } from "../agents/agentRoster";
 import { mappingFor, specialistToolDecision } from "../agents/agentMcpMap";
 import { redactSecrets } from "../runtime/RunReport";
+import {
+  createMcpExecutionBinding,
+  validateMcpApprovalAttestation,
+  type McpApprovalAttestation,
+  type McpApprovalAttestationVerifier,
+} from "./McpApprovalAttestation";
 
 export interface BridgeConfig {
   configPath: string;
@@ -25,6 +31,26 @@ export interface BridgeConfig {
   maxOutputBytes: number;
   /** Test-only owner injection; production omits this and requires UID 0. */
   trustedOwnerUid?: number;
+  /**
+   * Trusted durable consume boundary for approval-required execution. It must
+   * atomically verify and consume the exact claim; a passive boolean check is
+   * intentionally not supported.
+   */
+  verifyAndConsumeApprovalAttestation?: McpApprovalAttestationVerifier;
+  /** Test-only clock injection. */
+  now?: () => Date;
+}
+
+export interface McpBridgeExecuteInput {
+  readonly runId?: string;
+  readonly stepId?: string;
+  readonly specialistAgentId: string;
+  readonly mcpServer: string;
+  readonly toolName: string;
+  readonly arguments?: unknown;
+  readonly startedAtMs: number;
+  readonly signal?: AbortSignal;
+  readonly approvalAttestation?: McpApprovalAttestation;
 }
 
 export interface SpecialistToolView {
@@ -36,6 +62,8 @@ export interface SpecialistToolView {
 
 export class McpArsenalBridge {
   readonly registry: McpServerRegistry;
+  readonly #claimsInFlight = new Set<string>();
+  readonly #consumedClaims = new Map<string, number>();
   constructor(private cfg: BridgeConfig) {
     this.registry = new McpServerRegistry(cfg.configPath, cfg.manifestPath, cfg.trustedOwnerUid);
   }
@@ -75,11 +103,11 @@ export class McpArsenalBridge {
   }
 
   /**
-   * Execute (or dry-run) a specialist tool against its assigned MCP server. Assumes UPSTREAM
-   * policy/routing/gate/approval already passed. Still re-verifies the tool↔specialist↔server binding
-   * (defense in depth). Returns a normalized, truncated, secret-redacted McpToolResult.
+   * Execute (or dry-run) a specialist tool against its assigned MCP server. It
+   * re-verifies the tool↔specialist↔server binding and independently requires
+   * an exact, durable, one-time attestation for approval-required tools.
    */
-  async execute(input: { specialistAgentId: string; mcpServer: string; toolName: string; arguments?: unknown; startedAtMs: number; signal?: AbortSignal }): Promise<McpToolResult> {
+  async execute(input: McpBridgeExecuteInput): Promise<McpToolResult> {
     const base: McpToolResult = { success: false, dryRun: this.isDryRun(), mcpServer: input.mcpServer, toolName: input.toolName, specialistAgentId: input.specialistAgentId, outputPreview: "", fullOutputBytes: 0, artifactId: null, evidenceIds: [], error: null, durationMs: 0, isError: false };
     const fin = (over: Partial<McpToolResult>): McpToolResult => ({ ...base, ...over, durationMs: Math.max(0, (over.durationMs ?? 0)) });
 
@@ -89,6 +117,10 @@ export class McpArsenalBridge {
     const decision = specialistToolDecision(input.specialistAgentId, input.toolName);
     if (decision === "unknown_agent") return fin({ error: `unknown specialist '${input.specialistAgentId}'` });
     if (decision === "deny") return fin({ error: `'${input.toolName}' is outside ${input.specialistAgentId}'s allowlist` });
+    const specialist = getAgent(input.specialistAgentId);
+    if (!specialist?.allowedMcpServers.includes(input.mcpServer)) {
+      return fin({ error: `MCP server '${input.mcpServer}' is outside ${input.specialistAgentId}'s server allowlist` });
+    }
     const spec = this.registry.get(input.mcpServer);
     if (!spec) return fin({ error: `MCP server '${input.mcpServer}' not in arsenal config` });
     if (!spec.assignedAgents.map((a) => a.toLowerCase()).includes(input.specialistAgentId.toLowerCase())) return fin({ error: `server '${input.mcpServer}' is not assigned to ${input.specialistAgentId}` });
@@ -105,6 +137,41 @@ export class McpArsenalBridge {
     if (h.state === "missing_dependency" || h.state === "missing_secret" || h.state === "failed" || h.state === "disabled") {
       return fin({ error: `server '${input.mcpServer}' not runnable (${h.state}): ${h.reasons.join("; ")}` });
     }
+    if (decision === "require_approval" || input.approvalAttestation) {
+      if (!input.runId || !input.stepId) {
+        return fin({ error: "approval-required MCP execution must be bound to a run and step" });
+      }
+      const binding = createMcpExecutionBinding({
+        runId: input.runId,
+        stepId: input.stepId,
+        specialistAgentId: input.specialistAgentId,
+        mcpServer: input.mcpServer,
+        toolName: input.toolName,
+        arguments: input.arguments,
+      });
+      const verifiedAt = (this.cfg.now ?? (() => new Date()))().toISOString();
+      const invalid = validateMcpApprovalAttestation(input.approvalAttestation, binding, verifiedAt);
+      if (invalid) return fin({ error: `approval denied: ${invalid}` });
+      const attestation = input.approvalAttestation!;
+      this.#pruneConsumedClaims(Date.parse(verifiedAt));
+      if (this.#claimsInFlight.has(attestation.claimId) || this.#consumedClaims.has(attestation.claimId)) {
+        return fin({ error: "approval denied: approval attestation was already consumed" });
+      }
+      const verifier = this.cfg.verifyAndConsumeApprovalAttestation;
+      if (!verifier) return fin({ error: "approval denied: durable approval verifier is unavailable" });
+      this.#claimsInFlight.add(attestation.claimId);
+      try {
+        const verification = await verifier({ attestation, binding, verifiedAt });
+        if (!verification.approved) {
+          return fin({ error: `approval denied: ${redactSecrets(verification.reason).slice(0, 500)}` });
+        }
+        this.#consumedClaims.set(attestation.claimId, Date.parse(attestation.expiresAt));
+      } catch {
+        return fin({ error: "approval denied: durable approval verification failed" });
+      } finally {
+        this.#claimsInFlight.delete(attestation.claimId);
+      }
+    }
     const opts: ExecOptions = {
       timeoutMs: this.cfg.defaultTimeoutMs,
       allowDocker: this.cfg.allowDocker,
@@ -118,6 +185,12 @@ export class McpArsenalBridge {
     const fullBytes = Buffer.byteLength(redacted, "utf-8");
     const preview = fullBytes > this.cfg.maxOutputBytes ? redacted.slice(0, this.cfg.maxOutputBytes) + `\n…[truncated ${fullBytes - this.cfg.maxOutputBytes} bytes → artifact]` : redacted;
     return fin({ success: !isError, isError, outputPreview: preview, fullOutputBytes: fullBytes, durationMs: dur, error: isError ? "MCP tool reported an error (see output)" : null });
+  }
+
+  #pruneConsumedClaims(nowMs: number): void {
+    for (const [claimId, expiresAtMs] of this.#consumedClaims) {
+      if (expiresAtMs <= nowMs) this.#consumedClaims.delete(claimId);
+    }
   }
 
   /**
@@ -149,11 +222,15 @@ export class McpArsenalBridge {
   }
 
   /** Live tools/list health probe (only in enabled mode + startServers). Safe: no target args. */
-  async probeTools(name: string): Promise<{ ok: boolean; tools?: string[]; error?: string }> {
+  async probeTools(name: string, signal?: AbortSignal): Promise<{ ok: boolean; tools?: string[]; error?: string }> {
     if (!this.isEnabled() || !this.cfg.startServers) return { ok: false, error: "probe requires enabled mode + start permission" };
     const spec = this.registry.get(name);
     if (!spec) return { ok: false, error: "unknown server" };
-    const raw = await listServerTools(spec, { timeoutMs: this.cfg.defaultTimeoutMs, allowDocker: this.cfg.allowDocker });
+    const raw = await listServerTools(spec, {
+      timeoutMs: this.cfg.defaultTimeoutMs,
+      allowDocker: this.cfg.allowDocker,
+      signal,
+    });
     if (!raw.ok) return { ok: false, error: raw.error };
     const tools = Array.isArray(raw.result?.tools) ? raw.result.tools.map((t: any) => t.name).filter(Boolean) : [];
     return { ok: true, tools };

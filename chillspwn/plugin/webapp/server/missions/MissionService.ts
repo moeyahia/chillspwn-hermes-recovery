@@ -40,6 +40,7 @@ export class MissionService {
     const contractHash = autonomousContractHash(request);
     const base = await this.readiness.evaluateJourney("autonomous", { request });
     const context = this.missions.autonomousContextPreview(request);
+    const execution = this.missions.autonomousExecutionPreview(request);
     const checks = [...base.checks];
     checks.push(context.invalidSelectedNodeIds.length > 0
       ? {
@@ -81,14 +82,59 @@ export class MissionService {
           : "The server issued a versioned SHA-256 for deliberate review before launch.",
       });
     }
+    const compatibleProviders = execution.providers.filter((provider) => provider.compatible);
+    checks.push(compatibleProviders.length > 0
+      ? {
+          id: "contract_provider_inventory",
+          label: "Inspected enforcing provider paths",
+          status: "pass",
+          journeys: ["autonomous"],
+          impact: `${compatibleProviders.length} projected authenticated provider path${compatibleProviders.length === 1 ? " is" : "s are"} compatible with the Autonomous boundary; live readiness is also rechecked at launch.`,
+        }
+      : {
+          id: "contract_provider_inventory",
+          label: "Inspected enforcing provider paths",
+          status: "fail",
+          journeys: ["autonomous"],
+          impact: "The canonical runtime projection contains no authenticated provider path compatible with the Autonomous boundary.",
+          remediation: "Restore an enforcing provider, wait for runtime projection health to update, and rerun preflight.",
+        });
+    const selectedCount = execution.team.selectedAgentIds.length;
+    const invalidCount = execution.team.invalidSelectedAgentIds.length;
+    checks.push(selectedCount === 0
+      ? {
+          id: "contract_specialist_selection",
+          label: "Signed specialist pool",
+          status: "fail",
+          journeys: ["autonomous"],
+          impact: "No exact specialist is selected, so the planner would not have a reviewed assignment boundary.",
+          remediation: "Select at least one compatible specialist from the inspected fleet.",
+        }
+      : invalidCount > 0 || execution.team.effectiveAgentIds.length === 0
+        ? {
+            id: "contract_specialist_selection",
+            label: "Signed specialist pool",
+            status: "fail",
+            journeys: ["autonomous"],
+            impact: `${invalidCount} selected specialist${invalidCount === 1 ? " is" : "s are"} unavailable, unknown, or incompatible with this contract.`,
+            remediation: "Remove incompatible specialists and select at least one candidate marked compatible.",
+          }
+        : {
+            id: "contract_specialist_selection",
+            label: "Signed specialist pool",
+            status: "pass",
+            journeys: ["autonomous"],
+            impact: `${execution.team.effectiveAgentIds.length} exact compatible specialist${execution.team.effectiveAgentIds.length === 1 ? " is" : "s are"} bound into the contract and planner inventory.`,
+          });
     return {
       schemaVersion: "2.1",
       contract: { version: 1, hash: contractHash },
       readiness: readinessSummary(checks),
       context,
+      execution,
       policySummary: {
-        provider: "Automatic selection; only authenticated paths behind the enforceable Autonomous boundary are eligible.",
-        tools: "Exact signed action-class and target allowlists; specialist assignment is mandatory.",
+        provider: `Automatic selection across ${compatibleProviders.length} inspected authenticated enforcing path${compatibleProviders.length === 1 ? "" : "s"}.`,
+        tools: `${execution.tools.filter((tool) => tool.enabled && tool.startPermitted && (tool.status === "healthy" || tool.status === "degraded")).length} inspected runnable MCP server binding${execution.tools.length === 1 ? "" : "s"}; planner assignments are restricted to ${execution.team.effectiveAgentIds.length} signed specialist${execution.team.effectiveAgentIds.length === 1 ? "" : "s"}.`,
         notifications: "In-product semantic events only; no external channel is implied.",
         reporting: "Scope-checked Command OS JSON completion bundle with integrity digest.",
         retention: "Local private data plane with operator-managed retention; no unenforced automatic expiry is promised.",

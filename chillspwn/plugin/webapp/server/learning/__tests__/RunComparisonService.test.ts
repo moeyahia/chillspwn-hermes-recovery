@@ -33,6 +33,13 @@ function evaluation(database: SqliteDatabase, input: {
   repeatedActionRate?: number;
   evidenceCoverage?: number;
   objectiveCompletion?: number;
+  timeToFirstMeaningfulEvidenceMs?: number;
+  noProgressActionCount?: number;
+  recoverySuccessRate?: number;
+  operatorInterventionCount?: number;
+  memoryContextPrecision?: number;
+  preferenceCorrectionRate?: number;
+  toolCallSuccessRate?: number;
 }): void {
   const journey = input.journey ?? "autonomous";
   const status = input.status ?? "completed";
@@ -61,8 +68,15 @@ function evaluation(database: SqliteDatabase, input: {
     JSON.stringify({
       terminalStatus: status,
       durationMs: input.durationMs ?? 60_000,
+      timeToFirstMeaningfulEvidenceMs: input.timeToFirstMeaningfulEvidenceMs ?? 30_000,
+      noProgressActionCount: input.noProgressActionCount ?? 0,
       repeatedActionRate: input.repeatedActionRate ?? 0,
       retryRate: 0,
+      recoverySuccessRate: input.recoverySuccessRate ?? 1,
+      operatorInterventionCount: input.operatorInterventionCount ?? 0,
+      memoryContextPrecision: input.memoryContextPrecision ?? 1,
+      preferenceCorrectionRate: input.preferenceCorrectionRate ?? 0,
+      toolCallSuccessRate: input.toolCallSuccessRate ?? 1,
       providerTokens: 100,
       estimatedCost: 0,
     }),
@@ -75,6 +89,9 @@ function compare(database: SqliteDatabase, input: {
   evaluationId: string; runId: string; missionId: string; engagementId: string | null;
   endedAt: string; status?: "completed" | "failed" | "cancelled";
   durationMs?: number; repeatedActionRate?: number; evidenceCoverage?: number; objectiveCompletion?: number;
+  timeToFirstMeaningfulEvidenceMs?: number; noProgressActionCount?: number;
+  recoverySuccessRate?: number; operatorInterventionCount?: number;
+  memoryContextPrecision?: number; preferenceCorrectionRate?: number; toolCallSuccessRate?: number;
 }) {
   return new RunComparisonService(database).record({
     evaluationId: input.evaluationId,
@@ -93,8 +110,15 @@ function compare(database: SqliteDatabase, input: {
     },
     metrics: {
       durationMs: input.durationMs ?? 60_000,
+      timeToFirstMeaningfulEvidenceMs: input.timeToFirstMeaningfulEvidenceMs ?? 30_000,
+      noProgressActionCount: input.noProgressActionCount ?? 0,
       repeatedActionRate: input.repeatedActionRate ?? 0,
       retryRate: 0,
+      recoverySuccessRate: input.recoverySuccessRate ?? 1,
+      operatorInterventionCount: input.operatorInterventionCount ?? 0,
+      memoryContextPrecision: input.memoryContextPrecision ?? 1,
+      preferenceCorrectionRate: input.preferenceCorrectionRate ?? 0,
+      toolCallSuccessRate: input.toolCallSuccessRate ?? 1,
       providerTokens: 100,
       estimatedCost: 0,
     },
@@ -132,6 +156,9 @@ describe("RunComparisonService", () => {
       evaluation(database, {
         missionId: "mission-current", runId: "run-same-mission", evaluationId: "evaluation-same-mission",
         endedAt: T1, durationMs: 120_000, repeatedActionRate: 0.5, evidenceCoverage: 0.5,
+        timeToFirstMeaningfulEvidenceMs: 90_000, noProgressActionCount: 3,
+        recoverySuccessRate: 0, operatorInterventionCount: 2,
+        memoryContextPrecision: 0.5, preferenceCorrectionRate: 0.5, toolCallSuccessRate: 0.5,
       });
       evaluation(database, {
         missionId: "mission-other", runId: "run-newer-engagement", evaluationId: "evaluation-newer-engagement",
@@ -146,6 +173,9 @@ describe("RunComparisonService", () => {
         evaluationId: "evaluation-current", runId: "run-current", missionId: "mission-current",
         engagementId: "engagement-a", endedAt: T3, durationMs: 60_000,
         repeatedActionRate: 0.25, evidenceCoverage: 0.75,
+        timeToFirstMeaningfulEvidenceMs: 20_000, noProgressActionCount: 1,
+        recoverySuccessRate: 1, operatorInterventionCount: 0,
+        memoryContextPrecision: 1, preferenceCorrectionRate: 0, toolCallSuccessRate: 1,
       });
       expect(result).toMatchObject({
         status: "available",
@@ -158,6 +188,18 @@ describe("RunComparisonService", () => {
       });
       expect(result.metrics.find((metric) => metric.key === "evidenceCoverage")).toMatchObject({
         prior: 0.5, current: 0.75, delta: 0.25, movement: "favorable",
+      });
+      expect(result.metrics.find((metric) => metric.key === "timeToFirstMeaningfulEvidenceMs")).toMatchObject({
+        prior: 90_000, current: 20_000, delta: -70_000, movement: "favorable",
+      });
+      expect(result.metrics.find((metric) => metric.key === "noProgressActionCount")).toMatchObject({
+        prior: 3, current: 1, delta: -2, movement: "favorable",
+      });
+      expect(result.metrics.find((metric) => metric.key === "memoryContextPrecision")).toMatchObject({
+        prior: 0.5, current: 1, delta: 0.5, movement: "favorable",
+      });
+      expect(result.metrics.find((metric) => metric.key === "preferenceCorrectionRate")).toMatchObject({
+        prior: 0.5, current: 0, delta: -0.5, movement: "favorable",
       });
       expect(result.summary).toContain("does not establish that the system improved");
       expect(result.summary).not.toContain("mission-current");

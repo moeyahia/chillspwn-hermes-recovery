@@ -8,6 +8,7 @@ import {
 } from "react";
 import { AppLink } from "../../app/router/navigation";
 import { guidedCommanderApi } from "../../data/api/guidedCommander";
+import { runtimeV2Api } from "../../data/api/runtimeV2";
 import { useGuidedTranscript } from "../../data/queries/guidedCommander";
 import { useEventStream } from "../../data/events/EventStreamProvider";
 import type {
@@ -56,7 +57,11 @@ function uniqueMessages(
   });
 }
 
-export function GuidedCommanderPanel({ missionId, runId }: { missionId: string; runId: string }) {
+export function GuidedCommanderPanel({ missionId, runId, onAdvanced }: {
+  missionId: string;
+  runId: string;
+  onAdvanced?: () => void;
+}) {
   const transcript = useGuidedTranscript(missionId, runId);
   const stream = useEventStream();
   const [recentMessages, setRecentMessages] = useState<readonly GuidedCommanderMessage[]>([]);
@@ -70,6 +75,7 @@ export function GuidedCommanderPanel({ missionId, runId }: { missionId: string; 
   const [contextPackId, setContextPackId] = useState<string>();
   const [localCandidates, setLocalCandidates] = useState<Record<string, { candidateId: string; status: string }>>({});
   const [mutation, setMutation] = useState<MutationState>({});
+  const [completionConfirmed, setCompletionConfirmed] = useState(false);
   const controllers = useRef(new Set<AbortController>());
   const retryKeys = useRef(new Map<string, string>());
   const automaticExplanations = useRef(new Set<string>());
@@ -101,6 +107,9 @@ export function GuidedCommanderPanel({ missionId, runId }: { missionId: string; 
     return result;
   }, [durableCandidates, localCandidates]);
   const step = transcript.data?.currentStep;
+  const observation = transcript.data?.currentObservation;
+
+  useEffect(() => setCompletionConfirmed(false), [observation?.evidenceId, step?.id]);
 
   async function runMutation<T>(input: {
     kind: string;
@@ -196,6 +205,36 @@ export function GuidedCommanderPanel({ missionId, runId }: { missionId: string; 
       setResultSource("paste");
       setResultMediaType("text/plain");
     }
+  }
+
+  async function completeFromReviewedObservation(): Promise<void> {
+    if (!step || !observation || !completionConfirmed) return;
+    const response = await runMutation({
+      kind: "complete_reviewed_step",
+      signature: JSON.stringify({
+        action: "manual-result",
+        decisionId: step.guidedDecisionId,
+        evidenceId: observation.evidenceId,
+        expectedFingerprint: step.actionFingerprint,
+        expectedParameters: step.decisionParameters,
+      }),
+      operation: (key, signal) => runtimeV2Api.decision(
+        step.guidedDecisionId,
+        "manual-result",
+        {
+          evidenceId: observation.evidenceId,
+          expectedFingerprint: step.actionFingerprint,
+          expectedParameters: step.decisionParameters,
+        },
+        key,
+        signal,
+      ),
+      success: "Reviewed evidence verified. The exact step advanced to its next durable checkpoint.",
+    });
+    if (!response) return;
+    setCompletionConfirmed(false);
+    transcript.refresh();
+    onAdvanced?.();
   }
 
   async function selectTextFile(event: ChangeEvent<HTMLInputElement>): Promise<void> {
@@ -374,6 +413,34 @@ export function GuidedCommanderPanel({ missionId, runId }: { missionId: string; 
         {fileError && <p className="os-guided-field-error" role="alert">{fileError}</p>}
         <Button disabled={!active || pending || !resultText.trim()}>Interpret only — keep step paused</Button>
       </form>
+
+      {observation && step && <section className="os-guided-result-form" aria-labelledby="guided-reviewed-result-title">
+        <div>
+          <p className="os-eyebrow">Durable reviewed observation</p>
+          <h3 id="guided-reviewed-result-title">Interpretation ready for your decision</h3>
+          <p>{observation.interpretationSummary}</p>
+        </div>
+        <dl className="os-key-values">
+          <div><dt>Evidence</dt><dd><AppLink href={`/intelligence/evidence/${encodeURIComponent(observation.evidenceId)}`}>{observation.evidenceId}</AppLink></dd></div>
+          <div><dt>Source</dt><dd>{observation.fileName ?? observation.source.replaceAll("_", " ")}</dd></div>
+          <div><dt>Size</dt><dd>{observation.byteSize.toLocaleString()} bytes</dd></div>
+          <div><dt>Hash</dt><dd className="os-mono">{observation.contentHash.slice(0, 16)}…</dd></div>
+        </dl>
+        <p>The evidence and interpretation are stored against this exact decision independently of the transcript. Advancing verifies this same evidence identity; it cannot substitute changed parameters or a different result.</p>
+        <label className="os-checkbox-row">
+          <input
+            type="checkbox"
+            checked={completionConfirmed}
+            onChange={(event) => setCompletionConfirmed(event.target.checked)}
+          />
+          <span>I performed the exact represented action and reviewed this interpretation.</span>
+        </label>
+        <Button
+          type="button"
+          disabled={!active || pending || !completionConfirmed || observation.verificationState !== "unverified"}
+          onClick={completeFromReviewedObservation}
+        >Accept interpreted evidence and advance exact step</Button>
+      </section>}
 
       {mutation.error && <ErrorPanel title="The Guided action did not complete" error={mutation.error} />}
       {mutation.message && <p className="os-success-note" role="status">{mutation.message}</p>}

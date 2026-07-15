@@ -179,6 +179,12 @@ export interface ResponseLike {
   send(body: string): void;
 }
 
+export type AuthRejectionHandler = (
+  request: ExpressLike,
+  response: ResponseLike,
+  reason: string,
+) => boolean;
+
 /**
  * Build the express auth middleware. `audit` is invoked (best-effort) on each
  * rejection so the caller can append a security_event to the EventLog.
@@ -186,6 +192,7 @@ export interface ResponseLike {
 export function createAuthMiddleware(
   cfg: SecurityConfig,
   audit?: (e: AuthAuditEvent) => void,
+  reject?: AuthRejectionHandler,
 ) {
   return function authMiddleware(req: ExpressLike, res: ResponseLike, next: () => void): void {
     const outcome = evaluateAuth(req, cfg);
@@ -205,6 +212,7 @@ export function createAuthMiddleware(
         /* non-fatal */
       }
     }
+    if (reject?.(req, res, outcome.reason)) return;
     res.status(401).type("html").send(UNAUTHORIZED_HTML);
   };
 }

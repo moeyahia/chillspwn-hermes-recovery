@@ -544,6 +544,127 @@ export class RuntimeRepository {
     return context;
   }
 
+  /** Persist the specialist result as the Guided interpretation before advance. */
+  recordGuidedExecutionInterpretation(
+    actionId: string,
+    summary: string,
+    claimedEvidenceIds: readonly string[],
+    now: string,
+  ): string {
+    const action = new ActionRepository(this.database).get(actionId);
+    if (action.status !== "succeeded") {
+      throw new CommandRuntimeError(409, "guided_interpretation_action_incomplete", "Only a successful action can be interpreted");
+    }
+    const existing = this.database.prepare(`
+      SELECT msg.id FROM messages msg
+      JOIN conversations c ON c.id = msg.conversation_id
+      WHERE c.run_id = ? AND c.conversation_type = 'guided'
+        AND json_extract(msg.structured_content_json, '$.kind') = 'guided_execution_interpretation'
+        AND json_extract(msg.structured_content_json, '$.actionId') = ?
+      LIMIT 1
+    `).get(action.runId, action.id) as { id: string } | undefined;
+    if (existing) return existing.id;
+    const verifiedEvidenceIds = claimedEvidenceIds.filter((evidenceId) => Boolean(
+      this.database.prepare(`
+        SELECT 1 AS present FROM evidence
+        WHERE id = ? AND mission_id = ? AND run_id = ? AND step_id = ?
+          AND action_id = ? AND verification_state = 'verified'
+      `).get(evidenceId, action.missionId, action.runId, action.stepId, action.id),
+    ));
+    const interpreted = redactSensitiveText(summary).text;
+    const assigned = this.database.prepare(`
+      SELECT agent_id FROM assignments WHERE run_id = ? AND step_id = ?
+      ORDER BY created_at, id LIMIT 1
+    `).get(action.runId, action.stepId) as { agent_id: string } | undefined;
+    const interpreterId = assigned?.agent_id ?? "guided-specialist";
+    const conversation = this.database.prepare(`
+      SELECT id FROM conversations
+      WHERE run_id = ? AND step_id = ? AND conversation_type = 'guided'
+      ORDER BY created_at, id LIMIT 1
+    `).get(action.runId, action.stepId) as { id: string } | undefined;
+    const conversationId = conversation?.id ?? id("conversation");
+    if (!conversation) {
+      this.database.prepare(`
+        INSERT INTO conversations (
+          id, mission_id, run_id, step_id, conversation_type, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, 'guided', ?, ?)
+      `).run(conversationId, action.missionId, action.runId, action.stepId, now, now);
+    }
+    const latest = this.database.prepare(`
+      SELECT created_at FROM messages WHERE conversation_id = ?
+      ORDER BY created_at DESC, id DESC LIMIT 1
+    `).get(conversationId) as { created_at: string } | undefined;
+    const createdAt = latest && Date.parse(latest.created_at) >= Date.parse(now)
+      ? new Date(Date.parse(latest.created_at) + 1).toISOString()
+      : now;
+    const messageId = id("message");
+    this.database.prepare(`
+      INSERT INTO messages (
+        id, conversation_id, role, body, structured_content_json, created_at
+      ) VALUES (?, ?, 'assistant', ?, ?, ?)
+    `).run(
+      messageId,
+      conversationId,
+      `The authorized specialist completed this exact step.\n\nObserved result: ${interpreted}\n\nThe result was recorded before advancing. Any next consequential action will be explained and will require a new exact Guided decision.`,
+      canonicalJson({
+        kind: "guided_execution_interpretation",
+        stepId: action.stepId,
+        actionId: action.id,
+        guidedDecisionId: action.guidedDecisionId,
+        actionFingerprint: action.fingerprint,
+        summary: interpreted,
+        observations: [interpreted],
+        evidenceIds: verifiedEvidenceIds,
+        evidenceId: verifiedEvidenceIds[0] ?? null,
+        executionPerformed: true,
+        planMutated: false,
+        nextConsequentialActionRequiresDecision: true,
+      }),
+      createdAt,
+    );
+    this.database.prepare("UPDATE conversations SET updated_at = ? WHERE id = ?")
+      .run(createdAt, conversationId);
+    for (const evidenceId of verifiedEvidenceIds) {
+      const already = this.database.prepare(`
+        SELECT 1 AS present FROM evidence_chain_events
+        WHERE evidence_id = ? AND event_type = 'interpreted'
+          AND json_extract(details_json, '$.actionId') = ? LIMIT 1
+      `).get(evidenceId, action.id) as { present: number } | undefined;
+      if (!already) {
+        this.database.prepare(`
+          INSERT INTO evidence_chain_events (
+            id, evidence_id, event_type, actor, details_json, occurred_at
+          ) VALUES (?, ?, 'interpreted', ?, ?, ?)
+        `).run(
+          id("evidence-chain"),
+          evidenceId,
+          interpreterId,
+          canonicalJson({ actionId: action.id, messageId, actionFingerprint: action.fingerprint }),
+          createdAt,
+        );
+      }
+    }
+    this.events.append({
+      missionId: action.missionId,
+      runId: action.runId,
+      journey: "guided",
+      eventType: "guided.execution_interpreted",
+      actorType: "agent",
+      actorId: interpreterId,
+      summary: "Specialist result was interpreted and recorded before Guided advancement",
+      payload: {
+        stepId: action.stepId,
+        actionId: action.id,
+        guidedDecisionId: action.guidedDecisionId,
+        actionFingerprint: action.fingerprint,
+        evidenceIds: verifiedEvidenceIds,
+        messageId,
+      },
+      sensitivity: "private",
+    });
+    return messageId;
+  }
+
   assertLease(runId: string, lease: RunLeaseToken, now: string): void {
     const row = this.database.prepare(`
       SELECT version, lease_owner, lease_expires_at FROM runs WHERE id = ?
@@ -591,16 +712,35 @@ export class RuntimeRepository {
       });
     }
     const policy = parseObject(contract.action_policy_json);
+    const normalizePolicyValue = (value: string): string => value.trim().toLowerCase();
     const allowed = new Set(
       (Array.isArray(policy.allowedActionClasses) ? policy.allowedActionClasses : [])
         .filter((item): item is string => typeof item === "string")
-        .map((item) => item.trim().toLowerCase()),
+        .map(normalizePolicyValue)
+        .filter(Boolean),
     );
     const prohibited = new Set(
       (Array.isArray(policy.prohibitedActionClasses) ? policy.prohibitedActionClasses : [])
         .filter((item): item is string => typeof item === "string")
-        .map((item) => item.trim().toLowerCase()),
+        .map(normalizePolicyValue)
+        .filter(Boolean),
     );
+    const destructivePolicy = typeof policy.destructivePolicy === "string"
+      ? normalizePolicyValue(policy.destructivePolicy)
+      : "";
+    const specialists = new Set(
+      (Array.isArray(policy.specialistAgentIds) ? policy.specialistAgentIds : [])
+        .filter((item): item is string => typeof item === "string")
+        .map((item) => item.trim())
+        .filter(Boolean),
+    );
+    if (specialists.size === 0) {
+      throw new CommandRuntimeError(409, "autonomous_specialist_pool_missing", "Autonomous contract has no signed specialist pool", {
+        humanMessage: "Safe-stopped: this contract predates the exact specialist boundary and cannot execute autonomously.",
+        category: "policy_denied",
+        remediation: "Create a versioned contract amendment or a new Autonomous run with at least one reviewed compatible specialist.",
+      });
+    }
     const targets = new Set(
       (this.database.prepare(`
         SELECT target FROM mission_targets WHERE mission_id = (
@@ -609,12 +749,44 @@ export class RuntimeRepository {
       `).all(runId) as Array<{ target: string }>).map((row) => row.target.trim()),
     );
     for (const step of plan.steps) {
-      const actionType = step.action.actionType.trim().toLowerCase();
-      if (!allowed.has(actionType) || prohibited.has(actionType) || !targets.has(step.action.target.trim())) {
+      const actionType = normalizePolicyValue(step.action.actionType);
+      const actionClass = normalizePolicyValue(step.action.actionClass);
+      if (step.action.destructive && destructivePolicy !== "contract_only") {
+        throw new CommandRuntimeError(
+          409,
+          "autonomous_destructive_action_not_authorized",
+          "Plan contains a destructive action that is not authorized by the signed contract",
+          {
+            humanMessage: `Safe-stopped: ${step.title} is destructive and the signed contract does not explicitly authorize destructive actions.`,
+            category: "policy_denied",
+            details: {
+              step: step.title,
+              actionType,
+              actionClass,
+              destructivePolicy: destructivePolicy || "missing",
+            },
+            remediation: "Use a non-destructive in-contract alternative or create a versioned contract amendment before a new run.",
+          },
+        );
+      }
+      if (
+        !allowed.has(actionType) ||
+        !allowed.has(actionClass) ||
+        prohibited.has(actionType) ||
+        prohibited.has(actionClass) ||
+        !targets.has(step.action.target.trim()) ||
+        !specialists.has(step.assignedAgentId)
+      ) {
         throw new CommandRuntimeError(409, "autonomous_plan_outside_contract", "Plan contains an out-of-contract action", {
           humanMessage: `Safe-stopped: ${step.title} is outside the signed action or target boundary.`,
           category: "scope_conflict",
-          details: { step: step.title, actionType, target: step.action.target },
+          details: {
+            step: step.title,
+            actionType,
+            actionClass,
+            target: step.action.target,
+            assignedAgentId: step.assignedAgentId,
+          },
           remediation: "Use an in-contract alternative or create a versioned contract amendment before a new run.",
         });
       }
@@ -881,6 +1053,18 @@ export class RuntimeRepository {
     now: string;
     expiresAt: string;
   }): string {
+    const pending = this.database.prepare(`
+      SELECT id FROM guided_decisions
+      WHERE run_id = ? AND status = 'pending'
+      ORDER BY created_at, id LIMIT 1
+    `).get(input.runId) as { id: string } | undefined;
+    if (pending) {
+      throw new CommandRuntimeError(409, "guided_pending_decision_conflict", "A Guided run may have only one pending decision", {
+        humanMessage: "The run already has an unresolved exact Guided decision and no second decision was created.",
+        category: "conflict",
+        remediation: "Resolve or cancel the current Guided decision before preparing another represented step.",
+      });
+    }
     const decisionId = id("decision");
     const fingerprint = fingerprintAction(input.intent).hash;
     this.database.prepare(`
@@ -983,8 +1167,10 @@ export class RuntimeRepository {
       JOIN plans p ON p.id = ps.plan_id
       JOIN runs r ON r.id = ps.run_id
       JOIN mission_constraints mc ON mc.source = ps.id AND mc.constraint_type = 'represented_action'
-      JOIN assignments a ON a.step_id = ps.id
+      JOIN assignments a ON a.step_id = ps.id AND a.run_id = ps.run_id
+        AND a.agent_id = ps.assigned_agent_id
       WHERE ps.id = ?
+      ORDER BY a.created_at DESC, a.id DESC LIMIT 1
     `).get(stepId) as {
       id: string; run_id: string; mission_id: string; version: number;
       representation_json: string; assignment_id: string;
@@ -1609,11 +1795,290 @@ export class RuntimeRepository {
     return { id: evidenceId, contentHash, byteSize, verificationState: "verified", deduplicated: false };
   }
 
+  /** Create an immutable verified derivative of reviewed source evidence. */
+  promoteInterpretedGuidedEvidence(input: {
+    decision: GuidedDecisionProjection;
+    actionId: string;
+    evidenceId: string;
+    actorId: string;
+    now: string;
+  }): ManualEvidenceReceipt {
+    const action = new ActionRepository(this.database).get(input.actionId);
+    if (
+      action.missionId !== input.decision.missionId ||
+      action.runId !== input.decision.runId ||
+      action.stepId !== input.decision.stepId ||
+      action.guidedDecisionId !== input.decision.id
+    ) {
+      throw new CommandRuntimeError(409, "manual_evidence_action_mismatch", "Reviewed evidence does not match its represented action", {
+        humanMessage: "The reviewed observation could not be linked to the unchanged Guided action.",
+        category: "conflict",
+      });
+    }
+    const row = this.database.prepare(`
+      SELECT mission_id, run_id, step_id, action_id, evidence_type,
+        content_hash, provenance_json, verification_state, target,
+        sensitivity, extracted_text
+      FROM evidence WHERE id = ?
+    `).get(input.evidenceId) as {
+      mission_id: string;
+      run_id: string | null;
+      step_id: string | null;
+      action_id: string | null;
+      evidence_type: string;
+      content_hash: string;
+      provenance_json: string;
+      verification_state: string;
+      target: string | null;
+      sensitivity: "public" | "internal" | "private" | "restricted";
+      extracted_text: string | null;
+    } | undefined;
+    if (!row) {
+      throw new CommandRuntimeError(404, "guided_evidence_not_found", "Reviewed Guided evidence was not found", {
+        category: "not_found",
+      });
+    }
+    const provenance = parseObject(row.provenance_json);
+    const interpreted = this.database.prepare(`
+      SELECT details_json FROM evidence_chain_events
+      WHERE evidence_id = ? AND event_type = 'interpreted'
+      ORDER BY occurred_at DESC, id DESC LIMIT 1
+    `).get(input.evidenceId) as { details_json: string } | undefined;
+    if (
+      row.mission_id !== input.decision.missionId ||
+      row.run_id !== input.decision.runId ||
+      row.step_id !== input.decision.stepId ||
+      row.evidence_type !== "guided_text_result" ||
+      row.action_id !== null ||
+      row.verification_state !== "unverified" ||
+      provenance.representedActionFingerprint !== input.decision.actionFingerprint ||
+      !interpreted
+    ) {
+      throw new CommandRuntimeError(409, "guided_evidence_scope_conflict", "Reviewed evidence does not belong to this exact Guided decision", {
+        humanMessage: "Interpret output from the current exact action before completing this step.",
+        category: "scope_conflict",
+        remediation: "Refresh the Guided workspace and submit output for the unchanged represented step.",
+      });
+    }
+    const existing = this.database.prepare(`
+      SELECT id FROM evidence
+      WHERE action_id = ? AND evidence_type = 'guided_manual_result'
+        AND json_extract(provenance_json, '$.originalEvidenceId') = ?
+      ORDER BY created_at, id LIMIT 1
+    `).get(action.id, input.evidenceId) as { id: string } | undefined;
+    if (existing) {
+      return {
+        id: existing.id,
+        contentHash: row.content_hash,
+        byteSize: Number(provenance.byteSize ?? 0),
+        verificationState: "verified",
+        deduplicated: true,
+      };
+    }
+    const interpretation = parseObject(interpreted.details_json);
+    const interpretationSummary = typeof interpretation.summary === "string"
+      ? interpretation.summary
+      : "Operator reviewed the Guided result interpretation";
+    const verifiedEvidenceId = id("evidence");
+    const byteSize = Number(provenance.byteSize ?? Buffer.byteLength(row.extracted_text ?? "", "utf8"));
+    this.database.prepare(`
+      INSERT INTO evidence (
+        id, mission_id, run_id, step_id, action_id, source, acquired_at,
+        target, evidence_type, content_hash, provenance_json, confidence,
+        sensitivity, verification_state, summary, extracted_text,
+        artifact_id, created_by, created_at
+      ) VALUES (?, ?, ?, ?, ?, 'guided.operator_manual_result', ?, ?,
+        'guided_manual_result', ?, ?, 0.8, ?, 'verified', ?, ?, NULL, ?, ?)
+    `).run(
+      verifiedEvidenceId,
+      input.decision.missionId,
+      input.decision.runId,
+      input.decision.stepId,
+      action.id,
+      input.now,
+      row.target,
+      row.content_hash,
+      canonicalJson({
+        method: "operator_attestation_after_interpretation",
+        originalEvidenceId: input.evidenceId,
+        originalContentHash: row.content_hash,
+        interpretationMessageId: interpretation.assistantMessageId ?? null,
+        contextPackId: interpretation.contextPackId ?? null,
+        operatorAttestedAt: input.now,
+        operatorId: input.actorId,
+        decisionId: input.decision.id,
+        actionId: action.id,
+        representedActionFingerprint: input.decision.actionFingerprint,
+        byteSize,
+      }),
+      row.sensitivity,
+      interpretationSummary,
+      row.extracted_text,
+      input.actorId,
+      input.now,
+    );
+    this.database.prepare(`
+      INSERT INTO evidence_chain_events (
+        id, evidence_id, event_type, actor, details_json, occurred_at
+      ) VALUES (?, ?, 'derived', ?, ?, ?), (?, ?, 'verified', ?, ?, ?)
+    `).run(
+      id("evidence-chain"),
+      verifiedEvidenceId,
+      input.actorId,
+      canonicalJson({ originalEvidenceId: input.evidenceId, contentHash: row.content_hash }),
+      input.now,
+      id("evidence-chain"),
+      verifiedEvidenceId,
+      input.actorId,
+      canonicalJson({
+        method: "operator_attestation_after_interpretation",
+        decisionId: input.decision.id,
+        actionId: action.id,
+        actionFingerprint: input.decision.actionFingerprint,
+      }),
+      input.now,
+    );
+    this.events.append({
+      missionId: input.decision.missionId,
+      runId: input.decision.runId,
+      journey: "guided",
+      eventType: "evidence.guided_interpretation_verified",
+      actorType: "operator",
+      actorId: input.actorId,
+      summary: "Operator accepted the interpretation and verified evidence for the exact Guided action",
+      payload: {
+        evidenceId: verifiedEvidenceId,
+        originalEvidenceId: input.evidenceId,
+        decisionId: input.decision.id,
+        stepId: input.decision.stepId,
+        actionId: action.id,
+        contentHash: row.content_hash,
+        verificationState: "verified",
+      },
+      sensitivity: "private",
+    });
+    this.appendAudit({
+      missionId: input.decision.missionId,
+      runId: input.decision.runId,
+      actorId: input.actorId,
+      action: "evidence.guided_interpretation_verified",
+      resourceType: "evidence",
+      resourceId: verifiedEvidenceId,
+      reason: "Operator accepted the persisted interpretation for the exact Guided action",
+      details: {
+        decisionId: input.decision.id,
+        stepId: input.decision.stepId,
+        actionId: action.id,
+        contentHash: row.content_hash,
+        originalEvidenceId: input.evidenceId,
+      },
+      now: input.now,
+    });
+    return {
+      id: verifiedEvidenceId,
+      contentHash: row.content_hash,
+      byteSize,
+      verificationState: "verified",
+      deduplicated: false,
+    };
+  }
+
   getDecision(decisionId: string): GuidedDecisionProjection {
     const row = this.database.prepare("SELECT * FROM guided_decisions WHERE id = ?")
       .get(decisionId) as DecisionRow | undefined;
     if (!row) throw new CommandRuntimeError(404, "guided_decision_not_found", `Decision not found: ${decisionId}`);
     return mapDecision(row);
+  }
+
+  /**
+   * Resolve the one pending decision that currently owns a Guided checkpoint.
+   *
+   * This assertion is intentionally repository-owned so HTTP handlers, direct
+   * engine calls, crash continuations, and future adapters cannot validate only
+   * a decision row while overlooking a changed run, plan, or represented step.
+   */
+  requireCurrentPendingDecision(decisionId: string): GuidedDecisionProjection {
+    const decision = this.getDecision(decisionId);
+    if (decision.status !== "pending") {
+      throw new CommandRuntimeError(409, "guided_decision_not_pending", "Only a pending Guided decision can use this control", {
+        humanMessage: "This exact-step control is stale. Refresh the current Guided checkpoint.",
+        category: "conflict",
+      });
+    }
+
+    const boundary = this.database.prepare(`
+      SELECT r.mission_id, r.journey, r.status AS run_status,
+        r.current_plan_id, r.current_step_id,
+        ps.run_id AS step_run_id, ps.plan_id AS step_plan_id,
+        ps.status AS step_status,
+        p.run_id AS plan_run_id, p.status AS plan_status,
+        (
+          SELECT COUNT(*) FROM guided_decisions pending
+          WHERE pending.run_id = gd.run_id AND pending.status = 'pending'
+        ) AS pending_count
+      FROM guided_decisions gd
+      JOIN runs r ON r.id = gd.run_id
+      JOIN plan_steps ps ON ps.id = gd.step_id
+      JOIN plans p ON p.id = ps.plan_id
+      WHERE gd.id = ?
+    `).get(decision.id) as {
+      mission_id: string;
+      journey: Journey;
+      run_status: RunState;
+      current_plan_id: string | null;
+      current_step_id: string | null;
+      step_run_id: string;
+      step_plan_id: string;
+      step_status: string;
+      plan_run_id: string;
+      plan_status: string;
+      pending_count: number;
+    } | undefined;
+
+    if (!boundary) {
+      throw new CommandRuntimeError(409, "guided_step_stale", "The represented Guided step is no longer current", {
+        humanMessage: "This exact-step control no longer resolves to a current Guided run, plan, and step.",
+        category: "conflict",
+        remediation: "Refresh the Guided workspace and use the one current decision card.",
+      });
+    }
+    if (boundary.pending_count !== 1) {
+      throw new CommandRuntimeError(409, "guided_pending_decision_conflict", "Guided decision ownership is ambiguous", {
+        humanMessage: "The run does not have exactly one pending Guided decision, so no decision was applied.",
+        category: "conflict",
+        remediation: "Keep the run blocked and reconcile its Guided decisions before resuming.",
+      });
+    }
+    if (
+      boundary.journey !== "guided" ||
+      boundary.mission_id !== decision.missionId ||
+      boundary.run_status !== "waiting_guided_decision" ||
+      boundary.current_step_id !== decision.stepId ||
+      boundary.current_plan_id !== boundary.step_plan_id ||
+      boundary.step_run_id !== decision.runId ||
+      boundary.plan_run_id !== decision.runId ||
+      boundary.plan_status !== "active" ||
+      boundary.step_status !== "waiting_guided_decision"
+    ) {
+      throw new CommandRuntimeError(409, "guided_step_stale", "The represented Guided step is no longer current", {
+        humanMessage: "This exact-step control is stale. Review the current Guided checkpoint before deciding.",
+        category: "conflict",
+        remediation: "Refresh the Guided workspace and use the one current decision card.",
+      });
+    }
+
+    const representedIntent = this.getStepIntent(decision.stepId);
+    if (
+      fingerprintAction(representedIntent).hash !== decision.actionFingerprint ||
+      canonicalJson(representedIntent) !== canonicalJson(decision.requestedParameters)
+    ) {
+      throw new CommandRuntimeError(409, "guided_action_changed", "The represented Guided action changed", {
+        humanMessage: "The decision no longer represents the exact current fingerprint and parameters.",
+        category: "conflict",
+        remediation: "Refresh the Guided workspace and decide on the newly represented action.",
+      });
+    }
+    return decision;
   }
 
   listDecisions(options: { status?: string; runId?: string; query?: string; limit?: number } = {}): GuidedDecisionProjection[] {

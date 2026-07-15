@@ -18,6 +18,16 @@ export interface OperationsAccessPolicy {
   readonly canReviewFindings?: boolean;
   readonly canOverrideEvidenceGate?: boolean;
   readonly canReviewLessons?: boolean;
+  /** Review is limited to administrative records and never resumes runtime work. */
+  readonly canReviewAdministrativeApprovals?: boolean;
+  /** Mutate only durable, scope-checked recovery boundaries. */
+  readonly canManageRecovery?: boolean;
+  /** Download integrity-verified content from an explicitly supported canonical store. */
+  readonly canDownloadArtifactContent?: boolean;
+  /** Export bounded redacted evidence metadata for an authorized run. */
+  readonly canExportEvidenceBundles?: boolean;
+  /** Export restricted, run-scoped immutable audit records. */
+  readonly canExportAuditRecords?: boolean;
 }
 
 export interface OperationsActor {
@@ -33,6 +43,17 @@ export interface OperationsRouterDependencies {
     actor: OperationsActor,
   ) => OperationsAccessPolicy;
   readonly clock?: () => Date;
+  /** Provider routes that have a real callable execution adapter. */
+  readonly providerRouteIds?: readonly string[];
+  /** Bounded freshness window for provider health attestations. */
+  readonly providerHealthMaxAgeMs?: number;
+  /** Bounded freshness window for replacement-specialist heartbeats. */
+  readonly agentHeartbeatMaxAgeMs?: number;
+  /** Required for the only supported canonical artifact scheme: vault-attachment. */
+  readonly vaultPathPolicy?: import("../vault").VaultPathPolicy;
+  readonly maximumArtifactDownloadBytes?: number;
+  readonly maximumSecureExportBytes?: number;
+  readonly maximumSecureExportRecords?: number;
 }
 
 export interface OperationsPage<T> {
@@ -56,6 +77,108 @@ export interface OperationsErrorEnvelope {
 export interface OperationsContext {
   readonly actor: OperationsActor;
   readonly access: OperationsAccessPolicy;
+}
+
+export type DecisionInboxKind =
+  | "guided_decision"
+  | "autonomous_contract"
+  | "autonomous_exception"
+  | "administrative_approval";
+
+export interface DecisionInboxBase {
+  readonly id: string;
+  readonly kind: DecisionInboxKind;
+  readonly mission: MissionReference | null;
+  readonly run: {
+    readonly id: string;
+    readonly status: string;
+    readonly journey: "autonomous" | "guided";
+  } | null;
+  readonly status: string;
+  readonly title: string;
+  readonly summary: unknown;
+  readonly createdAt: string;
+  readonly resolvedAt: string | null;
+  readonly expiresAt: string | null;
+  readonly deepLink: string;
+}
+
+export interface GuidedDecisionInboxItem extends DecisionInboxBase {
+  readonly kind: "guided_decision";
+  readonly mission: MissionReference;
+  readonly run: { readonly id: string; readonly status: string; readonly journey: "guided" };
+  readonly exactStep: {
+    readonly stepId: string;
+    readonly actionFingerprint: string;
+    readonly requestedParameters: unknown;
+    readonly rationale: unknown;
+    readonly riskClass: string;
+    readonly reversibility: unknown;
+    readonly decisionActor: string | null;
+    readonly decisionReason: unknown | null;
+  };
+}
+
+export interface AutonomousContractInboxItem extends DecisionInboxBase {
+  readonly kind: "autonomous_contract";
+  readonly mission: MissionReference;
+  readonly contract: {
+    readonly version: number;
+    readonly hash: string;
+    readonly state: "draft" | "confirmed" | "superseded" | "revoked";
+    readonly confirmedBy: string | null;
+    readonly confirmedAt: string | null;
+  };
+}
+
+export interface AutonomousExceptionInboxItem extends DecisionInboxBase {
+  readonly kind: "autonomous_exception";
+  readonly mission: MissionReference;
+  readonly run: { readonly id: string; readonly status: string; readonly journey: "autonomous" };
+  readonly exception: {
+    readonly eventType: string;
+    readonly sequence: number;
+    readonly phase: "active" | "post_run";
+    readonly code: string | null;
+    readonly category: string | null;
+    readonly traceId: string | null;
+    readonly details: unknown;
+  };
+}
+
+export interface AdministrativeApprovalInboxItem extends DecisionInboxBase {
+  readonly kind: "administrative_approval";
+  readonly approval: {
+    readonly approvalType: string;
+    readonly requestedBy: string;
+    readonly policyRule: string | null;
+    readonly request: unknown;
+    readonly decidedBy: string | null;
+    readonly reviewAvailable: boolean;
+    readonly reviewUnavailableReason: string | null;
+  };
+}
+
+export type DecisionInboxItem =
+  | GuidedDecisionInboxItem
+  | AutonomousContractInboxItem
+  | AutonomousExceptionInboxItem
+  | AdministrativeApprovalInboxItem;
+
+export interface AdministrativeApprovalReviewProjection {
+  readonly schemaVersion: typeof OPERATIONS_SCHEMA_VERSION;
+  readonly approval: {
+    readonly id: string;
+    readonly missionId: string | null;
+    readonly runId: string | null;
+    readonly approvalType: string;
+    readonly status: "approved" | "rejected";
+    readonly decidedBy: string;
+    readonly decidedAt: string;
+    readonly decisionReason: string;
+    readonly runtimeStateChanged: false;
+    readonly autonomousActionUnblocked: false;
+  };
 }
 
 export interface MissionReference {
@@ -106,8 +229,30 @@ export interface RecoveryActionAvailability {
   readonly label: string;
   readonly available: boolean;
   readonly reason: string;
-  /** The only public runtime commands currently supported by this projection. */
-  readonly command: "resume" | "cancel" | null;
+  readonly command: "resume" | "replan" | "reassign" | "change_provider" | "cancel" | null;
+}
+
+export interface RecoveryMutationProjection {
+  readonly schemaVersion: typeof OPERATIONS_SCHEMA_VERSION;
+  readonly mutation: {
+    readonly kind: "replan" | "reassign" | "change_provider";
+    readonly eventId: string;
+    readonly checkpointId: string;
+    readonly continuationId: string | null;
+    readonly agentId: string | null;
+    readonly providerId: string | null;
+    readonly providerRouteVersion: number | null;
+  };
+  readonly run: {
+    readonly id: string;
+    readonly journey: "autonomous" | "guided";
+    readonly status: string;
+    readonly version: number;
+    readonly planId: string;
+    readonly planVersion: number;
+    readonly stepId: string;
+    readonly assignmentId: string;
+  };
 }
 
 export interface RunRecoveryProjection {
@@ -119,12 +264,35 @@ export interface RunRecoveryProjection {
     readonly missionName: string;
     readonly journey: "autonomous" | "guided";
     readonly status: string;
+    readonly version: number;
     readonly statusReason: string | null;
     readonly currentStepId: string | null;
     readonly currentOwnerId: string | null;
     readonly nextAction: string | null;
     readonly leaseExpiresAt: string | null;
   };
+  readonly boundary: {
+    readonly planId: string;
+    readonly planVersion: number;
+    readonly stepId: string;
+    readonly assignmentId: string;
+    readonly agentId: string;
+    readonly actionKind: string | null;
+  } | null;
+  readonly reassignmentCandidates: readonly {
+    readonly agentId: string;
+    readonly displayName: string;
+    readonly status: "available";
+    readonly capabilities: readonly string[];
+  }[];
+  readonly providerCandidates: readonly {
+    readonly providerId: string;
+    readonly status: "healthy";
+    readonly supportsGuided: boolean;
+    readonly enforcesAutonomousBoundary: boolean;
+    readonly reportsExactTokenUsage: boolean;
+    readonly reportsExactCostUsage: boolean;
+  }[];
   readonly detection: {
     readonly summary: string;
     readonly category: string | null;
@@ -181,6 +349,7 @@ export interface RunRecoveryProjection {
   readonly guidedDecision: {
     readonly id: string;
     readonly stepId: string;
+    readonly actionFingerprint: string;
     readonly rationale: string;
     readonly riskClass: string;
     readonly expiresAt: string;
@@ -194,6 +363,29 @@ export interface RunRecoveryProjection {
     readonly failureCategory: string | null;
   }[];
   readonly actions: readonly RecoveryActionAvailability[];
+}
+
+export interface FollowUpRunProjection {
+  readonly schemaVersion: typeof OPERATIONS_SCHEMA_VERSION;
+  readonly sourceRunId: string;
+  readonly run: {
+    readonly id: string;
+    readonly missionId: string;
+    readonly missionName: string;
+    readonly journey: "autonomous" | "guided";
+    readonly status: "planning";
+    readonly statusReason: string;
+    readonly nextAction: string;
+    readonly createdAt: string;
+  };
+  readonly selectedLessons: readonly {
+    readonly id: string;
+    readonly nodeId: string;
+    readonly statement: string;
+    /** Selection makes the lesson eligible; actual use is recorded only after planner citation. */
+    readonly selectionState: "eligible_for_planning";
+  }[];
+  readonly nextUrl: string;
 }
 
 export interface EvidenceProjection {
@@ -260,6 +452,41 @@ export interface ArtifactProjection {
   readonly createdAt: string;
 }
 
+/**
+ * A semantic, scope-checked view of one durable action. Deliberately excludes
+ * normalized arguments because those can contain target payloads or credential
+ * references; exact represented parameters remain available through the
+ * signed plan/Guided decision boundary.
+ */
+export interface ActionProjection {
+  readonly id: string;
+  readonly mission: MissionReference;
+  readonly runId: string;
+  readonly journey: "autonomous" | "guided";
+  readonly step: {
+    readonly id: string;
+    readonly phase: string;
+    readonly title: string;
+  } | null;
+  readonly agentId: string | null;
+  readonly actionType: string;
+  readonly actionClass: string;
+  readonly target: string | null;
+  readonly status: "queued" | "running" | "succeeded" | "failed" | "cancelled" | "timed_out" | "denied";
+  readonly intentSummary: string;
+  readonly resultSummary: string | null;
+  readonly errorCategory: string | null;
+  readonly retryCount: number;
+  readonly guidedDecisionId: string | null;
+  readonly contractId: string | null;
+  readonly contextPackId: string | null;
+  readonly correlation: { readonly traceId: string | null; readonly spanId: string | null };
+  readonly startedAt: string | null;
+  readonly endedAt: string | null;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+}
+
 export interface EventProjection {
   readonly id: string;
   readonly occurredAt: string;
@@ -313,7 +540,25 @@ export interface EvaluationProjection {
   readonly evidenceCoverage: number | null;
   readonly createdBy: string;
   readonly createdAt: string;
+  readonly budget: EvaluationBudgetProjection;
   readonly comparison: EvaluationComparisonProjection;
+}
+
+export type EvaluationBudgetKey = "wallClockMs" | "providerTokens" | "estimatedCost" | "toolCalls" | "retries" | "replans";
+export interface EvaluationBudgetMetricProjection {
+  readonly key: EvaluationBudgetKey;
+  readonly label: string;
+  readonly unit: "milliseconds" | "count" | "cost";
+  readonly limit: number | null;
+  readonly usage: number | null;
+  readonly limitStatus: "configured" | "not_configured";
+  readonly usageStatus: "recorded_exact" | "recorded_estimate" | "unknown";
+  readonly status: "within_limit" | "limit_reached" | "limit_exceeded" | "not_configured" | "unknown_usage";
+  readonly limitSource: "terminal_run_budget" | null;
+  readonly usageSource: "terminal_run" | "run_evaluation" | "canonical_records" | null;
+}
+export interface EvaluationBudgetProjection {
+  readonly metrics: readonly EvaluationBudgetMetricProjection[];
 }
 
 export interface EvaluationComparisonMetricProjection {

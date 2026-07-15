@@ -2,6 +2,7 @@ import {
   type FormEvent,
   type KeyboardEvent,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -115,7 +116,7 @@ export function CommandPalette({ open, onClose }: { open: boolean; onClose: () =
   const returnFocusRef = useRef<HTMLElement | null>(null);
   const routeContext = useMemo(() => parsePaletteRoute(pathname), [pathname]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (!open) {
       if (returnFocusRef.current?.isConnected) returnFocusRef.current.focus();
       returnFocusRef.current = null;

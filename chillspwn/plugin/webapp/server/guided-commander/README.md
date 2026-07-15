@@ -33,14 +33,19 @@ records are written to the canonical SQLite database.
 ## Interpretation versus exact-step state changes
 
 `commander/interpret-result` is planning-only. It retains bounded, redacted,
-unverified text evidence and asks the Commander to interpret it, but it never
-attests success, completes the represented step, or advances the run.
+unverified text evidence, persists the Commander's interpretation as an
+append-only evidence-chain event, and exposes that reviewed observation from
+canonical evidence state after reconnect. It never attests success, completes
+the represented step, or advances the run.
 
 Consequential state changes remain on the exact Guided decision boundary:
 
-- `POST /api/v2/guided-decisions/:decisionId/manual-result` attests a reviewed
-  operator-run result, creates the canonical manual action/evidence records,
-  completes that exact represented step, and advances execution.
+- `POST /api/v2/guided-decisions/:decisionId/manual-result` requires the
+  current action fingerprint, exact canonical parameters, and the unconsumed
+  interpreted evidence ID. After explicit operator attestation it creates an
+  immutable verified derivative linked to the original observation, completes
+  only that represented step, and advances execution. The original evidence
+  remains immutable and unverified.
 - `POST /api/v2/guided-decisions/:decisionId/skip` creates no action or
   evidence. It records the reason, marks only the current represented step as
   skipped, checkpoints progress, and moves to the next dependency-eligible

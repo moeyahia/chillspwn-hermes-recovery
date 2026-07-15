@@ -1,4 +1,3 @@
-import { randomUUID } from "node:crypto";
 import { Router, type Request, type Response } from "express";
 import {
   CommandRuntimeError,
@@ -8,16 +7,12 @@ import { DurableOrchestrationError } from "../orchestration";
 import type { JsonValue } from "../events";
 import { canonicalJson, hashCanonical } from "../missions/canonical";
 import type { RunState } from "../supervisor";
-import type { GuidedDecisionProjection } from "../command-runtime";
+import { redactSensitiveText } from "../guided-commander/validation";
+import { attachV2RequestId, sendV2Error } from "../contracts/ApiErrorContract";
 
 export interface MissionRuntimeV2RouterDependencies {
   readonly runtime: MissionRuntimeEngine;
   readonly resolveActor: (request: Request) => string;
-}
-
-function requestTraceId(request: Request): string {
-  const supplied = request.get("X-Request-ID")?.trim();
-  return supplied && /^[a-zA-Z0-9._:-]{1,128}$/u.test(supplied) ? supplied : randomUUID();
 }
 
 function runtimeError(error: unknown): CommandRuntimeError {
@@ -38,18 +33,15 @@ function runtimeError(error: unknown): CommandRuntimeError {
 
 function sendError(response: Response, error: unknown, traceId: string): void {
   const known = runtimeError(error);
-  response.status(known.status).json({
-    error: {
-      code: known.code,
-      message: known.message,
-      humanMessage: known.options.humanMessage ?? known.message,
-      retryable: known.options.retryable ?? false,
-      category: known.options.category ?? "runtime",
-      ...(known.options.details === undefined ? {} : { details: known.options.details }),
-      traceId,
-      ...(known.options.remediation ? { remediation: known.options.remediation } : {}),
-      timestamp: new Date().toISOString(),
-    },
+  sendV2Error(response, traceId, {
+    status: known.status,
+    code: known.code,
+    message: known.message,
+    humanMessage: known.options.humanMessage ?? known.message,
+    retryable: known.options.retryable ?? false,
+    category: known.options.category ?? "runtime",
+    ...(known.options.details === undefined ? {} : { details: known.options.details }),
+    ...(known.options.remediation ? { remediation: known.options.remediation } : {}),
   });
 }
 
@@ -101,7 +93,15 @@ function optionalReason(value: unknown): string | undefined {
       category: "invalid_input",
     });
   }
-  return value.trim();
+  const normalized = value.trim().normalize("NFKC");
+  if (redactSensitiveText(normalized).redactionCount > 0) {
+    throw new CommandRuntimeError(422, "sensitive_material_not_retained", "Operator reason contains authentication material", {
+      humanMessage: "The operator reason was rejected because immutable decision and audit records cannot retain credentials or authentication material.",
+      category: "policy_denied",
+      remediation: "Remove the sensitive value and reference protected evidence or credentials by an opaque ID.",
+    });
+  }
+  return normalized;
 }
 
 function requiredReason(value: unknown): string {
@@ -145,30 +145,6 @@ function expectedParameters(body: Record<string, unknown>, actual: JsonValue): s
   return hashCanonical(actual);
 }
 
-function requireCurrentPendingDecision(
-  dependencies: MissionRuntimeV2RouterDependencies,
-  decision: GuidedDecisionProjection,
-): ReturnType<MissionRuntimeV2RouterDependencies["runtime"]["repository"]["getRunProjection"]> {
-  if (decision.status !== "pending") {
-    throw new CommandRuntimeError(409, "guided_decision_not_pending", "Only a pending Guided decision can use this control", {
-      humanMessage: "This exact-step control is stale. Refresh the current Guided checkpoint.",
-      category: "conflict",
-    });
-  }
-  const run = dependencies.runtime.repository.getRunProjection(decision.runId);
-  if (
-    run.journey !== "guided" ||
-    run.status !== "waiting_guided_decision" ||
-    run.currentStepId !== decision.stepId
-  ) {
-    throw new CommandRuntimeError(409, "guided_step_stale", "The represented Guided step is no longer current", {
-      humanMessage: "This exact-step control is stale. Review the current Guided checkpoint before deciding.",
-      category: "conflict",
-    });
-  }
-  return run;
-}
-
 function asJson(value: unknown): JsonValue {
   return JSON.parse(JSON.stringify(value)) as JsonValue;
 }
@@ -186,8 +162,7 @@ export function createMissionRuntimeV2Router(
   const route = (
     handler: (request: Request, response: Response, traceId: string) => void | Promise<void>,
   ) => async (request: Request, response: Response) => {
-    const traceId = requestTraceId(request);
-    response.setHeader("X-Request-ID", traceId);
+    const traceId = attachV2RequestId(request, response);
     try {
       await handler(request, response, traceId);
     } catch (error) {
@@ -297,8 +272,9 @@ export function createMissionRuntimeV2Router(
   router.post("/api/v2/guided-decisions/:decisionId/approve", mutation("decision.approve", async (request, operatorId) => {
     const decisionId = pathId(request.params.decisionId, "decisionId");
     const body = bodyObject(request.body);
-    const decision = dependencies.runtime.repository.getDecision(decisionId);
+    const decision = dependencies.runtime.repository.requireCurrentPendingDecision(decisionId);
     expectedFingerprint(body, decision.actionFingerprint);
+    expectedParameters(body, decision.requestedParameters);
     const action = await dependencies.runtime.approveGuidedDecision(
       decisionId,
       operatorId,
@@ -310,8 +286,9 @@ export function createMissionRuntimeV2Router(
   router.post("/api/v2/guided-decisions/:decisionId/reject", mutation("decision.reject", async (request, operatorId) => {
     const decisionId = pathId(request.params.decisionId, "decisionId");
     const body = bodyObject(request.body);
-    const decision = dependencies.runtime.repository.getDecision(decisionId);
+    const decision = dependencies.runtime.repository.requireCurrentPendingDecision(decisionId);
     expectedFingerprint(body, decision.actionFingerprint);
+    expectedParameters(body, decision.requestedParameters);
     await dependencies.runtime.rejectGuidedDecision(decisionId, operatorId, requiredReason(body.reason));
     return { schemaVersion: "2.1", decisionId, status: "rejected" };
   }));
@@ -321,10 +298,40 @@ export function createMissionRuntimeV2Router(
     const body = bodyObject(request.body);
     const decision = dependencies.runtime.repository.getDecision(decisionId);
     expectedFingerprint(body, decision.actionFingerprint);
-    if (typeof body.summary !== "string") {
-      throw new CommandRuntimeError(400, "manual_result_required", "Manual result summary is required", { category: "invalid_input" });
+    expectedParameters(body, decision.requestedParameters);
+    if (typeof body.evidenceId !== "string") {
+      throw new CommandRuntimeError(400, "interpreted_evidence_required", "Commander-interpreted evidence is required", {
+        humanMessage: "Submit the manual output for interpretation before completing this exact step.",
+        category: "invalid_input",
+        remediation: "Use the Guided workspace result form, review the interpretation, then accept it to advance.",
+      });
     }
-    const receipt = await dependencies.runtime.submitManualGuidedResult(decisionId, operatorId, body.summary);
+    const evidenceId = pathId(body.evidenceId, "evidenceId");
+    const evidence = dependencies.runtime.repository.database.prepare(`
+      SELECT json_extract(chain.details_json, '$.summary') AS summary
+      FROM evidence e
+      JOIN evidence_chain_events chain
+        ON chain.evidence_id = e.id AND chain.event_type = 'interpreted'
+      WHERE e.id = ? AND e.mission_id = ? AND e.run_id = ? AND e.step_id = ?
+        AND e.action_id IS NULL AND e.evidence_type = 'guided_text_result'
+        AND e.verification_state = 'unverified'
+      ORDER BY chain.occurred_at DESC, chain.id DESC LIMIT 1
+    `).get(evidenceId, decision.missionId, decision.runId, decision.stepId) as {
+      summary: string;
+    } | undefined;
+    if (!evidence?.summary.trim()) {
+      throw new CommandRuntimeError(409, "interpreted_evidence_not_current", "Interpreted evidence does not belong to the current exact step", {
+        humanMessage: "The reviewed observation is stale, already consumed, or belongs to another step.",
+        category: "scope_conflict",
+        remediation: "Refresh the Guided workspace and interpret output for the current represented action.",
+      });
+    }
+    const receipt = await dependencies.runtime.submitManualGuidedResult(
+      decisionId,
+      operatorId,
+      evidence.summary,
+      evidenceId,
+    );
     return asJson({ schemaVersion: "2.1", decisionId, status: "manual", receipt });
   }));
 
@@ -348,7 +355,7 @@ export function createMissionRuntimeV2Router(
     const decision = dependencies.runtime.repository.getDecision(decisionId);
     expectedFingerprint(body, decision.actionFingerprint);
     const parameterHash = expectedParameters(body, decision.requestedParameters);
-    requireCurrentPendingDecision(dependencies, decision);
+    dependencies.runtime.repository.requireCurrentPendingDecision(decisionId);
     const reason = requiredReason(body.reason);
     await dependencies.runtime.cancelRun(decision.runId, operatorId, reason);
     const now = new Date().toISOString();

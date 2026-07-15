@@ -40,6 +40,9 @@ describe("RuntimeProjectionService", () => {
             id: "grok-acp",
             health: "healthy",
             authenticated: true,
+            callable: true,
+            attestedAt: "2026-07-15T08:59:00.000Z",
+            expiresAt: "2026-07-15T09:04:00.000Z",
             supportsGuided: true,
             enforcesAutonomousBoundary: true,
             reportsExactTokenUsage: true,
@@ -68,7 +71,12 @@ describe("RuntimeProjectionService", () => {
           toolPolicy: { allowed: ["nmap"] },
           configuration: { noHands: true },
           version: "2.1",
-          capabilities: [{ name: "nmap", source: "roster", enabled: true }],
+          capabilities: [{
+            name: "nmap",
+            source: "live-route-attestation",
+            enabled: true,
+            metadata: { validUntil: "2026-07-15T09:04:00.000Z" },
+          }],
         }],
         mcpServers: [{
           id: "recon-mcp",
@@ -93,6 +101,9 @@ describe("RuntimeProjectionService", () => {
       id: "ReconScout",
       status: "available",
     });
+    expect(db.prepare("SELECT last_heartbeat_at FROM agents").get()).toEqual({
+      last_heartbeat_at: null,
+    });
     expect(db.prepare("SELECT capability FROM agent_capabilities").get()).toEqual({
       capability: "nmap",
     });
@@ -107,8 +118,73 @@ describe("RuntimeProjectionService", () => {
     const metrics = String(
       (db.prepare("SELECT metrics_json FROM health_snapshots WHERE component_type = 'provider'").get() as { metrics_json: string }).metrics_json,
     );
+    expect(JSON.parse(metrics)).toMatchObject({
+      authenticated: true,
+      callable: true,
+      attestedAt: "2026-07-15T08:59:00.000Z",
+      expiresAt: "2026-07-15T09:04:00.000Z",
+      enforcesAutonomousBoundary: true,
+      reportsExactTokenUsage: true,
+      reportsExactCostUsage: false,
+    });
     expect(metrics).not.toContain("token");
     expect(metrics).not.toContain("secret");
+    db.close();
+  });
+
+  test("preserves a genuine worker heartbeat instead of refreshing it from roster projection", () => {
+    const db = database();
+    let now = new Date("2026-07-15T09:00:00.000Z");
+    const service = new RuntimeProjectionService({
+      database: db,
+      intervalMs: 60_000,
+      clock: () => now,
+      read: () => ({
+        readiness: {
+          actionBoundaryActive: true,
+          delegationEnforced: true,
+          noHandsCommanderEnforced: true,
+          directCommanderToolsDenied: true,
+          specialistAssignmentRequired: true,
+          specialistsConfigured: 0,
+          providers: [],
+          mcp: {
+            enabled: false,
+            executionMode: "disabled",
+            startPermitted: false,
+            configuredServers: 0,
+            runnableServers: 0,
+            missingDependencies: 0,
+            missingSecrets: 0,
+          },
+          eventStream: "healthy",
+          secondBrain: "healthy",
+          legacyExecutionEnabled: false,
+        },
+        agents: [{
+          id: "worker-recon",
+          role: "reconnaissance",
+          displayName: "Worker Recon",
+          status: "degraded",
+          providerPolicy: {},
+          toolPolicy: {},
+          configuration: {},
+          version: "2.1",
+          capabilities: [],
+        }],
+        mcpServers: [],
+      }),
+    });
+
+    service.projectNow();
+    expect(db.prepare("SELECT last_heartbeat_at FROM agents WHERE id = 'worker-recon'").get())
+      .toEqual({ last_heartbeat_at: null });
+    db.prepare("UPDATE agents SET last_heartbeat_at = ? WHERE id = 'worker-recon'")
+      .run("2026-07-15T09:00:30.000Z");
+    now = new Date("2026-07-15T09:05:00.000Z");
+    service.projectNow();
+    expect(db.prepare("SELECT last_heartbeat_at FROM agents WHERE id = 'worker-recon'").get())
+      .toEqual({ last_heartbeat_at: "2026-07-15T09:00:30.000Z" });
     db.close();
   });
 

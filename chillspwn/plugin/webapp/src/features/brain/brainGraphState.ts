@@ -11,13 +11,14 @@ import {
   type MemoryScope,
   type MemorySensitivity,
 } from "../../domain/types/brain";
+import { GRAPH_CLUSTERS, type GraphCluster } from "./graphUtils";
 
 export const BRAIN_GRAPH_PRESETS = ["attack_path", "lessons_failures"] as const;
 export const BRAIN_GRAPH_LABEL_DENSITIES = ["minimal", "balanced", "all"] as const;
 export const BRAIN_GRAPH_URL_KEYS = [
-  "view", "root", "mission", "selected", "search", "nodeType", "edgeType", "scope",
+  "view", "root", "mission", "selected", "pathFrom", "search", "nodeType", "edgeType", "scope",
   "engagement", "lifecycle", "sensitivity", "confidence", "from", "to", "preset",
-  "labels", "layout", "table", "limit",
+  "labels", "layout", "physics", "collapsed", "table", "limit",
 ] as const;
 
 export type BrainGraphPreset = (typeof BRAIN_GRAPH_PRESETS)[number] | "";
@@ -28,6 +29,7 @@ export interface BrainGraphState {
   rootNodeId: string;
   missionId: string;
   selectedId: string;
+  pathFromId: string;
   search: string;
   nodeType: MemoryNodeType | "";
   edgeType: MemoryEdgeType | "";
@@ -41,6 +43,8 @@ export interface BrainGraphState {
   preset: BrainGraphPreset;
   labelDensity: BrainGraphLabelDensity;
   compact: boolean;
+  physics: boolean;
+  collapsedClusters: GraphCluster[];
   table: boolean;
   limit: number;
 }
@@ -51,6 +55,20 @@ export interface SavedBrainGraphView {
   state: BrainGraphState;
   createdAt: string;
   updatedAt: string;
+}
+
+export interface PinnedGraphPosition {
+  readonly x: number;
+  readonly y: number;
+  readonly updatedAt: string;
+}
+
+export type PinnedGraphPositions = Readonly<Record<string, PinnedGraphPosition>>;
+export const MAX_PINNED_GRAPH_POSITIONS = 2_000;
+
+export interface PinnedGraphPositionPersistence {
+  readonly positions: PinnedGraphPositions;
+  readonly persisted: boolean;
 }
 
 const VIEWS: readonly MemoryGraphView[] = ["global", "local", "mission", "operator"];
@@ -89,6 +107,13 @@ function limit(value: unknown): number {
   return Math.max(250, Math.min(1_000, Math.ceil(parsed / 250) * 250));
 }
 
+function collapsedClusters(value: unknown): GraphCluster[] {
+  if (typeof value !== "string") return [];
+  return [...new Set(value.split(",").filter((item): item is GraphCluster => (
+    GRAPH_CLUSTERS.includes(item as GraphCluster)
+  )))];
+}
+
 export function parseBrainGraphState(values: Readonly<Record<string, unknown>>, fallbackRoot = ""): BrainGraphState {
   const rootNodeId = identifier(values.root) || identifier(fallbackRoot);
   const preset = member(values.preset, BRAIN_GRAPH_PRESETS, "" as BrainGraphPreset);
@@ -99,6 +124,7 @@ export function parseBrainGraphState(values: Readonly<Record<string, unknown>>, 
     rootNodeId,
     missionId: identifier(values.mission),
     selectedId: identifier(values.selected),
+    pathFromId: identifier(values.pathFrom),
     search: boundedText(values.search, 240),
     nodeType: member(values.nodeType, MEMORY_NODE_TYPES, "" as MemoryNodeType | ""),
     edgeType: member(values.edgeType, MEMORY_EDGE_TYPES, "" as MemoryEdgeType | ""),
@@ -112,6 +138,8 @@ export function parseBrainGraphState(values: Readonly<Record<string, unknown>>, 
     preset,
     labelDensity: member(values.labels, BRAIN_GRAPH_LABEL_DENSITIES, "balanced"),
     compact: values.layout === "compact" || values.layout === true,
+    physics: values.physics === "1" || values.physics === true,
+    collapsedClusters: collapsedClusters(values.collapsed),
     table: values.table === "1" || values.table === true,
     limit: limit(values.limit),
   };
@@ -123,6 +151,7 @@ export function brainGraphStateToUrl(state: BrainGraphState): Record<string, str
     root: state.view === "local" ? state.rootNodeId || undefined : undefined,
     mission: state.missionId || undefined,
     selected: state.selectedId || undefined,
+    pathFrom: state.pathFromId || undefined,
     search: state.search || undefined,
     nodeType: state.nodeType || undefined,
     edgeType: state.edgeType || undefined,
@@ -136,6 +165,8 @@ export function brainGraphStateToUrl(state: BrainGraphState): Record<string, str
     preset: state.preset || undefined,
     labels: state.labelDensity === "balanced" ? undefined : state.labelDensity,
     layout: state.compact ? "compact" : undefined,
+    physics: state.physics ? "1" : undefined,
+    collapsed: state.collapsedClusters.length > 0 ? state.collapsedClusters.join(",") : undefined,
     table: state.table ? "1" : undefined,
     limit: state.limit > 250 ? String(state.limit) : undefined,
   };
@@ -181,6 +212,7 @@ export function parseSavedBrainGraphViews(raw: string | null): SavedBrainGraphVi
         root: stored.rootNodeId,
         mission: stored.missionId,
         selected: stored.selectedId,
+        pathFrom: stored.pathFromId,
         search: stored.search,
         nodeType: stored.nodeType,
         edgeType: stored.edgeType,
@@ -194,6 +226,8 @@ export function parseSavedBrainGraphViews(raw: string | null): SavedBrainGraphVi
         preset: stored.preset,
         labels: stored.labelDensity,
         layout: stored.compact,
+        physics: stored.physics,
+        collapsed: Array.isArray(stored.collapsedClusters) ? stored.collapsedClusters.join(",") : undefined,
         table: stored.table,
         limit: stored.limit,
       });
@@ -201,5 +235,59 @@ export function parseSavedBrainGraphViews(raw: string | null): SavedBrainGraphVi
     });
   } catch {
     return [];
+  }
+}
+
+function normalizePinnedGraphPosition(id: string, value: unknown): PinnedGraphPosition | null {
+  if (!IDENTIFIER.test(id) || !value || typeof value !== "object" || Array.isArray(value)) return null;
+  const item = value as Record<string, unknown>;
+  const x = Number(item.x);
+  const y = Number(item.y);
+  const updatedAt = typeof item.updatedAt === "string" ? item.updatedAt : "";
+  if (!Number.isFinite(x) || !Number.isFinite(y) || Math.abs(x) > 1_000_000 || Math.abs(y) > 1_000_000) return null;
+  if (!Number.isFinite(Date.parse(updatedAt))) return null;
+  return { x: Math.round(x * 100) / 100, y: Math.round(y * 100) / 100, updatedAt };
+}
+
+/** Keeps the most recently positioned nodes inside the browser-owned cap. */
+export function prunePinnedGraphPositions(positions: PinnedGraphPositions): PinnedGraphPositions {
+  return Object.fromEntries(
+    Object.entries(positions)
+      .flatMap(([id, value]) => {
+        const normalized = normalizePinnedGraphPosition(id, value);
+        return normalized ? [[id, normalized] as const] : [];
+      })
+      .sort(([leftId, left], [rightId, right]) => (
+        Date.parse(right.updatedAt) - Date.parse(left.updatedAt) || leftId.localeCompare(rightId)
+      ))
+      .slice(0, MAX_PINNED_GRAPH_POSITIONS),
+  );
+}
+
+/** Browser-owned layout state. Node content never enters this projection. */
+export function parsePinnedGraphPositions(raw: string | null): PinnedGraphPositions {
+  if (!raw) return {};
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+    return prunePinnedGraphPositions(parsed as PinnedGraphPositions);
+  } catch {
+    return {};
+  }
+}
+
+/** A storage failure must never make the in-memory graph interaction fail. */
+export function persistPinnedGraphPositions(
+  storage: Pick<Storage, "setItem"> | null | undefined,
+  key: string,
+  positions: PinnedGraphPositions,
+): PinnedGraphPositionPersistence {
+  const pruned = prunePinnedGraphPositions(positions);
+  try {
+    if (!storage) return { positions: pruned, persisted: false };
+    storage.setItem(key, JSON.stringify(pruned));
+    return { positions: pruned, persisted: true };
+  } catch {
+    return { positions: pruned, persisted: false };
   }
 }

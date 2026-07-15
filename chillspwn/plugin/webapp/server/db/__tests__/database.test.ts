@@ -49,15 +49,188 @@ describe("Command OS database foundation", () => {
       const second = migrateDatabase(database);
       const health = getDatabaseHealth(database);
 
-      expect(first.applied.map((migration) => migration.version)).toEqual([1, 2, 3, 4, 5, 6, 7]);
+      expect(first.applied.map((migration) => migration.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9]);
       expect(second.applied).toEqual([]);
-      expect(listAppliedMigrations(database)).toHaveLength(7);
+      expect(listAppliedMigrations(database)).toHaveLength(9);
       expect(health.healthy).toBe(true);
       expect(health.journalMode).toBe("wal");
       expect(health.foreignKeys).toBe(true);
       expect(health.busyTimeoutMs).toBe(5_000);
-      expect(health.currentMigration).toBe(7);
+      expect(health.currentMigration).toBe(9);
       expect(existsSync(databasePath)).toBe(true);
+    } finally {
+      database.close();
+    }
+  });
+
+  test("rehearses the schema-eight bridge, then applies the Guided boundary migration", () => {
+    const database = createDatabaseConnection({ filename: ":memory:" });
+    try {
+      const schemaSeven = DATABASE_MIGRATIONS.slice(0, 7);
+      expect(migrateDatabase(database, schemaSeven).currentVersion).toBe(7);
+      insertMission(database, "mission-expand-bridge");
+
+      // The compatibility bridge is additive: legacy notification.read_at
+      // remains available to a schema-seven binary while the current app uses
+      // actor-scoped receipts and the new runtime-continuation records.
+      const schemaEight = DATABASE_MIGRATIONS.slice(0, 8);
+      const bridge = migrateDatabase(database, schemaEight);
+      expect(bridge.applied.map((migration) => migration.version)).toEqual([8]);
+      expect(database.prepare("SELECT name FROM missions WHERE id = ?")
+        .get("mission-expand-bridge")).toEqual({ name: "Mission mission-expand-bridge" });
+      expect(database.prepare(`
+        SELECT name FROM sqlite_master
+        WHERE type = 'table' AND name = 'run_context_selections'
+      `).get()).toEqual({ name: "run_context_selections" });
+      expect(database.prepare(`
+        SELECT name FROM sqlite_master
+        WHERE type = 'table' AND name = 'notification_read_receipts'
+      `).get()).toEqual({ name: "notification_read_receipts" });
+
+      // Re-starting the bridge/full migration set is idempotent. The retained
+      // rollback target must know this exact migration checksum.
+      expect(migrateDatabase(database, schemaEight)).toEqual({
+        applied: [],
+        currentVersion: 8,
+      });
+      expect(() => migrateDatabase(database, schemaSeven)).toThrow(
+        "Database contains unknown migration version 8",
+      );
+      expect(migrateDatabase(database, DATABASE_MIGRATIONS)).toMatchObject({
+        applied: [{ version: 9, name: "guided_decision_single_pending_boundary" }],
+        currentVersion: 9,
+      });
+      expect(getDatabaseHealth(database)).toMatchObject({
+        healthy: true,
+        currentMigration: 9,
+      });
+    } finally {
+      database.close();
+    }
+  });
+
+  test("cancels ambiguous legacy Guided decisions fail-closed and enforces one pending decision per run", () => {
+    const database = createDatabaseConnection({ filename: ":memory:" });
+    try {
+      migrateDatabase(database, DATABASE_MIGRATIONS.slice(0, 8));
+      insertMission(database, "mission-guided-boundary", "guided");
+      const now = "2026-07-15T12:00:00.000Z";
+      database.prepare(`
+        INSERT INTO agents (
+          id, role, display_name, status, version, created_at, updated_at
+        ) VALUES (
+          'agent-guided-boundary', 'specialist', 'Legacy specialist',
+          'busy', 'legacy', ?, ?
+        )
+      `).run(now, now);
+      database.prepare(`
+        INSERT INTO runs (
+          id, mission_id, journey, status, status_reason, created_at, updated_at
+        ) VALUES (
+          'run-guided-boundary', 'mission-guided-boundary', 'guided',
+          'waiting_guided_decision', 'Legacy ambiguous checkpoint', ?, ?
+        )
+      `).run(now, now);
+      database.prepare(`
+        INSERT INTO plans (
+          id, run_id, version, status, strategy_summary, plan_hash,
+          created_by, created_at, activated_at
+        ) VALUES (
+          'plan-guided-boundary', 'run-guided-boundary', 1, 'active',
+          'Legacy plan', ?, 'legacy-runtime', ?, ?
+        )
+      `).run("a".repeat(64), now, now);
+      for (const [stepId, ordinal] of [["step-guided-current", 0], ["step-guided-stale", 1]] as const) {
+        database.prepare(`
+          INSERT INTO plan_steps (
+            id, plan_id, run_id, ordinal, phase, title, objective, status,
+            created_at, updated_at
+          ) VALUES (?, 'plan-guided-boundary', 'run-guided-boundary', ?,
+            'reconnaissance', ?, 'Collect one bounded observation',
+            'waiting_guided_decision', ?, ?)
+        `).run(stepId, ordinal, stepId, now, now);
+        database.prepare(`
+          INSERT INTO assignments (
+            id, run_id, step_id, agent_id, status, lease_owner,
+            lease_acquired_at, last_heartbeat_at, lease_expires_at,
+            created_at, updated_at
+          ) VALUES (?, 'run-guided-boundary', ?, 'agent-guided-boundary', ?,
+            'legacy-worker', ?, ?, ?, ?, ?)
+        `).run(
+          `assignment-${stepId}`,
+          stepId,
+          ordinal === 0 ? "active" : "queued",
+          now,
+          now,
+          "2026-07-16T12:00:00.000Z",
+          now,
+          now,
+        );
+      }
+      database.prepare(`
+        UPDATE runs SET current_plan_id = 'plan-guided-boundary',
+          current_step_id = 'step-guided-current'
+        WHERE id = 'run-guided-boundary'
+      `).run();
+      const insertDecision = database.prepare(`
+        INSERT INTO guided_decisions (
+          id, mission_id, run_id, step_id, requested_action_fingerprint,
+          requested_parameters_json, rationale, risk_class, reversibility,
+          status, expires_at, created_at
+        ) VALUES (?, 'mission-guided-boundary', 'run-guided-boundary', ?, ?,
+          '{}', 'Legacy exact step', 'low', 'Read only', 'pending', ?, ?)
+      `);
+      insertDecision.run("decision-guided-current", "step-guided-current", "b".repeat(64), "2026-07-16T12:00:00.000Z", now);
+      insertDecision.run("decision-guided-stale", "step-guided-stale", "c".repeat(64), "2026-07-16T12:00:00.000Z", now);
+
+      expect(migrateDatabase(database)).toMatchObject({
+        applied: [{ version: 9, name: "guided_decision_single_pending_boundary" }],
+        currentVersion: 9,
+      });
+      expect(database.prepare(`
+        SELECT DISTINCT status, decision_actor, decision_reason
+        FROM guided_decisions WHERE run_id = 'run-guided-boundary'
+      `).all()).toEqual([{
+        status: "cancelled",
+        decision_actor: "migration:guided-decision-boundary-v9",
+        decision_reason: "Cancelled fail-closed because this run had multiple pending Guided decisions",
+      }]);
+      expect(database.prepare(`
+        SELECT status, status_reason, lease_owner, lease_expires_at
+        FROM runs WHERE id = 'run-guided-boundary'
+      `).get()).toEqual({
+        status: "blocked",
+        status_reason: "Guided decision authority was ambiguous; legacy pending decisions were cancelled fail-closed",
+        lease_owner: null,
+        lease_expires_at: null,
+      });
+      expect(database.prepare(`
+        SELECT DISTINCT status FROM plan_steps WHERE run_id = 'run-guided-boundary'
+      `).all()).toEqual([{ status: "blocked" }]);
+      expect(database.prepare(`
+        SELECT DISTINCT status, lease_owner, lease_acquired_at,
+          last_heartbeat_at, lease_expires_at
+        FROM assignments WHERE run_id = 'run-guided-boundary'
+      `).all()).toEqual([{
+        status: "blocked",
+        lease_owner: null,
+        lease_acquired_at: null,
+        last_heartbeat_at: null,
+        lease_expires_at: null,
+      }]);
+      expect(database.prepare(`
+        SELECT name FROM sqlite_master
+        WHERE type = 'index' AND name = 'idx_guided_decisions_one_pending_per_run'
+      `).get()).toEqual({ name: "idx_guided_decisions_one_pending_per_run" });
+
+      insertDecision.run("decision-guided-new", "step-guided-current", "d".repeat(64), "2026-07-16T12:00:00.000Z", now);
+      expect(() => insertDecision.run(
+        "decision-guided-duplicate",
+        "step-guided-stale",
+        "e".repeat(64),
+        "2026-07-16T12:00:00.000Z",
+        now,
+      )).toThrow("UNIQUE constraint failed");
     } finally {
       database.close();
     }
@@ -127,6 +300,11 @@ describe("Command OS database foundation", () => {
         "vault_conflicts",
         "lessons",
         "lesson_usage",
+        "run_context_selections",
+        "mission_contract_snapshots",
+        "run_branches",
+        "runtime_continuations",
+        "notification_read_receipts",
         "lesson_attack_chain_details",
         "lesson_attack_chain_items",
         "lesson_attack_chain_sources",
@@ -134,6 +312,109 @@ describe("Command OS database foundation", () => {
       ]) {
         expect(names.has(expected)).toBe(true);
       }
+    } finally {
+      database.close();
+    }
+  });
+
+  test("keeps full Autonomous contract snapshots immutable", () => {
+    const database = createDatabaseConnection({ filename: ":memory:" });
+    try {
+      migrateDatabase(database);
+      insertMission(database, "mission-contract-snapshot");
+      const now = "2026-07-15T12:00:00.000Z";
+      database.prepare(`
+        INSERT INTO mission_contracts (
+          id, mission_id, version, state, contract_hash,
+          authorization_json, action_policy_json, budgets_json,
+          safe_stop_json, deliverables_json, memory_scopes_json,
+          confirmed_by, confirmed_at, created_at
+        ) VALUES (
+          'contract-snapshot', 'mission-contract-snapshot', 1, 'confirmed', ?,
+          '{}', '{}', '{}', '{}', '[]', '[]', 'operator', ?, ?
+        )
+      `).run("a".repeat(64), now, now);
+      database.prepare(`
+        INSERT INTO mission_contract_snapshots (
+          contract_id, mission_id, source_contract_id, request_json,
+          amendment_reason, created_by, created_at
+        ) VALUES (
+          'contract-snapshot', 'mission-contract-snapshot', NULL, '{}',
+          NULL, 'operator', ?
+        )
+      `).run(now);
+
+      expect(() => database.prepare(`
+        UPDATE mission_contract_snapshots SET request_json = '{"changed":true}'
+        WHERE contract_id = 'contract-snapshot'
+      `).run()).toThrow("mission contract snapshots are immutable");
+      expect(() => database.prepare(`
+        DELETE FROM mission_contract_snapshots WHERE contract_id = 'contract-snapshot'
+      `).run()).toThrow("mission contract snapshots are immutable");
+      expect(database.prepare(`
+        SELECT request_json FROM mission_contract_snapshots
+        WHERE contract_id = 'contract-snapshot'
+      `).get()).toEqual({ request_json: "{}" });
+    } finally {
+      database.close();
+    }
+  });
+
+  test("binds a new Autonomous run to its exact contract revision and keeps that binding immutable", () => {
+    const database = createDatabaseConnection({ filename: ":memory:" });
+    try {
+      migrateDatabase(database);
+      insertMission(database, "mission-contract-binding");
+      const now = "2026-07-15T12:10:00.000Z";
+      database.prepare(`
+        INSERT INTO mission_contracts (
+          id, mission_id, version, state, contract_hash,
+          authorization_json, action_policy_json, budgets_json,
+          safe_stop_json, deliverables_json, memory_scopes_json,
+          confirmed_by, confirmed_at, created_at
+        ) VALUES (
+          'contract-binding', 'mission-contract-binding', 3, 'confirmed', ?,
+          '{}', '{}', '{}', '{}', '[]', '[]', 'operator', ?, ?
+        )
+      `).run("c".repeat(64), now, now);
+      database.prepare(`
+        INSERT INTO runs (
+          id, mission_id, journey, status, contract_id, created_at, updated_at
+        ) VALUES (
+          'run-contract-binding', 'mission-contract-binding', 'autonomous',
+          'planning', 'contract-binding', ?, ?
+        )
+      `).run(now, now);
+
+      expect(database.prepare(`
+        SELECT contract_id, contract_version_bound, contract_hash_bound
+        FROM runs WHERE id = 'run-contract-binding'
+      `).get()).toEqual({
+        contract_id: "contract-binding",
+        contract_version_bound: 3,
+        contract_hash_bound: "c".repeat(64),
+      });
+      expect(() => database.prepare(`
+        UPDATE runs SET contract_id = NULL WHERE id = 'run-contract-binding'
+      `).run()).toThrow("run contract binding is immutable");
+      expect(() => database.prepare(`
+        UPDATE runs SET contract_version_bound = 4 WHERE id = 'run-contract-binding'
+      `).run()).toThrow("run contract binding is immutable");
+      expect(() => database.prepare(`
+        UPDATE runs SET contract_hash_bound = ? WHERE id = 'run-contract-binding'
+      `).run("d".repeat(64))).toThrow("run contract binding is immutable");
+
+      database.prepare(`
+        UPDATE mission_contracts SET version = 4, contract_hash = ?
+        WHERE id = 'contract-binding'
+      `).run("d".repeat(64));
+      expect(database.prepare(`
+        SELECT contract_version_bound, contract_hash_bound
+        FROM runs WHERE id = 'run-contract-binding'
+      `).get()).toEqual({
+        contract_version_bound: 3,
+        contract_hash_bound: "c".repeat(64),
+      });
     } finally {
       database.close();
     }
@@ -161,7 +442,7 @@ describe("Command OS database foundation", () => {
       `).run(now);
 
       const result = migrateDatabase(database);
-      expect(result.applied.map((migration) => migration.version)).toEqual([6, 7]);
+      expect(result.applied.map((migration) => migration.version)).toEqual([6, 7, 8, 9]);
       expect(database.prepare(`
         SELECT comparison_status, reason, prior_run_id, metrics_json
         FROM run_evaluation_comparisons WHERE evaluation_id = 'evaluation-legacy'
@@ -215,7 +496,7 @@ describe("Command OS database foundation", () => {
       `).run("b".repeat(64), now);
 
       const result = migrateDatabase(database);
-      expect(result.applied.map((migration) => migration.version)).toEqual([7]);
+      expect(result.applied.map((migration) => migration.version)).toEqual([7, 8, 9]);
       expect(database.prepare(
         "SELECT journey, record_hash FROM audit_records WHERE id = 'audit-legacy'",
       ).get()).toEqual({ journey: "guided", record_hash: "legacy-record-hash" });

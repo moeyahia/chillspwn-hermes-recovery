@@ -27,6 +27,10 @@ export function RecoveryPanel({ runId, onChanged }: { runId: string; onChanged: 
   const query = useQuery(`run-recovery:${runId}`, (signal) => operationsApi.recovery(runId, signal), { staleTime: 0 });
   const stream = useEventStream();
   const [reason, setReason] = useState("");
+  const [strategyReason, setStrategyReason] = useState("");
+  const [targetAgentId, setTargetAgentId] = useState("");
+  const [capability, setCapability] = useState("");
+  const [providerId, setProviderId] = useState("");
   const mutation = useActionState();
   useEffect(() => {
     if (stream.lastEvent?.runId === runId) query.refresh();
@@ -37,16 +41,83 @@ export function RecoveryPanel({ runId, onChanged }: { runId: string; onChanged: 
   const recovery = query.data;
   if (!recovery?.recoveryRequired) return null;
 
+  const selectedAgent = recovery.reassignmentCandidates.find((candidate) => candidate.agentId === targetAgentId);
+  const exactBoundary = recovery.boundary ? {
+    expectedRunVersion: recovery.run.version,
+    expectedPlanId: recovery.boundary.planId,
+    expectedPlanVersion: recovery.boundary.planVersion,
+    expectedStepId: recovery.boundary.stepId,
+    expectedAssignmentId: recovery.boundary.assignmentId,
+  } : null;
+  const guidedBinding = recovery.guidedDecision ? {
+    guidedDecisionId: recovery.guidedDecision.id,
+    expectedDecisionFingerprint: recovery.guidedDecision.actionFingerprint,
+  } : {};
+
+  const actionReady = (action: RecoveryActionAvailability): boolean => {
+    if (!action.available || !action.command || mutation.pending) return false;
+    if (action.command === "replan") return Boolean(exactBoundary && strategyReason.trim().length >= 12);
+    if (action.command === "reassign") return Boolean(exactBoundary && reason.trim() && selectedAgent && capability);
+    if (action.command === "change_provider") return Boolean(exactBoundary && reason.trim() && providerId);
+    return Boolean(reason.trim());
+  };
+
+  const finishMutation = (message: string) => {
+    setReason("");
+    setStrategyReason("");
+    query.refresh();
+    onChanged();
+    return message;
+  };
+
   const perform = (action: RecoveryActionAvailability) => {
-    if (!action.available || !action.command || !reason.trim()) return;
-    void mutation.run(
-      () => runtimeV2Api.controlRun(
+    if (!actionReady(action) || !action.command) return;
+    const key = `recovery-${action.command}-${crypto.randomUUID()}`;
+    let operation: Promise<unknown>;
+    let success: string;
+    if (action.command === "replan" && exactBoundary) {
+      operation = operationsApi.requestRecoveryReplan(
+        runId,
+        { ...exactBoundary, strategyReason: strategyReason.trim() },
+        key,
+      );
+      success = "The materially different strategy was checkpointed and queued through the bounded supervisor.";
+    } else if (action.command === "reassign" && exactBoundary && selectedAgent) {
+      operation = operationsApi.reassignRecoverySpecialist(
+        runId,
+        {
+          ...exactBoundary,
+          targetAgentId: selectedAgent.agentId,
+          capability,
+          reason: reason.trim(),
+          ...guidedBinding,
+        },
+        key,
+      );
+      success = "The exact stopped assignment was transferred to the declared-capable specialist; execution remains stopped.";
+    } else if (action.command === "change_provider" && exactBoundary) {
+      operation = operationsApi.changeRecoveryProvider(
+        runId,
+        { ...exactBoundary, providerId, reason: reason.trim(), ...guidedBinding },
+        key,
+      );
+      success = "The provider route was versioned for the exact current step; execution remains stopped.";
+    } else if (action.command === "resume" || action.command === "cancel") {
+      operation = runtimeV2Api.controlRun(
         runId,
         action.command === "cancel" ? "cancel" : "resume",
         reason.trim(),
-        `recovery-${action.command}-${crypto.randomUUID()}`,
-      ).then(() => { setReason(""); query.refresh(); onChanged(); }),
-      action.command === "cancel" ? "Run terminated gracefully." : "Run resumed from its durable checkpoint.",
+        key,
+      );
+      success = action.command === "cancel"
+        ? "Run terminated gracefully."
+        : "Run resumed from its durable checkpoint.";
+    } else {
+      return;
+    }
+    void mutation.run(
+      () => operation.then(() => { finishMutation(success); }),
+      success,
     );
   };
 
@@ -151,7 +222,22 @@ export function RecoveryPanel({ runId, onChanged }: { runId: string; onChanged: 
       <label><span>Operator reason (audited)</span><input value={reason} onChange={(event) => setReason(event.target.value)} placeholder="Why is this recovery action necessary?" /></label>
       <ul>
         {recovery.actions.map((action) => <li key={action.kind}>
-          <Button variant={actionVariant(action)} disabled={!action.available || mutation.pending || !reason.trim()} onClick={() => perform(action)}>{action.label}</Button>
+          <div className="os-recovery-action-control">
+            {action.kind === "replan" && action.available && <label>
+              <span>Materially different in-scope strategy</span>
+              <textarea value={strategyReason} onChange={(event) => setStrategyReason(event.target.value)} placeholder="Describe the new fact or strategy that makes another bounded plan useful." />
+            </label>}
+            {action.kind === "reassign" && action.available && <>
+              <label><span>Healthy capable specialist</span><select value={targetAgentId} onChange={(event) => {
+                const next = recovery.reassignmentCandidates.find((candidate) => candidate.agentId === event.target.value);
+                setTargetAgentId(event.target.value);
+                setCapability(next?.capabilities[0] ?? "");
+              }}><option value="">Choose a specialist</option>{recovery.reassignmentCandidates.map((candidate) => <option key={candidate.agentId} value={candidate.agentId}>{candidate.displayName} · {candidate.agentId}</option>)}</select></label>
+              <label><span>Declared shared capability</span><select value={capability} disabled={!selectedAgent} onChange={(event) => setCapability(event.target.value)}><option value="">Choose a capability</option>{selectedAgent?.capabilities.map((name) => <option key={name} value={name}>{name}</option>)}</select></label>
+            </>}
+            {action.kind === "change_provider" && action.available && <label><span>Compatible callable provider</span><select value={providerId} onChange={(event) => setProviderId(event.target.value)}><option value="">Choose a provider</option>{recovery.providerCandidates.map((provider) => <option key={provider.providerId} value={provider.providerId}>{provider.providerId}</option>)}</select></label>}
+            <Button variant={actionVariant(action)} disabled={!actionReady(action)} onClick={() => perform(action)}>{action.label}</Button>
+          </div>
           <span><StatusPill status={action.available ? "available" : "unavailable"} />{action.reason}</span>
         </li>)}
       </ul>

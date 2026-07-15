@@ -1,11 +1,19 @@
 export { MissionRepository } from "./MissionRepository";
 export type { CreateMissionOptions, ListMissionsOptions } from "./MissionRepository";
+export { MissionPortfolioService, MISSION_PORTFOLIO_LIMITS } from "./MissionPortfolioService";
 export { OverviewRepository } from "./OverviewRepository";
 export {
   ReadinessService,
   createDatabaseReadinessProvider,
 } from "./ReadinessService";
 export { MissionService } from "./MissionService";
+export {
+  AutonomousBranchService,
+  type AutonomousBranchContext,
+  type AutonomousBranchPreflight,
+  type AutonomousBranchResult,
+  type VersionedAutonomousPreflight,
+} from "./AutonomousBranchService";
 export {
   AutonomousReadinessError,
   IdempotencyConflictError,
@@ -29,6 +37,11 @@ export type {
   Journey,
   MissionCreateRequest,
   MissionListPage,
+  MissionBulkArchiveResult,
+  MissionBulkExportResult,
+  MissionBulkItemOutcome,
+  MissionExportRecord,
+  MissionPortfolioFilterState,
   MissionRecord,
   MissionSummary,
   OverviewSnapshot,
@@ -37,4 +50,6 @@ export type {
   ReadinessContext,
   ReadinessSummary,
   RunStatus,
+  SavedMissionView,
+  SavedMissionViewCollection,
 } from "./types";

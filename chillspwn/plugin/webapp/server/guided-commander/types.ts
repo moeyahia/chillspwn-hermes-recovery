@@ -41,9 +41,29 @@ export interface GuidedRepresentedStep {
   readonly rationale: string;
   readonly reversibility: string;
   readonly representedAction: Readonly<Record<string, unknown>>;
+  /** Exact canonical parameters owned by the pending Guided decision. */
+  readonly decisionParameters: JsonValue;
   readonly actionFingerprint: string;
   readonly guidedDecisionId: string;
   readonly guidedDecisionStatus: string;
+}
+
+/**
+ * Canonical observation state for the current step. This is projected from
+ * evidence and chain-of-custody records, so reload/resume never depends on the
+ * chat transcript or client memory.
+ */
+export interface GuidedReviewedObservation {
+  readonly evidenceId: string;
+  readonly contentHash: string;
+  readonly source: "paste" | "text_upload";
+  readonly mediaType: string;
+  readonly fileName: string | null;
+  readonly byteSize: number;
+  readonly redactionCount: number;
+  readonly interpretationSummary: string;
+  readonly verificationState: "unverified" | "verified" | "disputed" | "rejected";
+  readonly acquiredAt: string;
 }
 
 export interface GuidedMessage {
@@ -63,6 +83,7 @@ export interface GuidedTranscriptPage {
   readonly mission: GuidedMissionContext;
   readonly run: GuidedRunContext;
   readonly currentStep: GuidedRepresentedStep | null;
+  readonly currentObservation: GuidedReviewedObservation | null;
   readonly items: readonly GuidedMessage[];
   readonly nextCursor: string | null;
 }
@@ -156,6 +177,8 @@ export interface GuidedCommanderOptions {
   readonly memoryContextBudget?: number;
   readonly memoryContextLimit?: number;
   readonly transcriptContextLimit?: number;
+  /** Durable cross-process provider-mutation lease; renewed while work is live. */
+  readonly providerMutationLeaseMs?: number;
   readonly clock?: () => Date;
   readonly createId?: (prefix: string) => string;
 }

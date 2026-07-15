@@ -27,6 +27,11 @@ interface ReplayPage {
 const LAST_EVENT_STORAGE_KEY = "chillspwn.command-os.last-event-id.v2";
 const MAX_DEDUPE_IDS = 2_000;
 
+export function invalidateNotificationQueries(cache: Pick<ReturnType<typeof useQueryCache>, "invalidate">): void {
+  cache.invalidate("notifications:recent");
+  cache.invalidate("notifications:unread");
+}
+
 function readLastEventId(): string {
   try {
     const durable = localStorage.getItem(LAST_EVENT_STORAGE_KEY);
@@ -139,6 +144,10 @@ export function EventStreamProvider({ children }: { children: ReactNode }) {
       }
       cache.invalidatePrefix("observability-events:");
       cache.invalidatePrefix("observability-health:");
+      // Notifications are an idempotent projection of this same semantic
+      // event. Refresh only the mounted canonical queries; no polling loop or
+      // raw event payload is copied into client notification state.
+      invalidateNotificationQueries(cache);
       const type = event.type.toLowerCase();
       if (event.journey === "autonomous") cache.invalidate("autonomous-runs");
       if (event.journey === "guided") cache.invalidate("guided-runs");

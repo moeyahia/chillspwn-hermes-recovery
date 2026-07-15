@@ -1,4 +1,5 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
+import { useNavigation } from "../../app/router/navigation";
 import { confirmMemoryCandidate, fetchMemoryCandidates, rejectMemoryCandidate } from "../../data/api/brain";
 import { useQuery } from "../../data/cache/QueryProvider";
 import { Button, Card, ErrorPanel, LoadingPanel, PageHeader, StatusPill } from "../../design-system/components/Primitives";
@@ -53,12 +54,24 @@ function CandidateCard({ candidate, onChanged }: { candidate: MemoryCandidate; o
 }
 
 export default function BrainInboxPage() {
-  const candidates = useQuery("brain-candidates", fetchMemoryCandidates, { staleTime: 0 });
+  const { search } = useNavigation();
+  const exactScope = useMemo(() => {
+    const query = new URLSearchParams(search);
+    const missionId = query.get("missionId")?.trim() || undefined;
+    const runId = query.get("runId")?.trim() || undefined;
+    return { missionId, runId };
+  }, [search]);
+  const candidates = useQuery(
+    `brain-candidates:${exactScope.missionId ?? "all"}:${exactScope.runId ?? "all"}`,
+    (signal) => fetchMemoryCandidates(exactScope, signal),
+    { staleTime: 0 },
+  );
   const pending = candidates.data?.items.filter((item) => item.status === "pending") ?? [];
   return (
     <div className="os-page brain-page">
       <PageHeader eyebrow="Consent and confirmation" title="Memory Inbox" description="Confirm, correct, scope, or reject proposed memories. Personal preferences remain candidates until your consent policy permits promotion." />
       <BrainNav />
+      {exactScope.runId && <Card><p className="os-eyebrow">Exact-run review scope</p><p>Only candidates whose canonical provenance resolves to run <code>{exactScope.runId}</code>{exactScope.missionId ? <> in mission <code>{exactScope.missionId}</code></> : null} are shown.</p></Card>}
       {candidates.isLoading && <LoadingPanel label="Loading memory candidates and provenance" />}
       {candidates.error && !candidates.data && <ErrorPanel error={candidates.error} onRetry={candidates.refresh} />}
       {candidates.data && pending.length === 0 && <Card><BrainEmpty title="No memories awaiting review" description="New operator-preference and uncertain operational candidates will appear here with their source and confidence." /></Card>}

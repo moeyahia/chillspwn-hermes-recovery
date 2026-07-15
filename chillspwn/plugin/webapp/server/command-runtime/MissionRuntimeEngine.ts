@@ -22,6 +22,12 @@ import {
   type RunState,
 } from "../supervisor";
 import { RuntimeRepository } from "./RuntimeRepository";
+import { commitPlanningContextAttribution } from "./PlanningContextAttribution";
+import {
+  RuntimeContinuationRepository,
+  type RuntimeContinuation,
+  type RuntimeContinuationKind,
+} from "./RuntimeContinuationRepository";
 import type {
   ExecutionResult,
   ExecutionResultReceipt,
@@ -42,6 +48,13 @@ import { validateExecutionResultSummary, validateMissionPlanDraft, validateReaso
 interface HeartbeatLease {
   token(): Promise<RunLeaseToken>;
   stop(): Promise<RunLeaseToken>;
+}
+
+class RuntimeCrashAfterCommit extends Error {
+  constructor(readonly point: string) {
+    super(`Injected process crash after durable commit: ${point}`);
+    this.name = "RuntimeCrashAfterCommit";
+  }
 }
 
 function planResult(value: MissionPlanDraft | MissionPlanPortResult): MissionPlanPortResult {
@@ -150,6 +163,7 @@ function asRuntimeError(error: unknown): CommandRuntimeError {
 
 export class MissionRuntimeEngine implements ExecutionResultSink {
   readonly repository: RuntimeRepository;
+  readonly continuations: RuntimeContinuationRepository;
   readonly coordinator: DurableRunCoordinator;
   readonly learning: RunLearningService;
   private readonly database: SqliteDatabase;
@@ -160,6 +174,7 @@ export class MissionRuntimeEngine implements ExecutionResultSink {
   private readonly maxPlanSteps: number;
   private readonly now: () => Date;
   private readonly processing = new Map<string, Promise<void>>();
+  private readonly continuationProcessing = new Map<string, Promise<void>>();
   private readonly actionContexts = new Map<string, RuntimeActionContext>();
   private readonly controllers = new Map<string, AbortController>();
   private scanTimer?: ReturnType<typeof setInterval>;
@@ -170,6 +185,7 @@ export class MissionRuntimeEngine implements ExecutionResultSink {
     this.database = options.database;
     this.now = options.now ?? (() => new Date());
     this.repository = new RuntimeRepository(options.database);
+    this.continuations = new RuntimeContinuationRepository(options.database);
     this.learning = new RunLearningService(options.database, {
       clock: this.now,
       events: this.repository.events,
@@ -185,6 +201,12 @@ export class MissionRuntimeEngine implements ExecutionResultSink {
     this.coordinator = new DurableRunCoordinator(options.database, options.execution, {
       now: this.now,
       leaseTtlMs: this.leaseTtlMs,
+      afterActionCommit: (action) => {
+        this.crashAfterCommit("action_reserved_before_dispatch", action.runId, action.id);
+      },
+      afterCancellationCleanup: (runId) => {
+        this.crashAfterCommit("cancellation_cleanup_before_finalize", runId);
+      },
     });
     const unbind = options.execution.bindResultSink?.(this);
     if (typeof unbind === "function") this.unbindResultSink = unbind;
@@ -192,6 +214,22 @@ export class MissionRuntimeEngine implements ExecutionResultSink {
 
   private timestamp(): string {
     return this.now().toISOString();
+  }
+
+  private crashAfterCommit(
+    point: Parameters<NonNullable<MissionRuntimeOptions["crashAfterCommit"]>>[0],
+    runId: string,
+    sourceId?: string,
+  ): void {
+    if (!this.options.crashAfterCommit) return;
+    try {
+      this.options.crashAfterCommit(point, {
+        runId,
+        ...(sourceId ? { sourceId } : {}),
+      });
+    } catch {
+      throw new RuntimeCrashAfterCommit(point);
+    }
   }
 
   private controller(runId: string): AbortController {
@@ -275,11 +313,18 @@ export class MissionRuntimeEngine implements ExecutionResultSink {
   async start(): Promise<RuntimeLifecycleResult> {
     if (this.scanTimer) return { recoveredRuns: 0, scheduledRuns: 0 };
     this.stopping = false;
+    this.continuations.reconcileFromCanonicalState(this.timestamp());
+    // Cancellation wins over ordinary action recovery. A process that died
+    // after child cleanup but before aggregate finalization must never resume
+    // the very work the operator asked it to stop.
+    await this.replayContinuations(undefined, ["cancellation_finalize_pending"]);
+    await this.replayContinuations();
     const recovered = await this.recover();
     // Recovery must classify every expired lease before the scheduler can
     // reclaim planning work. In particular, this closes an interrupted ACP
     // provider turn and checkpoints run.recovery_started before a fresh
     // planning lease is acquired.
+    this.continuations.reconcileFromCanonicalState(this.timestamp());
     const scheduledRuns = await this.scanOnce();
     this.scanTimer = setInterval(() => {
       void this.scanOnce().catch(() => undefined);
@@ -293,6 +338,7 @@ export class MissionRuntimeEngine implements ExecutionResultSink {
     this.scanTimer = undefined;
     for (const controller of this.controllers.values()) controller.abort("Command OS runtime stopped");
     await Promise.allSettled([...this.processing.values()]);
+    await Promise.allSettled([...this.continuationProcessing.values()]);
     // Active actions are owned by the execution port, not by the planning
     // promises above. Confirm child cleanup before unbinding the result sink;
     // leave their durable action/lease records nonterminal so startup recovery
@@ -335,10 +381,21 @@ export class MissionRuntimeEngine implements ExecutionResultSink {
 
   async scanOnce(): Promise<number> {
     if (this.stopping) return 0;
-    const candidates = this.repository.listRunnableRuns(this.timestamp());
+    this.continuations.reconcileFromCanonicalState(this.timestamp());
+    const continuationRuns = this.continuations.readyRunIds(this.timestamp());
     let scheduled = 0;
+    for (const runId of continuationRuns) {
+      if (this.continuationProcessing.has(runId)) continue;
+      const work = this.processContinuationRun(runId)
+        .then(() => undefined)
+        .catch(() => undefined)
+        .finally(() => this.continuationProcessing.delete(runId));
+      this.continuationProcessing.set(runId, work);
+      scheduled += 1;
+    }
+    const candidates = this.repository.listRunnableRuns(this.timestamp());
     for (const runId of candidates) {
-      if (this.processing.has(runId)) continue;
+      if (this.processing.has(runId) || this.continuationProcessing.has(runId)) continue;
       const work = this.processRun(runId)
         .catch(() => undefined)
         .finally(() => this.processing.delete(runId));
@@ -354,6 +411,563 @@ export class MissionRuntimeEngine implements ExecutionResultSink {
     const work = this.processRun(runId).finally(() => this.processing.delete(runId));
     this.processing.set(runId, work);
     return work;
+  }
+
+  async replayContinuations(
+    runId?: string,
+    kinds?: readonly RuntimeContinuationKind[],
+  ): Promise<number> {
+    const runIds = runId ? [runId] : this.continuations.readyRunIds(this.timestamp(), 200);
+    let processed = 0;
+    for (const candidate of runIds) {
+      if (this.continuationProcessing.has(candidate)) {
+        await this.continuationProcessing.get(candidate);
+        continue;
+      }
+      processed += await this.processContinuationRun(candidate, kinds);
+    }
+    return processed;
+  }
+
+  private async processContinuationRun(
+    runId: string,
+    kinds?: readonly RuntimeContinuationKind[],
+  ): Promise<number> {
+    let processed = 0;
+    for (let index = 0; index < 64 && !this.stopping; index += 1) {
+      const continuation = this.continuations.claimNext({
+        runId,
+        workerId: this.workerId,
+        now: this.timestamp(),
+        leaseTtlMs: this.leaseTtlMs,
+        ...(kinds?.length ? { kinds } : {}),
+      });
+      if (!continuation?.leaseOwner) break;
+      const heartbeat = setInterval(() => {
+        try {
+          this.continuations.heartbeat(
+            continuation.id,
+            continuation.leaseOwner!,
+            this.timestamp(),
+            this.leaseTtlMs,
+          );
+        } catch {
+          clearInterval(heartbeat);
+        }
+      }, Math.max(250, Math.floor(this.leaseTtlMs / 3)));
+      try {
+        await this.handleContinuation(continuation);
+        processed += 1;
+      } catch (error) {
+        if (error instanceof RuntimeCrashAfterCommit) throw error;
+        const message = error instanceof Error ? error.message : "Continuation handler failed";
+        const current = this.continuations.get(continuation.id);
+        if (current.status === "processing" && current.leaseOwner === continuation.leaseOwner) {
+          const run = this.coordinator.getRun(runId);
+          if (isTerminalRunState(run.run.state) || run.run.state === "blocked") {
+            this.continuations.complete(continuation.id, continuation.leaseOwner, this.timestamp());
+          } else if (continuation.attemptCount >= 5) {
+            this.failContinuation(continuation, message);
+          } else {
+            const delayMs = Math.min(30_000, 250 * (2 ** Math.max(0, continuation.attemptCount - 1)));
+            this.continuations.retry({
+              id: continuation.id,
+              ownerToken: continuation.leaseOwner,
+              now: this.timestamp(),
+              availableAt: new Date(Date.parse(this.timestamp()) + delayMs).toISOString(),
+              error: message,
+            });
+          }
+        }
+        break;
+      } finally {
+        clearInterval(heartbeat);
+      }
+    }
+    return processed;
+  }
+
+  private continuationText(
+    continuation: RuntimeContinuation,
+    key: "actionId" | "stepId" | "decisionId" | "terminalStatus",
+  ): string | null {
+    const value = continuation.payload[key];
+    return typeof value === "string" && value.trim() ? value : null;
+  }
+
+  private continuationLease(runId: string): RunLeaseToken {
+    const durable = this.coordinator.getRun(runId);
+    if (durable.lease?.ownerId === this.workerId) return durable.lease;
+    if (durable.lease && Date.parse(durable.lease.expiresAt) > Date.parse(this.timestamp())) {
+      throw new CommandRuntimeError(409, "continuation_run_lease_busy", "Another worker owns this run continuation", {
+        retryable: true,
+        category: "conflict",
+      });
+    }
+    return this.coordinator.acquireRunLease(runId, this.workerId, this.leaseTtlMs);
+  }
+
+  private completeContinuation(continuation: RuntimeContinuation): void {
+    if (!continuation.leaseOwner) throw new Error("Claimed continuation has no owner fence");
+    this.continuations.complete(continuation.id, continuation.leaseOwner, this.timestamp());
+  }
+
+  private async handleContinuation(continuation: RuntimeContinuation): Promise<void> {
+    const run = this.coordinator.getRun(continuation.runId);
+    if (isTerminalRunState(run.run.state) && continuation.kind !== "evaluation_pending") {
+      this.completeContinuation(continuation);
+      return;
+    }
+    switch (continuation.kind) {
+      case "autonomous_retry_to_dispatch": {
+        await this.dispatchAutonomousRetryContinuation(continuation);
+        return;
+      }
+      case "plan_ready_to_dispatch":
+      case "guided_approval_to_dispatch": {
+        const stepId = this.continuationText(continuation, "stepId");
+        if (!stepId) throw new Error("Dispatch continuation is missing its canonical step ID");
+        const decisionId = continuation.kind === "guided_approval_to_dispatch"
+          ? this.continuationText(continuation, "decisionId") ?? continuation.sourceId
+          : undefined;
+        const existing = this.database.prepare(`
+          SELECT id, status FROM actions
+          WHERE run_id = ? AND step_id = ?
+            ${decisionId ? "AND guided_decision_id = ?" : ""}
+          ORDER BY created_at, id LIMIT 1
+        `).get(...(decisionId
+          ? [continuation.runId, stepId, decisionId]
+          : [continuation.runId, stepId])) as { id: string; status: string } | undefined;
+        if (existing) {
+          inImmediateTransaction(this.database, () => {
+            if (existing.status === "succeeded") {
+              this.continuations.enqueue({
+                runId: continuation.runId,
+                kind: "action_result_to_advance",
+                sourceId: existing.id,
+                payload: { actionId: existing.id, stepId },
+                now: this.timestamp(),
+              });
+            }
+            this.completeContinuation(continuation);
+          });
+          return;
+        }
+        const lease = this.continuationLease(continuation.runId);
+        await this.startRepresentedAction(
+          this.repository.getStepIntent(stepId),
+          lease,
+          decisionId,
+        );
+        this.completeContinuation(continuation);
+        return;
+      }
+      case "action_result_to_advance": {
+        await this.advanceContinuation(continuation);
+        return;
+      }
+      case "guided_failure_to_recover": {
+        const actionId = this.continuationText(continuation, "actionId") ?? continuation.sourceId;
+        inImmediateTransaction(this.database, () => {
+          this.repository.recordGuidedActionFailure(actionId, this.timestamp());
+          this.continuations.enqueue({
+            runId: continuation.runId,
+            kind: "resume_recovery_pending",
+            sourceId: actionId,
+            payload: { actionId },
+            now: this.timestamp(),
+          });
+          this.completeContinuation(continuation);
+        });
+        return;
+      }
+      case "resume_recovery_pending": {
+        const latest = this.coordinator.getRun(continuation.runId);
+        if (latest.run.state !== "recovering" && latest.run.state !== "planning") {
+          this.completeContinuation(continuation);
+          return;
+        }
+        await this.processRunNow(continuation.runId);
+        this.completeContinuation(continuation);
+        return;
+      }
+      case "evaluation_pending": {
+        const terminalStatus = this.continuationText(continuation, "terminalStatus");
+        const latest = this.coordinator.getRun(continuation.runId);
+        if (terminalStatus === "cancelled" || latest.run.state === "cancelled") {
+          const cancellation = this.database.prepare(`
+            SELECT actor_id, summary FROM events WHERE id = ? AND run_id = ?
+          `).get(continuation.sourceId, continuation.runId) as {
+            actor_id: string | null;
+            summary: string;
+          } | undefined;
+          const actorId = cancellation?.actor_id ?? "operator";
+          const reason = cancellation?.summary.replace(/^Run cancelled and child work stopped:\s*/u, "").trim()
+            || "Operator requested cancellation";
+          inImmediateTransaction(this.database, () => {
+            this.repository.cancelOpenWork(continuation.runId, actorId, reason, this.timestamp());
+            this.database.prepare("UPDATE missions SET status = 'cancelled', updated_at = ? WHERE id = ?")
+              .run(this.timestamp(), latest.run.missionId);
+            const audit = this.database.prepare(`
+              SELECT id FROM audit_records
+              WHERE run_id = ? AND action = 'run.cancelled'
+              ORDER BY occurred_at DESC, id DESC LIMIT 1
+            `).get(continuation.runId) as { id: string } | undefined;
+            if (!audit) {
+              this.repository.appendAudit({
+                missionId: latest.run.missionId,
+                runId: continuation.runId,
+                actorId,
+                action: "run.cancelled",
+                resourceType: "run",
+                resourceId: continuation.runId,
+                reason,
+                now: this.timestamp(),
+              });
+            }
+            this.learning.recordTerminalEvaluation({
+              runId: continuation.runId,
+              terminalStatus: "cancelled",
+              createdBy: "run-supervisor",
+            });
+            this.completeContinuation(continuation);
+          });
+          return;
+        }
+        if (terminalStatus === "failed" || latest.run.state === "failed") {
+          inImmediateTransaction(this.database, () => {
+            this.learning.recordTerminalEvaluation({
+              runId: continuation.runId,
+              terminalStatus: "failed",
+              createdBy: "run-supervisor",
+            });
+            this.completeContinuation(continuation);
+          });
+          return;
+        }
+        if (latest.run.state === "completed") {
+          this.completeContinuation(continuation);
+          return;
+        }
+        const lease = this.continuationLease(continuation.runId);
+        await this.evaluateAndFinish(lease);
+        this.completeContinuation(continuation);
+        return;
+      }
+      case "cancellation_finalize_pending": {
+        await this.finalizeCancellationContinuation(continuation);
+        return;
+      }
+    }
+  }
+
+  private async dispatchAutonomousRetryContinuation(
+    continuation: RuntimeContinuation,
+  ): Promise<void> {
+    const actionId = this.continuationText(continuation, "actionId") ?? continuation.sourceId;
+    const stepId = this.continuationText(continuation, "stepId");
+    if (!stepId) throw new Error("Autonomous retry continuation is missing its canonical step ID");
+    const predecessor = this.database.prepare(`
+      SELECT id, status, step_id FROM actions
+      WHERE id = ? AND run_id = ?
+    `).get(actionId, continuation.runId) as {
+      id: string;
+      status: string;
+      step_id: string;
+    } | undefined;
+    if (
+      !predecessor || predecessor.step_id !== stepId ||
+      !["failed", "timed_out"].includes(predecessor.status)
+    ) {
+      throw new Error("Autonomous retry predecessor is not the exact canonical failed action");
+    }
+
+    // A retry successor is explicitly linked to its failed predecessor. This
+    // makes replay deterministic even when the process dies after reservation
+    // but before external dispatch or continuation acknowledgement.
+    const successor = this.database.prepare(`
+      SELECT id, status FROM actions
+      WHERE run_id = ? AND step_id = ? AND parent_action_id = ?
+      ORDER BY created_at, id LIMIT 1
+    `).get(continuation.runId, stepId, actionId) as {
+      id: string;
+      status: string;
+    } | undefined;
+    if (successor) {
+      if (successor.status === "succeeded") {
+        inImmediateTransaction(this.database, () => {
+          this.continuations.enqueue({
+            runId: continuation.runId,
+            kind: "action_result_to_advance",
+            sourceId: successor.id,
+            payload: { actionId: successor.id, stepId },
+            now: this.timestamp(),
+          });
+          this.completeContinuation(continuation);
+        });
+        return;
+      }
+      if (successor.status === "running" && !this.actionContexts.has(successor.id)) {
+        await this.recover();
+        const current = this.database.prepare("SELECT status FROM actions WHERE id = ?")
+          .get(successor.id) as { status: string } | undefined;
+        if (current?.status === "running" && !this.actionContexts.has(successor.id)) {
+          throw new Error("Reserved retry action still has a live owner lease; recovery is not yet claimable");
+        }
+      }
+      this.completeContinuation(continuation);
+      return;
+    }
+
+    let durable = this.coordinator.getRun(continuation.runId);
+    if (["blocked", "completed", "failed", "cancelled"].includes(durable.run.state)) {
+      this.completeContinuation(continuation);
+      return;
+    }
+    let lease = this.continuationLease(continuation.runId);
+    if (durable.run.state === "recovering") {
+      const accounted = this.coordinator.accountUsage({ lease, phase: "delayed retry readiness" });
+      if (!accounted.allowed || !accounted.run.lease) {
+        throw new CommandRuntimeError(409, "run_budget_exhausted", "Signed run budget was exhausted during recovery", {
+          humanMessage: `Safe-stopped before retry: ${accounted.exhausted.join(", ")} budget exhausted.`,
+          category: "policy_denied",
+        });
+      }
+      const running = this.coordinator.transitionRun({
+        lease: accounted.run.lease,
+        to: "running",
+        reason: `Bounded retry delay elapsed for ${actionId}; re-authorizing the unchanged in-contract action`,
+      });
+      if (!running.run.lease) {
+        throw new CommandRuntimeError(500, "retry_lease_lost", "Retry lost its run lease");
+      }
+      lease = running.run.lease;
+      durable = running.run;
+    }
+    if (durable.run.state !== "running") {
+      throw new Error(`Autonomous retry cannot dispatch from ${durable.run.state}`);
+    }
+    const intent = this.repository.getStepIntent(stepId);
+    await this.startRepresentedAction({ ...intent, parentActionId: actionId }, lease);
+    this.completeContinuation(continuation);
+  }
+
+  private async advanceContinuation(continuation: RuntimeContinuation): Promise<void> {
+    const actionId = this.continuationText(continuation, "actionId") ?? continuation.sourceId;
+    const action = this.database.prepare(`
+      SELECT a.step_id, a.status, a.result_summary,
+        json_extract(a.normalized_arguments_json, '$.orchestration.kind') AS action_kind,
+        r.journey, ps.status AS step_status, ps.plan_id
+      FROM actions a
+      JOIN runs r ON r.id = a.run_id
+      JOIN plan_steps ps ON ps.id = a.step_id
+      WHERE a.id = ? AND a.run_id = ?
+    `).get(actionId, continuation.runId) as {
+      step_id: string;
+      status: string;
+      result_summary: string | null;
+      action_kind: string | null;
+      journey: "autonomous" | "guided";
+      step_status: string;
+      plan_id: string;
+    } | undefined;
+    if (!action) throw new Error("Continuation action no longer exists");
+    if (["completed", "skipped", "cancelled"].includes(action.step_status)) {
+      this.completeContinuation(continuation);
+      this.continuations.reconcileFromCanonicalState(this.timestamp());
+      return;
+    }
+    if (action.status !== "succeeded") {
+      throw new Error(`Action ${actionId} is not a successful advance predecessor`);
+    }
+    const lease = this.continuationLease(continuation.runId);
+    const now = this.timestamp();
+    let evaluationQueued = false;
+    inImmediateTransaction(this.database, () => {
+      const runs = new RunRepository(this.database);
+      const current = runs.get(continuation.runId);
+      runs.assertLease(current, lease, now);
+      if (action.journey === "guided" && action.action_kind !== "manual") {
+        const evidenceIds = (this.database.prepare(`
+          SELECT id FROM evidence WHERE action_id = ? ORDER BY created_at, id
+        `).all(actionId) as Array<{ id: string }>).map((row) => row.id);
+        this.repository.recordGuidedExecutionInterpretation(
+          actionId,
+          action.result_summary ?? "The authorized specialist completed this exact step.",
+          evidenceIds,
+          now,
+        );
+      }
+      const advanced = this.repository.advanceSuccessfulStep({
+        runId: continuation.runId,
+        stepId: action.step_id,
+        actionId,
+        journey: action.journey,
+        now,
+        decisionTtlMs: this.decisionTtlMs,
+      });
+      if (advanced.completed) {
+        evaluationQueued = true;
+        this.continuations.enqueue({
+          runId: continuation.runId,
+          kind: "evaluation_pending",
+          sourceId: action.plan_id,
+          now,
+        });
+      } else if (action.journey === "guided") {
+        if (!advanced.guidedDecisionId) {
+          throw new CommandRuntimeError(500, "guided_decision_missing", "Next Guided decision was not created");
+        }
+        this.coordinator.transitionRun({
+          lease,
+          to: "waiting_guided_decision",
+          reason: "The previous result was interpreted and the next explained step is ready",
+          guidedDecisionId: advanced.guidedDecisionId,
+        });
+      } else {
+        if (!advanced.nextStepId) {
+          throw new CommandRuntimeError(500, "next_action_missing", "Next Autonomous action is missing");
+        }
+        this.continuations.enqueue({
+          runId: continuation.runId,
+          kind: "plan_ready_to_dispatch",
+          sourceId: advanced.nextStepId,
+          payload: { stepId: advanced.nextStepId },
+          now,
+        });
+      }
+      this.completeContinuation(continuation);
+      this.repository.events.append({
+        missionId: current.run.missionId,
+        runId: continuation.runId,
+        journey: current.run.journey,
+        eventType: "run.continuation_replayed",
+        actorType: "system",
+        actorId: this.workerId,
+        summary: advanced.completed
+          ? "Durable action result advanced to mission success evaluation"
+          : current.run.journey === "guided"
+            ? "Durable action result advanced to the next exact Guided decision"
+            : "Durable action result advanced to the next in-contract Autonomous step",
+        payload: {
+          continuationId: continuation.id,
+          kind: continuation.kind,
+          actionId,
+          nextStepId: advanced.nextStepId,
+          nextGuidedDecisionId: advanced.guidedDecisionId,
+        },
+      });
+    });
+    if (evaluationQueued) {
+      this.crashAfterCommit("step_advance_to_evaluation", continuation.runId, action.plan_id);
+    }
+  }
+
+  private failContinuation(continuation: RuntimeContinuation, message: string): void {
+    if (!continuation.leaseOwner) return;
+    const now = this.timestamp();
+    const durable = this.coordinator.getRun(continuation.runId);
+    const lease = durable.lease?.ownerId === this.workerId
+      ? durable.lease
+      : (!durable.lease || Date.parse(durable.lease.expiresAt) <= Date.parse(now))
+        ? this.coordinator.acquireRunLease(continuation.runId, this.workerId, this.leaseTtlMs)
+        : null;
+    inImmediateTransaction(this.database, () => {
+      this.continuations.fail({
+        id: continuation.id,
+        ownerToken: continuation.leaseOwner!,
+        now,
+        error: message,
+      });
+      if (!lease || isTerminalRunState(durable.run.state) || durable.run.state === "blocked") return;
+      const transition = this.coordinator.transitionRun({
+        lease,
+        to: "blocked",
+        reason: `Durable continuation retry budget exhausted for ${continuation.kind}`,
+      });
+      this.repository.events.append({
+        missionId: transition.run.run.missionId,
+        runId: continuation.runId,
+        journey: transition.run.run.journey,
+        eventType: "run.continuation_blocked",
+        actorType: "system",
+        summary: `Run blocked after five bounded attempts to resume ${continuation.kind}`,
+        payload: {
+          continuationId: continuation.id,
+          kind: continuation.kind,
+          attempts: continuation.attemptCount,
+        },
+      });
+    });
+  }
+
+  private async finalizeCancellationContinuation(continuation: RuntimeContinuation): Promise<void> {
+    const event = this.database.prepare(`
+      SELECT actor_id, summary FROM events
+      WHERE id = ? AND run_id = ? AND event_type = 'run.cancellation_requested'
+    `).get(continuation.sourceId, continuation.runId) as {
+      actor_id: string | null;
+      summary: string;
+    } | undefined;
+    const actorId = event?.actor_id ?? "operator";
+    const reason = event?.summary.replace(/^Cancellation requested:\s*/u, "").trim()
+      || "Operator requested cancellation";
+    const before = this.coordinator.getRun(continuation.runId);
+    if (before.run.state === "cancelled") {
+      inImmediateTransaction(this.database, () => {
+        this.repository.cancelOpenWork(continuation.runId, actorId, reason, this.timestamp());
+        this.completeContinuation(continuation);
+      });
+      return;
+    }
+    const lease = this.continuationLease(continuation.runId);
+    this.controllers.get(continuation.runId)?.abort(reason);
+    await this.options.execution.cancelRun(continuation.runId, reason);
+    const now = this.timestamp();
+    inImmediateTransaction(this.database, () => {
+      // Close child aggregates before the terminal transition creates its
+      // checkpoint so the checkpoint cannot retain ghost in-flight work.
+      this.repository.cancelOpenWork(continuation.runId, actorId, reason, now);
+      const transition = this.coordinator.transitionRun({
+        lease,
+        to: "cancelled",
+        reason,
+      });
+      this.database.prepare("UPDATE missions SET status = 'cancelled', updated_at = ? WHERE id = ?")
+        .run(now, transition.run.run.missionId);
+      this.repository.appendAudit({
+        missionId: transition.run.run.missionId,
+        runId: continuation.runId,
+        actorId,
+        action: "run.cancelled",
+        resourceType: "run",
+        resourceId: continuation.runId,
+        reason,
+        now,
+      });
+      this.learning.recordTerminalEvaluation({
+        runId: continuation.runId,
+        terminalStatus: "cancelled",
+        createdBy: "run-supervisor",
+      });
+      this.completeContinuation(continuation);
+      this.continuations.cancelOpen(continuation.runId, now, "Run reached a terminal cancelled state");
+      this.repository.events.append({
+        missionId: transition.run.run.missionId,
+        runId: continuation.runId,
+        journey: transition.run.run.journey,
+        eventType: "run.cancelled",
+        actorType: "operator",
+        actorId,
+        summary: `Run cancelled and all durable child work closed: ${reason}`,
+        payload: { continuationId: continuation.id, aggregateClosed: true },
+      });
+    });
+    for (const [actionId, context] of this.actionContexts) {
+      if (context.action.runId !== continuation.runId) continue;
+      if (context.heartbeat) clearInterval(context.heartbeat);
+      this.actionContexts.delete(actionId);
+    }
   }
 
   private async processRun(runId: string): Promise<void> {
@@ -373,30 +987,11 @@ export class MissionRuntimeEngine implements ExecutionResultSink {
       ? durableAtStart.lease
       : this.coordinator.acquireRunLease(runId, this.workerId, this.leaseTtlMs);
     if (planningRun.journey === "autonomous" && planningRun.state === "recovering" && recovery?.kind === "retry") {
-      try {
-        const accounted = this.coordinator.accountUsage({ lease, phase: "delayed retry readiness" });
-        if (!accounted.allowed || !accounted.run.lease) {
-          throw new CommandRuntimeError(409, "run_budget_exhausted", "Signed run budget was exhausted during recovery", {
-            humanMessage: `Safe-stopped before retry: ${accounted.exhausted.join(", ")} budget exhausted.`,
-            category: "policy_denied",
-          });
-        }
-        const running = this.coordinator.transitionRun({
-          lease: accounted.run.lease,
-          to: "running",
-          reason: `Bounded retry delay elapsed for ${recovery.failedActionId}; re-authorizing the unchanged in-contract action`,
-        });
-        if (!running.run.lease) throw new CommandRuntimeError(500, "retry_lease_lost", "Retry lost its run lease");
-        const failed = new ActionRepository(this.database).get(recovery.failedActionId);
-        await this.startRepresentedAction(this.repository.getStepIntent(failed.stepId), running.run.lease);
-        return;
-      } catch (error) {
-        const runtimeError = asRuntimeError(error);
-        const latest = this.coordinator.getRun(runId);
-        const stopLease = latest.lease?.ownerId === this.workerId ? latest.lease : lease;
-        await this.safeStopPlanning(runId, stopLease, runtimeError);
-        throw runtimeError;
-      }
+      // The failed action committed a delayed, owner-fenced continuation in
+      // the same transaction that requeued its exact assignment and step.
+      // Never reconstruct retry work from an in-memory timer.
+      await this.replayContinuations(runId, ["autonomous_retry_to_dispatch"]);
+      return;
     }
     if (planningRun.journey === "autonomous" && planningRun.state === "recovering" && recovery?.kind === "replan") {
       try {
@@ -454,6 +1049,12 @@ export class MissionRuntimeEngine implements ExecutionResultSink {
           run: planningRun,
           ...(guidedRecovery ? {
             rejectionReason: `The represented action "${guidedRecovery.attemptedActionSummary}" failed with ${guidedRecovery.errorCategory}: ${guidedRecovery.failureSummary}. Propose one materially different in-scope action; do not repeat the failed parameters.`,
+          } : recovery?.kind === "replan" ? {
+            // beginReplan intentionally moves the run from recovering to
+            // planning before this provider turn. Preserve the durable,
+            // operator-supplied strategy across that transition so a replay
+            // cannot silently fall back to an equivalent plan.
+            rejectionReason: recovery.reason,
           } : planningRun.state === "recovering" ? { rejectionReason: planningRun.stateReason } : {}),
         }, signal));
       const draft = validateMissionPlanDraft(
@@ -464,20 +1065,31 @@ export class MissionRuntimeEngine implements ExecutionResultSink {
       lease = await heartbeat.stop();
       heartbeatStopped = true;
       lease = this.accountProviderUsage(lease, planned.usage, "mission planning");
+      const activationAt = this.timestamp();
       const committed = inImmediateTransaction(this.database, () => {
         const plan = this.repository.persistPlanRecords({
           mission,
           run: planningRun,
           lease,
           plan: draft,
-          now: this.timestamp(),
+          now: activationAt,
           decisionTtlMs: this.decisionTtlMs,
           ...(guidedRecovery ? { guidedRecovery } : {}),
         });
+        commitPlanningContextAttribution(
+          this.database,
+          planned.plan.planningAttribution,
+          {
+            missionId: mission.id,
+            runId,
+            journey: planningRun.journey,
+            usedAt: activationAt,
+          },
+        );
         if (planningRun.journey === "guided") {
           this.database.prepare(`
             UPDATE plan_steps SET status = 'waiting_guided_decision', updated_at = ? WHERE id = ?
-          `).run(this.timestamp(), plan.firstStepId);
+          `).run(activationAt, plan.firstStepId);
         }
         let transition = this.coordinator.transitionRun({
           lease,
@@ -497,15 +1109,31 @@ export class MissionRuntimeEngine implements ExecutionResultSink {
             guidedDecisionId: plan.guidedDecisionId,
           });
         }
+        if (planningRun.journey === "autonomous") {
+          this.continuations.enqueue({
+            runId,
+            kind: "plan_ready_to_dispatch",
+            sourceId: plan.planId,
+            payload: { stepId: plan.firstStepId },
+            now: activationAt,
+          });
+        }
         return { plan, transition };
       });
       if (planningRun.journey === "autonomous") {
-        const runLease = committed.transition.run.lease;
-        if (!runLease) throw new CommandRuntimeError(500, "runtime_lease_lost", "Autonomous launch lost its lease");
-        await this.startRepresentedAction(committed.plan.firstIntent, runLease);
+        this.crashAfterCommit("plan_ready_to_dispatch", runId, committed.plan.planId);
+      }
+      if (planningRun.journey === "autonomous") {
+        if (!committed.transition.run.lease) {
+          throw new CommandRuntimeError(500, "runtime_lease_lost", "Autonomous launch lost its lease");
+        }
+        if (!this.continuationProcessing.has(runId)) {
+          await this.replayContinuations(runId, ["plan_ready_to_dispatch"]);
+        }
       }
     } catch (error) {
       if (!heartbeatStopped) lease = await heartbeat.stop().catch(() => lease);
+      if (error instanceof RuntimeCrashAfterCommit) throw error;
       const runtimeError = asRuntimeError(error);
       await this.safeStopPlanning(runId, lease, runtimeError);
       throw runtimeError;
@@ -566,8 +1194,6 @@ export class MissionRuntimeEngine implements ExecutionResultSink {
     lease: RunLeaseToken,
     guidedDecisionId?: string,
   ): Promise<DurableAction> {
-    const now = this.timestamp();
-    this.repository.transaction(() => this.repository.markStepRunning(intent.stepId, now));
     try {
       const before = this.coordinator.getRun(intent.runId).control.progress;
       const started = await this.coordinator.startAction({
@@ -589,6 +1215,7 @@ export class MissionRuntimeEngine implements ExecutionResultSink {
       }
       return started.action;
     } catch (error) {
+      if (error instanceof RuntimeCrashAfterCommit) throw error;
       const runtimeError = asRuntimeError(error);
       if (
         runtimeError.code === "autonomous_action_not_allowed" ||
@@ -690,34 +1317,17 @@ export class MissionRuntimeEngine implements ExecutionResultSink {
       });
       completionCommitted = true;
       this.actionContexts.delete(result.actionId);
-      if (!result.success && completed.run.run.journey === "guided") {
-        // Make the failed attempt and taxonomy visible before any recovery
-        // planning begins. This mutation never creates, approves, or executes
-        // a replacement action.
-        this.repository.transaction(() => {
-          this.repository.recordGuidedActionFailure(result.actionId, this.timestamp());
-        });
+      if (result.success && completed.directive === "continue") {
+        this.crashAfterCommit("action_result_to_advance", result.runId, result.actionId);
+      } else if (!result.success && completed.directive === "recover") {
+        this.crashAfterCommit("guided_failure_to_recover", result.runId, result.actionId);
       }
-      if (result.success && completed.directive === "continue" && completed.run.lease) {
-        try {
-          await this.advanceAfterSuccess(completed.run.lease, result.actionId, row.step_id);
-        } catch (error) {
-          await this.safeStopPlanning(result.runId, completed.run.lease, asRuntimeError(error));
-          throw error;
-        }
-      } else if (completed.directive === "recover") {
-        void this.processRunNow(result.runId).catch(() => undefined);
-      } else if (completed.run.run.state === "failed") {
-        inImmediateTransaction(this.database, () => {
-          this.database.prepare(`
-            UPDATE missions SET status = 'failed', updated_at = ? WHERE id = ?
-          `).run(this.timestamp(), completed.run.run.missionId);
-          this.learning.recordTerminalEvaluation({
-            runId: result.runId,
-            terminalStatus: "failed",
-            createdBy: "run-supervisor",
-          });
-        });
+      if (
+        (result.success && completed.directive === "continue") ||
+        completed.directive === "recover" ||
+        completed.run.run.state === "failed"
+      ) {
+        await this.replayContinuations(result.runId);
       }
       const projection = this.repository.getRunProjection(result.runId);
       return {
@@ -735,37 +1345,9 @@ export class MissionRuntimeEngine implements ExecutionResultSink {
       } else {
         this.actionContexts.delete(result.actionId);
       }
+      if (error instanceof RuntimeCrashAfterCommit) throw error;
       throw asRuntimeError(error);
     }
-  }
-
-  private async advanceAfterSuccess(lease: RunLeaseToken, actionId: string, stepId: string): Promise<void> {
-    const durable = this.coordinator.getRun(lease.runId);
-    const advanced = inImmediateTransaction(this.database, () =>
-      this.repository.advanceSuccessfulStep({
-        runId: lease.runId,
-        stepId,
-        actionId,
-        journey: durable.run.journey,
-        now: this.timestamp(),
-        decisionTtlMs: this.decisionTtlMs,
-      }));
-    if (advanced.completed) {
-      await this.evaluateAndFinish(lease);
-      return;
-    }
-    if (durable.run.journey === "guided") {
-      if (!advanced.guidedDecisionId) throw new CommandRuntimeError(500, "guided_decision_missing", "Next Guided decision was not created");
-      this.coordinator.transitionRun({
-        lease,
-        to: "waiting_guided_decision",
-        reason: "The previous result was interpreted and the next explained step is ready",
-        guidedDecisionId: advanced.guidedDecisionId,
-      });
-      return;
-    }
-    if (!advanced.nextIntent) throw new CommandRuntimeError(500, "next_action_missing", "Next Autonomous action is missing");
-    await this.startRepresentedAction(advanced.nextIntent, lease);
   }
 
   private async evaluateAndFinish(initialLease: RunLeaseToken): Promise<void> {
@@ -849,14 +1431,16 @@ export class MissionRuntimeEngine implements ExecutionResultSink {
   }
 
   async approveGuidedDecision(decisionId: string, actorId: string, reason?: string): Promise<DurableAction> {
-    const decision = this.repository.getDecision(decisionId);
-    if (decision.status !== "pending") {
+    const existingDecision = this.repository.getDecision(decisionId);
+    if (existingDecision.status !== "pending") {
       const existing = this.database.prepare(`
         SELECT id FROM actions WHERE guided_decision_id = ? ORDER BY created_at LIMIT 1
       `).get(decisionId) as { id: string } | undefined;
-      if (decision.status === "approved" && existing) return new ActionRepository(this.database).get(existing.id);
+      if (existingDecision.status === "approved" && existing) return new ActionRepository(this.database).get(existing.id);
       throw new CommandRuntimeError(409, "guided_decision_not_pending", "Only a pending Guided decision can be approved");
     }
+    const now = this.timestamp();
+    const decision = this.repository.requireCurrentPendingDecision(decisionId);
     const representedIntent = this.repository.getStepIntent(decision.stepId);
     if (representedIntent.kind === "manual") {
       throw new CommandRuntimeError(
@@ -870,12 +1454,14 @@ export class MissionRuntimeEngine implements ExecutionResultSink {
         },
       );
     }
-    if (Date.parse(decision.expiresAt) <= Date.parse(this.timestamp())) {
+    if (Date.parse(decision.expiresAt) <= Date.parse(now)) {
       this.database.prepare("UPDATE guided_decisions SET status = 'expired' WHERE id = ? AND status = 'pending'").run(decisionId);
       throw new CommandRuntimeError(409, "guided_decision_expired", "The Guided decision expired");
     }
-    const now = this.timestamp();
     inImmediateTransaction(this.database, () => {
+      // Repeat the complete boundary under the write reservation so a plan,
+      // step, or current-decision change cannot race the status mutation.
+      this.repository.requireCurrentPendingDecision(decisionId);
       const updated = this.database.prepare(`
         UPDATE guided_decisions SET status = 'approved', decision_actor = ?, decision_reason = ?, decided_at = ?
         WHERE id = ? AND status = 'pending'
@@ -897,9 +1483,27 @@ export class MissionRuntimeEngine implements ExecutionResultSink {
         resourceId: decisionId, reason: reason?.trim() || "Approved exact represented step",
         details: { actionFingerprint: decision.actionFingerprint }, now,
       });
+      this.continuations.enqueue({
+        runId: decision.runId,
+        kind: "guided_approval_to_dispatch",
+        sourceId: decisionId,
+        payload: { decisionId, stepId: decision.stepId },
+        now,
+      });
     });
-    const lease = this.controlLease(decision.runId);
-    return this.startRepresentedAction(representedIntent, lease, decisionId);
+    this.crashAfterCommit("guided_approval_to_dispatch", decision.runId, decisionId);
+    await this.replayContinuations(decision.runId, ["guided_approval_to_dispatch"]);
+    const created = this.database.prepare(`
+      SELECT id FROM actions WHERE guided_decision_id = ? ORDER BY created_at, id LIMIT 1
+    `).get(decisionId) as { id: string } | undefined;
+    if (!created) {
+      throw new CommandRuntimeError(503, "guided_dispatch_pending", "Approved Guided action is durably queued", {
+        humanMessage: "The exact Guided decision is approved and will resume automatically from its durable continuation.",
+        retryable: true,
+        category: "runtime",
+      });
+    }
+    return new ActionRepository(this.database).get(created.id);
   }
 
   async skipGuidedDecision(
@@ -1046,13 +1650,23 @@ export class MissionRuntimeEngine implements ExecutionResultSink {
         eventSequence,
         now,
       });
+      if (advanced.completed) {
+        const plan = this.database.prepare("SELECT plan_id FROM plan_steps WHERE id = ?")
+          .get(decision.stepId) as { plan_id: string };
+        this.continuations.enqueue({
+          runId: decision.runId,
+          kind: "evaluation_pending",
+          sourceId: plan.plan_id,
+          now,
+        });
+      }
       if (!persisted.lease) {
         throw new CommandRuntimeError(500, "runtime_lease_lost", "Guided skip lost its run lease");
       }
       return { advanced, lease: persisted.lease };
     });
     if (committed.advanced.completed) {
-      await this.evaluateAndFinish(committed.lease);
+      await this.replayContinuations(decision.runId, ["evaluation_pending"]);
     }
     const updated = this.repository.getRunProjection(decision.runId);
     return {
@@ -1069,15 +1683,20 @@ export class MissionRuntimeEngine implements ExecutionResultSink {
 
   async rejectGuidedDecision(decisionId: string, actorId: string, reason: string): Promise<void> {
     const normalizedReason = validateReason(reason);
-    const decision = this.repository.getDecision(decisionId);
-    if (decision.status === "rejected") return;
-    if (decision.status !== "pending") throw new CommandRuntimeError(409, "guided_decision_not_pending", "Only a pending decision can be rejected");
+    const existingDecision = this.repository.getDecision(decisionId);
+    if (existingDecision.status === "rejected") return;
+    if (existingDecision.status !== "pending") throw new CommandRuntimeError(409, "guided_decision_not_pending", "Only a pending decision can be rejected");
+    const decision = this.repository.requireCurrentPendingDecision(decisionId);
     const lease = this.controlLease(decision.runId);
     inImmediateTransaction(this.database, () => {
-      this.database.prepare(`
+      this.repository.requireCurrentPendingDecision(decisionId);
+      const updated = this.database.prepare(`
         UPDATE guided_decisions SET status = 'rejected', decision_actor = ?, decision_reason = ?, decided_at = ?
         WHERE id = ? AND status = 'pending'
       `).run(actorId, normalizedReason, this.timestamp(), decisionId);
+      if (updated.changes !== 1) {
+        throw new CommandRuntimeError(409, "guided_decision_conflict", "Decision changed concurrently");
+      }
       this.database.prepare(`
         UPDATE plan_steps SET status = 'recovering', updated_at = ? WHERE id = ?
       `).run(this.timestamp(), decision.stepId);
@@ -1091,14 +1710,22 @@ export class MissionRuntimeEngine implements ExecutionResultSink {
         action: "guided.decision_rejected", resourceType: "guided_decision",
         resourceId: decisionId, reason: normalizedReason, now: this.timestamp(),
       });
+      this.continuations.enqueue({
+        runId: decision.runId,
+        kind: "resume_recovery_pending",
+        sourceId: decisionId,
+        payload: { decisionId },
+        now: this.timestamp(),
+      });
     });
-    void this.processRunNow(decision.runId).catch(() => undefined);
+    await this.replayContinuations(decision.runId, ["resume_recovery_pending"]);
   }
 
   async submitManualGuidedResult(
     decisionId: string,
     actorId: string,
     summary: string,
+    interpretedEvidenceId?: string,
   ): Promise<ExecutionResultReceipt> {
     const normalized = validateExecutionResultSummary(summary);
     const decision = this.repository.getDecision(decisionId);
@@ -1114,13 +1741,27 @@ export class MissionRuntimeEngine implements ExecutionResultSink {
           category: "internal",
         });
       }
-      const evidence = this.repository.transaction(() => this.repository.createManualEvidence({
-        decision,
-        actionId: existing.id,
-        actorId,
-        content: existing.result_summary!,
-        now: this.timestamp(),
-      }));
+      const linked = this.database.prepare(`
+        SELECT id FROM evidence WHERE action_id = ? AND verification_state = 'verified'
+        ORDER BY created_at, id LIMIT 1
+      `).get(existing.id) as { id: string } | undefined;
+      const evidence = linked
+        ? { id: linked.id }
+        : this.repository.transaction(() => interpretedEvidenceId
+          ? this.repository.promoteInterpretedGuidedEvidence({
+              decision,
+              actionId: existing.id,
+              evidenceId: interpretedEvidenceId,
+              actorId,
+              now: this.timestamp(),
+            })
+          : this.repository.createManualEvidence({
+              decision,
+              actionId: existing.id,
+              actorId,
+              content: existing.result_summary!,
+              now: this.timestamp(),
+            }));
       const projection = this.repository.getRunProjection(decision.runId);
       return {
         accepted: true,
@@ -1135,29 +1776,49 @@ export class MissionRuntimeEngine implements ExecutionResultSink {
     if (decision.status !== "pending") throw new CommandRuntimeError(409, "guided_decision_not_pending", "Manual result requires the pending represented step");
     const lease = this.controlLease(decision.runId);
     const now = this.timestamp();
-    const accepted = inImmediateTransaction(this.database, () => {
+    const { accepted, runningLease } = inImmediateTransaction(this.database, () => {
+      const runs = new RunRepository(this.database);
+      const current = runs.get(decision.runId);
+      runs.assertLease(current, lease, now);
+      if (
+        current.run.journey !== "guided" ||
+        current.run.state !== "waiting_guided_decision"
+      ) {
+        throw new CommandRuntimeError(409, "guided_run_not_waiting", "Guided run is not waiting for this exact result");
+      }
       const updated = this.database.prepare(`
         UPDATE guided_decisions SET status = 'manual', decision_actor = ?, decision_reason = ?, decided_at = ?
         WHERE id = ? AND status = 'pending'
       `).run(actorId, "Operator supplied the result for the represented action", now, decisionId);
       if (updated.changes !== 1) throw new CommandRuntimeError(409, "guided_decision_conflict", "Decision changed concurrently");
       const created = this.repository.createManualAction({ decision, summary: normalized, now });
-      const evidence = this.repository.createManualEvidence({
-        decision,
-        actionId: created,
-        actorId,
-        content: normalized,
-        now,
-      });
+      const evidence = interpretedEvidenceId
+        ? this.repository.promoteInterpretedGuidedEvidence({
+            decision,
+            actionId: created,
+            evidenceId: interpretedEvidenceId,
+            actorId,
+            now,
+          })
+        : this.repository.createManualEvidence({
+            decision,
+            actionId: created,
+            actorId,
+            content: normalized,
+            now,
+          });
       this.repository.events.append({
         missionId: decision.missionId, runId: decision.runId, journey: "guided",
         eventType: "guided.manual_result_recorded", actorType: "operator", actorId,
-        summary: "Operator recorded the result for the exact Guided action",
+        summary: interpretedEvidenceId
+          ? "Operator accepted the interpreted evidence for the exact Guided action"
+          : "Operator recorded the result for the exact Guided action",
         payload: {
           decisionId,
           actionId: created,
           actionFingerprint: decision.actionFingerprint,
           evidenceId: evidence.id,
+          interpretedBeforeAdvance: Boolean(interpretedEvidenceId),
           contentHash: evidence.contentHash,
           byteSize: evidence.byteSize,
         },
@@ -1171,18 +1832,6 @@ export class MissionRuntimeEngine implements ExecutionResultSink {
         details: { actionId: created, evidenceId: evidence.id, contentHash: evidence.contentHash },
         now,
       });
-      return { actionId: created, evidence };
-    });
-    // Manual work resolves the exact decision without dispatching a duplicate
-    // provider action. This is the manual analogue of startAction's guarded
-    // waiting -> running transition and is fully evented/checkpointed.
-    const runningLease = inImmediateTransaction(this.database, () => {
-      const runs = new RunRepository(this.database);
-      const current = runs.get(decision.runId);
-      runs.assertLease(current, lease, now);
-      if (current.run.journey !== "guided" || current.run.state !== "waiting_guided_decision") {
-        throw new CommandRuntimeError(409, "guided_run_not_waiting", "Guided run is not waiting for this result");
-      }
       const nextRun = {
         ...current.run,
         state: "running" as const,
@@ -1198,9 +1847,9 @@ export class MissionRuntimeEngine implements ExecutionResultSink {
           ...(current.control.progress.stepStates ?? {}),
           [decision.stepId]: "completed",
         },
-        evidenceIds: [...new Set([...(current.control.progress.evidenceIds ?? []), accepted.evidence.id])],
+        evidenceIds: [...new Set([...(current.control.progress.evidenceIds ?? []), evidence.id])],
         resolvedDecisionIds: [...new Set([...(current.control.progress.resolvedDecisionIds ?? []), decisionId])],
-        verifiedWorkerResultIds: [...new Set([...(current.control.progress.verifiedWorkerResultIds ?? []), accepted.actionId])],
+        verifiedWorkerResultIds: [...new Set([...(current.control.progress.verifiedWorkerResultIds ?? []), created])],
       };
       const persisted = runs.persistMutation({
         current,
@@ -1224,10 +1873,25 @@ export class MissionRuntimeEngine implements ExecutionResultSink {
         eventSequence: event.sequence,
         now,
       });
+      this.continuations.enqueue({
+        runId: decision.runId,
+        kind: "action_result_to_advance",
+        sourceId: created,
+        payload: { actionId: created, stepId: decision.stepId },
+        now,
+      });
       if (!persisted.lease) throw new CommandRuntimeError(500, "runtime_lease_lost", "Manual result lost its run lease");
-      return persisted.lease;
+      return {
+        accepted: { actionId: created, evidence },
+        runningLease: persisted.lease,
+      };
     });
-    await this.advanceAfterSuccess(runningLease, accepted.actionId, decision.stepId);
+    // Manual work resolves the exact decision without dispatching a duplicate
+    // provider action. Decision, immutable evidence, progress, state, event,
+    // and checkpoint are committed atomically before execution advances.
+    void runningLease;
+    this.crashAfterCommit("manual_result_to_advance", decision.runId, accepted.actionId);
+    await this.replayContinuations(decision.runId, ["action_result_to_advance", "evaluation_pending"]);
     const projection = this.repository.getRunProjection(decision.runId);
     return {
       accepted: true,
@@ -1242,7 +1906,10 @@ export class MissionRuntimeEngine implements ExecutionResultSink {
 
   pauseRun(runId: string, actorId: string, reason: string): void {
     const normalized = validateReason(reason);
-    if ([...this.actionContexts.values()].some((context) => context.action.runId === runId)) {
+    const inFlight = this.database.prepare(`
+      SELECT id FROM actions WHERE run_id = ? AND status IN ('queued', 'running') LIMIT 1
+    `).get(runId) as { id: string } | undefined;
+    if (inFlight) {
       throw new CommandRuntimeError(409, "pause_requires_safe_checkpoint", "An in-flight action cannot be safely paused", {
         humanMessage: "Pause is available at a durable checkpoint; cancel if active child work must stop now.",
         category: "conflict",
@@ -1250,38 +1917,110 @@ export class MissionRuntimeEngine implements ExecutionResultSink {
     }
     const lease = this.controlLease(runId);
     const current = this.coordinator.getRun(runId);
-    if (current.run.state === "blocked") return;
-    const result = this.coordinator.transitionRun({ lease, to: "blocked", reason: `Paused by operator: ${normalized}` });
-    this.database.prepare("UPDATE missions SET status = 'paused', updated_at = ? WHERE id = ?")
-      .run(this.timestamp(), result.run.run.missionId);
-    this.repository.appendAudit({
-      missionId: result.run.run.missionId, runId, actorId, action: "run.paused",
-      resourceType: "run", resourceId: runId, reason: normalized, now: this.timestamp(),
+    if (current.run.state === "blocked") {
+      const paused = this.database.prepare(`
+        SELECT id FROM audit_records
+        WHERE run_id = ? AND action = 'run.paused'
+        ORDER BY occurred_at DESC, id DESC LIMIT 1
+      `).get(runId) as { id: string } | undefined;
+      if (paused) return;
+      throw new CommandRuntimeError(409, "run_blocked_not_paused", "Blocked run requires recovery rather than pause");
+    }
+    const now = this.timestamp();
+    inImmediateTransaction(this.database, () => {
+      const result = this.coordinator.transitionRun({
+        lease,
+        to: "blocked",
+        reason: `Paused by operator: ${normalized}`,
+      });
+      this.database.prepare("UPDATE missions SET status = 'paused', updated_at = ? WHERE id = ?")
+        .run(now, result.run.run.missionId);
+      this.repository.appendAudit({
+        missionId: result.run.run.missionId, runId, actorId, action: "run.paused",
+        resourceType: "run", resourceId: runId, reason: normalized, now,
+      });
     });
+    this.crashAfterCommit("pause_projection_committed", runId);
   }
 
   resumeRun(runId: string, actorId: string, reason: string): void {
     const normalized = validateReason(reason);
+    const successor = this.database.prepare(`
+      SELECT rb.run_id, r.status
+      FROM run_branches rb
+      JOIN runs r ON r.id = rb.run_id
+      WHERE rb.source_run_id = ?
+      ORDER BY rb.created_at DESC, rb.id DESC LIMIT 1
+    `).get(runId) as { run_id: string; status: string } | undefined;
+    if (successor) {
+      throw new CommandRuntimeError(409, "run_superseded_by_branch", "A branched source run cannot resume", {
+        humanMessage: "This paused run was superseded by an explicit new execution attempt and cannot run alongside it.",
+        category: "conflict",
+        details: { successorRunId: successor.run_id, successorStatus: successor.status },
+      });
+    }
     const current = this.coordinator.getRun(runId);
     if (current.run.state !== "blocked") throw new CommandRuntimeError(409, "run_not_paused", "Only a blocked run can resume");
+    const recoveryRetry = current.run.journey === "autonomous" && current.control.recovery?.kind === "retry"
+      ? this.database.prepare(`
+          SELECT a.id AS action_id, a.step_id
+          FROM actions a JOIN runs r ON r.id = a.run_id
+          WHERE a.id = ? AND a.run_id = ? AND a.status IN ('failed', 'timed_out')
+            AND r.current_step_id = a.step_id
+        `).get(current.control.recovery.failedActionId, runId) as {
+          action_id: string;
+          step_id: string;
+        } | undefined
+      : undefined;
+    if (current.control.recovery?.kind === "retry" && current.run.journey === "autonomous" && !recoveryRetry) {
+      throw new CommandRuntimeError(409, "recovery_retry_predecessor_stale", "The exact recovery predecessor is no longer current", {
+        humanMessage: "Refresh recovery state; the failed predecessor no longer matches the current step.",
+        category: "conflict",
+      });
+    }
     const lease = this.controlLease(runId);
-    const pending = this.database.prepare(`
-      SELECT id FROM guided_decisions WHERE run_id = ? AND status = 'pending' ORDER BY created_at DESC LIMIT 1
-    `).get(runId) as { id: string } | undefined;
-    const target: RunState = current.run.journey === "guided" && pending ? "waiting_guided_decision" : "recovering";
-    this.coordinator.transitionRun({
-      lease,
-      to: target,
-      reason: `Resumed by operator: ${normalized}`,
-      ...(pending ? { guidedDecisionId: pending.id } : {}),
+    let target: RunState = "recovering";
+    let continuationKind: RuntimeContinuationKind = "resume_recovery_pending";
+    const now = this.timestamp();
+    inImmediateTransaction(this.database, () => {
+      const pending = this.database.prepare(`
+        SELECT id FROM guided_decisions WHERE run_id = ? AND status = 'pending' ORDER BY created_at DESC LIMIT 1
+      `).get(runId) as { id: string } | undefined;
+      target = current.run.journey === "guided" && pending ? "waiting_guided_decision" : "recovering";
+      const transitioned = this.coordinator.transitionRun({
+        lease,
+        to: target,
+        reason: `Resumed by operator: ${normalized}`,
+        ...(pending ? { guidedDecisionId: pending.id } : {}),
+      });
+      this.database.prepare("UPDATE missions SET status = 'active', updated_at = ? WHERE id = ?")
+        .run(now, current.run.missionId);
+      this.repository.appendAudit({
+        missionId: current.run.missionId, runId, actorId, action: "run.resumed",
+        resourceType: "run", resourceId: runId, reason: normalized, now,
+      });
+      if (target === "recovering") {
+        if (recoveryRetry) {
+          continuationKind = "autonomous_retry_to_dispatch";
+          this.continuations.enqueue({
+            runId,
+            kind: continuationKind,
+            sourceId: recoveryRetry.action_id,
+            payload: { actionId: recoveryRetry.action_id, stepId: recoveryRetry.step_id },
+            now,
+          });
+        } else {
+          this.continuations.enqueue({
+            runId,
+            kind: continuationKind,
+            sourceId: String(transitioned.run.run.stateVersion),
+            now,
+          });
+        }
+      }
     });
-    this.database.prepare("UPDATE missions SET status = 'active', updated_at = ? WHERE id = ?")
-      .run(this.timestamp(), current.run.missionId);
-    this.repository.appendAudit({
-      missionId: current.run.missionId, runId, actorId, action: "run.resumed",
-      resourceType: "run", resourceId: runId, reason: normalized, now: this.timestamp(),
-    });
-    if (target === "recovering") void this.processRunNow(runId).catch(() => undefined);
+    this.crashAfterCommit("resume_projection_committed", runId);
+    if (target === "recovering") void this.replayContinuations(runId, [continuationKind]);
   }
 
   async cancelRun(runId: string, actorId: string, reason: string): Promise<void> {
@@ -1294,6 +2033,7 @@ export class MissionRuntimeEngine implements ExecutionResultSink {
           terminalStatus: "cancelled",
           createdBy: "run-supervisor",
         });
+        await this.replayContinuations(runId, ["evaluation_pending"]);
       }
       return;
     }
@@ -1313,6 +2053,7 @@ export class MissionRuntimeEngine implements ExecutionResultSink {
         createdBy: "run-supervisor",
       });
     });
+    await this.replayContinuations(runId, ["evaluation_pending"]);
   }
 }
 

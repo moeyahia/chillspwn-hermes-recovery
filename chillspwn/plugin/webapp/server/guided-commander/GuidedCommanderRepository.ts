@@ -7,6 +7,7 @@ import type {
   GuidedMessage,
   GuidedMissionContext,
   GuidedRepresentedStep,
+  GuidedReviewedObservation,
   GuidedRunContext,
   GuidedTextResult,
   GuidedTranscriptPage,
@@ -45,6 +46,7 @@ interface ScopeRow {
 interface DecisionRow {
   readonly id: string;
   readonly requested_action_fingerprint: string;
+  readonly requested_parameters_json: string;
   readonly status: string;
 }
 
@@ -66,10 +68,25 @@ interface CursorValue {
   readonly id: string;
 }
 
-interface StoredIdempotency {
+interface StoredCompletedIdempotency {
+  readonly state?: "completed";
   readonly requestHash: string;
   readonly response: JsonValue;
 }
+
+interface StoredProviderReservation {
+  readonly state: "in_progress";
+  readonly requestHash: string;
+  readonly ownerToken: string;
+  readonly expiresAt: string;
+}
+
+type StoredIdempotency = StoredCompletedIdempotency | StoredProviderReservation;
+
+export type ProviderMutationReservationResult =
+  | { readonly status: "reserved"; readonly ownerToken: string; readonly expiresAt: string }
+  | { readonly status: "in_progress"; readonly expiresAt: string }
+  | { readonly status: "replay"; readonly response: JsonValue };
 
 interface Representation {
   readonly action: Readonly<Record<string, unknown>>;
@@ -192,6 +209,46 @@ function idempotencySettingKey(scope: string, key: string): string {
   return `idempotency.guided-commander.${sha256(`${scope}:${key}`)}`;
 }
 
+function parseStoredIdempotency(source: string): StoredIdempotency {
+  let value: unknown;
+  try {
+    value = JSON.parse(source) as unknown;
+  } catch {
+    throw new Error("Stored Guided Commander idempotency record is corrupt");
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("Stored Guided Commander idempotency record is corrupt");
+  }
+  const stored = value as Record<string, unknown>;
+  if (typeof stored.requestHash !== "string" || !stored.requestHash) {
+    throw new Error("Stored Guided Commander idempotency record is corrupt");
+  }
+  if (stored.state === "in_progress") {
+    if (
+      typeof stored.ownerToken !== "string" || !stored.ownerToken ||
+      typeof stored.expiresAt !== "string" || Number.isNaN(Date.parse(stored.expiresAt))
+    ) {
+      throw new Error("Stored Guided Commander provider reservation is corrupt");
+    }
+    return {
+      state: "in_progress",
+      requestHash: stored.requestHash,
+      ownerToken: stored.ownerToken,
+      expiresAt: stored.expiresAt,
+    };
+  }
+  // Records written before durable reservations had no explicit state. Keep
+  // them replayable as completed records during the compatibility window.
+  if ((stored.state === undefined || stored.state === "completed") && "response" in stored) {
+    return {
+      state: "completed",
+      requestHash: stored.requestHash,
+      response: stored.response as JsonValue,
+    };
+  }
+  throw new Error("Stored Guided Commander idempotency record is corrupt");
+}
+
 function asJsonValue<T>(value: T): JsonValue {
   return JSON.parse(JSON.stringify(value)) as JsonValue;
 }
@@ -265,7 +322,7 @@ export class GuidedCommanderRepository {
       });
     }
     const decision = this.database.prepare(`
-      SELECT id, requested_action_fingerprint, status
+      SELECT id, requested_action_fingerprint, requested_parameters_json, status
       FROM guided_decisions
       WHERE mission_id = ? AND run_id = ? AND step_id = ?
       ORDER BY created_at DESC, id DESC LIMIT 1
@@ -314,6 +371,10 @@ export class GuidedCommanderRepository {
         rationale: represented.rationale,
         reversibility: represented.reversibility,
         representedAction: represented.action,
+        decisionParameters: parseJsonValue(
+          decision.requested_parameters_json,
+          "Guided decision parameters",
+        ),
         actionFingerprint: decision.requested_action_fingerprint,
         guidedDecisionId: decision.id,
         guidedDecisionStatus: decision.status,
@@ -395,9 +456,16 @@ export class GuidedCommanderRepository {
     const hasMore = rows.length > input.limit;
     const page = rows.slice(0, input.limit);
     let currentStep: GuidedRepresentedStep | null = null;
+    let currentObservation: GuidedReviewedObservation | null = null;
     if (base.run.currentStepId) {
       try {
         currentStep = this.requireScope(input.missionId, input.runId, base.run.currentStepId).step;
+        currentObservation = this.reviewedObservation(
+          input.missionId,
+          input.runId,
+          base.run.currentStepId,
+          currentStep.actionFingerprint,
+        );
       } catch (error) {
         if (!(error instanceof GuidedCommanderError) || error.code !== "guided_decision_not_represented") throw error;
       }
@@ -405,8 +473,54 @@ export class GuidedCommanderRepository {
     return {
       ...base,
       currentStep,
+      currentObservation,
       items: page.map(messageFromRow),
       nextCursor: hasMore && page.length ? encodeCursor(page[page.length - 1]!) : null,
+    };
+  }
+
+  reviewedObservation(
+    missionId: string,
+    runId: string,
+    stepId: string,
+    actionFingerprint: string,
+  ): GuidedReviewedObservation | null {
+    const row = this.database.prepare(`
+      SELECT e.id, e.content_hash, e.provenance_json, e.verification_state,
+        e.acquired_at, interpreted.details_json AS interpretation_json
+      FROM evidence e
+      JOIN evidence_chain_events interpreted
+        ON interpreted.evidence_id = e.id AND interpreted.event_type = 'interpreted'
+      WHERE e.mission_id = ? AND e.run_id = ? AND e.step_id = ?
+        AND e.evidence_type = 'guided_text_result'
+      ORDER BY interpreted.occurred_at DESC, interpreted.id DESC LIMIT 1
+    `).get(missionId, runId, stepId) as {
+      id: string;
+      content_hash: string;
+      provenance_json: string;
+      verification_state: GuidedReviewedObservation["verificationState"];
+      interpretation_json: string;
+      acquired_at: string;
+    } | undefined;
+    if (!row) return null;
+    const provenance = parseObject(row.provenance_json, "Guided evidence provenance");
+    const interpretation = parseObject(row.interpretation_json, "Guided evidence interpretation");
+    if (provenance.representedActionFingerprint !== actionFingerprint) return null;
+    const source = provenance.source;
+    if (source !== "paste" && source !== "text_upload") return null;
+    return {
+      evidenceId: row.id,
+      contentHash: row.content_hash,
+      source,
+      mediaType: typeof provenance.mediaType === "string" ? provenance.mediaType : "text/plain",
+      fileName: typeof provenance.fileName === "string" ? provenance.fileName : null,
+      byteSize: Number(provenance.byteSize ?? 0),
+      redactionCount: Number(provenance.redactionCount ?? 0),
+      interpretationSummary: typeof interpretation.summary === "string"
+        ? interpretation.summary
+        : "The Guided observation was interpreted.",
+      verificationState: row.verification_state,
+      acquiredAt: row.acquired_at,
     };
   }
 
@@ -701,6 +815,73 @@ export class GuidedCommanderRepository {
     });
   }
 
+  recordTextEvidenceInterpretation(input: {
+    scope: GuidedScope;
+    evidenceId: string;
+    assistantMessageId: string;
+    contextPackId: string;
+    summary: string;
+    confidence: number;
+  }): void {
+    const row = this.database.prepare(`
+      SELECT provenance_json FROM evidence
+      WHERE id = ? AND mission_id = ? AND run_id = ? AND step_id = ?
+        AND evidence_type = 'guided_text_result' AND action_id IS NULL
+    `).get(
+      input.evidenceId,
+      input.scope.mission.id,
+      input.scope.run.id,
+      input.scope.step.id,
+    ) as { provenance_json: string } | undefined;
+    if (!row) {
+      throw new GuidedCommanderError(409, "guided_evidence_scope_conflict", "Evidence is not available for this exact Guided step", {
+        humanMessage: "The observed result no longer belongs to the current represented step.",
+        category: "scope_conflict",
+      });
+    }
+    const provenance = parseObject(row.provenance_json, "Guided evidence provenance");
+    if (provenance.representedActionFingerprint !== input.scope.step.actionFingerprint) {
+      throw new GuidedCommanderError(409, "guided_evidence_fingerprint_conflict", "Evidence action fingerprint changed", {
+        humanMessage: "The observed result was captured for a different exact action.",
+        category: "conflict",
+      });
+    }
+    const now = this.now();
+    this.database.prepare(`
+      INSERT INTO evidence_chain_events (
+        id, evidence_id, event_type, actor, details_json, occurred_at
+      ) VALUES (?, ?, 'interpreted', 'guided-commander', ?, ?)
+    `).run(
+      this.createId("evidence-chain"),
+      input.evidenceId,
+      canonicalJson({
+        assistantMessageId: input.assistantMessageId,
+        contextPackId: input.contextPackId,
+        actionFingerprint: input.scope.step.actionFingerprint,
+        confidence: input.confidence,
+        summary: input.summary,
+      }),
+      now,
+    );
+    this.events.append({
+      missionId: input.scope.mission.id,
+      runId: input.scope.run.id,
+      journey: "guided",
+      eventType: "evidence.guided_text_interpreted",
+      actorType: "agent",
+      actorId: "guided-commander",
+      summary: "Guided Commander interpreted the bounded observation without advancing the step",
+      payload: {
+        evidenceId: input.evidenceId,
+        stepId: input.scope.step.id,
+        assistantMessageId: input.assistantMessageId,
+        actionFingerprint: input.scope.step.actionFingerprint,
+      },
+      contextPackId: input.contextPackId,
+      sensitivity: "private",
+    });
+  }
+
   startProviderTurn(scope: GuidedScope, provider: string, model?: string): { id: string; startedAt: number } {
     const id = this.createId("provider-turn");
     const now = this.now();
@@ -734,19 +915,167 @@ export class GuidedCommanderRepository {
     const row = this.database.prepare("SELECT value_json FROM settings WHERE key = ?")
       .get(idempotencySettingKey(scope, key)) as { value_json: string } | undefined;
     if (!row) return undefined;
-    let stored: StoredIdempotency;
-    try {
-      stored = JSON.parse(row.value_json) as StoredIdempotency;
-    } catch {
-      throw new Error("Stored Guided Commander idempotency record is corrupt");
-    }
+    const stored = parseStoredIdempotency(row.value_json);
     if (stored.requestHash !== requestHash) {
       throw new GuidedCommanderError(409, "idempotency_key_conflict", "Idempotency key was reused with another request", {
         humanMessage: "This action key already belongs to another Guided command.",
         category: "conflict",
       });
     }
-    return stored.response;
+    return stored.state === "in_progress" ? undefined : stored.response;
+  }
+
+  reserveProviderMutation(input: {
+    scope: string;
+    key: string;
+    requestHash: string;
+    actorId: string;
+    leaseMs: number;
+  }): ProviderMutationReservationResult {
+    if (!Number.isSafeInteger(input.leaseMs) || input.leaseMs < 1_000 || input.leaseMs > 15 * 60_000) {
+      throw new RangeError("Guided provider reservation lease must be 1,000 through 900,000 milliseconds");
+    }
+    return this.transaction(() => {
+      const settingKey = idempotencySettingKey(input.scope, input.key);
+      const row = this.database.prepare("SELECT value_json FROM settings WHERE key = ?")
+        .get(settingKey) as { value_json: string } | undefined;
+      const now = this.now();
+      if (row) {
+        const stored = parseStoredIdempotency(row.value_json);
+        if (stored.requestHash !== input.requestHash) {
+          throw new GuidedCommanderError(409, "idempotency_key_conflict", "Idempotency key was reused with another request", {
+            humanMessage: "This action key already belongs to another Guided command.",
+            category: "conflict",
+          });
+        }
+        if (stored.state !== "in_progress") {
+          return { status: "replay", response: stored.response };
+        }
+        if (Date.parse(stored.expiresAt) > Date.parse(now)) {
+          return { status: "in_progress", expiresAt: stored.expiresAt };
+        }
+      }
+
+      const ownerToken = this.createId("guided-provider-owner");
+      const expiresAt = new Date(Date.parse(now) + input.leaseMs).toISOString();
+      const value = canonicalJson({
+        state: "in_progress",
+        requestHash: input.requestHash,
+        ownerToken,
+        expiresAt,
+      });
+      if (row) {
+        this.database.prepare(`
+          UPDATE settings SET value_json = ?, version = version + 1,
+            updated_by = ?, updated_at = ? WHERE key = ?
+        `).run(value, input.actorId, now, settingKey);
+      } else {
+        this.database.prepare(`
+          INSERT INTO settings (key, value_json, sensitivity, version, updated_by, updated_at)
+          VALUES (?, ?, 'private', 1, ?, ?)
+        `).run(settingKey, value, input.actorId, now);
+      }
+      return { status: "reserved", ownerToken, expiresAt };
+    });
+  }
+
+  renewProviderMutationReservation(input: {
+    scope: string;
+    key: string;
+    requestHash: string;
+    ownerToken: string;
+    leaseMs: number;
+  }): boolean {
+    return this.transaction(() => {
+      const settingKey = idempotencySettingKey(input.scope, input.key);
+      const row = this.database.prepare("SELECT value_json FROM settings WHERE key = ?")
+        .get(settingKey) as { value_json: string } | undefined;
+      if (!row) return false;
+      const stored = parseStoredIdempotency(row.value_json);
+      if (
+        stored.state !== "in_progress" ||
+        stored.requestHash !== input.requestHash ||
+        stored.ownerToken !== input.ownerToken
+      ) return false;
+      const now = this.now();
+      const expiresAt = new Date(Date.parse(now) + input.leaseMs).toISOString();
+      this.database.prepare(`
+        UPDATE settings SET value_json = ?, version = version + 1, updated_at = ?
+        WHERE key = ?
+      `).run(canonicalJson({ ...stored, expiresAt }), now, settingKey);
+      return true;
+    });
+  }
+
+  releaseProviderMutationReservation(input: {
+    scope: string;
+    key: string;
+    requestHash: string;
+    ownerToken: string;
+  }): boolean {
+    return this.transaction(() => {
+      const settingKey = idempotencySettingKey(input.scope, input.key);
+      const row = this.database.prepare("SELECT value_json FROM settings WHERE key = ?")
+        .get(settingKey) as { value_json: string } | undefined;
+      if (!row) return false;
+      const stored = parseStoredIdempotency(row.value_json);
+      if (
+        stored.state !== "in_progress" ||
+        stored.requestHash !== input.requestHash ||
+        stored.ownerToken !== input.ownerToken
+      ) return false;
+      return this.database.prepare("DELETE FROM settings WHERE key = ?").run(settingKey).changes === 1;
+    });
+  }
+
+  completeProviderMutationReservation<T>(input: {
+    scope: string;
+    key: string;
+    requestHash: string;
+    ownerToken: string;
+    actorId: string;
+    operation: () => T;
+  }): { value: T; replayed: boolean } {
+    return this.transaction(() => {
+      const settingKey = idempotencySettingKey(input.scope, input.key);
+      const row = this.database.prepare("SELECT value_json FROM settings WHERE key = ?")
+        .get(settingKey) as { value_json: string } | undefined;
+      if (!row) {
+        throw new GuidedCommanderError(409, "guided_commander_reservation_lost", "Provider reservation no longer exists", {
+          category: "conflict",
+          retryable: true,
+          remediation: "Retry with the same Idempotency-Key to obtain the stored response or a new reservation.",
+        });
+      }
+      const stored = parseStoredIdempotency(row.value_json);
+      if (stored.requestHash !== input.requestHash) {
+        throw new GuidedCommanderError(409, "idempotency_key_conflict", "Idempotency key was reused with another request", {
+          category: "conflict",
+        });
+      }
+      if (stored.state !== "in_progress") {
+        return { value: stored.response as T, replayed: true };
+      }
+      if (stored.ownerToken !== input.ownerToken) {
+        throw new GuidedCommanderError(409, "guided_commander_reservation_lost", "Another worker owns the provider reservation", {
+          category: "conflict",
+          retryable: true,
+          remediation: "Retry with the same Idempotency-Key after the active owner completes.",
+        });
+      }
+      const value = input.operation();
+      const response = asJsonValue(value);
+      this.database.prepare(`
+        UPDATE settings SET value_json = ?, version = version + 1,
+          updated_by = ?, updated_at = ? WHERE key = ?
+      `).run(
+        canonicalJson({ state: "completed", requestHash: input.requestHash, response }),
+        input.actorId,
+        this.now(),
+        settingKey,
+      );
+      return { value, replayed: false };
+    });
   }
 
   commitIdempotent<T>(input: {
@@ -766,7 +1095,7 @@ export class GuidedCommanderRepository {
         VALUES (?, ?, 'private', 1, ?, ?)
       `).run(
         idempotencySettingKey(input.scope, input.key),
-        canonicalJson({ requestHash: input.requestHash, response }),
+        canonicalJson({ state: "completed", requestHash: input.requestHash, response }),
         input.actorId,
         this.now(),
       );

@@ -1,4 +1,4 @@
-import express from "express";
+import express, { type Request, type Response } from "express";
 import { createServer } from "http";
 import { WebSocketServer, WebSocket } from "ws";
 import { resolve, join, sep, isAbsolute, dirname } from "path";
@@ -116,6 +116,10 @@ import { registerRuntimeRoutes } from "./routes/runtimeRoutes";
 import { SessionRunMap } from "./runtime/SessionRunMap";
 import { SessionObserver } from "./runtime/SessionObserver";
 import { shutdownProcessTree } from "./runtime/ProcessTreeShutdown";
+import {
+  LiveAttestationCache,
+  type LiveAttestationResult,
+} from "./runtime/LiveAttestationCache";
 import { generatePlanPreview, createOpenRouterCaller, PlanPreviewError } from "./runtime/PlanPreviewService";
 import { generateStrictPlan } from "./runtime/ManagedPlanService";
 import { selectExecutionPersona } from "./runtime/PersonaSelect";
@@ -132,6 +136,7 @@ import { classifySessionKind, structuredSessionName, filterSessionsForList, type
 import { registerMcpRoutes } from "./routes/mcpRoutes";
 import { registerAssetRoutes } from "./routes/assetRoutes";
 import { McpArsenalBridge } from "./mcp/McpArsenalBridge";
+import { verifyAndConsumeGuidedExactStepAttestation } from "./mcp/CommandOsGuidedApproval";
 import {
   acpNotification,
   buildGrokAgentArgs,
@@ -180,6 +185,10 @@ import {
   validateGrokCommanderAssets,
 } from "./providers/GrokCommanderRuntime";
 import {
+  assessGrokSubscriptionAttestation,
+  classifyGrokSubscriptionRpcError,
+} from "./providers/GrokReadinessAttestation";
+import {
   createCommandOsApplication,
   createRuntimeReadinessProviders,
   type CommandOsApplication,
@@ -188,7 +197,15 @@ import {
   type RuntimeProjectionInput,
   type RuntimeReadinessSnapshot,
 } from "./app";
+import { deriveSpecialistCallability, type AttestedMcpRoute } from "./app/SpecialistCallability";
+import { deriveCommandOsDurableActionBoundary } from "./app/DurableActionBoundary";
+import { createE2eLiveAttestationFixture } from "./app/E2eLiveAttestationFixture";
 import {
+  reviewedSelftestDeterministicProjection,
+  verifyReviewedSelftestAttestation,
+} from "./app/ReviewedSelftestAttestation";
+import {
+  autonomousSpecialistTools,
   createCommandOsRuntimeAdapters,
   type CommandOsToolInventory,
   type GrokOAuthTurnResult,
@@ -199,8 +216,16 @@ import {
 } from "./command-runtime";
 import { createMissionRuntimeV2Router } from "./routes/missionRuntimeV2Routes";
 import { createOperationsRouter } from "./routes/operationsRoutes";
+import { createNotificationRouter } from "./notifications";
 import { getDatabaseHealth } from "./db";
 import { createSecondBrainRouter } from "./memory/SecondBrainRouter";
+import {
+  attachV2RequestId,
+  sendV2Error,
+  v2JsonBodyError,
+  v2NotFound,
+  v2RequestContext,
+} from "./contracts/ApiErrorContract";
 import { MemoryRepository } from "./memory";
 import {
   ObsidianVaultBridge,
@@ -210,6 +235,7 @@ import {
 import {
   createGrokGuidedCommanderPort,
   createGuidedCommanderRouter,
+  type GuidedCommanderPort,
 } from "./guided-commander";
 
 
@@ -1535,6 +1561,251 @@ function buildGrokAcpBootstrap(persisted: PersistedSession, prompt: string): str
     previous ? "# DURABLE CONVERSATION CONTEXT\nUse this as established context; do not repeat completed work.\n" + previous : "",
     "# CURRENT OPERATOR MESSAGE\n" + prompt,
   ].filter(Boolean).join("\n\n");
+}
+
+interface GrokLiveReadinessValue {
+  readonly authenticated: true;
+  readonly boundaryVersion: string;
+}
+
+/**
+ * Perform a no-prompt ACP handshake that proves both the refreshable OAuth
+ * identity and the isolated commander boundary are live. No provider response,
+ * auth payload, or stderr content is retained. The outer attestation cache
+ * supplies the hard deadline and abort signal.
+ */
+async function probeGrokAcpReadiness(
+  signal: AbortSignal,
+): Promise<LiveAttestationResult<GrokLiveReadinessValue>> {
+  let grokCommanderRuntime: ReturnType<typeof prepareGrokCommanderRuntime>;
+  let executable: string;
+  try {
+    grokCommanderRuntime = prepareGrokCommanderRuntime("readiness", false);
+    executable = trustedGrokBin();
+  } catch {
+    return {
+      ok: false,
+      retryable: false,
+      reason: "Grok OAuth or a root-controlled ACP boundary prerequisite is unavailable",
+    };
+  }
+
+  const env = buildGrokCommanderEnv(
+    process.env,
+    grokCommanderRuntime,
+    GROK_OAUTH_AUTH_PATH,
+    "planner",
+  );
+  return new Promise((resolveProbe) => {
+    const proc = spawn(executable, buildGrokAgentArgs("grok-4.5", {
+      alwaysApprove: false,
+      noLeader: true,
+      agentProfile: GROK_COMMANDER_PROFILE,
+    }), {
+      stdio: ["pipe", "pipe", "pipe"],
+      cwd: grokCommanderRuntime.cwd,
+      env,
+    });
+    let settled = false;
+    let buffer = "";
+    let requestId = 0;
+    let sessionId = "";
+    let profileAttested = false;
+    let hooksAttested = false;
+    let mcpsAttested = false;
+    let subscriptionAttested = false;
+    let mcpAttempts = 0;
+    const pending = new Map<number, string>();
+
+    const writeWire = (message: unknown): boolean => {
+      if (!proc.stdin?.writable) return false;
+      try {
+        proc.stdin.write(`${JSON.stringify(message)}\n`);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    const onAbort = (): void => {
+      void finish({
+        ok: false,
+        retryable: true,
+        reason: "Grok live OAuth/ACP attestation was cancelled or timed out",
+      });
+    };
+    const finish = async (result: LiveAttestationResult<GrokLiveReadinessValue>): Promise<void> => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener("abort", onAbort);
+      try {
+        await shutdownProcessTree(proc.pid, {
+          requestGracefulStop: () => {
+            if (sessionId) writeWire(acpNotification("session/cancel", { sessionId }));
+            try { proc.stdin?.end(); } catch {}
+          },
+          gracefulWaitMs: 100,
+          termGraceMs: 1_000,
+          killWaitMs: 500,
+        });
+      } catch {
+        // Cleanup never upgrades a failed attestation or exposes diagnostics.
+      } finally {
+        rmSync(grokCommanderRuntime.root, { recursive: true, force: true });
+        resolveProbe(result);
+      }
+    };
+    const rpc = (method: string, params: unknown): void => {
+      const id = ++requestId;
+      pending.set(id, method);
+      if (!writeWire({ jsonrpc: "2.0", id, method, params })) {
+        pending.delete(id);
+        void finish({
+          ok: false,
+          retryable: true,
+          reason: "Grok ACP readiness transport closed during initialization",
+        });
+      }
+    };
+    const maybeFinish = (): void => {
+      if (!settled && profileAttested && hooksAttested && mcpsAttested && subscriptionAttested) {
+        void finish({
+          ok: true,
+          value: {
+            authenticated: true,
+            boundaryVersion: GROK_COMMANDER_BOUNDARY_VERSION,
+          },
+          reason: "Live Grok OAuth and isolated ACP boundary attested",
+        });
+      }
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    if (signal.aborted) {
+      onAbort();
+      return;
+    }
+
+    proc.stdout?.on("data", (chunk: Buffer) => {
+      if (settled) return;
+      buffer += chunk.toString("utf-8");
+      const lines = buffer.split("\n");
+      buffer = lines.pop() ?? "";
+      for (const line of lines) {
+        if (settled || !line.trim()) continue;
+        let message: any;
+        try {
+          message = JSON.parse(line);
+        } catch {
+          void finish({ ok: false, retryable: true, reason: "Grok ACP readiness returned malformed protocol data" });
+          break;
+        }
+        if (isAcpClientRequest(message)) {
+          writeWire(unsupportedAcpMethodResponse(message.id, message.method));
+          continue;
+        }
+        if (message.method === "session/update") {
+          const attestation = attestGrokCommanderToolSurface(message.params?.update);
+          if (!attestation) continue;
+          if (!attestation.ok && !attestation.retryable) {
+            void finish({ ok: false, retryable: false, reason: "Grok ACP root tool boundary attestation failed" });
+          } else if (attestation.ok) {
+            profileAttested = true;
+            maybeFinish();
+          }
+          continue;
+        }
+        if (typeof message.id !== "number") continue;
+        const method = pending.get(message.id);
+        if (!method) continue;
+        pending.delete(message.id);
+        if (message.error) {
+          const subscriptionRpcError = classifyGrokSubscriptionRpcError(method, message.error);
+          if (subscriptionRpcError.outcome === "optional_extension_unavailable" && sessionId) {
+            subscriptionAttested = true;
+            maybeFinish();
+            continue;
+          }
+          const errorText = String(message.error?.message ?? "");
+          const authenticationFailure = method === "authenticate"
+            || /(?:oauth|token|authenticat|unauthori[sz]ed|forbidden|401|403)/iu.test(errorText);
+          const readinessStage = ({
+            initialize: "initialization",
+            "session/new": "session creation",
+            "x.ai/auth/check_subscription": "subscription attestation",
+            "_x.ai/hooks/list": "hook attestation",
+            "_x.ai/mcp/list": "MCP isolation attestation",
+          } as Readonly<Record<string, string>>)[method] ?? "extension attestation";
+          void finish(authenticationFailure
+            ? { ok: false, retryable: false, reason: "Live Grok OAuth authentication was rejected" }
+            : { ok: false, retryable: true, reason: `Grok ACP readiness failed during ${readinessStage}` });
+        } else if (method === "initialize") {
+          if (!supportsGrokPreToolDeny(message.result)) {
+            void finish({ ok: false, retryable: false, reason: "Grok ACP does not attest a blocking pre-tool deny boundary" });
+          } else {
+            rpc("authenticate", { methodId: "cached_token", _meta: { headless: true } });
+          }
+        } else if (method === "authenticate") {
+          rpc("session/new", {
+            cwd: grokCommanderRuntime.cwd,
+            mcpServers: [],
+            _meta: { rules: buildGrokPlanningOnlyRules(GROK_COMMANDER_SOUL) },
+          });
+        } else if (method === "session/new") {
+          sessionId = typeof message.result?.sessionId === "string" ? message.result.sessionId : "";
+          if (!sessionId) {
+            void finish({ ok: false, retryable: true, reason: "Grok ACP did not create an authenticated readiness session" });
+          } else {
+            rpc("x.ai/auth/check_subscription", {});
+            rpc("_x.ai/hooks/list", { sessionId });
+            rpc("_x.ai/mcp/list", { sessionId });
+          }
+        } else if (method === "x.ai/auth/check_subscription") {
+          const subscription = assessGrokSubscriptionAttestation(message.result);
+          if (!subscription.allowed) {
+            void finish({ ok: false, retryable: false, reason: subscription.reason });
+          } else {
+            subscriptionAttested = true;
+            maybeFinish();
+          }
+        } else if (method === "_x.ai/hooks/list") {
+          const attestation = attestGrokCommanderHooks(
+            message.result,
+            GROK_COMMANDER_GUARD,
+            join(grokCommanderRuntime.grokHome, "hooks"),
+            GROK_COMMANDER_BUN,
+          );
+          if (!attestation.ok) {
+            void finish({ ok: false, retryable: false, reason: "Grok ACP pre-tool guard attestation failed" });
+          } else {
+            hooksAttested = true;
+            maybeFinish();
+          }
+        } else if (method === "_x.ai/mcp/list") {
+          const attestation = attestGrokCommanderMcps(message.result, []);
+          if (attestation.retryable && mcpAttempts++ < 25) {
+            setTimeout(() => {
+              if (!settled && sessionId) rpc("_x.ai/mcp/list", { sessionId });
+            }, 200).unref?.();
+          } else if (!attestation.ok) {
+            void finish({ ok: false, retryable: false, reason: "Grok ACP MCP-isolation attestation failed" });
+          } else {
+            mcpsAttested = true;
+            maybeFinish();
+          }
+        }
+      }
+    });
+    // Diagnostics may include provider/auth metadata. Drain but never retain.
+    proc.stderr?.on("data", () => {});
+    proc.on("error", () => {
+      void finish({ ok: false, retryable: true, reason: "Grok ACP readiness process could not start" });
+    });
+    proc.on("close", () => {
+      if (!settled) {
+        void finish({ ok: false, retryable: true, reason: "Grok ACP readiness process exited before attestation" });
+      }
+    });
+    rpc("initialize", grokAcpInitializeParams());
+  });
 }
 
 /**
@@ -3596,6 +3867,8 @@ app.use((_req, res, next) => {
   res.setHeader("Cross-Origin-Opener-Policy", "same-origin");
   next();
 });
+// Correlate canonical API failures before authentication or body parsing.
+app.use(v2RequestContext);
 // IMPORTANT: raw body parser for /proxy must register BEFORE the json
 // middleware below — otherwise express.json() consumes the body before
 // our proxy handler sees the original bytes.
@@ -3604,8 +3877,27 @@ app.use((_req, res, next) => {
 // auth check only reads headers/cookies/query (no parsed body needed). Loopback is
 // always trusted; /api/health stays open; a valid ?token= sets a cookie so the built
 // PWA keeps working without a rebuild. WS upgrades are gated separately (verifyClient).
-app.use(createAuthMiddleware(SECURITY, (e) =>
-  auditSecurity(e.kind, { path: e.path || "", addr: e.addr || "", reason: e.reason })));
+app.use(createAuthMiddleware(
+  SECURITY,
+  (e) => auditSecurity(e.kind, { path: e.path || "", addr: e.addr || "", reason: e.reason }),
+  (request, response) => {
+    const path = request.path ?? "/";
+    if (path !== "/api/v2" && !path.startsWith("/api/v2/")) return false;
+    const expressRequest = request as Request;
+    const expressResponse = response as Response;
+    const requestTraceId = attachV2RequestId(expressRequest, expressResponse);
+    sendV2Error(expressResponse, requestTraceId, {
+      status: 401,
+      code: "command_os_authentication_required",
+      message: "Command OS authentication is required",
+      humanMessage: "Sign in before accessing the Command OS API.",
+      retryable: false,
+      category: "authentication_missing",
+      remediation: "Authenticate with the dashboard session or a supported bearer/header token.",
+    });
+    return true;
+  },
+));
 
 // A valid one-time /?token= bootstrap has already set the HttpOnly cookie above.
 // Redirect before serving HTML so the secret cannot remain in history, screenshots,
@@ -3628,6 +3920,7 @@ app.use(createLegacyExecutionHttpGate({
 // Body parsers (run only for requests that passed auth above).
 app.use("/proxy", express.raw({ type: "*/*", limit: "50mb" }));
 app.use(express.json({ limit: "10mb" }));
+app.use(v2JsonBodyError);
 
 // Serve built frontend in production.
 // index.html: no-store so an iOS PWA can never launch a STALE index that references a
@@ -5197,10 +5490,80 @@ function getMcpBridge(): McpArsenalBridge | null {
       startServers: SECURITY.mcpArsenalStartServers,
       defaultTimeoutMs: SECURITY.mcpArsenalDefaultTimeoutSeconds * 1000,
       maxOutputBytes: SECURITY.mcpArsenalMaxOutputBytes,
+      verifyAndConsumeApprovalAttestation: (request) => {
+        if (request.attestation.kind === "legacy_tool_approval") {
+          return agentRuntime.verifyAndConsumeMcpApprovalAttestation(request);
+        }
+        if (!commandOsApplication) {
+          return { approved: false, reason: "the canonical Guided approval store is unavailable" };
+        }
+        return verifyAndConsumeGuidedExactStepAttestation(
+          commandOsApplication.database,
+          request,
+        );
+      },
     });
   }
   return _mcpBridge;
 }
+
+const grokReadinessAttestations = new LiveAttestationCache<string, GrokLiveReadinessValue>({
+  probe: (_providerId, signal) => probeGrokAcpReadiness(signal),
+  successTtlMs: 5 * 60_000,
+  failureTtlMs: 30_000,
+  maximumFailureBackoffMs: 5 * 60_000,
+  timeoutMs: 15_000,
+  maximumConcurrency: 1,
+  describeKey: () => "Grok OAuth/ACP route",
+});
+const e2eLiveAttestationFixture = createE2eLiveAttestationFixture(process.env);
+const reviewedSelftestAttestation = (() => {
+  try {
+    return verifyReviewedSelftestAttestation(process.env, SECURITY.mcpArsenalConfig);
+  } catch (error) {
+    log("warn", "Reviewed no-network selftest attestation failed; deterministic compilation remains disabled", {
+      error: String(error instanceof Error ? error.message : error).slice(0, 500),
+    });
+    return null;
+  }
+})();
+
+interface LiveMcpRouteValue {
+  readonly tools: readonly string[];
+}
+
+const mcpRouteAttestations = new LiveAttestationCache<string, LiveMcpRouteValue>({
+  async probe(serverName, signal) {
+    const bridge = getMcpBridge();
+    if (!bridge?.isEnabled() || !SECURITY.mcpArsenalStartServers) {
+      return { ok: false, retryable: false, reason: "MCP live execution or server startup is disabled" };
+    }
+    const record = bridge.listServers().find(({ spec }) => spec.name === serverName);
+    if (!record || (record.health.state !== "configured" && record.health.state !== "healthy")) {
+      return { ok: false, retryable: false, reason: "MCP route prerequisites are unavailable" };
+    }
+    const result = await bridge.probeTools(serverName, signal);
+    if (!result.ok || !Array.isArray(result.tools)) {
+      return { ok: false, retryable: true, reason: "MCP live tools/list attestation failed" };
+    }
+    const expected = [...new Set(record.spec.toolNames)].sort();
+    const actual = [...new Set(result.tools)].sort();
+    if (expected.length !== actual.length || expected.some((tool, index) => tool !== actual[index])) {
+      return { ok: false, retryable: false, reason: "MCP live tool surface differs from the reviewed route declaration" };
+    }
+    return {
+      ok: true,
+      value: { tools: actual },
+      reason: "Live MCP tools/list surface attested",
+    };
+  },
+  successTtlMs: 2 * 60_000,
+  failureTtlMs: 30_000,
+  maximumFailureBackoffMs: 5 * 60_000,
+  timeoutMs: Math.min(60_000, Math.max(2_000, SECURITY.mcpArsenalDefaultTimeoutSeconds * 1_000)),
+  maximumConcurrency: 2,
+  describeKey: (name) => `MCP route ${name}`,
+});
 registerMcpRoutes(app, {
   bridge: getMcpBridge,
   agentRuntime,
@@ -5230,14 +5593,15 @@ registerAssetRoutes(app, {
 let commandOsApplication: CommandOsApplication | null = null;
 let commandOsMissionRuntime: MissionRuntimeEngine | null = null;
 let obsidianVaultWatcher: ObsidianVaultWatcher | null = null;
-let commandOsDurableBoundaryActive = false;
 
 /**
  * Project only the specialist/tool bindings that the live MCP bridge can
  * actually dispatch. The planning-only Grok commander receives this bounded
  * inventory; it never receives a shell or an MCP connection of its own.
  */
-function commandOsToolInventory(): CommandOsToolInventory[] {
+function commandOsToolInventory(
+  currentAttestedRoutes = commandOsAttestedMcpRoutes(),
+): CommandOsToolInventory[] {
   const planningOnlySpecialists = AGENT_ROSTER.map((agent) => ({
     agentId: agent.agentId,
     role: agent.specialty,
@@ -5246,29 +5610,64 @@ function commandOsToolInventory(): CommandOsToolInventory[] {
     toolNames: [] as string[],
     safetyBoundaries: agent.safetyBoundaries,
   }));
+  if (e2eLiveAttestationFixture) {
+    const recon = getSpecialistAgent("ReconScout");
+    const route = e2eLiveAttestationFixture.mcpRoutes[0];
+    if (recon && route) {
+      return [...planningOnlySpecialists, {
+        agentId: recon.agentId,
+        role: recon.specialty,
+        description: recon.description,
+        mcpServer: route.name,
+        toolNames: route.tools.filter((tool) => recon.allowedTools.includes(tool)),
+        // The opt-in no-network E2E fixture is the only inventory projection
+        // with a reviewed deterministic empty-input template. Live/general
+        // MCP inventory remains ineligible for analysis-to-tool compilation.
+        deterministicToolInputs: { quick_scan: {} },
+        deterministicToolInputAttestations: {
+          quick_scan: {
+            attestationId: "e2e-no-network-quick-scan-empty-input-v1",
+            templateHash: "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+          },
+        },
+        safetyBoundaries: recon.safetyBoundaries,
+      }];
+    }
+  }
   try {
     const bridge = getMcpBridge();
     if (!bridge?.isEnabled() || !SECURITY.mcpArsenalStartServers) return planningOnlySpecialists;
-
+    const attestedRoutes = new Map(
+      currentAttestedRoutes
+        .filter((route) => route.verified)
+        .map((route) => [route.name, route] as const),
+    );
     const inventory: CommandOsToolInventory[] = [...planningOnlySpecialists];
-    for (const { spec, health } of bridge.listServers()) {
-      if (health.state !== "healthy" && health.state !== "configured") continue;
+    for (const { spec } of bridge.listServers()) {
+      const route = attestedRoutes.get(spec.name);
+      if (!route) continue;
       for (const assignedAgentId of spec.assignedAgents) {
         const agent = getSpecialistAgent(assignedAgentId);
-        const view = bridge.toolsForSpecialist(assignedAgentId);
-        const serverView = view?.servers.find((server) => server.name === spec.name);
-        if (!agent || !view || !serverView) continue;
-        const toolNames = serverView.tools.filter((toolName) =>
-          view.availableTools.includes(toolName)
-          && spec.toolNames.includes(toolName)
-          && !agent.deniedTools.includes(toolName));
+        // Config assignment is not authority to create a new specialist route.
+        // The reviewed selftest uses the existing reconnaissance alias so it
+        // must pass this unchanged static roster boundary like production.
+        if (!agent || !agent.allowedMcpServers.includes(spec.name)) continue;
+        const toolNames = autonomousSpecialistTools(
+          agent.agentId,
+          route.tools.filter((toolName) => agent.allowedTools.includes(toolName) && spec.toolNames.includes(toolName)),
+        );
         if (toolNames.length === 0) continue;
+        const deterministicProjection = reviewedSelftestDeterministicProjection(
+          reviewedSelftestAttestation,
+          { agentId: agent.agentId, mcpServer: spec.name, toolNames },
+        );
         inventory.push({
           agentId: agent.agentId,
           role: agent.specialty,
           description: agent.description,
           mcpServer: spec.name,
           toolNames,
+          ...(deterministicProjection ?? {}),
           safetyBoundaries: agent.safetyBoundaries,
         });
       }
@@ -5282,23 +5681,58 @@ function commandOsToolInventory(): CommandOsToolInventory[] {
   }
 }
 
-function commandOsProviderReadiness(): ProviderReadiness[] {
-  let grokHealth: ProviderReadiness["health"] = "unhealthy";
-  let grokAuthenticated = false;
-  let grokReason = "Grok OAuth or the isolated ACP commander boundary is unavailable";
-  try {
-    trustedGrokBin();
-    validateGrokCommanderAssets({
-      profile: GROK_COMMANDER_PROFILE,
-      pluginDir: GROK_COMMANDER_PLUGIN,
-      soul: GROK_COMMANDER_SOUL,
-      authPath: GROK_OAUTH_AUTH_PATH,
-    });
-    grokHealth = "healthy";
-    grokAuthenticated = true;
-    grokReason = "OAuth state and the isolated ACP commander assets passed local validation";
-  } catch (error: any) {
-    grokReason = String(error?.message || grokReason).replaceAll(resolve(process.env.HOME || "/var/lib/chillspwn"), "~").slice(0, 500);
+function currentCommandOsDurableBoundary(
+  attestedRoutes: readonly AttestedMcpRoute[],
+): boolean {
+  return deriveCommandOsDurableActionBoundary({
+    runtimeCoordinatorReady: Boolean(commandOsMissionRuntime),
+    policy: {
+      routingEnabled: SECURITY.enableSpecialistAgentRouting,
+      delegationEnforced: SECURITY.enforceChillspwnDelegation,
+      noHandsCommanderEnforced: SECURITY.enforceChillspwnNoHands,
+      directCommanderToolsAllowed: SECURITY.allowChillspwnDirectTools,
+      specialistAssignmentRequired: SECURITY.requireSpecialistAssignment,
+    },
+    specialistInventory: commandOsToolInventory(attestedRoutes),
+  });
+}
+
+function commandOsProviderReadiness(durableBoundaryActive: boolean): ProviderReadiness[] {
+  let grokProvider: ProviderReadiness;
+  if (e2eLiveAttestationFixture) {
+    grokProvider = e2eLiveAttestationFixture.provider;
+  } else {
+    grokReadinessAttestations.refreshIfDue("grok-acp");
+    const grokAttestation = grokReadinessAttestations.snapshot("grok-acp");
+    const grokCallable = grokAttestation.verified
+      && grokAttestation.value?.authenticated === true;
+    const grokHealth: ProviderReadiness["health"] = grokAttestation.state === "healthy"
+      ? "healthy"
+      : grokAttestation.state === "unhealthy"
+        ? "unhealthy"
+        : "degraded";
+    grokProvider = {
+      id: "grok-acp",
+      health: grokHealth,
+      authenticated: grokCallable,
+      callable: grokCallable,
+      ...(grokAttestation.attestedAt ? { attestedAt: grokAttestation.attestedAt } : {}),
+      ...(grokAttestation.expiresAt ? { expiresAt: grokAttestation.expiresAt } : {}),
+      circuitState: grokAttestation.inFlight
+        ? "probing"
+        : grokAttestation.consecutiveFailures > 0
+          ? "open"
+          : "closed",
+      supportsGuided: grokCallable,
+      enforcesAutonomousBoundary: grokCallable && durableBoundaryActive
+        && SECURITY.enforceChillspwnDelegation
+        && SECURITY.enforceChillspwnNoHands
+        && !SECURITY.allowChillspwnDirectTools
+        && SECURITY.requireSpecialistAssignment,
+      reportsExactTokenUsage: true,
+      reportsExactCostUsage: false,
+      reason: grokAttestation.reason,
+    };
   }
 
   const credentialProviders = readHermesCredentialProviderNames(resolve(HERMES_HOME, "auth.json"));
@@ -5318,27 +5752,19 @@ function commandOsProviderReadiness(): ProviderReadiness[] {
     && existsSync(CLAUDE_PROJECTS_DIR);
   const legacyGateEnforced = SECURITY.enableOpenrouterRuntimeGating
     && SECURITY.openrouterGateMode === "enforce";
-  const strongBoundary = commandOsDurableBoundaryActive
+  const strongBoundary = durableBoundaryActive
     && SECURITY.enforceChillspwnDelegation
     && SECURITY.enforceChillspwnNoHands
     && !SECURITY.allowChillspwnDirectTools
     && SECURITY.requireSpecialistAssignment;
 
   return [
-    {
-      id: "grok-acp",
-      health: grokHealth,
-      authenticated: grokAuthenticated,
-      supportsGuided: grokAuthenticated,
-      enforcesAutonomousBoundary: grokAuthenticated && strongBoundary,
-      reportsExactTokenUsage: true,
-      reportsExactCostUsage: false,
-      reason: grokReason,
-    },
+    grokProvider,
     {
       id: "codex-oauth",
       health: codexConfigured ? "degraded" : "unhealthy",
       authenticated: codexConfigured,
+      callable: false,
       supportsGuided: codexConfigured,
       enforcesAutonomousBoundary: codexConfigured && strongBoundary && legacyGateEnforced,
       reportsExactTokenUsage: false,
@@ -5351,6 +5777,7 @@ function commandOsProviderReadiness(): ProviderReadiness[] {
       id: "openrouter",
       health: openRouterConfigured ? "degraded" : "unhealthy",
       authenticated: openRouterConfigured,
+      callable: false,
       supportsGuided: openRouterConfigured,
       enforcesAutonomousBoundary: openRouterConfigured && strongBoundary && legacyGateEnforced,
       reportsExactTokenUsage: false,
@@ -5363,6 +5790,7 @@ function commandOsProviderReadiness(): ProviderReadiness[] {
       id: "gemini",
       health: geminiConfigured ? "degraded" : "unhealthy",
       authenticated: geminiConfigured,
+      callable: false,
       supportsGuided: geminiConfigured,
       enforcesAutonomousBoundary: geminiConfigured && strongBoundary && legacyGateEnforced,
       reportsExactTokenUsage: false,
@@ -5375,6 +5803,7 @@ function commandOsProviderReadiness(): ProviderReadiness[] {
       id: "claude-oauth",
       health: claudeConfigured ? "degraded" : "unhealthy",
       authenticated: claudeConfigured,
+      callable: false,
       supportsGuided: claudeConfigured,
       enforcesAutonomousBoundary: false,
       reportsExactTokenUsage: false,
@@ -5386,10 +5815,67 @@ function commandOsProviderReadiness(): ProviderReadiness[] {
   ];
 }
 
-function commandOsMcpProjection(): {
+function commandOsAttestedMcpRoutes(): AttestedMcpRoute[] {
+  if (e2eLiveAttestationFixture) return [...e2eLiveAttestationFixture.mcpRoutes];
+  const bridge = getMcpBridge();
+  if (!bridge) return [];
+  return bridge.listServers().map(({ spec, health }) => {
+    if (
+      bridge.isEnabled()
+      && SECURITY.mcpArsenalStartServers
+      && (health.state === "configured" || health.state === "healthy")
+    ) {
+      mcpRouteAttestations.refreshIfDue(spec.name);
+    }
+    const snapshot = mcpRouteAttestations.snapshot(spec.name);
+    return {
+      name: spec.name,
+      verified: snapshot.verified,
+      tools: snapshot.verified ? snapshot.value?.tools ?? [] : [],
+      assignedAgentIds: spec.assignedAgents,
+      attestedAt: snapshot.attestedAt,
+      expiresAt: snapshot.expiresAt,
+      reason: snapshot.reason,
+    };
+  });
+}
+
+function commandOsMcpProjection(attestedRoutes = commandOsAttestedMcpRoutes()): {
   readiness: RuntimeReadinessSnapshot["mcp"];
   servers: McpServerProjection[];
 } {
+  if (e2eLiveAttestationFixture) {
+    const route = e2eLiveAttestationFixture.mcpRoutes[0]!;
+    return {
+      readiness: {
+        enabled: true,
+        executionMode: "enabled",
+        startPermitted: true,
+        configuredServers: 1,
+        runnableServers: 1,
+        missingDependencies: 0,
+        missingSecrets: 0,
+      },
+      servers: [{
+        id: `mcp:${route.name}`,
+        name: route.name,
+        transport: "e2e-no-network-fixture",
+        endpointRedacted: "[E2E-only fixture] no network endpoint",
+        status: "healthy",
+        capabilities: route.tools,
+        policy: {
+          enabled: true,
+          assignedAgents: ["ReconScout"],
+          declaredCapabilities: route.tools,
+          riskClass: "read-only-fixture",
+          startPermitted: true,
+          liveAttested: true,
+          liveAttestedAt: route.attestedAt,
+          attestationReason: route.reason,
+        },
+      }],
+    };
+  }
   const bridge = getMcpBridge();
   if (!bridge) {
     return {
@@ -5407,8 +5893,9 @@ function commandOsMcpProjection(): {
   }
   const records = bridge.listServers();
   const health = records.map((record) => record.health);
-  const serverStatus = (state: string): McpServerProjection["status"] => {
-    if (state === "healthy") return "healthy";
+  const routeByName = new Map(attestedRoutes.map((route) => [route.name, route] as const));
+  const serverStatus = (state: string, verified: boolean): McpServerProjection["status"] => {
+    if (verified) return "healthy";
     if (state === "configured" || state === "starting") return "degraded";
     if (state === "disabled" || state === "failed" || state === "stopped"
       || state === "missing_dependency" || state === "missing_secret") return "offline";
@@ -5420,29 +5907,45 @@ function commandOsMcpProjection(): {
       executionMode: bridge.mode,
       startPermitted: SECURITY.mcpArsenalStartServers,
       configuredServers: records.length,
-      runnableServers: health.filter((item) => item.state === "healthy" || item.state === "configured").length,
+      runnableServers: attestedRoutes.filter((route) => route.verified).length,
       missingDependencies: health.filter((item) => item.state === "missing_dependency").length,
       missingSecrets: health.filter((item) => item.state === "missing_secret").length,
     },
-    servers: records.map(({ spec, health: serverHealth }) => ({
-      id: `mcp:${spec.name.replace(/[^A-Za-z0-9._-]+/gu, "-")}`,
-      name: spec.name,
-      transport: spec.runtime,
-      endpointRedacted: `local ${spec.runtime}`,
-      status: serverStatus(serverHealth.state),
-      capabilities: spec.toolNames,
-      policy: {
-        enabled: spec.enabled,
-        assignedAgents: spec.assignedAgents,
-        riskClass: spec.riskClass ?? "unspecified",
-        startPermitted: SECURITY.mcpArsenalStartServers,
-      },
-    })),
+    servers: records.map(({ spec, health: serverHealth }) => {
+      const route = routeByName.get(spec.name);
+      return {
+        id: `mcp:${spec.name.replace(/[^A-Za-z0-9._-]+/gu, "-")}`,
+        name: spec.name,
+        transport: spec.runtime,
+        endpointRedacted: `local ${spec.runtime}`,
+        status: serverStatus(serverHealth.state, route?.verified === true),
+        capabilities: route?.verified ? route.tools : [],
+        policy: {
+          enabled: spec.enabled,
+          assignedAgents: spec.assignedAgents,
+          declaredCapabilities: spec.toolNames,
+          riskClass: spec.riskClass ?? "unspecified",
+          startPermitted: SECURITY.mcpArsenalStartServers,
+          liveAttested: route?.verified === true,
+          liveAttestedAt: route?.attestedAt ?? null,
+          attestationReason: route?.reason ?? "Live MCP route has not been attested",
+        },
+      };
+    }),
   };
 }
 
 function commandOsRuntimeSnapshot(): RuntimeReadinessSnapshot {
-  const mcp = commandOsMcpProjection().readiness;
+  const routes = commandOsAttestedMcpRoutes();
+  const durableBoundaryActive = currentCommandOsDurableBoundary(routes);
+  const providers = commandOsProviderReadiness(durableBoundaryActive);
+  const mcp = commandOsMcpProjection(routes).readiness;
+  const agents = AGENT_ROSTER.map((agent) => deriveSpecialistCallability(agent, {
+    routingEnabled: SECURITY.enableSpecialistAgentRouting,
+    durableBoundaryActive,
+    providers,
+    mcpRoutes: routes,
+  }));
   let secondBrain: RuntimeReadinessSnapshot["secondBrain"] = "unknown";
   try {
     secondBrain = commandOsApplication && getDatabaseHealth(commandOsApplication.database).healthy
@@ -5452,13 +5955,13 @@ function commandOsRuntimeSnapshot(): RuntimeReadinessSnapshot {
     secondBrain = "unhealthy";
   }
   return {
-    actionBoundaryActive: commandOsDurableBoundaryActive,
+    actionBoundaryActive: durableBoundaryActive,
     delegationEnforced: SECURITY.enableSpecialistAgentRouting && SECURITY.enforceChillspwnDelegation,
     noHandsCommanderEnforced: SECURITY.enforceChillspwnNoHands,
     directCommanderToolsDenied: !SECURITY.allowChillspwnDirectTools,
     specialistAssignmentRequired: SECURITY.requireSpecialistAssignment,
-    specialistsConfigured: SECURITY.enableSpecialistAgentRouting ? AGENT_ROSTER.length : 0,
-    providers: commandOsProviderReadiness(),
+    specialistsConfigured: agents.filter((agent) => agent.status === "available").length,
+    providers,
     mcp,
     eventStream: commandOsApplication?.eventStream.isStarted ? "healthy" : "unhealthy",
     secondBrain,
@@ -5468,40 +5971,15 @@ function commandOsRuntimeSnapshot(): RuntimeReadinessSnapshot {
 
 function commandOsRuntimeProjection(): RuntimeProjectionInput {
   const readiness = commandOsRuntimeSnapshot();
-  const mcp = commandOsMcpProjection();
-  const agentStatus = !SECURITY.enableSpecialistAgentRouting
-    ? "offline" as const
-    : commandOsDurableBoundaryActive
-      ? "available" as const
-      : "degraded" as const;
+  const routes = commandOsAttestedMcpRoutes();
+  const mcp = commandOsMcpProjection(routes);
   return {
     readiness,
-    agents: AGENT_ROSTER.map((agent) => ({
-      id: agent.agentId,
-      role: agent.specialty,
-      displayName: agent.displayName,
-      status: agentStatus,
-      providerPolicy: { defaultProvider: agent.defaultProvider },
-      toolPolicy: {
-        allowedTools: agent.allowedTools,
-        deniedTools: agent.deniedTools,
-        approvalRequiredTools: agent.approvalRequiredTools,
-      },
-      configuration: {
-        personaId: agent.personaId,
-        allowedMcpServers: agent.allowedMcpServers,
-        outputContract: agent.outputContract,
-        evidenceRequirements: agent.evidenceRequirements,
-        safetyBoundaries: agent.safetyBoundaries,
-        canProposeLessons: agent.canProposeTrainingLessons,
-        canApproveLessons: agent.canApproveTrainingLessons,
-      },
-      version: "2.1",
-      capabilities: agent.allowedTools.map((name) => ({
-        name,
-        source: "reviewed-roster",
-        enabled: true,
-      })),
+    agents: AGENT_ROSTER.map((agent) => deriveSpecialistCallability(agent, {
+      routingEnabled: SECURITY.enableSpecialistAgentRouting,
+      durableBoundaryActive: readiness.actionBoundaryActive,
+      providers: readiness.providers,
+      mcpRoutes: routes,
     })),
     mcpServers: mcp.servers,
   };
@@ -5549,18 +6027,45 @@ app.use(createSecondBrainRouter({
   vaultBridge: commandOsVaultBridge,
   onVaultConnectionChanged: () => obsidianVaultWatcher?.refreshConnections(),
 }));
+const guidedCommanderPort: GuidedCommanderPort =
+  process.env.NODE_ENV === "test" && process.env.CHILLSPWN_E2E_GUIDED_FIXTURE === "1"
+    ? {
+        kind: "planning_only",
+        supportsToolExecution: false,
+        providerId: "e2e-guided-fixture",
+        model: "explicit-test-fixture",
+        async respond(input) {
+          return {
+            body: input.action === "interpret_result"
+              ? "[E2E fixture] The bounded result contains the expected success marker. It supports completing this exact manual step after operator review."
+              : "[E2E fixture] This read-only step gathers one bounded result and remains paused for the exact operator decision.",
+            summary: input.action === "interpret_result"
+              ? "[E2E fixture] Result matches the represented success pattern"
+              : "[E2E fixture] Exact step explained without execution",
+            confidence: 1,
+            observations: input.action === "interpret_result"
+              ? ["[E2E fixture] The expected success marker is present"]
+              : ["[E2E fixture] No action was executed"],
+            recommendedNextStep: input.action === "interpret_result"
+              ? "Review and accept this exact evidence to advance."
+              : "Choose one exact-step control.",
+          };
+        },
+      }
+    : createGrokGuidedCommanderPort({
+        model: "grok-4.5",
+        callGrok: (prompt, signal) => callGrokAcpOAuth(
+          prompt,
+          "grok-4.5",
+          process.cwd(),
+          signal,
+        ),
+      });
+
 app.use(createGuidedCommanderRouter({
   database: commandOsApplication.database,
   resolveActor: () => "operator:local",
-  port: createGrokGuidedCommanderPort({
-    model: "grok-4.5",
-    callGrok: (prompt, signal) => callGrokAcpOAuth(
-      prompt,
-      "grok-4.5",
-      process.cwd(),
-      signal,
-    ),
-  }),
+  port: guidedCommanderPort,
   options: {
     maximumMemorySensitivity: "private",
     memoryContextBudget: 6_000,
@@ -5592,6 +6097,8 @@ app.use(createMissionRuntimeV2Router({
 }));
 app.use(createOperationsRouter({
   database: commandOsApplication.database,
+  providerRouteIds: commandOsRuntimeAdapters.providerRouteIds,
+  vaultPathPolicy: commandOsVaultPathPolicy,
   resolveActor: () => ({ id: "operator:local", type: "admin" }),
   // The host auth middleware already gates this single-operator deployment.
   // Supplying scope explicitly keeps the operations module tenant-safe and
@@ -5604,21 +6111,27 @@ app.use(createOperationsRouter({
     canReviewFindings: true,
     canOverrideEvidenceGate: true,
     canReviewLessons: true,
+    canReviewAdministrativeApprovals: true,
+    canManageRecovery: true,
+    canDownloadArtifactContent: true,
+    canExportEvidenceBundles: true,
+    canExportAuditRecords: true,
   }),
 }));
+app.use(createNotificationRouter({
+  database: commandOsApplication.database,
+  resolveActor: () => ({ id: "operator:local", type: "admin" }),
+  resolveAccess: () => ({
+    maximumSensitivity: "restricted",
+    allEngagements: true,
+    allowUnscopedSystemData: true,
+  }),
+}));
+app.use(v2NotFound);
 
-// This projection is deliberately fail-closed. It becomes true only when the
-// durable coordinator, strict no-hands policy, and a real executable specialist
-// inventory all exist. Provider OAuth alone is never advertised as autonomy.
-commandOsDurableBoundaryActive = Boolean(
-  commandOsMissionRuntime
-  && SECURITY.enableSpecialistAgentRouting
-  && SECURITY.enforceChillspwnDelegation
-  && SECURITY.enforceChillspwnNoHands
-  && !SECURITY.allowChillspwnDirectTools
-  && SECURITY.requireSpecialistAssignment
-  && commandOsToolInventory().some((binding) => Boolean(binding.mcpServer) && binding.toolNames.length > 0),
-);
+// Readiness derives the durable boundary from the current coordinator, policy,
+// and live-attested specialist inventory on every evaluation. Provider OAuth
+// alone is never advertised as autonomy, and expired routes fail closed again.
 
 // ── Phase 7.1: chat ↔ agent-runtime integration (observe-only) ────────────────────────
 // Seam A creates/attaches an OBSERVE-ONLY AgentRun per chat session; the SessionObserver
@@ -10457,7 +10970,9 @@ try {
   log("info", "Command OS V2.1 canonical services started", {
     database: "command-os-v2.sqlite",
     eventStream: "ready",
-    autonomousBoundary: commandOsDurableBoundaryActive ? "enforced" : "blocked-until-coordinator-ready",
+    autonomousBoundary: currentCommandOsDurableBoundary(commandOsAttestedMcpRoutes())
+      ? "enforced"
+      : "blocked-until-coordinator-ready",
     recoveredRuns: runtimeLifecycle?.recoveredRuns ?? 0,
     scheduledRuns: runtimeLifecycle?.scheduledRuns ?? 0,
   });
@@ -10571,6 +11086,8 @@ async function gracefulShutdown(signal: NodeJS.Signals): Promise<void> {
   try {
     // Stop workers and confirm child cleanup while the database remains open;
     // then stop live delivery. Durable outbox rows remain replayable.
+    grokReadinessAttestations.stop();
+    mcpRouteAttestations.stop();
     await commandOsMissionRuntime?.stop();
     await obsidianVaultWatcher?.stop();
     await commandOsApplication?.stop();

@@ -1,7 +1,7 @@
 import { type FormEvent, type ReactNode, useCallback, useEffect, useMemo, useState } from "react";
 import { useEventStream } from "../../data/events/EventStreamProvider";
 import { Button, Card, EmptyState, ErrorPanel, LoadingPanel, StatusPill } from "../../design-system/components/Primitives";
-import { AppLink } from "../../app/router/navigation";
+import { AppLink, useNavigation } from "../../app/router/navigation";
 
 export function formatTime(value: string | null | undefined): string {
   if (!value) return "Not reported";
@@ -63,22 +63,23 @@ export interface UrlFilters {
 }
 
 export function useUrlFilters(defaults: Record<string, string> = {}): UrlFilters {
+  const navigation = useNavigation();
+  const defaultsKey = JSON.stringify(defaults);
   const read = useCallback(() => {
-    const params = new URLSearchParams(window.location.search);
+    const params = new URLSearchParams(navigation.search);
     const result: Record<string, string> = { ...defaults };
     params.forEach((value, key) => { result[key] = value; });
     return result;
-  }, [JSON.stringify(defaults)]);
-  const [values, setValues] = useState(read);
-  useEffect(() => { const update = () => setValues(read()); window.addEventListener("popstate", update); return () => window.removeEventListener("popstate", update); }, [read]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- defaultsKey is the stable value contract for caller literals.
+  }, [defaultsKey, navigation.search]);
+  const values = useMemo(read, [read]);
   const set = useCallback((patch: Record<string, string | undefined>, options: { resetCursor?: boolean; replace?: boolean } = {}) => {
-    const params = new URLSearchParams(window.location.search);
+    const params = new URLSearchParams(navigation.search);
     if (options.resetCursor !== false && !("cursor" in patch)) params.delete("cursor");
     Object.entries(patch).forEach(([key, value]) => value ? params.set(key, value) : params.delete(key));
-    const url = `${window.location.pathname}${params.size ? `?${params.toString()}` : ""}`;
-    window.history[options.replace === false ? "pushState" : "replaceState"]({}, "", url);
-    setValues(read());
-  }, [read]);
+    const url = `${navigation.pathname}${params.size ? `?${params.toString()}` : ""}`;
+    navigation.navigate(url, { replace: options.replace !== false });
+  }, [navigation]);
   return useMemo(() => ({ values, set, key: new URLSearchParams(values).toString() }), [values, set]);
 }
 

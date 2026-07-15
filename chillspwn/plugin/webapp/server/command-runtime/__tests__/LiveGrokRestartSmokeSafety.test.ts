@@ -3,6 +3,8 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import {
   LIVE_RESTART_CONFIRMATION,
+  REVIEWED_SELFTEST_ATTESTATION_ENV,
+  REVIEWED_SELFTEST_ATTESTATION_TOKEN,
   REVIEWED_SELFTEST_PATH,
   REVIEWED_SELFTEST_SERVER,
   REVIEWED_SELFTEST_TOOL,
@@ -96,10 +98,11 @@ describe("live Grok process restart smoke safety boundary", () => {
     expect(child.OPENROUTER_API_KEY).toBe("");
     expect(child.GITHUB_TOKEN).toBeUndefined();
     expect(child.AWS_SECRET_ACCESS_KEY).toBeUndefined();
+    expect(child[REVIEWED_SELFTEST_ATTESTATION_ENV]).toBeUndefined();
     expect(Object.values(child)).not.toContain("must-not-cross");
   });
 
-  test("accepts only the pinned no-network local-selftest MCP surface", () => {
+  test("accepts only the pinned no-network selftest on the existing reconnaissance alias", () => {
     const fixture = JSON.parse(readFileSync(resolve(
       import.meta.dir,
       "../../../scripts/command-os-v2/fixtures/local-selftest.mcp.json",
@@ -109,7 +112,7 @@ describe("live Grok process restart smoke safety boundary", () => {
     expect(() => validateReviewedSelftestConfig({
       ...fixture,
       mcpServers: { ...fixture.mcpServers, anotherServer: fixture.mcpServers[REVIEWED_SELFTEST_SERVER] },
-    })).toThrow("only local-selftest");
+    })).toThrow("outside the reviewed schema");
     expect(() => validateReviewedSelftestConfig({
       ...fixture,
       mcpServers: {
@@ -130,7 +133,74 @@ describe("live Grok process restart smoke safety boundary", () => {
     expect(source).toContain("await waitUntilLeaseExpired(paths.databasePath, runId)");
     expect(source).toContain("eventType=run.recovery_started");
     expect(source).toContain("await stopGracefully(finalServer)");
+    const configValidation = source.indexOf("validateReviewedSelftestConfig(");
+    const tokenAssignment = source.indexOf(
+      "serverEnvironment[REVIEWED_SELFTEST_ATTESTATION_ENV] = REVIEWED_SELFTEST_ATTESTATION_TOKEN",
+    );
+    expect(configValidation).toBeGreaterThan(0);
+    expect(tokenAssignment).toBeGreaterThan(configValidation);
+    expect(REVIEWED_SELFTEST_ATTESTATION_TOKEN).not.toBe("1");
+    expect(source).toContain("verifiedEvidenceCount: count(database");
+    expect(source).toContain("unverifiedEvidenceCount: count(database");
+    expect(source).toContain("toolCallStatusCounts");
+    expect(source).toContain("actionStatusCounts");
+    expect(source).toContain("evaluatorLogs");
+    expect(source).toContain("domain = 'command-runtime.evaluator'");
+    expect(source).toContain('validationField: String(attributes.validationField || "unknown")');
+    expect(source).toContain('validationRule: String(attributes.validationRule || "unknown")');
+    expect(source).toContain('if (value === "1/2" || value === "2/2") return value');
+    expect(source).toContain("return value === 1 ? 1 : 0");
+    expect(source.match(/repairAttempt: safeRepairAttempt\(attributes\.repairAttempt\)/gu)).toHaveLength(2);
+    expect(source).not.toContain("Number(attributes.repairAttempt || 0)");
+    expect(source).not.toContain("String(attributes.repairAttempt");
+    expect(source).toContain("GROUP BY tc.status ORDER BY tc.status");
+    expect(source).toContain("GROUP BY status ORDER BY status");
     expect(source).not.toMatch(/readFileSync\([^\n]*(?:authPath|GROK_AUTH_PATH)/u);
+    expect(source).not.toMatch(/safePlanningFailureDiagnostic[\s\S]*?SELECT[^;]*(?:content|raw_output|prompt|response_json)/iu);
+  });
+
+  test("contains a real Guided planning-only acceptance before Autonomous process recovery", () => {
+    const source = readFileSync(resolve(
+      import.meta.dir,
+      "../../../scripts/command-os-v2/live-grok-restart-resume-smoke.ts",
+    ), "utf8");
+    const guidedCall = source.indexOf("await runGuidedAcceptance(paths.databasePath, activeServer)");
+    const autonomousCreate = source.indexOf('"live-restart-autonomous-create"');
+    expect(guidedCall).toBeGreaterThan(0);
+    expect(autonomousCreate).toBeGreaterThan(guidedCall);
+    expect(source).toContain('journey: "guided"');
+    expect(source).toContain('target: "127.0.0.1"');
+    expect(source).toContain('new Set(["waiting_guided_decision"])');
+    expect(source).toContain("decisions.items.length !== 1");
+    expect(source).toContain('/^[a-f0-9]{64}$/u.test(actionFingerprint)');
+    expect(source).toContain("requested_parameters_json");
+    expect(source).toContain("commander/show-next-step");
+    expect(source).toContain("structured.executionPerformed !== false");
+    expect(source).toContain("structured.planMutated !== false");
+    expect(source).toContain("after.planDigest !== before.planDigest");
+    expect(source).toContain("after.actionCount !== 0");
+    expect(source).toContain("after.toolCallCount !== 0");
+    expect(source).toContain("Guided explanation changed the pending exact-step decision");
+    expect(source).toContain("Guided cancellation left a pending decision, action, assignment, provider turn, or ghost-active run");
+  });
+
+  test("contains interrupted-run cleanup for both conventional termination signals", () => {
+    const source = readFileSync(resolve(
+      import.meta.dir,
+      "../../../scripts/command-os-v2/live-grok-restart-resume-smoke.ts",
+    ), "utf8");
+    expect(source).toContain('process.on("SIGINT", () => terminateFromSignal("SIGINT"))');
+    expect(source).toContain('process.on("SIGTERM", () => terminateFromSignal("SIGTERM"))');
+    expect(source).toContain('signal === "SIGINT" ? 130 : 143');
+    expect(source).toContain("const server = activeServer;\n      activeServer = undefined;");
+    expect(source).toContain("await stopBestEffort(server)");
+    expect(source).toContain("const disposableRoot = tempRoot;\n      tempRoot = undefined;");
+    expect(source).toContain("rmSync(disposableRoot, { recursive: true, force: true })");
+    expect(source).toContain("if (!isolatedCleanup)");
+    expect(source).toContain("if (!server.containment)");
+    expect(source).toContain('signalProcessGroupBestEffort(pid, "SIGTERM")');
+    expect(source).toContain('signalProcessGroupBestEffort(pid, "SIGKILL")');
+    expect(source).toContain("waitForProcessGroupExit(pid, 10_000)");
   });
 
   test("rejects duplicate work, user-wait states, and ghost process records", () => {

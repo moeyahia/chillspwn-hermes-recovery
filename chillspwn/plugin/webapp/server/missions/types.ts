@@ -31,7 +31,7 @@ export interface AutonomousMissionRequest {
   readonly contract: {
     readonly allowedActionClasses: readonly string[];
     readonly prohibitedActionClasses: readonly string[];
-    readonly destructivePolicy: string;
+    readonly destructivePolicy: "prohibited" | "contract_only";
     readonly evidenceRequirements: readonly string[];
     readonly timeBudgetMinutes: number;
     readonly tokenBudget?: number;
@@ -55,6 +55,8 @@ export interface AutonomousMissionRequest {
     readonly providerPolicy: "automatic_enforcing_only";
     /** Every tool action must match the signed action-class and target allowlist. */
     readonly toolPolicy: "contract_allowlist";
+    /** Exact specialists permitted for this run; the planner cannot assign outside this pool. */
+    readonly specialistAgentIds: readonly string[];
     readonly memoryScopes: readonly string[];
     /** Exact, operator-selected memory nodes; no broader memory may be retrieved. */
     readonly contextNodeIds: readonly string[];
@@ -84,6 +86,63 @@ export interface AutonomousContextCandidate {
   readonly updatedAt: string;
 }
 
+export interface AutonomousProviderPathCandidate {
+  readonly id: string;
+  readonly status: "healthy" | "degraded" | "unhealthy" | "unknown";
+  readonly authenticated: boolean;
+  readonly enforcesAutonomousBoundary: boolean;
+  readonly reportsExactTokenUsage: boolean;
+  readonly reportsExactCostUsage: boolean;
+  readonly compatible: boolean;
+  readonly reason: string;
+  readonly checkedAt: string;
+}
+
+export interface AutonomousToolServerCandidate {
+  readonly id: string;
+  readonly name: string;
+  readonly status: "unknown" | "healthy" | "degraded" | "offline" | "quarantined";
+  readonly capabilities: readonly string[];
+  readonly assignedAgentIds: readonly string[];
+  readonly enabled: boolean;
+  readonly startPermitted: boolean;
+  readonly riskClass: string;
+  readonly checkedAt?: string;
+}
+
+export interface AutonomousSpecialistCandidate {
+  readonly id: string;
+  readonly displayName: string;
+  readonly role: string;
+  readonly status: "available" | "busy" | "degraded" | "offline" | "quarantined";
+  readonly capabilities: readonly string[];
+  readonly runnableTools: readonly string[];
+  readonly mcpServerIds: readonly string[];
+  readonly providerPolicy: {
+    readonly defaultProvider?: string;
+  };
+  readonly toolPolicy: {
+    readonly allowedTools: readonly string[];
+    readonly deniedTools: readonly string[];
+    readonly approvalRequiredTools: readonly string[];
+  };
+  readonly compatible: boolean;
+  readonly incompatibilityReasons: readonly string[];
+  readonly lastHeartbeatAt?: string;
+}
+
+export interface AutonomousExecutionPreview {
+  readonly providers: readonly AutonomousProviderPathCandidate[];
+  readonly tools: readonly AutonomousToolServerCandidate[];
+  readonly team: {
+    readonly candidates: readonly AutonomousSpecialistCandidate[];
+    readonly selectedAgentIds: readonly string[];
+    readonly invalidSelectedAgentIds: readonly string[];
+    readonly recommendedAgentIds: readonly string[];
+    readonly effectiveAgentIds: readonly string[];
+  };
+}
+
 export interface AutonomousMissionPreflight {
   readonly schemaVersion: "2.1";
   readonly contract: {
@@ -96,6 +155,7 @@ export interface AutonomousMissionPreflight {
     readonly selectedNodeIds: readonly string[];
     readonly invalidSelectedNodeIds: readonly string[];
   };
+  readonly execution: AutonomousExecutionPreview;
   readonly policySummary: {
     readonly provider: string;
     readonly tools: string;
@@ -179,10 +239,138 @@ export interface MissionSummary {
   readonly title: string;
   readonly journey: Journey;
   readonly status: string;
+  readonly missionStatus: string;
+  readonly authorizationStatus: string;
+  readonly engagementId: string | null;
+  readonly scope: {
+    readonly allowedTargets: readonly string[];
+    readonly allowedTargetCount: number;
+    readonly prohibitedTargetCount: number;
+  };
+  readonly createdAt: string;
   readonly updatedAt: string;
-  readonly currentPhase?: string;
-  readonly progress?: number;
-  readonly nextAction?: string;
+  readonly runId: string | null;
+  readonly activeRunId: string | null;
+  readonly runStartedAt: string | null;
+  readonly runEndedAt: string | null;
+  readonly currentPhase: string | null;
+  readonly progress: number | null;
+  readonly currentOwner: {
+    readonly id: string;
+    readonly name: string | null;
+  } | null;
+  readonly team: readonly {
+    readonly id: string;
+    readonly name: string | null;
+  }[];
+  readonly provider: string | null;
+  readonly risk: string | null;
+  readonly evidenceCount: number;
+  readonly highestFindingSeverity: "informational" | "low" | "medium" | "high" | "critical" | null;
+  readonly decisionState: string | null;
+  readonly recoveryState: "recovering" | "blocked" | null;
+  readonly lastMeaningfulEvent: {
+    readonly type: string;
+    readonly summary: string;
+    readonly occurredAt: string;
+  } | null;
+  readonly budget: {
+    readonly limits: Readonly<Record<string, number>>;
+    readonly usage: Readonly<Record<string, number>>;
+  };
+  readonly nextAction: string | null;
+}
+
+export type MissionEvidenceFilter = "present" | "none";
+export type MissionRecoveryFilter = "recovering" | "blocked" | "none";
+
+export interface MissionPortfolioFilterState {
+  readonly query: string;
+  readonly journey: Journey | "";
+  readonly status: string;
+  readonly engagement: string;
+  readonly target: string;
+  readonly agent: string;
+  readonly provider: string;
+  readonly updatedFrom: string;
+  readonly updatedTo: string;
+  readonly risk: string;
+  readonly evidence: MissionEvidenceFilter | "";
+  readonly findingSeverity: string;
+  readonly decisionState: string;
+  readonly recoveryState: MissionRecoveryFilter | "";
+  readonly view: "table" | "board";
+}
+
+export interface SavedMissionView {
+  readonly id: string;
+  readonly name: string;
+  readonly state: MissionPortfolioFilterState;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+}
+
+export interface SavedMissionViewCollection {
+  readonly schemaVersion: "2.1";
+  readonly version: number;
+  readonly items: readonly SavedMissionView[];
+}
+
+export interface MissionBulkItemOutcome {
+  readonly missionId: string;
+  readonly status: "archived" | "exported" | "ineligible" | "not_found";
+  readonly reason: string;
+}
+
+export interface MissionBulkArchiveResult {
+  readonly schemaVersion: "2.1";
+  readonly selectionHash: string;
+  readonly outcomes: readonly MissionBulkItemOutcome[];
+  readonly archivedCount: number;
+}
+
+export interface MissionExportRecord {
+  readonly missionId: string;
+  readonly titlePreview: string;
+  readonly titleSha256: string;
+  readonly titleTruncated: boolean;
+  readonly journey: Journey;
+  readonly missionStatus: string;
+  readonly authorizationStatus: string;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+  readonly engagement: { readonly present: boolean; readonly sha256: string | null };
+  readonly scope: {
+    readonly allowedTargetCount: number;
+    readonly prohibitedTargetCount: number;
+    readonly targetSetSha256: string;
+  };
+  readonly latestRun: {
+    readonly id: string;
+    readonly status: string;
+    readonly progress: number;
+    readonly phase: string | null;
+    readonly ownerId: string | null;
+    readonly startedAt: string | null;
+    readonly endedAt: string | null;
+  } | null;
+  readonly evidenceCount: number;
+  readonly findingCounts: Readonly<Record<string, number>>;
+}
+
+export interface MissionBulkExportResult {
+  readonly schemaVersion: "2.1";
+  readonly generatedAt: string;
+  readonly selectionHash: string;
+  readonly exportSha256: string;
+  readonly records: readonly MissionExportRecord[];
+  readonly outcomes: readonly MissionBulkItemOutcome[];
+  readonly policy: {
+    readonly maxBatch: number;
+    readonly evidenceBlobsIncluded: false;
+    readonly confidentialPayloadsIncluded: false;
+    readonly titlePreviewLimit: number;
+  };
 }
 
 export interface AttentionItem {

@@ -8,6 +8,7 @@ import {
   type MemoryCandidate,
   type MemoryCandidatePage,
   type MemoryContextPack,
+  type MemoryContextPackPage,
   type MemoryControlPolicy,
   type MemoryEdgeSummary,
   type MemoryGraph,
@@ -320,6 +321,32 @@ export function parseMemoryContextPack(payload: unknown): MemoryContextPack {
     retrievalMetrics: record(value.retrievalMetrics ?? {}, "retrieval metrics"),
     createdBy: text(value.createdBy, "context creator"), createdAt: text(value.createdAt, "context createdAt"),
     items: list(value.items, "context items").map(parseContextItem),
+  };
+}
+
+export function parseMemoryContextPackPage(payload: unknown): MemoryContextPackPage {
+  const value = record(unwrap(payload), "context pack page");
+  return {
+    items: list(value.items, "context pack summaries").map((entry) => {
+      const item = record(entry, "context pack summary");
+      return {
+        id: text(item.id, "context pack summary id"),
+        ...(optionalText(item.missionId) ? { missionId: optionalText(item.missionId) } : {}),
+        ...(optionalText(item.runId) ? { runId: optionalText(item.runId) } : {}),
+        ...(optionalText(item.stepId) ? { stepId: optionalText(item.stepId) } : {}),
+        ...(optionalText(item.actionId) ? { actionId: optionalText(item.actionId) } : {}),
+        ...(optionalText(item.messageId) ? { messageId: optionalText(item.messageId) } : {}),
+        journey: enumValue(item.journey, ["autonomous", "guided"] as const, "context pack summary journey"),
+        purpose: text(item.purpose, "context pack summary purpose"),
+        contextBudget: count(item.contextBudget, "context pack summary budget"),
+        createdBy: text(item.createdBy, "context pack summary creator"),
+        createdAt: text(item.createdAt, "context pack summary createdAt"),
+        retrievedItemCount: count(item.retrievedItemCount, "context pack retrieved count"),
+        usedItemCount: count(item.usedItemCount, "context pack used count"),
+        correctedItemCount: count(item.correctedItemCount, "context pack corrected count"),
+      };
+    }),
+    totalReturned: count(value.totalReturned, "returned context pack count"),
   };
 }
 

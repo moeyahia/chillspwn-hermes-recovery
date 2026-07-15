@@ -37,6 +37,7 @@ describe("Guided Commander client schemas", () => {
       rationale: "Evidence selects the next branch.",
       reversibility: "Read-only.",
       representedAction: { target: "lab.internal" },
+      decisionParameters: { kind: "manual", target: "lab.internal" },
       actionFingerprint: "a".repeat(64),
       guidedDecisionId: "decision-test",
       guidedDecisionStatus: "pending",
@@ -58,10 +59,24 @@ describe("Guided Commander client schemas", () => {
         progress: 0,
       },
       currentStep: representedStep,
+      currentObservation: {
+        evidenceId: "evidence-test",
+        contentHash: "c".repeat(64),
+        source: "paste",
+        mediaType: "text/plain",
+        fileName: null,
+        byteSize: 9,
+        redactionCount: 0,
+        interpretationSummary: "The observed marker matches the expected output",
+        verificationState: "unverified",
+        acquiredAt: "2026-07-15T10:00:00.000Z",
+      },
       items: [message("message-operator", "operator"), message("message-assistant", "assistant")],
       nextCursor: null,
     });
     expect(transcript.currentStep?.actionFingerprint).toBe("a".repeat(64));
+    expect(transcript.currentStep?.decisionParameters).toEqual({ kind: "manual", target: "lab.internal" });
+    expect(transcript.currentObservation?.evidenceId).toBe("evidence-test");
     expect(transcript.items).toHaveLength(2);
 
     const reply = parseGuidedCommanderReply({

@@ -33,6 +33,7 @@ const REQUEST: AutonomousMissionRequest = {
     retentionPolicy: "operator_managed",
     providerPolicy: "automatic_enforcing_only",
     toolPolicy: "contract_allowlist",
+    specialistAgentIds: ["agent-recon"],
     memoryScopes: ["verified_lessons"],
     contextNodeIds: [],
     safeStopConditions: ["Scope conflict"],
@@ -52,6 +53,7 @@ function healthy(): RuntimeReadinessSnapshot {
       id: "xai-grok",
       health: "healthy",
       authenticated: true,
+      callable: true,
       supportsGuided: true,
       enforcesAutonomousBoundary: true,
       reportsExactTokenUsage: true,
@@ -90,6 +92,7 @@ describe("runtime-backed readiness", () => {
         id: "xai-grok",
         health: "healthy",
         authenticated: true,
+        callable: true,
         supportsGuided: true,
         enforcesAutonomousBoundary: false,
         reportsExactTokenUsage: true,
@@ -148,6 +151,33 @@ describe("runtime-backed readiness", () => {
         "provider_token_accounting_autonomous",
         "provider_cost_accounting_autonomous",
       ]));
+  });
+
+  test("does not authorize an unprobed or revoked Grok route", async () => {
+    for (const provider of [
+      {
+        ...healthy().providers[0]!,
+        health: "degraded" as const,
+        authenticated: false,
+        callable: false,
+        reason: "Grok OAuth has not completed a live attestation",
+      },
+      {
+        ...healthy().providers[0]!,
+        health: "unhealthy" as const,
+        authenticated: false,
+        callable: false,
+        reason: "Live Grok OAuth authentication was rejected",
+      },
+    ]) {
+      const result = await new ReadinessService(createRuntimeReadinessProviders(() => ({
+        ...healthy(),
+        providers: [provider],
+      }))).evaluateJourney("autonomous", { request: REQUEST });
+      expect(result.status).toBe("blocked");
+      expect(result.checks.find((item) => item.id === "provider_execution_autonomous")?.status)
+        .toBe("fail");
+    }
   });
 
   test("surfaces an explicit degraded state when the legacy execution rollback window is active", async () => {

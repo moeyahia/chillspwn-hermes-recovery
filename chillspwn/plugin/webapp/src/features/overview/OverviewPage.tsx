@@ -105,7 +105,7 @@ function Dashboard({ data }: { data: OverviewSnapshot }) {
                   <StatusPill status={mission.journey}>{mission.journey === "autonomous" ? "Autonomous" : "Guided"}</StatusPill>
                   <span className="os-operation-progress">
                     <span><i style={{ width: `${mission.progress ?? 0}%` }} /></span>
-                    <small>{mission.progress === undefined ? "Progress unavailable" : `${Math.round(mission.progress)}%`}</small>
+                    <small>{mission.progress === null ? "Progress unavailable" : `${Math.round(mission.progress)}%`}</small>
                   </span>
                   <span className="os-operation-next">{mission.nextAction ?? mission.status}</span>
                 </ButtonLink>

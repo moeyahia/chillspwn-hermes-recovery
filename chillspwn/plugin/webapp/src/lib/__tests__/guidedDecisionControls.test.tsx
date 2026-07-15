@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { renderToStaticMarkup } from "react-dom/server";
+import { NavigationProvider } from "../../app/router/navigation";
 import { RUNTIME_ENDPOINTS } from "../../data/api/runtimeV2";
 import type { GuidedDecision } from "../../domain/types/runtimeV2";
 import { DecisionCard } from "../../features/decisions/DecisionsPage";
@@ -26,11 +27,25 @@ const decision: GuidedDecision = {
 
 describe("Guided exact-step control presentation", () => {
   test("visibly separates planning-only interpretation from completion and mission stop", () => {
-    const markup = renderToStaticMarkup(<DecisionCard decision={decision} onChanged={() => undefined} />);
-    expect(markup).toContain("Complete and advance after manual execution");
-    expect(markup).toContain("This is not interpretation.");
-    expect(markup).toContain("marks the step complete, and advances canonical execution");
-    expect(markup).toContain("Complete exact step and advance");
+    const originalWindow = globalThis.window;
+    Object.defineProperty(globalThis, "window", {
+      configurable: true,
+      value: {
+        location: { pathname: "/decisions" },
+        addEventListener: () => undefined,
+        removeEventListener: () => undefined,
+        history: { pushState: () => undefined, replaceState: () => undefined },
+        scrollTo: () => undefined,
+      },
+    });
+    const markup = renderToStaticMarkup(
+      <NavigationProvider><DecisionCard decision={decision} onChanged={() => undefined} /></NavigationProvider>,
+    );
+    Object.defineProperty(globalThis, "window", { configurable: true, value: originalWindow });
+    expect(markup).toContain("I ran it — submit and interpret output");
+    expect(markup).toContain("Manual completion is evidence-gated.");
+    expect(markup).toContain("review the persisted Commander interpretation");
+    expect(markup).toContain("Open Guided result review");
     expect(markup).toContain("Skip this exact step");
     expect(markup).toContain("Creates no action and no evidence.");
     expect(markup).toContain("Skip exact step");

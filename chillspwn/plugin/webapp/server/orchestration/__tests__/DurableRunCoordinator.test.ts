@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { mappingFor, specialistToolDecision } from "../../agents/agentMcpMap";
 import { createDatabaseConnection, migrateDatabase } from "../../db";
 import { fingerprintAction } from "../../supervisor";
 import {
@@ -53,11 +54,12 @@ function seedRun(database: Database, input: {
   status?: string;
   allowedActions?: string[];
   budget?: Record<string, number>;
-}): { missionId: string; stepId: string; contractId?: string } {
+}): { missionId: string; stepId: string; assignmentId: string; contractId?: string } {
   const now = "2026-07-14T23:59:00.000Z";
   const missionId = `mission_${input.runId}`;
   const planId = `plan_${input.runId}`;
   const stepId = `step_${input.runId}`;
+  const assignmentId = `assignment_${input.runId}`;
   database.prepare(`
     INSERT INTO missions (
       id, name, objective, journey, status, authorization_status,
@@ -80,20 +82,23 @@ function seedRun(database: Database, input: {
       missionId,
       "a".repeat(64),
       JSON.stringify({
-        allowedActionClasses: input.allowedActions ?? ["scan", "mutate"],
+        allowedActionClasses: input.allowedActions ?? ["scan", "mutate", "reconnaissance"],
         prohibitedActionClasses: [],
+        destructivePolicy: "prohibited",
+        specialistAgentIds: ["ReconScout"],
       }),
       JSON.stringify(input.budget ?? { toolCalls: 20, concurrency: 3, retries: 2, replans: 2 }),
       now,
       now,
     );
-    database.prepare(`
-      INSERT INTO mission_targets (
-        id, mission_id, target, target_type, disposition,
-        normalized_target, created_at
-      ) VALUES (?, ?, 'target-1', 'other', 'allowed', 'target-1', ?)
-    `).run(`target_${input.runId}`, missionId, now);
   }
+
+  database.prepare(`
+    INSERT INTO mission_targets (
+      id, mission_id, target, target_type, disposition,
+      normalized_target, created_at
+    ) VALUES (?, ?, 'target-1', 'other', 'allowed', 'target-1', ?)
+  `).run(`target_${input.runId}`, missionId, now);
 
   database.prepare(`
     INSERT INTO runs (
@@ -118,25 +123,41 @@ function seedRun(database: Database, input: {
     ) VALUES (?, ?, 1, 'active', 'Fixture strategy', ?, 'system', ?, ?)
   `).run(planId, input.runId, `hash_${input.runId}`, now, now);
   database.prepare(`
+    INSERT OR IGNORE INTO agents (
+      id, role, display_name, status, version, created_at, updated_at
+    ) VALUES ('ReconScout', 'reconnaissance', 'ReconScout', 'available', '1', ?, ?)
+  `).run(now, now);
+  database.prepare(`
     INSERT INTO plan_steps (
       id, plan_id, run_id, ordinal, phase, title, objective,
-      status, created_at, updated_at
-    ) VALUES (?, ?, ?, 0, 'recon', 'Fixture step', 'Collect evidence', 'running', ?, ?)
+      status, assigned_agent_id, created_at, updated_at
+    ) VALUES (?, ?, ?, 0, 'recon', 'Fixture step', 'Collect evidence',
+      'ready', 'ReconScout', ?, ?)
   `).run(stepId, planId, input.runId, now, now);
+  database.prepare(`
+    INSERT INTO assignments (
+      id, run_id, step_id, agent_id, status, created_at, updated_at
+    ) VALUES (?, ?, ?, 'ReconScout', 'queued', ?, ?)
+  `).run(assignmentId, input.runId, stepId, now, now);
   database.prepare("UPDATE runs SET current_plan_id = ?, current_step_id = ? WHERE id = ?")
     .run(planId, stepId, input.runId);
-  return { missionId, stepId, ...(contractId ? { contractId } : {}) };
+  return { missionId, stepId, assignmentId, ...(contractId ? { contractId } : {}) };
 }
 
-function intent(fixture: { missionId: string; stepId: string }, runId: string, overrides: Partial<DurableActionIntent> = {}): DurableActionIntent {
+function intent(fixture: { missionId: string; stepId: string; assignmentId: string }, runId: string, overrides: Partial<DurableActionIntent> = {}): DurableActionIntent {
   return {
     missionId: fixture.missionId,
     runId,
     stepId: fixture.stepId,
+    assignmentId: fixture.assignmentId,
     planVersion: 1,
     actionType: "scan",
     actionClass: "reconnaissance",
-    arguments: { ports: [80, 443] },
+    arguments: {
+      mcpServer: "sechub-reconnaissance",
+      toolName: "quick_scan",
+      arguments: { ports: [80, 443] },
+    },
     target: "target-1",
     intentSummary: "Map approved services",
     kind: "tool",
@@ -204,6 +225,104 @@ describe("DurableRunCoordinator", () => {
     }
   });
 
+  test("revalidates canonical Autonomous authority after lease acquisition and safe-stops without an action", async () => {
+    const cases: Array<{
+      name: string;
+      mutate: (database: Database, fixture: ReturnType<typeof seedRun>) => void;
+    }> = [
+      {
+        name: "mission authorization revoked",
+        mutate(database, fixture) {
+          database.prepare("UPDATE missions SET authorization_status = 'revoked' WHERE id = ?")
+            .run(fixture.missionId);
+        },
+      },
+      {
+        name: "contract superseded",
+        mutate(database, fixture) {
+          database.prepare("UPDATE mission_contracts SET state = 'superseded' WHERE id = ?")
+            .run(fixture.contractId!);
+        },
+      },
+      {
+        name: "contract version drifted",
+        mutate(database, fixture) {
+          database.prepare("UPDATE mission_contracts SET version = version + 1 WHERE id = ?")
+            .run(fixture.contractId!);
+        },
+      },
+      {
+        name: "contract hash drifted",
+        mutate(database, fixture) {
+          database.prepare("UPDATE mission_contracts SET contract_hash = ? WHERE id = ?")
+            .run("b".repeat(64), fixture.contractId!);
+        },
+      },
+      {
+        name: "target prohibited",
+        mutate(database, fixture) {
+          database.prepare("UPDATE mission_targets SET disposition = 'prohibited' WHERE mission_id = ?")
+            .run(fixture.missionId);
+        },
+      },
+      {
+        name: "specialist removed from contract",
+        mutate(database, fixture) {
+          database.prepare(`
+            UPDATE mission_contracts
+            SET action_policy_json = json_set(
+              action_policy_json, '$.specialistAgentIds', json('["WebBreaker"]')
+            ) WHERE id = ?
+          `).run(fixture.contractId!);
+        },
+      },
+      {
+        name: "assignment no longer executable",
+        mutate(database, fixture) {
+          database.prepare("UPDATE assignments SET status = 'blocked' WHERE id = ?")
+            .run(fixture.assignmentId);
+        },
+      },
+    ];
+
+    for (const testCase of cases) {
+      const { database, coordinator, port } = setup();
+      try {
+        const runId = `run-authority-race-${testCase.name.replaceAll(" ", "-")}`;
+        const fixture = seedRun(database, { runId, journey: "autonomous" });
+        const lease = coordinator.acquireRunLease(runId, "worker-race");
+        testCase.mutate(database, fixture);
+
+        let rejection: unknown;
+        try {
+          await coordinator.startAction({ lease, intent: intent(fixture, runId) });
+        } catch (error) {
+          rejection = error;
+        }
+        expect(rejection).toBeInstanceOf(DurableOrchestrationError);
+        expect((rejection as DurableOrchestrationError).code.length).toBeGreaterThan(0);
+        expect(port.dispatched).toHaveLength(0);
+        expect(database.prepare("SELECT COUNT(*) AS count FROM actions WHERE run_id = ?").get(runId))
+          .toEqual({ count: 0 });
+        expect(database.prepare("SELECT status FROM plan_steps WHERE id = ?").get(fixture.stepId))
+          .toEqual({ status: "blocked" });
+        expect(database.prepare("SELECT status FROM assignments WHERE id = ?").get(fixture.assignmentId))
+          .toEqual({ status: "blocked" });
+        expect(coordinator.getRun(runId)).toMatchObject({ run: { state: "blocked" }, lease: null });
+        expect(coordinator.getLatestCheckpoint(runId)?.state.run.state).toBe("blocked");
+        expect(database.prepare(`
+          SELECT event_type, json_extract(payload_json, '$.dispatchAttempted') AS dispatch_attempted
+          FROM events WHERE run_id = ? ORDER BY sequence DESC LIMIT 1
+        `).get(runId)).toEqual({
+          event_type: "run.autonomous_safe_stopped",
+          dispatch_attempted: 0,
+        });
+      } finally {
+        database.close();
+      }
+    }
+  });
+
   test("consumes an approved Guided decision once and binds it to the exact action", async () => {
     const { database, coordinator, port } = setup();
     try {
@@ -247,6 +366,94 @@ describe("DurableRunCoordinator", () => {
         .toEqual({ count: 1 });
     } finally {
       database.close();
+    }
+  });
+
+  test("revalidates Guided authorization, scope, plan, and assignment before action creation", async () => {
+    const cases: Array<{
+      name: string;
+      mutate: (
+        database: Database,
+        missionId: string,
+        fixture: { missionId: string; stepId: string; assignmentId: string },
+        runId: string,
+      ) => void;
+    }> = [
+      {
+        name: "authorization revoked",
+        mutate(database, missionId) {
+          database.prepare("UPDATE missions SET authorization_status = 'revoked' WHERE id = ?").run(missionId);
+        },
+      },
+      {
+        name: "target prohibited",
+        mutate(database, missionId) {
+          database.prepare("UPDATE mission_targets SET disposition = 'prohibited' WHERE mission_id = ?").run(missionId);
+        },
+      },
+      {
+        name: "assignment cancelled",
+        mutate(database, _missionId, fixture) {
+          database.prepare("UPDATE assignments SET status = 'cancelled' WHERE id = ?").run(fixture.assignmentId);
+        },
+      },
+      {
+        name: "specialist quarantined",
+        mutate(database) {
+          database.prepare("UPDATE agents SET status = 'quarantined' WHERE id = 'ReconScout'").run();
+        },
+      },
+      {
+        name: "step reassigned",
+        mutate(database, _missionId, fixture) {
+          database.prepare("UPDATE plan_steps SET assigned_agent_id = NULL WHERE id = ?").run(fixture.stepId);
+        },
+      },
+      {
+        name: "plan superseded",
+        mutate(database, _missionId, _fixture, runId) {
+          database.prepare("UPDATE plans SET status = 'superseded' WHERE run_id = ?").run(runId);
+        },
+      },
+    ];
+    for (const testCase of cases) {
+      const { database, coordinator, port } = setup();
+      try {
+        const runId = `run-guided-race-${testCase.name.replaceAll(" ", "-")}`;
+        const fixture = seedRun(database, { runId, journey: "guided", status: "waiting_guided_decision" });
+        const represented = intent(fixture, runId);
+        const decisionId = `decision-${runId}`;
+        database.prepare(`
+          INSERT INTO guided_decisions (
+            id, mission_id, run_id, step_id, requested_action_fingerprint,
+            requested_parameters_json, rationale, risk_class, reversibility,
+            status, decision_actor, decided_at, expires_at, created_at
+          ) VALUES (?, ?, ?, ?, ?, '{}', 'Run exact scan', 'low', 'reversible',
+            'approved', 'operator', ?, ?, ?)
+        `).run(
+          decisionId,
+          fixture.missionId,
+          runId,
+          fixture.stepId,
+          fingerprintAction(represented).hash,
+          "2026-07-14T23:59:30.000Z",
+          "2026-07-15T01:00:00.000Z",
+          "2026-07-14T23:59:00.000Z",
+        );
+        const lease = coordinator.acquireRunLease(runId, "guided-worker");
+        testCase.mutate(database, fixture.missionId, fixture, runId);
+        await expect(coordinator.startAction({ lease, intent: represented, guidedDecisionId: decisionId }))
+          .rejects.toBeInstanceOf(DurableOrchestrationError);
+        expect(port.dispatched).toHaveLength(0);
+        expect(database.prepare("SELECT COUNT(*) AS count FROM actions WHERE run_id = ?").get(runId))
+          .toEqual({ count: 0 });
+        expect(database.prepare("SELECT status FROM guided_decisions WHERE id = ?").get(decisionId))
+          .toEqual({ status: "approved" });
+        expect(coordinator.getRun(runId)).toMatchObject({ run: { state: "blocked" }, lease: null });
+        expect(coordinator.getLatestCheckpoint(runId)?.state.run.state).toBe("blocked");
+      } finally {
+        database.close();
+      }
     }
   });
 
@@ -367,6 +574,12 @@ describe("DurableRunCoordinator", () => {
           after: {},
         });
         if (last.run.lease) lease = last.run.lease;
+        if (index < 2) {
+          database.prepare("UPDATE assignments SET status = 'queued' WHERE id = ?")
+            .run(fixture.assignmentId);
+          database.prepare("UPDATE plan_steps SET status = 'ready' WHERE id = ?")
+            .run(fixture.stepId);
+        }
       }
       expect(last?.directive).toBe("blocked");
       expect(last?.loopKinds).toContain("identical_action");
@@ -397,7 +610,7 @@ describe("DurableRunCoordinator", () => {
           actionType: "mutate",
           intentSummary: "Perform non-repeatable change",
           idempotent: false,
-          destructive: true,
+          destructive: false,
         }),
       });
       clock.advance(2_000);
@@ -515,6 +728,158 @@ describe("DurableRunCoordinator", () => {
         recovery: { kind: "retry", failedActionId: started.action.id },
       });
     } finally {
+      database.close();
+    }
+  });
+
+  test("Autonomous transient failures do not retry after specialist tool policy drifts", async () => {
+    for (const drift of ["require_approval", "deny"] as const) {
+      const { database, coordinator } = setup();
+      const mapping = mappingFor("ReconScout");
+      if (!mapping) throw new Error("ReconScout mapping fixture is missing");
+      const originalApproval = [...mapping.approvalRequiredTools];
+      const originalDenied = [...mapping.deniedTools];
+      try {
+        const runId = `run-tool-policy-drift-${drift}`;
+        const fixture = seedRun(database, { runId, journey: "autonomous" });
+        expect(specialistToolDecision("ReconScout", "quick_scan")).toBe("allow");
+        const lease = coordinator.acquireRunLease(runId, "worker-1");
+        const started = await coordinator.startAction({ lease, intent: intent(fixture, runId) });
+
+        if (drift === "require_approval") mapping.approvalRequiredTools.push("quick_scan");
+        else mapping.deniedTools.push("quick_scan");
+        expect(specialistToolDecision("ReconScout", "quick_scan")).toBe(drift);
+
+        const failed = await coordinator.completeAction({
+          lease: started.lease,
+          actionId: started.action.id,
+          success: false,
+          resultSummary: "The exact MCP call timed out after its policy changed",
+          failureCategory: "timeout",
+          before: {},
+          after: {},
+        });
+        expect(failed).toMatchObject({
+          directive: "blocked",
+          run: {
+            run: { state: "blocked" },
+            control: { retryCount: 0 },
+            lease: null,
+          },
+        });
+        expect(failed.reason).toContain("Safe-stopped (outside_contract)");
+        expect(failed.run.control.recovery).toBeUndefined();
+        expect(database.prepare(`
+          SELECT json_extract(payload_json, '$.directive') AS directive
+          FROM events WHERE run_id = ? AND event_type = 'action.completed'
+          ORDER BY sequence DESC LIMIT 1
+        `).get(runId)).toEqual({ directive: "blocked" });
+      } finally {
+        mapping.approvalRequiredTools.splice(0, mapping.approvalRequiredTools.length, ...originalApproval);
+        mapping.deniedTools.splice(0, mapping.deniedTools.length, ...originalDenied);
+        database.close();
+      }
+    }
+  });
+
+  test("Autonomous authorization rejects an unsigned class and incomplete MCP bindings before action creation", async () => {
+    const cases: Array<{ name: string; overrides: Partial<DurableActionIntent> }> = [
+      {
+        name: "unsigned action class",
+        overrides: { actionClass: "credential-access" },
+      },
+      {
+        name: "missing exact MCP server",
+        overrides: {
+          arguments: { toolName: "quick_scan", arguments: { ports: [80, 443] } },
+        },
+      },
+      {
+        name: "missing exact MCP tool",
+        overrides: {
+          arguments: { mcpServer: "sechub-reconnaissance", arguments: { ports: [80, 443] } },
+        },
+      },
+    ];
+    for (const testCase of cases) {
+      const { database, coordinator } = setup();
+      try {
+        const runId = `run-retry-boundary-${testCase.name.replaceAll(" ", "-")}`;
+        const fixture = seedRun(database, { runId, journey: "autonomous" });
+        const lease = coordinator.acquireRunLease(runId, "worker-1");
+        await expect(coordinator.startAction({
+          lease,
+          intent: intent(fixture, runId, testCase.overrides),
+        })).rejects.toBeInstanceOf(DurableOrchestrationError);
+        expect(coordinator.getRun(runId)).toMatchObject({ run: { state: "blocked" }, lease: null });
+        expect(database.prepare("SELECT COUNT(*) AS count FROM actions WHERE run_id = ?").get(runId))
+          .toEqual({ count: 0 });
+        expect(coordinator.getLatestCheckpoint(runId)?.state.run.state).toBe("blocked");
+      } finally {
+        database.close();
+      }
+    }
+  });
+
+  test("Autonomous retry fails closed when the signed action class or specialist pool drifts", async () => {
+    const cases: Array<{ name: string; policyPath: string; value: string }> = [
+      { name: "action class removed", policyPath: "$.allowedActionClasses", value: '["scan"]' },
+      { name: "specialist removed", policyPath: "$.specialistAgentIds", value: '["WebBreaker"]' },
+    ];
+    for (const testCase of cases) {
+      const { database, coordinator } = setup();
+      try {
+        const runId = `run-retry-drift-${testCase.name.replaceAll(" ", "-")}`;
+        const fixture = seedRun(database, { runId, journey: "autonomous" });
+        const lease = coordinator.acquireRunLease(runId, "worker-1");
+        const started = await coordinator.startAction({ lease, intent: intent(fixture, runId) });
+        database.prepare(`
+          UPDATE mission_contracts
+          SET action_policy_json = json_set(action_policy_json, ?, json(?))
+          WHERE id = ?
+        `).run(testCase.policyPath, testCase.value, fixture.contractId!);
+        const failed = await coordinator.completeAction({
+          lease: started.lease,
+          actionId: started.action.id,
+          success: false,
+          resultSummary: `Transient failure after ${testCase.name}`,
+          failureCategory: "timeout",
+          before: {},
+          after: {},
+        });
+        expect(failed).toMatchObject({ directive: "blocked", run: { run: { state: "blocked" } } });
+        expect(failed.run.control.retryCount).toBe(0);
+        expect(failed.run.control.recovery).toBeUndefined();
+      } finally {
+        database.close();
+      }
+    }
+  });
+
+  test("startup recovery does not resume an idempotent tool after it becomes approval-gated", async () => {
+    const { database, coordinator, clock, port } = setup();
+    const mapping = mappingFor("ReconScout");
+    if (!mapping) throw new Error("ReconScout mapping fixture is missing");
+    const originalApproval = [...mapping.approvalRequiredTools];
+    try {
+      const runId = "run-startup-policy-drift";
+      const fixture = seedRun(database, { runId, journey: "autonomous" });
+      const lease = coordinator.acquireRunLease(runId, "dead-worker");
+      await coordinator.startAction({ lease, intent: intent(fixture, runId) });
+      expect(specialistToolDecision("ReconScout", "quick_scan")).toBe("allow");
+      mapping.approvalRequiredTools.push("quick_scan");
+      clock.advance(2_000);
+
+      const restarted = new DurableRunCoordinator(database, port, { now: clock.now, leaseTtlMs: 1_000 });
+      const results = await restarted.recoverOnStartup("recovery-worker");
+      expect(results).toContainEqual(expect.objectContaining({
+        runId,
+        disposition: "blocked_for_review",
+      }));
+      expect(port.resumed).toHaveLength(0);
+      expect(restarted.getRun(runId)).toMatchObject({ run: { state: "blocked" }, lease: null });
+    } finally {
+      mapping.approvalRequiredTools.splice(0, mapping.approvalRequiredTools.length, ...originalApproval);
       database.close();
     }
   });

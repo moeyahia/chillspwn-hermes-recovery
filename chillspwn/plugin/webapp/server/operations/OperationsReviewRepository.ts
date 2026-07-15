@@ -10,6 +10,12 @@ import { AttackChainLearningService } from "../learning";
 
 type Row = Record<string, any>;
 
+interface LessonSupportSummary {
+  readonly supportCount: number;
+  readonly verifiedEvidenceCount: number;
+  readonly supportingRunCount: number;
+}
+
 export interface FindingReviewInput {
   readonly expectedVersion: number;
   readonly status: "under_review" | "verified" | "rejected" | "accepted_risk";
@@ -85,11 +91,29 @@ export class OperationsReviewRepository {
       }
 
       const visibleEvidence = sensitivitySql("e.sensitivity", access);
+      const visibleEvidenceMission = missionScopeSql("em", access);
       const evidenceCount = Number((this.database.prepare(`
         SELECT COUNT(*) AS count FROM finding_evidence fe
         JOIN evidence e ON e.id = fe.evidence_id
-        WHERE fe.finding_id = ? AND fe.relationship = 'supports' AND ${visibleEvidence.sql}
-      `).get(findingId, ...visibleEvidence.params) as Row).count);
+        JOIN missions em ON em.id = e.mission_id
+        WHERE fe.finding_id = ? AND fe.relationship = 'supports'
+          AND e.mission_id = ?
+          AND (? IS NULL OR e.run_id = ?)
+          AND em.engagement_id IS ?
+          AND (e.run_id IS NULL OR EXISTS (
+            SELECT 1 FROM runs er WHERE er.id = e.run_id AND er.mission_id = e.mission_id
+          ))
+          AND ${visibleEvidence.sql}
+          AND ${visibleEvidenceMission.sql}
+      `).get(
+        findingId,
+        row.mission_id,
+        row.run_id,
+        row.run_id,
+        row.engagement_id,
+        ...visibleEvidence.params,
+        ...visibleEvidenceMission.params,
+      ) as Row).count);
       if (input.status === "verified" && evidenceCount === 0) {
         if (!input.operatorOverride) {
           throw conflict(
@@ -178,14 +202,8 @@ export class OperationsReviewRepository {
           "Ask a different authorized reviewer to verify the evidence-linked lesson.",
         );
       }
-      const visibleEvidence = sensitivitySql("e.sensitivity", access);
-      const supportCount = Number((this.database.prepare(`
-        SELECT COUNT(*) AS count FROM lesson_evidence le
-        LEFT JOIN evidence e ON e.id = le.evidence_id
-        WHERE le.lesson_id = ? AND le.relationship = 'supports'
-          AND (le.evidence_id IS NULL OR ${visibleEvidence.sql})
-      `).get(lessonId, ...visibleEvidence.params) as Row).count);
-      if (input.status === "verified" && supportCount === 0) {
+      const support = this.lessonSupport(row, access);
+      if (input.status === "verified" && support.supportCount === 0) {
         throw conflict(
           "A lesson cannot be verified without linked supporting evidence or a supporting run.",
           "Attach supporting evidence and have an independent reviewer retry verification.",
@@ -194,16 +212,19 @@ export class OperationsReviewRepository {
       if (input.status === "verified" && row.lesson_type === "attack_chain") {
         const details = new AttackChainLearningService(this.database, { clock: this.clock })
           .detailsForReview(lessonId);
-        const sourceCounts = this.database.prepare(`
-          SELECT
-            SUM(evidence_id IS NOT NULL AND relationship = 'supports') AS evidence_count,
-            SUM(run_id IS NOT NULL AND relationship = 'supports') AS run_count
-          FROM lesson_evidence WHERE lesson_id = ?
-        `).get(lessonId) as { evidence_count: number | null; run_count: number | null };
-        if (!details || Number(sourceCounts.evidence_count ?? 0) === 0 || Number(sourceCounts.run_count ?? 0) === 0) {
+        const chainSources = details
+          ? this.attackChainSources(row, details.id, access)
+          : { supportCount: 0, verifiedEvidenceCount: 0, supportingRunCount: 0 };
+        if (
+          !details
+          || support.verifiedEvidenceCount === 0
+          || support.supportingRunCount === 0
+          || chainSources.verifiedEvidenceCount === 0
+          || chainSources.supportingRunCount === 0
+        ) {
           throw conflict(
             "An attack chain cannot be verified without complete executable details, verified evidence, and a source run.",
-            "Attach the canonical chain details and both evidence/run provenance before independent review.",
+            "Attach scope-visible canonical chain details and context-consistent evidence/run provenance before independent review.",
           );
         }
       }
@@ -223,7 +244,7 @@ export class OperationsReviewRepository {
         lesson: {
           id: lessonId,
           status: input.status,
-          supportingEvidenceCount: supportCount,
+          supportingEvidenceCount: support.supportCount,
           reviewedBy: reviewed,
           reviewedAt,
           updatedAt,
@@ -238,12 +259,118 @@ export class OperationsReviewRepository {
         resourceType: "lesson",
         resourceId: lessonId,
         reason: input.reason,
-        details: { from: row.status, to: input.status, supportCount },
+        details: { from: row.status, to: input.status, supportCount: support.supportCount },
         occurredAt: updatedAt,
       });
       this.saveIdempotency(key, requestHash, response, actor.id, updatedAt);
       return response;
     });
+  }
+
+  private lessonSupport(row: Row, access: OperationsAccessPolicy): LessonSupportSummary {
+    return this.scopedLessonSourceSummary("lesson_evidence", "le", row, access, {
+      lessonId: row.id,
+      relationship: "supports",
+    });
+  }
+
+  private attackChainSources(
+    row: Row,
+    detailId: string,
+    access: OperationsAccessPolicy,
+  ): LessonSupportSummary {
+    return this.scopedLessonSourceSummary("lesson_attack_chain_sources", "source", row, access, {
+      lessonId: row.id,
+      detailId,
+    });
+  }
+
+  /**
+   * Count only provenance that the reviewer can inspect and that belongs to
+   * the reviewed lesson's mission/engagement. Both lesson_evidence and the
+   * latest normalized attack-chain source projection use the same boundary so
+   * a foreign run or hidden evidence record cannot promote a lesson.
+   */
+  private scopedLessonSourceSummary(
+    table: "lesson_evidence" | "lesson_attack_chain_sources",
+    alias: "le" | "source",
+    row: Row,
+    access: OperationsAccessPolicy,
+    filter: { readonly lessonId: string; readonly relationship?: "supports"; readonly detailId?: string },
+  ): LessonSupportSummary {
+    const visibleEvidence = sensitivitySql("e.sensitivity", access);
+    const visibleEvidenceMission = missionScopeSql("em", access);
+    const visibleRunMission = missionScopeSql("rm", access);
+    const clauses = [`${alias}.lesson_id = ?`];
+    const params: unknown[] = [filter.lessonId];
+    if (filter.relationship) {
+      clauses.push(`${alias}.relationship = ?`);
+      params.push(filter.relationship);
+    }
+    if (filter.detailId) {
+      clauses.push(`${alias}.detail_id = ?`);
+      params.push(filter.detailId);
+    }
+    clauses.push(`(
+      ${alias}.evidence_id IS NULL OR (
+        e.id IS NOT NULL
+        AND (? IS NULL OR e.mission_id = ?)
+        AND (? IS NULL OR em.engagement_id = ?)
+        AND (e.run_id IS NULL OR er.mission_id = e.mission_id)
+        AND ${visibleEvidence.sql}
+        AND ${visibleEvidenceMission.sql}
+      )
+    )`);
+    params.push(
+      row.mission_id,
+      row.mission_id,
+      row.engagement_id,
+      row.engagement_id,
+      ...visibleEvidence.params,
+      ...visibleEvidenceMission.params,
+    );
+    clauses.push(`(
+      ${alias}.run_id IS NULL OR (
+        source_run.id IS NOT NULL
+        AND (? IS NULL OR source_run.mission_id = ?)
+        AND (? IS NULL OR rm.engagement_id = ?)
+        AND ${visibleRunMission.sql}
+      )
+    )`);
+    params.push(
+      row.mission_id,
+      row.mission_id,
+      row.engagement_id,
+      row.engagement_id,
+      ...visibleRunMission.params,
+    );
+    clauses.push(`(
+      ${alias}.evidence_id IS NULL OR ${alias}.run_id IS NULL
+      OR e.run_id IS NULL OR e.run_id = ${alias}.run_id
+    )`);
+    const summary = this.database.prepare(`
+      SELECT
+        COUNT(*) AS support_count,
+        SUM(CASE WHEN ${alias}.evidence_id IS NOT NULL
+          AND e.verification_state = 'verified' THEN 1 ELSE 0 END) AS verified_evidence_count,
+        SUM(CASE WHEN ${alias}.run_id IS NOT NULL THEN 1 ELSE 0 END) AS supporting_run_count
+      FROM ${table} ${alias}
+      LEFT JOIN evidence e ON e.id = ${alias}.evidence_id
+      LEFT JOIN missions em ON em.id = e.mission_id
+      LEFT JOIN runs er ON er.id = e.run_id
+      LEFT JOIN runs source_run ON source_run.id = ${alias}.run_id
+      LEFT JOIN missions rm ON rm.id = source_run.mission_id
+      WHERE ${clauses.join(" AND ")}
+    `).get(...params) as {
+      support_count: number;
+      verified_evidence_count: number | null;
+      supporting_run_count: number | null;
+    };
+    return {
+      supportCount: Number(summary.support_count),
+      verifiedEvidenceCount: Number(summary.verified_evidence_count ?? 0),
+      supportingRunCount: Number(summary.supporting_run_count ?? 0),
+    };
   }
 
   private idempotencyReplay(key: string, requestHash: string): Record<string, unknown> | undefined {

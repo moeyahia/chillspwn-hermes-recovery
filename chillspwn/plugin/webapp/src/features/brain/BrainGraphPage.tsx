@@ -16,18 +16,38 @@ import {
   BRAIN_GRAPH_URL_KEYS,
   brainGraphStateToQuery,
   brainGraphStateToUrl,
+  parsePinnedGraphPositions,
   parseBrainGraphState,
   parseSavedBrainGraphViews,
+  persistPinnedGraphPositions as persistPinnedGraphPositionsToStorage,
   type BrainGraphPreset,
   type SavedBrainGraphView,
 } from "./brainGraphState";
 import { MemoryGraphCanvas } from "./MemoryGraphCanvas";
 import { MemoryNodeInspector } from "./MemoryNodeInspector";
+import { GRAPH_CLUSTERS, nodeCluster, type GraphCluster } from "./graphUtils";
 
 const SAVED_VIEWS_KEY = "chillspwn.brain.saved-graph-views.v1";
+const PINNED_POSITIONS_KEY = "chillspwn.brain.pinned-graph-positions.v1";
 
 function label(value: string): string {
   return value.replaceAll("_", " ").replace(/^./u, (first) => first.toUpperCase());
+}
+
+function availableLocalStorage(): Storage | null {
+  try {
+    return globalThis.localStorage;
+  } catch {
+    return null;
+  }
+}
+
+function storedValue(key: string): string | null {
+  try {
+    return availableLocalStorage()?.getItem(key) ?? null;
+  } catch {
+    return null;
+  }
 }
 
 export default function BrainGraphPage() {
@@ -35,7 +55,8 @@ export default function BrainGraphPage() {
   const [fallbackRoot] = useState(() => sessionStorage.getItem("chillspwn.brain.graph-root") ?? "");
   const fallbackRootConsumed = useRef(false);
   const state = useMemo(() => parseBrainGraphState(url.values, fallbackRootConsumed.current ? "" : fallbackRoot), [fallbackRoot, url.key]);
-  const [savedViews, setSavedViews] = useState<SavedBrainGraphView[]>(() => parseSavedBrainGraphViews(localStorage.getItem(SAVED_VIEWS_KEY)));
+  const [savedViews, setSavedViews] = useState<SavedBrainGraphView[]>(() => parseSavedBrainGraphViews(storedValue(SAVED_VIEWS_KEY)));
+  const [pinnedPositions, setPinnedPositions] = useState(() => parsePinnedGraphPositions(storedValue(PINNED_POSITIONS_KEY)));
   const [viewName, setViewName] = useState("");
   const [notice, setNotice] = useState("");
 
@@ -55,6 +76,14 @@ export default function BrainGraphPage() {
     return { nodes, edges: graph.data.edges.filter((edge) => ids.has(edge.sourceNodeId) && ids.has(edge.targetNodeId)) };
   }, [graph.data, state.search]);
   const hasActiveFilter = Boolean(state.search || state.nodeType || state.edgeType || state.scope || state.engagementId || state.lifecycle || state.sensitivity || state.minConfidence || state.updatedAfter || state.updatedBefore || state.preset);
+  const clusterCounts = useMemo(() => {
+    const counts = new Map<GraphCluster, number>();
+    filtered.nodes.forEach((node) => {
+      const cluster = nodeCluster(node);
+      counts.set(cluster, (counts.get(cluster) ?? 0) + 1);
+    });
+    return counts;
+  }, [filtered.nodes]);
 
   const patchUrl = (patch: Record<string, string | undefined>) => url.set(patch, { replace: true, resetCursor: false });
   const selectView = (view: MemoryGraphView) => {
@@ -73,13 +102,55 @@ export default function BrainGraphPage() {
     sessionStorage.setItem("chillspwn.brain.graph-root", nodeId);
     patchUrl({ view: "local", root: nodeId, selected: nodeId, preset: undefined });
   };
+  const setPathStart = (nodeId?: string) => {
+    patchUrl({ pathFrom: nodeId });
+    setNotice(nodeId
+      ? "Path start selected. Choose another visible memory to highlight the shortest explanatory path."
+      : "Memory path selection cleared.");
+  };
+  const toggleCluster = (cluster: GraphCluster, expand = false) => {
+    const next = new Set(state.collapsedClusters);
+    if (expand || next.has(cluster)) next.delete(cluster);
+    else next.add(cluster);
+    const selected = filtered.nodes.find((node) => node.id === state.selectedId);
+    patchUrl({
+      collapsed: next.size > 0 ? [...next].join(",") : undefined,
+      ...(selected && next.has(nodeCluster(selected)) ? { selected: undefined } : {}),
+    });
+  };
   const clearFilters = () => {
     sessionStorage.removeItem("chillspwn.brain.graph-root");
     patchUrl(Object.fromEntries(BRAIN_GRAPH_URL_KEYS.map((key) => [key, undefined])));
   };
   const persistViews = (next: SavedBrainGraphView[]) => {
     setSavedViews(next);
-    localStorage.setItem(SAVED_VIEWS_KEY, JSON.stringify(next));
+    try {
+      availableLocalStorage()?.setItem(SAVED_VIEWS_KEY, JSON.stringify(next));
+    } catch {
+      setNotice("The view remains available for this session, but browser storage is unavailable.");
+    }
+  };
+  const persistPinnedPositions = (next: typeof pinnedPositions) => {
+    const result = persistPinnedGraphPositionsToStorage(
+      availableLocalStorage(),
+      PINNED_POSITIONS_KEY,
+      next,
+    );
+    setPinnedPositions(result.positions);
+    if (!result.persisted) {
+      setNotice("The graph position is retained for this session, but browser storage is unavailable.");
+    }
+    return result.persisted;
+  };
+  const pinPosition = (nodeId: string, point: { x: number; y: number }) => {
+    persistPinnedPositions({ ...pinnedPositions, [nodeId]: { ...point, updatedAt: new Date().toISOString() } });
+  };
+  const clearPinnedPositions = (nodeIds: readonly string[]) => {
+    const next = { ...pinnedPositions };
+    nodeIds.forEach((nodeId) => { delete next[nodeId]; });
+    if (persistPinnedPositions(next)) {
+      setNotice(`Reset ${nodeIds.length} visible node position${nodeIds.length === 1 ? "" : "s"}.`);
+    }
   };
   const saveNamedView = (event: FormEvent) => {
     event.preventDefault();
@@ -133,7 +204,7 @@ export default function BrainGraphPage() {
         {state.view === "mission" && <label>Mission ID<input value={state.missionId} onChange={(event) => patchUrl({ mission: event.target.value || undefined })} placeholder="Mission stable ID" /></label>}
         <label className="brain-graph-search">Search visible graph<input value={state.search} onChange={(event) => patchUrl({ search: event.target.value || undefined })} placeholder="Title, summary, ID" /></label>
         <label>Edge type<select value={state.edgeType} onChange={(event) => patchUrl({ edgeType: event.target.value || undefined })}><option value="">All relationships</option>{MEMORY_EDGE_TYPES.map((item) => <option key={item} value={item}>{label(item)}</option>)}</select></label>
-        <div className="brain-graph-toggles"><Button variant="quiet" onClick={() => patchUrl({ layout: state.compact ? undefined : "compact" })}>Layout: {state.compact ? "compact" : "clusters"}</Button><Button variant="quiet" onClick={() => patchUrl({ table: state.table ? undefined : "1" })}>{state.table ? "Canvas view" : "Accessible table"}</Button></div>
+        <div className="brain-graph-toggles"><Button variant="quiet" onClick={() => patchUrl({ layout: state.compact ? undefined : "compact" })}>Layout: {state.compact ? "compact" : "clusters"}</Button><Button variant="quiet" aria-pressed={state.physics} onClick={() => patchUrl({ physics: state.physics ? undefined : "1" })}>Physics: {state.physics ? "relationship weighted" : "fixed clusters"}</Button><Button variant="quiet" onClick={() => patchUrl({ table: state.table ? undefined : "1" })}>{state.table ? "Canvas view" : "Accessible table"}</Button></div>
       </section>
 
       <details className="brain-graph-advanced">
@@ -148,6 +219,7 @@ export default function BrainGraphPage() {
           <label>Updated from<input type="date" value={state.updatedAfter} max={state.updatedBefore || undefined} onChange={(event) => patchUrl({ from: event.target.value || undefined })} /></label>
           <label>Updated through<input type="date" value={state.updatedBefore} min={state.updatedAfter || undefined} onChange={(event) => patchUrl({ to: event.target.value || undefined })} /></label>
           <label>Label density<select value={state.labelDensity} onChange={(event) => patchUrl({ labels: event.target.value === "balanced" ? undefined : event.target.value })}><option value="minimal">Minimal</option><option value="balanced">Balanced</option><option value="all">All labels</option></select></label>
+          <fieldset className="brain-cluster-controls"><legend>Canvas clusters</legend>{GRAPH_CLUSTERS.filter((cluster) => (clusterCounts.get(cluster) ?? 0) > 0).map((cluster) => <Button key={cluster} variant="quiet" aria-pressed={state.collapsedClusters.includes(cluster)} onClick={() => toggleCluster(cluster)}>{state.collapsedClusters.includes(cluster) ? "Expand" : "Collapse"} {label(cluster)} ({clusterCounts.get(cluster)})</Button>)}</fieldset>
           <Button variant="quiet" aria-label="Reset graph view" onClick={clearFilters}>Reset graph view</Button>
         </div>
       </details>
@@ -160,19 +232,20 @@ export default function BrainGraphPage() {
       {notice && <p className="brain-graph-notice" role="status" aria-live="polite">{notice}</p>}
 
       {state.view === "local" && state.rootNodeId && <p className="brain-active-filter"><span>Local neighborhood</span><code>{state.rootNodeId}</code><button onClick={() => { sessionStorage.removeItem("chillspwn.brain.graph-root"); patchUrl({ root: undefined, view: undefined, selected: undefined }); }}>Clear</button></p>}
+      {state.pathFromId && <p className="brain-active-filter"><span>Shortest path from</span><code>{state.pathFromId}</code><span>to</span><code>{state.selectedId || "select another memory"}</code><button onClick={() => setPathStart(undefined)}>Clear</button></p>}
       {state.view === "mission" && !state.missionId && <p className="brain-guidance" role="status">Enter a mission ID to load its isolated cluster. The global graph remains visible until then.</p>}
       {graph.isLoading && <LoadingPanel label="Loading a bounded memory neighborhood" />}
       {graph.error && !graph.data && <ErrorPanel error={graph.error} onRetry={graph.refresh} />}
       {graph.data && graph.data.nodes.length === 0 && <BrainEmpty title={hasActiveFilter ? "No memories match this graph view" : "The Second Brain is empty"} description={hasActiveFilter ? "No accessible canonical memory nodes match these filters. Reset the view or review a memory candidate." : "No canonical memory nodes are available for this view. Confirm a candidate or complete an evidence-backed mission to build the graph."} action={hasActiveFilter ? <Button variant="secondary" onClick={clearFilters}>Reset graph view</Button> : <ButtonLink href="/brain/inbox" variant="secondary">Open Memory Inbox</ButtonLink>} />}
       {graph.data && graph.data.nodes.length > 0 && (
         <>
-          <div className="brain-graph-meta"><span>{filtered.nodes.length} visible of {graph.data.nodes.length} loaded nodes</span><span>{filtered.edges.length} visible relationships</span><span>{state.labelDensity} labels</span><StatusPill status={graph.data.truncated ? "bounded" : "complete"}>{graph.data.truncated ? "Bounded view" : "Complete view"}</StatusPill></div>
+          <div className="brain-graph-meta"><span>{filtered.nodes.length} visible of {graph.data.nodes.length} loaded nodes</span><span>{filtered.edges.length} visible relationships</span><span>{filtered.nodes.filter((node) => pinnedPositions[node.id]).length} positioned nodes</span><span>{state.labelDensity} labels</span><StatusPill status={graph.data.truncated ? "bounded" : "complete"}>{graph.data.truncated ? "Bounded view" : "Complete view"}</StatusPill></div>
           {state.table ? (
             <div className="os-card os-table-card brain-graph-table"><div className="os-table-scroll"><table><caption className="os-visually-hidden">Accessible memory graph node list</caption><thead><tr><th>Memory</th><th>Type</th><th>State</th><th>Scope</th><th>Confidence</th><th>Updated</th><th>Connections</th><th>Action</th></tr></thead><tbody>{filtered.nodes.map((node) => <tr key={node.id}><th scope="row">{node.title}<small className="brain-table-summary">{node.summary}</small></th><td>{label(node.nodeType)}</td><td><StatusPill status={node.lifecycleStatus} /></td><td>{scopeLabel(node.scope)}</td><td>{Math.round(node.confidence * 100)}%</td><td><time dateTime={node.updatedAt}>{new Intl.DateTimeFormat(undefined, { dateStyle: "medium" }).format(new Date(node.updatedAt))}</time></td><td>{node.edgeCount}</td><td><Button variant="quiet" onClick={() => patchUrl({ selected: node.id })}>Inspect</Button></td></tr>)}</tbody></table></div></div>
           ) : (
-            <div className="brain-graph-workspace"><MemoryGraphCanvas nodes={filtered.nodes} edges={filtered.edges} selectedId={state.selectedId || undefined} rootNodeId={(graph.data.rootNodeId ?? state.rootNodeId) || undefined} onSelect={(nodeId) => patchUrl({ selected: nodeId })} compact={state.compact} labelDensity={state.labelDensity} /><MemoryNodeInspector nodeId={state.selectedId || undefined} onUseAsRoot={useAsRoot} /></div>
+            <div className="brain-graph-workspace"><MemoryGraphCanvas nodes={filtered.nodes} edges={filtered.edges} selectedId={state.selectedId || undefined} rootNodeId={(graph.data.rootNodeId ?? state.rootNodeId) || undefined} pathStartNodeId={state.pathFromId || undefined} onSelect={(nodeId) => patchUrl({ selected: nodeId })} compact={state.compact} physics={state.physics} labelDensity={state.labelDensity} collapsedClusters={state.collapsedClusters} pinnedPositions={pinnedPositions} onPinPosition={pinPosition} onClearPinnedPositions={clearPinnedPositions} onExpandCluster={(cluster) => toggleCluster(cluster, true)} /><MemoryNodeInspector nodeId={state.selectedId || undefined} onUseAsRoot={useAsRoot} pathStartId={state.pathFromId || undefined} onSetPathStart={setPathStart} /></div>
           )}
-          {state.table && <MemoryNodeInspector nodeId={state.selectedId || undefined} onUseAsRoot={useAsRoot} />}
+          {state.table && <MemoryNodeInspector nodeId={state.selectedId || undefined} onUseAsRoot={useAsRoot} pathStartId={state.pathFromId || undefined} onSetPathStart={setPathStart} />}
           {graph.data.truncated && <div className="brain-load-more"><p>The service bounded this neighborhood to protect rendering and retrieval latency.</p><Button variant="secondary" onClick={() => patchUrl({ limit: String(Math.min(1000, state.limit + 250)) })} disabled={state.limit >= 1000}>Load another bounded segment</Button></div>}
         </>
       )}

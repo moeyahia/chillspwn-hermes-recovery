@@ -1,40 +1,17 @@
 import type { MemoryRepository } from "./MemoryRepository";
 import type {
   MemoryNode,
-  MemorySensitivity,
   RetrievalPolicy,
   RetrievedMemory,
 } from "./types";
 import { validateJourney, validateSensitivity } from "./validation";
 import { getMemoryControlPolicy, memoryUseAllowed } from "./MemoryControlPolicy";
-
-const SENSITIVITY_RANK: Record<MemorySensitivity, number> = {
-  public: 0,
-  internal: 1,
-  private: 2,
-  restricted: 3,
-};
+import { memoryNodeMatchesPolicy } from "./MemoryScopePolicy";
 
 function ftsQuery(source: string): string | undefined {
   const tokens = source.normalize("NFKC").match(/[\p{L}\p{N}_-]+/gu)?.slice(0, 24) ?? [];
   if (tokens.length === 0) return undefined;
   return tokens.map((token) => `"${token.replaceAll('"', '""')}"`).join(" OR ");
-}
-
-function isInScope(node: MemoryNode, policy: RetrievalPolicy): boolean {
-  if (node.scope.kind === "global") return policy.allowGlobal !== false;
-  if (node.scope.kind === "engagement") {
-    return Boolean(policy.engagementId && node.scope.engagementId === policy.engagementId);
-  }
-  return Boolean(policy.missionId && node.scope.missionId === policy.missionId);
-}
-
-function isJourneyAllowed(node: MemoryNode, policy: RetrievalPolicy): boolean {
-  const retention = node.retentionPolicy;
-  if (retention.journeys && !retention.journeys.includes(policy.journey)) return false;
-  if (policy.journey === "autonomous" && retention.allowAutonomous === false) return false;
-  if (policy.journey === "guided" && retention.allowGuided === false) return false;
-  return true;
 }
 
 function approximateTokens(node: MemoryNode): number {
@@ -203,11 +180,12 @@ export class MemoryRetrievalService {
     policy: RetrievalPolicy,
     statuses: readonly ("confirmed" | "verified")[],
   ): boolean {
-    if (!statuses.includes(node.lifecycleStatus as "confirmed" | "verified")) return false;
-    if (node.expiresAt && Date.parse(node.expiresAt) <= Date.parse(this.#repository.now())) return false;
-    if (SENSITIVITY_RANK[node.sensitivity] > SENSITIVITY_RANK[policy.maximumSensitivity]) return false;
-    if (policy.allowedNodeTypes && !policy.allowedNodeTypes.includes(node.nodeType)) return false;
-    return isInScope(node, policy) && isJourneyAllowed(node, policy);
+    return memoryNodeMatchesPolicy(
+      this.#repository.database(),
+      node,
+      { ...policy, allowedStatuses: statuses },
+      this.#repository.now(),
+    );
   }
 }
 

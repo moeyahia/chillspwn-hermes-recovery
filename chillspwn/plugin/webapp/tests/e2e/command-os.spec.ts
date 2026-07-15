@@ -24,7 +24,6 @@ async function completeRequiredAutonomousFields(page: Page): Promise<void> {
 
   await expect(page.getByText("Autonomous blockers detected.")).toBeVisible();
   await page.getByRole("button", { name: "Continue" }).click();
-  await page.getByRole("button", { name: "Continue" }).click();
 }
 
 test.describe("Command OS V2.1 real application journeys", () => {
@@ -38,6 +37,66 @@ test.describe("Command OS V2.1 real application journeys", () => {
     await expect(page.getByText("No active missions")).toBeVisible();
     await expect(page.locator('.os-brand img[src="/Logo.svg"]')).toHaveCount(1);
     expect(await missionCount(request)).toBe(0);
+  });
+
+  test("empty in-app notification surface is accessible and keyboard-dismissible", async ({ page }) => {
+    await page.goto("/");
+    const trigger = page.getByRole("button", { name: "Notifications, 0 unread" });
+    await trigger.focus();
+    await page.keyboard.press("Enter");
+    const panel = page.getByRole("dialog", { name: "In-app notifications" });
+    await expect(panel).toBeVisible();
+    await expect(panel.getByRole("button", { name: "Close notifications" })).toBeFocused();
+    await expect(panel).toContainText("No in-app notifications");
+    await expect(panel).toContainText("In-app delivery only. No email, SMS, or webhook is configured.");
+    await page.keyboard.press("Escape");
+    await expect(panel).not.toBeVisible();
+    await expect(trigger).toBeFocused();
+
+    await page.keyboard.press("Enter");
+    await expect(panel.getByRole("button", { name: "Close notifications" })).toBeFocused();
+    await panel.getByRole("button", { name: "Close notifications" }).click();
+    await expect(panel).not.toBeVisible();
+    await expect(trigger).toBeFocused();
+
+    await page.keyboard.press("Enter");
+    await expect(panel.getByRole("button", { name: "Close notifications" })).toBeFocused();
+    await page.getByRole("heading", { level: 1, name: "Command Center" }).click();
+    await expect(panel).not.toBeVisible();
+    await expect(trigger).toBeFocused();
+
+    await page.keyboard.press("Enter");
+    await expect(panel.getByRole("button", { name: "Close notifications" })).toBeFocused();
+    await trigger.click();
+    await expect(panel).not.toBeVisible();
+    await expect(trigger).toBeFocused();
+  });
+
+  test("publishes checked API and resumable event contracts", async ({ request }) => {
+    const openApiResponse = await request.get("/api/v2/openapi.json");
+    expect(openApiResponse.ok()).toBe(true);
+    const openApi = await openApiResponse.json() as {
+      openapi: string;
+      paths: Record<string, Record<string, unknown>>;
+      components: { schemas: { Journey: { enum: string[] }; ErrorEnvelope: unknown } };
+    };
+    expect(openApi.openapi).toBe("3.1.0");
+    expect(openApi.components.schemas.Journey.enum).toEqual(["autonomous", "guided"]);
+    expect(openApi.components.schemas.ErrorEnvelope).toBeDefined();
+    expect(openApi.paths["/api/v2/guided-decisions/{decisionId}/approve"]?.post).toBeDefined();
+    expect(openApi.paths["/api/v2/events/stream"]?.get).toBeDefined();
+
+    const eventResponse = await request.get("/api/v2/contracts/events");
+    expect(eventResponse.ok()).toBe(true);
+    expect(await eventResponse.json()).toMatchObject({
+      schemaVersion: "2.1",
+      transport: "server-sent-events",
+      delivery: "at-least-once; clients must deduplicate by stable event ID",
+      resume: {
+        replayEndpoint: "/api/v2/events/replay",
+        gapRepairEndpoint: "/api/v2/events/gap",
+      },
+    });
   });
 
   test("legacy compatibility routes redirect into the two-journey product", async ({ page }) => {
@@ -76,8 +135,9 @@ test.describe("Command OS V2.1 real application journeys", () => {
     await page.goto("/missions/new/autonomous");
     await completeRequiredAutonomousFields(page);
 
-    await expect(page.getByText("Launch is blocked")).toBeVisible();
-    await expect(page.getByRole("button", { name: "Launch Autonomous Mission" })).toBeDisabled();
+    await expect(page.getByRole("alert")).toContainText("Select at least one compatible specialist");
+    await expect(page.getByRole("group", { name: "Team and readiness" })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Launch Autonomous Mission" })).toHaveCount(0);
 
     const bypassAttempt = await request.post("/api/v2/missions", {
       headers: {
@@ -112,6 +172,7 @@ test.describe("Command OS V2.1 real application journeys", () => {
           retentionPolicy: "operator_managed",
           providerPolicy: "automatic_enforcing_only",
           toolPolicy: "contract_allowlist",
+          specialistAgentIds: [],
           memoryScopes: ["verified_lessons"],
           contextNodeIds: [],
           safeStopConditions: ["Any dependency or scope conflict"],

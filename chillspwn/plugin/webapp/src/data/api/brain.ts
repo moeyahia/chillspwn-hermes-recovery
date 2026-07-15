@@ -4,6 +4,7 @@ import {
   parseForgetMutation,
   parseMemoryCandidatePage,
   parseMemoryContextPack,
+  parseMemoryContextPackPage,
   parseMemoryControlPolicy,
   parseMemoryGraph,
   parseMemoryNodeDetail,
@@ -17,6 +18,8 @@ import type {
   BrainSummary,
   MemoryCandidatePage,
   MemoryContextPack,
+  MemoryContextPackPage,
+  MemoryContextPackQuery,
   MemoryControlPolicy,
   MemoryGraph,
   MemoryGraphQuery,
@@ -84,8 +87,22 @@ export function fetchMemoryNode(nodeId: string, signal: AbortSignal): Promise<Me
   return apiRequest(`${ROOT}/nodes/${encodeURIComponent(nodeId)}`, { signal, parse: parseMemoryNodeDetail });
 }
 
-export function fetchMemoryCandidates(signal: AbortSignal): Promise<MemoryCandidatePage> {
-  return apiRequest(`${ROOT}/candidates`, { signal, parse: parseMemoryCandidatePage });
+export interface MemoryCandidateQuery {
+  missionId?: string;
+  runId?: string;
+  status?: MemoryCandidatePage["items"][number]["status"];
+  limit?: number;
+}
+
+export function fetchMemoryCandidates(signal: AbortSignal): Promise<MemoryCandidatePage>;
+export function fetchMemoryCandidates(filters: MemoryCandidateQuery, signal: AbortSignal): Promise<MemoryCandidatePage>;
+export function fetchMemoryCandidates(
+  filtersOrSignal: MemoryCandidateQuery | AbortSignal,
+  maybeSignal?: AbortSignal,
+): Promise<MemoryCandidatePage> {
+  const signal = filtersOrSignal instanceof AbortSignal ? filtersOrSignal : maybeSignal;
+  const filters = filtersOrSignal instanceof AbortSignal ? {} : filtersOrSignal;
+  return apiRequest(`${ROOT}/candidates${queryString(filters)}`, { signal, parse: parseMemoryCandidatePage });
 }
 
 export function confirmMemoryCandidate(candidateId: string, edits?: {
@@ -135,6 +152,10 @@ export function fetchContextPack(packId: string, signal: AbortSignal): Promise<M
   return apiRequest(`${ROOT}/context-packs/${encodeURIComponent(packId)}`, { signal, parse: parseMemoryContextPack });
 }
 
+export function fetchContextPacks(filters: MemoryContextPackQuery, signal: AbortSignal): Promise<MemoryContextPackPage> {
+  return apiRequest(`${ROOT}/context-packs${queryString(filters)}`, { signal, parse: parseMemoryContextPackPage });
+}
+
 export function fetchVaultSnapshot(signal: AbortSignal): Promise<VaultSnapshot> {
   return apiRequest(`${ROOT}/vault`, { signal, parse: parseVaultSnapshot });
 }
@@ -148,8 +169,8 @@ export function connectVault(input: {
   return mutation("/vault/connect", input, parseVaultConnectionMutation);
 }
 
-export function exportVault(connectionId: string): Promise<VaultOperationResult> {
-  return mutation("/vault/export", { connectionId }, parseVaultOperation);
+export function exportVault(connectionId: string, nodeId?: string): Promise<VaultOperationResult> {
+  return mutation("/vault/export", { connectionId, ...(nodeId ? { nodeId } : {}) }, parseVaultOperation);
 }
 
 export function importVault(connectionId: string): Promise<VaultOperationResult> {

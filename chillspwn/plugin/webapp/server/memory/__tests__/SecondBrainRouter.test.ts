@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import express from "express";
 import type { Server } from "node:http";
 import type { AddressInfo } from "node:net";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createDatabaseConnection, migrateDatabase } from "../../db/index";
@@ -30,13 +30,18 @@ function provenance(id: string): MemoryProvenance {
   };
 }
 
-function insertMission(database: ReturnType<typeof createDatabaseConnection>, id: string, engagementId: string): void {
+function insertMission(
+  database: ReturnType<typeof createDatabaseConnection>,
+  id: string,
+  engagementId: string,
+  journey: "autonomous" | "guided" = "guided",
+): void {
   const now = "2026-07-15T10:00:00.000Z";
   database.prepare(`
     INSERT INTO missions (
       id, name, objective, journey, engagement_id, created_by, created_at, updated_at
-    ) VALUES (?, ?, 'Authorized scope', 'guided', ?, 'operator', ?, ?)
-  `).run(id, id, engagementId, now, now);
+    ) VALUES (?, ?, 'Authorized scope', ?, ?, 'operator', ?, ?)
+  `).run(id, id, journey, engagementId, now, now);
 }
 
 function node(
@@ -68,7 +73,7 @@ async function application() {
   const database = createDatabaseConnection({ filename: join(directory, "brain.sqlite") });
   migrateDatabase(database);
   insertMission(database, "mission-a", "eng-a");
-  insertMission(database, "mission-b", "eng-b");
+  insertMission(database, "mission-b", "eng-b", "autonomous");
   const repository = new MemoryRepository(database);
   node(repository, "node-global", { kind: "global" }, "Global evidence method");
   node(repository, "node-a", { kind: "engagement", engagementId: "eng-a" }, "Engagement A credential path");
@@ -125,7 +130,7 @@ async function application() {
   app.use(createSecondBrainRouter({
     database,
     vaultAllowedRoot: join(directory, "vaults"),
-    resolveActor: () => "operator-route-test",
+    resolveActor: (request) => request.get("X-Test-Actor") ?? "operator-route-test",
     resolveAccess: (request) => policy(request.get("X-Test-Access")),
   }));
   const server = app.listen(0, "127.0.0.1");
@@ -250,7 +255,7 @@ describe("Second Brain HTTP boundary", () => {
   });
 
   test("candidate consent mutations require idempotency and cannot cross scope", async () => {
-    const { database, url } = await application();
+    const { database, repository, url } = await application();
     try {
       const inbox = await json(await fetch(`${url}/api/v2/brain/candidates`));
       expect(inbox.items.map((item: { id: string }) => item.id)).toEqual(["candidate-a"]);
@@ -278,6 +283,23 @@ describe("Second Brain HTTP boundary", () => {
       const replay = await json(await fetch(`${url}/api/v2/brain/candidates/candidate-a/confirm`, mutation));
       expect(replay).toEqual(confirmed);
 
+      const revokedReplay = await fetch(`${url}/api/v2/brain/candidates/candidate-a/confirm`, {
+        ...mutation,
+        headers: { ...mutation.headers, "X-Test-Access": "b" },
+      });
+      expect(revokedReplay.status).toBe(404);
+      const revokedBody = await json(revokedReplay);
+      expect(revokedBody).toMatchObject({ error: { category: "not_found" } });
+      expect(JSON.stringify(revokedBody)).not.toContain("Operator-confirmed deep evidence preference");
+      expect(repository.getNode(confirmed.node.id)).toMatchObject({ version: 1 });
+
+      const otherActor = await fetch(`${url}/api/v2/brain/candidates/candidate-a/confirm`, {
+        ...mutation,
+        headers: { ...mutation.headers, "X-Test-Actor": "operator-route-test-other" },
+      });
+      expect(otherActor.status).toBe(409);
+      expect(JSON.stringify(await otherActor.json())).not.toContain("Operator-confirmed deep evidence preference");
+
       const denied = await fetch(`${url}/api/v2/brain/candidates/candidate-b/confirm`, {
         method: "POST",
         headers: {
@@ -288,7 +310,7 @@ describe("Second Brain HTTP boundary", () => {
       });
       expect(denied.status).toBe(404);
 
-      const rejected = await fetch(`${url}/api/v2/brain/candidates/candidate-b/reject`, {
+      const rejectRequest = {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -296,9 +318,128 @@ describe("Second Brain HTTP boundary", () => {
           "X-Test-Access": "b",
         },
         body: JSON.stringify({ reason: "Operator rejected this engagement-specific preference" }),
-      });
+      };
+      const rejected = await fetch(`${url}/api/v2/brain/candidates/candidate-b/reject`, rejectRequest);
       expect(rejected.status).toBe(200);
-      expect(await rejected.json()).toMatchObject({ status: "suppressed", suppressionId: expect.any(String) });
+      const rejectedBody = await json(rejected);
+      expect(rejectedBody.status).toBe("suppressed");
+      expect(typeof rejectedBody.suppressionId).toBe("string");
+      const suppressionId = rejectedBody.suppressionId as string;
+      expect(suppressionId.length).toBeGreaterThan(0);
+      const rejectedReplay = await fetch(`${url}/api/v2/brain/candidates/candidate-b/reject`, {
+        ...rejectRequest,
+        headers: {
+          "Content-Type": "application/json",
+          "Idempotency-Key": "reject-candidate-b-0001",
+        },
+      });
+      expect(rejectedReplay.status).toBe(404);
+      expect(JSON.stringify(await rejectedReplay.json())).not.toContain(suppressionId);
+      expect(database.prepare("SELECT COUNT(*) AS count FROM memory_suppressions").get()).toEqual({ count: 1 });
+    } finally {
+      database.close();
+    }
+  });
+
+  test("run-filtered candidates require exact canonical provenance and remain scope isolated", async () => {
+    const { database, repository, url } = await application();
+    try {
+      const now = "2026-07-15T10:00:00.000Z";
+      const insertRun = database.prepare(`
+        INSERT INTO runs (id, mission_id, journey, status, created_at, updated_at)
+        VALUES (?, ?, ?, 'completed', ?, ?)
+      `);
+      insertRun.run("run-a-one", "mission-a", "guided", now, now);
+      insertRun.run("run-a-two", "mission-a", "guided", now, now);
+      insertRun.run("run-b-one", "mission-b", "autonomous", now, now);
+      insertMission(database, "mission-a-other", "eng-a");
+      const insertConversation = database.prepare(`
+        INSERT INTO conversations (id, mission_id, run_id, conversation_type, created_at, updated_at)
+        VALUES (?, ?, ?, 'guided', ?, ?)
+      `);
+      insertConversation.run("conversation-a-one", "mission-a", "run-a-one", now, now);
+      insertConversation.run("conversation-a-two", "mission-a", "run-a-two", now, now);
+      insertConversation.run("conversation-b-one", "mission-b", "run-b-one", now, now);
+      const insertMessage = database.prepare(`
+        INSERT INTO messages (id, conversation_id, role, body, created_at)
+        VALUES (?, ?, 'assistant', 'Bounded reusable insight', ?)
+      `);
+      insertMessage.run("message-a-one", "conversation-a-one", now);
+      insertMessage.run("message-a-two", "conversation-a-two", now);
+      insertMessage.run("message-b-one", "conversation-b-one", now);
+      for (const [id, missionId, messageId] of [
+        ["candidate-run-a-one", "mission-a", "message-a-one"],
+        ["candidate-run-a-two", "mission-a", "message-a-two"],
+        ["candidate-run-b-one", "mission-b", "message-b-one"],
+      ] as const) {
+        repository.createCandidate({
+          id,
+          nodeType: "procedure",
+          title: `Procedure from ${id}`,
+          summary: "Reviewable exact-run procedure",
+          scope: id === "candidate-run-a-one"
+            ? { kind: "engagement", engagementId: "eng-a" }
+            : { kind: "mission", missionId },
+          sensitivity: "private",
+          confidence: 0.8,
+          provenance: {
+            method: "operator_statement",
+            explanation: "Created from one exact Guided message.",
+            sources: [{ sourceType: "message", sourceId: messageId, acquiredAt: now }],
+          },
+          proposedBy: "operator-route-test",
+        });
+      }
+
+      for (const [id, scope, messageId] of [
+        ["candidate-run-a-global", { kind: "global" }, "message-a-one"],
+        ["candidate-run-a-wrong-mission", {
+          kind: "mission",
+          engagementId: "eng-a",
+          missionId: "mission-a-other",
+        }, "message-a-one"],
+        ["candidate-run-a-wrong-engagement", {
+          kind: "engagement",
+          engagementId: "eng-b",
+        }, "message-a-one"],
+        ["candidate-global-other-run", { kind: "global" }, "message-a-two"],
+      ] as const) {
+        repository.createCandidate({
+          id,
+          nodeType: "procedure",
+          title: `Procedure from ${id}`,
+          summary: "Reviewable scope-isolation procedure",
+          scope,
+          sensitivity: "private",
+          confidence: 0.8,
+          provenance: {
+            method: "operator_statement",
+            explanation: "Created from one exact Guided message.",
+            sources: [{ sourceType: "message", sourceId: messageId, acquiredAt: now }],
+          },
+          proposedBy: "operator-route-test",
+        });
+      }
+
+      const exact = await json(await fetch(`${url}/api/v2/brain/candidates?missionId=mission-a&runId=run-a-one`, {
+        headers: { "X-Test-Access": "all" },
+      }));
+      expect(exact.items.map((item: { id: string }) => item.id).sort()).toEqual([
+        "candidate-run-a-global",
+        "candidate-run-a-one",
+      ]);
+      expect(JSON.stringify(exact)).not.toContain("candidate-run-a-two");
+      expect(JSON.stringify(exact)).not.toContain("candidate-run-b-one");
+      expect(JSON.stringify(exact)).not.toContain("candidate-run-a-wrong-mission");
+      expect(JSON.stringify(exact)).not.toContain("candidate-run-a-wrong-engagement");
+      expect(JSON.stringify(exact)).not.toContain("candidate-global-other-run");
+
+      const inaccessible = await json(await fetch(`${url}/api/v2/brain/candidates?runId=run-b-one`));
+      expect(inaccessible.items).toEqual([]);
+      const mismatched = await json(await fetch(`${url}/api/v2/brain/candidates?missionId=mission-a&runId=run-b-one`, {
+        headers: { "X-Test-Access": "all" },
+      }));
+      expect(mismatched.items).toEqual([]);
     } finally {
       database.close();
     }
@@ -352,6 +493,44 @@ describe("Second Brain HTTP boundary", () => {
     }
   });
 
+  test("cached node mutations reauthorize the current canonical resource before replay", async () => {
+    const { database, repository, url } = await application();
+    try {
+      const request = {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Idempotency-Key": "correct-node-resource-reauth-0001",
+        },
+        body: JSON.stringify({
+          expectedVersion: 1,
+          summary: "Scoped result that must not survive revoked access",
+          reason: "Exercise replay authorization",
+        }),
+      };
+      const firstResponse = await fetch(`${url}/api/v2/brain/nodes/node-a/correct`, request);
+      expect(firstResponse.status).toBe(200);
+      const first = await json(firstResponse);
+      expect(first.node).toMatchObject({ id: "node-a", version: 2 });
+      expect(await json(await fetch(`${url}/api/v2/brain/nodes/node-a/correct`, request))).toEqual(first);
+
+      repository.correctNode("node-a", {
+        scope: { kind: "engagement", engagementId: "eng-b" },
+        authorType: "operator",
+        authorId: "scope-administrator",
+        changeReason: "Resource moved outside the original operator scope",
+      });
+      const denied = await fetch(`${url}/api/v2/brain/nodes/node-a/correct`, request);
+      expect(denied.status).toBe(404);
+      const deniedBody = await json(denied);
+      expect(deniedBody).toMatchObject({ error: { category: "not_found" } });
+      expect(JSON.stringify(deniedBody)).not.toContain("Scoped result that must not survive revoked access");
+      expect(repository.getNode("node-a")).toMatchObject({ version: 3, scope: { engagementId: "eng-b" } });
+    } finally {
+      database.close();
+    }
+  });
+
   test("context-pack detail enforces mission scope and exposes concise use explanations", async () => {
     const { database, repository, url } = await application();
     try {
@@ -378,6 +557,81 @@ describe("Second Brain HTTP boundary", () => {
         relevanceReason: "Same mission and phase",
         influenceSummary: "Expanded the evidence validation guidance",
       });
+      repository.persistContextPack({
+        id: "ctx-route-b",
+        missionId: "mission-b",
+        journey: "autonomous",
+        purpose: "Hidden engagement planning context",
+        scopePolicy: {
+          engagementId: "eng-b",
+          missionId: "mission-b",
+          journey: "autonomous",
+          maximumSensitivity: "private",
+          contextBudget: 1_000,
+        },
+        contextBudget: 1_000,
+        createdBy: "commander",
+        items: [{ node: repository.requireNode("node-b"), score: 1, relevanceReason: "Other engagement" }],
+      });
+      database.prepare(`
+        INSERT INTO runs (id, mission_id, journey, status, created_at, updated_at)
+        VALUES ('run-b', 'mission-b', 'autonomous', 'planning', ?, ?)
+      `).run("2026-07-15T10:00:00.000Z", "2026-07-15T10:00:00.000Z");
+      repository.persistContextPack({
+        id: "ctx-route-b-linked",
+        runId: "run-b",
+        journey: "autonomous",
+        purpose: "Run-linked hidden engagement planning context",
+        scopePolicy: {
+          engagementId: "eng-b",
+          missionId: "mission-b",
+          journey: "autonomous",
+          maximumSensitivity: "private",
+          contextBudget: 1_000,
+        },
+        contextBudget: 1_000,
+        createdBy: "commander",
+        items: [{ node: repository.requireNode("node-b"), score: 1, relevanceReason: "Other engagement run" }],
+      });
+      database.prepare(`
+        INSERT INTO runs (id, mission_id, journey, status, created_at, updated_at)
+        VALUES ('run-a', 'mission-a', 'guided', 'planning', ?, ?)
+      `).run("2026-07-15T10:00:00.000Z", "2026-07-15T10:00:00.000Z");
+      repository.persistContextPack({
+        id: "ctx-route-a-linked",
+        runId: "run-a",
+        journey: "guided",
+        purpose: "Run-linked visible planning context",
+        scopePolicy: {
+          engagementId: "eng-a",
+          missionId: "mission-a",
+          journey: "guided",
+          maximumSensitivity: "private",
+          contextBudget: 1_000,
+        },
+        contextBudget: 1_000,
+        createdBy: "commander",
+        items: [{ node: item, score: 1, relevanceReason: "Same engagement run" }],
+      });
+      const summaryA = await json(await fetch(`${url}/api/v2/brain/summary`));
+      const summaryB = await json(await fetch(`${url}/api/v2/brain/summary`, {
+        headers: { "X-Test-Access": "b" },
+      }));
+      expect(summaryA.counts.contextPacks).toBe(2);
+      expect(summaryB.counts.contextPacks).toBe(2);
+      const listed = await json(await fetch(`${url}/api/v2/brain/context-packs?missionId=mission-a`));
+      expect(listed.schemaVersion).toBe("2.1");
+      expect(listed.totalReturned).toBe(2);
+      expect(listed.items.map((entry: { id: string }) => entry.id).sort()).toEqual(["ctx-route-a", "ctx-route-a-linked"]);
+      expect(listed.items.find((entry: { id: string }) => entry.id === "ctx-route-a")).toMatchObject({
+        missionId: "mission-a", journey: "guided", purpose: "Explain the next step",
+        retrievedItemCount: 1, usedItemCount: 1, correctedItemCount: 0,
+      });
+      expect(listed.items.find((entry: { id: string }) => entry.id === "ctx-route-a-linked"))
+        .toMatchObject({ missionId: "mission-a", runId: "run-a" });
+      const visibleToA = JSON.stringify(await json(await fetch(`${url}/api/v2/brain/context-packs`)));
+      expect(visibleToA).not.toContain("ctx-route-b");
+      expect(visibleToA).not.toContain("ctx-route-b-linked");
       const detail = await json(await fetch(`${url}/api/v2/brain/context-packs/${pack.id}`));
       expect(detail.items[0]).toMatchObject({
         used: true,
@@ -386,6 +640,10 @@ describe("Second Brain HTTP boundary", () => {
       });
       const denied = await fetch(`${url}/api/v2/brain/context-packs/${pack.id}`, { headers: { "X-Test-Access": "b" } });
       expect(denied.status).toBe(404);
+      const linkedDenied = await fetch(`${url}/api/v2/brain/context-packs/ctx-route-b-linked`);
+      expect(linkedDenied.status).toBe(404);
+      const engagementB = await json(await fetch(`${url}/api/v2/brain/context-packs`, { headers: { "X-Test-Access": "b" } }));
+      expect(engagementB.items.map((item: { id: string }) => item.id).sort()).toEqual(["ctx-route-b", "ctx-route-b-linked"]);
     } finally {
       database.close();
     }
@@ -410,16 +668,29 @@ describe("Second Brain HTTP boundary", () => {
       const connected = await json(connect);
       expect(connected).toMatchObject({ connection: { vaultPath: "Operator-Brain", status: "connected" } });
 
-      const exported = await fetch(`${url}/api/v2/brain/vault/export`, {
+      const exportRequest = {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
           "Idempotency-Key": "export-vault-safe-0001",
         },
         body: JSON.stringify({ connectionId: connected.connection.id }),
-      });
+      };
+      const exported = await fetch(`${url}/api/v2/brain/vault/export`, exportRequest);
       expect(exported.status).toBe(200);
-      expect(await exported.json()).toMatchObject({ result: { connectionId: connected.connection.id, status: "synced" } });
+      const exportedPayload = await json(exported);
+      expect(exportedPayload).toMatchObject({ result: { connectionId: connected.connection.id, status: "synced" } });
+      expect(await json(await fetch(`${url}/api/v2/brain/vault/export`, exportRequest))).toEqual(exportedPayload);
+      const revokedExportReplay = await fetch(`${url}/api/v2/brain/vault/export`, {
+        ...exportRequest,
+        headers: { ...exportRequest.headers, "X-Test-Access": "b" },
+      });
+      expect(revokedExportReplay.status).toBe(404);
+      expect(JSON.stringify(await revokedExportReplay.json())).not.toContain("Exported 3 accessible canonical notes");
+      expect(database.prepare(`
+        SELECT COUNT(*) AS count FROM audit_records
+        WHERE action = 'memory.exported' AND resource_type = 'memory_node'
+      `).get()).toEqual({ count: 3 });
       const snapshot = await json(await fetch(`${url}/api/v2/brain/vault`));
       expect(snapshot.syncStates.length).toBe(3);
       expect(JSON.stringify(snapshot)).not.toContain(join(directory, "vaults"));
@@ -449,6 +720,88 @@ describe("Second Brain HTTP boundary", () => {
       });
       expect([400, 403]).toContain(traversal.status);
       expect(JSON.stringify(await traversal.json())).not.toContain(directory.replaceAll("\\", "/"));
+    } finally {
+      database.close();
+    }
+  });
+
+  test("portable exports bind downloads and idempotent replay to owner, access, and live nodes", async () => {
+    const { database, repository, directory, url } = await application();
+    try {
+      const connect = await fetch(`${url}/api/v2/brain/vault/connect`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Idempotency-Key": "connect-portable-vault-0001",
+        },
+        body: JSON.stringify({
+          vaultPath: "Portable-Brain",
+          displayName: "Portable Brain",
+          permissionGranted: true,
+        }),
+      });
+      expect(connect.status).toBe(201);
+      const connected = await json(connect);
+      const portableRequest = {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Idempotency-Key": "portable-export-owner-bound-0001",
+        },
+        body: JSON.stringify({ connectionId: connected.connection.id }),
+      };
+      const createdResponse = await fetch(`${url}/api/v2/brain/vault/portable-export`, portableRequest);
+      expect(createdResponse.status).toBe(200);
+      const created = await json(createdResponse);
+      const archiveName = String(created.result.archiveName);
+      expect(created.result.status).toBe("ready");
+      expect(archiveName).toMatch(/\.zip$/u);
+      expect(await json(await fetch(`${url}/api/v2/brain/vault/portable-export`, portableRequest))).toEqual(created);
+
+      const authorizedDownload = await fetch(`${url}${created.result.downloadUrl}`);
+      expect(authorizedDownload.status).toBe(200);
+      expect(authorizedDownload.headers.get("content-type")).toContain("application/zip");
+      expect(authorizedDownload.headers.get("content-disposition")).toBe(
+        `attachment; filename="${archiveName}"`,
+      );
+      expect(authorizedDownload.headers.get("x-content-type-options")).toBe("nosniff");
+      expect(authorizedDownload.headers.get("cross-origin-resource-policy")).toBe("same-origin");
+      expect(authorizedDownload.headers.get("content-security-policy")).toBe("sandbox");
+      expect(authorizedDownload.headers.get("referrer-policy")).toBe("no-referrer");
+
+      const crossActorDownload = await fetch(`${url}${created.result.downloadUrl}`, {
+        headers: { "X-Test-Actor": "operator-route-test-other" },
+      });
+      expect(crossActorDownload.status).toBe(404);
+      expect(JSON.stringify(await crossActorDownload.json())).not.toContain(archiveName);
+
+      const revokedDownload = await fetch(`${url}${created.result.downloadUrl}`, {
+        headers: { "X-Test-Access": "b" },
+      });
+      expect(revokedDownload.status).toBe(404);
+      expect(JSON.stringify(await revokedDownload.json())).not.toContain(archiveName);
+
+      const revokedReplay = await fetch(`${url}/api/v2/brain/vault/portable-export`, {
+        ...portableRequest,
+        headers: { ...portableRequest.headers, "X-Test-Access": "b" },
+      });
+      expect(revokedReplay.status).toBe(404);
+      expect(JSON.stringify(await revokedReplay.json())).not.toContain(archiveName);
+
+      const archivePath = join(directory, "vaults", "Portable-Brain", ".chillspwn", "exports", archiveName);
+      const originalArchive = readFileSync(archivePath);
+      const tamperedArchive = Buffer.from(originalArchive);
+      tamperedArchive[0] = tamperedArchive[0]! ^ 0xff;
+      writeFileSync(archivePath, tamperedArchive);
+      const tamperedDownload = await fetch(`${url}${created.result.downloadUrl}`);
+      expect(tamperedDownload.status).toBe(404);
+      expect(JSON.stringify(await tamperedDownload.json())).not.toContain(archiveName);
+      writeFileSync(archivePath, originalArchive);
+
+      repository.forgetNode("node-a", "operator-route-test", "Exercise portable-export resource revocation");
+      const forgottenNodeDownload = await fetch(`${url}${created.result.downloadUrl}`);
+      expect(forgottenNodeDownload.status).toBe(404);
+      expect(JSON.stringify(await forgottenNodeDownload.json())).not.toContain(archiveName);
     } finally {
       database.close();
     }

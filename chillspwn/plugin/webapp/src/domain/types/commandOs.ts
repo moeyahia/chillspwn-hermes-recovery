@@ -32,10 +32,118 @@ export interface MissionSummary {
   title: string;
   journey: Journey;
   status: string;
+  missionStatus: string;
+  authorizationStatus: string;
+  engagementId: string | null;
+  scope: {
+    allowedTargets: string[];
+    allowedTargetCount: number;
+    prohibitedTargetCount: number;
+  };
+  createdAt: string;
   updatedAt: string;
-  currentPhase?: string;
-  progress?: number;
-  nextAction?: string;
+  runId: string | null;
+  activeRunId: string | null;
+  runStartedAt: string | null;
+  runEndedAt: string | null;
+  currentPhase: string | null;
+  progress: number | null;
+  currentOwner: { id: string; name: string | null } | null;
+  team: Array<{ id: string; name: string | null }>;
+  provider: string | null;
+  risk: string | null;
+  evidenceCount: number;
+  highestFindingSeverity: "informational" | "low" | "medium" | "high" | "critical" | null;
+  decisionState: string | null;
+  recoveryState: "recovering" | "blocked" | null;
+  lastMeaningfulEvent: { type: string; summary: string; occurredAt: string } | null;
+  budget: { limits: Record<string, number>; usage: Record<string, number> };
+  nextAction: string | null;
+}
+
+export interface MissionPortfolioFilterState {
+  query: string;
+  journey: Journey | "";
+  status: string;
+  engagement: string;
+  target: string;
+  agent: string;
+  provider: string;
+  updatedFrom: string;
+  updatedTo: string;
+  risk: string;
+  evidence: "present" | "none" | "";
+  findingSeverity: string;
+  decisionState: string;
+  recoveryState: "recovering" | "blocked" | "none" | "";
+  view: "table" | "board";
+}
+
+export interface SavedMissionView {
+  id: string;
+  name: string;
+  state: MissionPortfolioFilterState;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface SavedMissionViewCollection {
+  schemaVersion: "2.1";
+  version: number;
+  items: SavedMissionView[];
+}
+
+export interface MissionBulkItemOutcome {
+  missionId: string;
+  status: "archived" | "exported" | "ineligible" | "not_found";
+  reason: string;
+}
+
+export interface MissionBulkArchiveResult {
+  schemaVersion: "2.1";
+  selectionHash: string;
+  outcomes: MissionBulkItemOutcome[];
+  archivedCount: number;
+}
+
+export interface MissionExportRecord {
+  missionId: string;
+  titlePreview: string;
+  titleSha256: string;
+  titleTruncated: boolean;
+  journey: Journey;
+  missionStatus: string;
+  authorizationStatus: string;
+  createdAt: string;
+  updatedAt: string;
+  engagement: { present: boolean; sha256: string | null };
+  scope: { allowedTargetCount: number; prohibitedTargetCount: number; targetSetSha256: string };
+  latestRun: {
+    id: string;
+    status: string;
+    progress: number;
+    phase: string | null;
+    ownerId: string | null;
+    startedAt: string | null;
+    endedAt: string | null;
+  } | null;
+  evidenceCount: number;
+  findingCounts: Record<string, number>;
+}
+
+export interface MissionBulkExportResult {
+  schemaVersion: "2.1";
+  generatedAt: string;
+  selectionHash: string;
+  exportSha256: string;
+  records: MissionExportRecord[];
+  outcomes: MissionBulkItemOutcome[];
+  policy: {
+    maxBatch: number;
+    evidenceBlobsIncluded: false;
+    confidentialPayloadsIncluded: false;
+    titlePreviewLimit: number;
+  };
 }
 
 export interface AttentionItem {
@@ -126,7 +234,7 @@ export interface AutonomousMissionRequest {
   contract: {
     allowedActionClasses: string[];
     prohibitedActionClasses: string[];
-    destructivePolicy: string;
+    destructivePolicy: "prohibited" | "contract_only";
     evidenceRequirements: string[];
     timeBudgetMinutes: number;
     tokenBudget?: number;
@@ -142,6 +250,7 @@ export interface AutonomousMissionRequest {
     retentionPolicy: "operator_managed";
     providerPolicy: "automatic_enforcing_only";
     toolPolicy: "contract_allowlist";
+    specialistAgentIds: string[];
     memoryScopes: string[];
     contextNodeIds: string[];
     safeStopConditions: string[];
@@ -163,6 +272,49 @@ export interface AutonomousContextCandidate {
   updatedAt: string;
 }
 
+export interface AutonomousProviderPathCandidate {
+  id: string;
+  status: "healthy" | "degraded" | "unhealthy" | "unknown";
+  authenticated: boolean;
+  enforcesAutonomousBoundary: boolean;
+  reportsExactTokenUsage: boolean;
+  reportsExactCostUsage: boolean;
+  compatible: boolean;
+  reason: string;
+  checkedAt: string;
+}
+
+export interface AutonomousToolServerCandidate {
+  id: string;
+  name: string;
+  status: "unknown" | "healthy" | "degraded" | "offline" | "quarantined";
+  capabilities: string[];
+  assignedAgentIds: string[];
+  enabled: boolean;
+  startPermitted: boolean;
+  riskClass: string;
+  checkedAt?: string;
+}
+
+export interface AutonomousSpecialistCandidate {
+  id: string;
+  displayName: string;
+  role: string;
+  status: "available" | "busy" | "degraded" | "offline" | "quarantined";
+  capabilities: string[];
+  runnableTools: string[];
+  mcpServerIds: string[];
+  providerPolicy: { defaultProvider?: string };
+  toolPolicy: {
+    allowedTools: string[];
+    deniedTools: string[];
+    approvalRequiredTools: string[];
+  };
+  compatible: boolean;
+  incompatibilityReasons: string[];
+  lastHeartbeatAt?: string;
+}
+
 export interface AutonomousMissionPreflight {
   schemaVersion: "2.1";
   contract: { version: 1; hash: string };
@@ -172,6 +324,17 @@ export interface AutonomousMissionPreflight {
     selectedNodeIds: string[];
     invalidSelectedNodeIds: string[];
   };
+  execution: {
+    providers: AutonomousProviderPathCandidate[];
+    tools: AutonomousToolServerCandidate[];
+    team: {
+      candidates: AutonomousSpecialistCandidate[];
+      selectedAgentIds: string[];
+      invalidSelectedAgentIds: string[];
+      recommendedAgentIds: string[];
+      effectiveAgentIds: string[];
+    };
+  };
   policySummary: {
     provider: string;
     tools: string;
@@ -180,6 +343,54 @@ export interface AutonomousMissionPreflight {
     retention: string;
     storage: string;
   };
+}
+
+export type VersionedAutonomousMissionPreflight = Omit<AutonomousMissionPreflight, "contract"> & {
+  contract: { version: number; hash: string };
+};
+
+export type AutonomousBranchMode = "unchanged_contract" | "contract_amendment";
+
+export interface AutonomousBranchContext {
+  schemaVersion: "2.1";
+  mission: { id: string; name: string; version: number };
+  sourceRun: {
+    id: string; status: string; statusReason: string | null; version: number;
+    safeToBranch: boolean; safeToBranchReason: string;
+  };
+  contract: { id: string; version: number; state: string; hash: string };
+  request: AutonomousMissionRequest;
+  history: Array<{
+    id: string; version: number; state: string; hash: string; sourceContractId: string | null;
+    confirmedBy: string | null; confirmedAt: string | null; createdAt: string;
+  }>;
+}
+
+export interface AutonomousBranchPreflight {
+  schemaVersion: "2.1";
+  mode: AutonomousBranchMode;
+  sourceRunId: string;
+  sourceRunVersion: number;
+  safeToBranch: boolean;
+  safeToBranchReason: string;
+  contract: {
+    id: string | null; version: number; state: "confirmed" | "draft" | "unpersisted";
+    hash: string; sourceContractId: string;
+  };
+  request: AutonomousMissionRequest;
+  preflight: VersionedAutonomousMissionPreflight;
+}
+
+export interface AutonomousBranchResult {
+  schemaVersion: "2.1";
+  sourceRunId: string;
+  branchMode: AutonomousBranchMode;
+  run: {
+    id: string; missionId: string; journey: "autonomous"; status: "planning";
+    contractId: string; createdAt: string;
+  };
+  contract: { id: string; version: number; state: "confirmed"; hash: string };
+  nextUrl: string;
 }
 
 export interface GuidedMissionRequest {
@@ -200,13 +411,13 @@ export type MissionCreateRequest = AutonomousMissionRequest | GuidedMissionReque
 export interface ApiErrorEnvelope {
   code: string;
   message: string;
-  humanMessage?: string;
-  retryable?: boolean;
-  category?: string;
+  humanMessage: string;
+  retryable: boolean;
+  category: string;
   details?: unknown;
-  traceId?: string;
+  traceId: string;
   remediation?: string;
-  timestamp?: string;
+  timestamp: string;
 }
 
 export interface OperationalEvent {

@@ -32,9 +32,23 @@ export interface GuidedCommanderStep {
   readonly rationale: string;
   readonly reversibility: string;
   readonly representedAction: Readonly<Record<string, unknown>>;
+  readonly decisionParameters: unknown;
   readonly actionFingerprint: string;
   readonly guidedDecisionId: string;
   readonly guidedDecisionStatus: string;
+}
+
+export interface GuidedReviewedObservation {
+  readonly evidenceId: string;
+  readonly contentHash: string;
+  readonly source: "paste" | "text_upload";
+  readonly mediaType: string;
+  readonly fileName: string | null;
+  readonly byteSize: number;
+  readonly redactionCount: number;
+  readonly interpretationSummary: string;
+  readonly verificationState: "unverified" | "verified" | "disputed" | "rejected";
+  readonly acquiredAt: string;
 }
 
 export interface GuidedTranscript {
@@ -54,6 +68,7 @@ export interface GuidedTranscript {
     readonly progress: number;
   };
   readonly currentStep: GuidedCommanderStep | null;
+  readonly currentObservation: GuidedReviewedObservation | null;
   readonly items: readonly GuidedCommanderMessage[];
   readonly nextCursor: string | null;
 }

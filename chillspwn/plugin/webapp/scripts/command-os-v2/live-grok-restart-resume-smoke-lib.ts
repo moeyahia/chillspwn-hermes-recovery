@@ -1,10 +1,26 @@
 import { isAbsolute, resolve } from "node:path";
+import {
+  REVIEWED_SELFTEST_AGENT,
+  REVIEWED_SELFTEST_ATTESTATION_ENV,
+  REVIEWED_SELFTEST_ATTESTATION_TOKEN,
+  REVIEWED_SELFTEST_PATH,
+  REVIEWED_SELFTEST_SERVER,
+  REVIEWED_SELFTEST_SHA256,
+  REVIEWED_SELFTEST_TOOL,
+  validateReviewedSelftestDocument,
+} from "../../server/app/ReviewedSelftestAttestation";
+
+export {
+  REVIEWED_SELFTEST_AGENT,
+  REVIEWED_SELFTEST_ATTESTATION_ENV,
+  REVIEWED_SELFTEST_ATTESTATION_TOKEN,
+  REVIEWED_SELFTEST_PATH,
+  REVIEWED_SELFTEST_SERVER,
+  REVIEWED_SELFTEST_SHA256,
+  REVIEWED_SELFTEST_TOOL,
+};
 
 export const LIVE_RESTART_CONFIRMATION = "authorized-local-selftest-restart-resume";
-export const REVIEWED_SELFTEST_PATH = "/opt/chillspwn-mcp-arsenal/local-selftest-mcp.mjs";
-export const REVIEWED_SELFTEST_SHA256 = "ecc77ab562c9cabf5f68297ede9df563935d1720ead341dff4c307363da8a215";
-export const REVIEWED_SELFTEST_SERVER = "local-selftest";
-export const REVIEWED_SELFTEST_TOOL = "quick_scan";
 
 export interface SmokeIdentity {
   readonly platform: NodeJS.Platform;
@@ -159,47 +175,9 @@ export function buildIsolatedServerEnvironment(
   return child;
 }
 
-function exactStrings(value: unknown, expected: readonly string[], label: string): void {
-  if (!Array.isArray(value) || value.length !== expected.length
-      || value.some((item, index) => item !== expected[index])) {
-    throw new Error(`${label} must contain only ${expected.join(", ") || "no values"}`);
-  }
-}
-
 /** Validate the committed config before the production registry sees it. */
 export function validateReviewedSelftestConfig(value: unknown): void {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    throw new Error("Reviewed MCP config must be an object");
-  }
-  const root = value as Record<string, unknown>;
-  const reviewed = root.reviewedAsset as Record<string, unknown> | undefined;
-  if (reviewed?.path !== REVIEWED_SELFTEST_PATH || reviewed.sha256 !== REVIEWED_SELFTEST_SHA256) {
-    throw new Error("Reviewed MCP config does not pin the approved local-selftest asset");
-  }
-  const servers = root.mcpServers;
-  if (!servers || typeof servers !== "object" || Array.isArray(servers)) {
-    throw new Error("Reviewed MCP config has no server map");
-  }
-  const entries = Object.entries(servers as Record<string, unknown>);
-  if (entries.length !== 1 || entries[0]?.[0] !== REVIEWED_SELFTEST_SERVER) {
-    throw new Error("The restart smoke MCP config may expose only local-selftest");
-  }
-  const spec = entries[0][1] as Record<string, unknown>;
-  if (!spec || typeof spec !== "object" || Array.isArray(spec)
-      || spec.enabled !== true || spec.runtime !== "stdio" || spec.command !== "/usr/bin/node") {
-    throw new Error("local-selftest must be the enabled reviewed stdio server");
-  }
-  exactStrings(spec.args, [REVIEWED_SELFTEST_PATH], "local-selftest args");
-  exactStrings(spec.assignedAgents, ["ReconScout"], "local-selftest agent assignment");
-  exactStrings(spec.toolNames, [REVIEWED_SELFTEST_TOOL], "local-selftest tool surface");
-  exactStrings(spec.requiredBinaries, ["/usr/bin/node"], "local-selftest binary requirements");
-  exactStrings(spec.requiredDockerImages, [], "local-selftest Docker requirements");
-  exactStrings(spec.apiKeysRequired, [], "local-selftest API-key requirements");
-  if (!spec.envTemplate || typeof spec.envTemplate !== "object" || Array.isArray(spec.envTemplate)
-      || Object.keys(spec.envTemplate as Record<string, unknown>).length !== 0
-      || (spec.env && Object.keys(spec.env as Record<string, unknown>).length !== 0)) {
-    throw new Error("local-selftest may not receive process credentials or custom environment values");
-  }
+  validateReviewedSelftestDocument(value);
 }
 
 export interface FinalDurabilitySnapshot {
@@ -257,7 +235,7 @@ export function validateFinalDurability(snapshot: FinalDurabilitySnapshot): void
   const action = snapshot.actions[0]!;
   if (action.status !== "succeeded" || action.kind !== "tool"
       || action.mcpServer !== REVIEWED_SELFTEST_SERVER || action.toolName !== REVIEWED_SELFTEST_TOOL) {
-    throw new Error("The only completed action was not the reviewed local-selftest.quick_scan tool");
+    throw new Error("The only completed action was not the reviewed sechub-reconnaissance.quick_scan selftest tool");
   }
   if (snapshot.toolCalls.length !== 1) {
     throw new Error("Recovered execution produced a duplicate or missing MCP tool call");
@@ -271,7 +249,7 @@ export function validateFinalDurability(snapshot: FinalDurabilitySnapshot): void
     throw new Error("Recovered execution emitted duplicate or missing action completion events");
   }
   if (snapshot.verifiedSelftestEvidenceCount < 1) {
-    throw new Error("Recovered execution produced no verified local-selftest evidence");
+    throw new Error("Recovered execution produced no verified reviewed-selftest evidence");
   }
   if (snapshot.evaluationCount !== 1 || snapshot.evaluationEvidenceCoverage <= 0) {
     throw new Error("Recovered execution produced no evidence-backed terminal evaluation");

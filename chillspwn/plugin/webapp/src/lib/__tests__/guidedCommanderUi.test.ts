@@ -40,8 +40,10 @@ describe("Guided Commander response contracts", () => {
         objective: "Collect a bounded readiness response", status: "waiting", assignedAgentId: "recon",
         riskClass: "low", successCriteria: ["Response retained"], explanation: "Read the local endpoint",
         rationale: "Establish readiness", reversibility: "Read-only", representedAction: { kind: "manual", target: "127.0.0.1" },
+        decisionParameters: { kind: "manual", target: "127.0.0.1" },
         actionFingerprint: fingerprint, guidedDecisionId: "decision-1", guidedDecisionStatus: "pending",
       },
+      currentObservation: null,
       items: [message({ structuredContent: { kind: "guided_commander_response" } })],
       nextCursor: null,
     });

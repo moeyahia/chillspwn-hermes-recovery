@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import type { SqliteDatabase } from "../db";
 import { inImmediateTransaction } from "../db";
 import { EventRepository } from "../events";
@@ -7,6 +7,7 @@ import { autonomousContractHash, canonicalJson, hashCanonical, sha256 } from "./
 import { IdempotencyConflictError } from "./errors";
 import type {
   AutonomousContextCandidate,
+  AutonomousExecutionPreview,
   AutonomousMissionRequest,
   CreatedMission,
   Journey,
@@ -14,6 +15,8 @@ import type {
   MissionListPage,
   MissionSummary,
 } from "./types";
+
+type JsonObject = Record<string, unknown>;
 
 interface IdempotencyRow {
   readonly value_json: string;
@@ -29,16 +32,42 @@ interface MissionSummaryRow {
   readonly title: string;
   readonly journey: Journey;
   readonly mission_status: string;
+  readonly authorization_status: string;
+  readonly engagement_id: string | null;
+  readonly created_at: string;
   readonly run_status: string | null;
+  readonly run_id: string | null;
+  readonly active_run_id: string | null;
+  readonly run_started_at: string | null;
+  readonly run_ended_at: string | null;
   readonly updated_at: string;
   readonly current_phase: string | null;
   readonly progress: number | null;
+  readonly current_owner_id: string | null;
+  readonly current_owner_name: string | null;
+  readonly team_json: string;
+  readonly scope_targets_json: string;
+  readonly allowed_target_count: number;
+  readonly prohibited_target_count: number;
+  readonly provider: string | null;
+  readonly risk: string | null;
+  readonly evidence_count: number;
+  readonly highest_finding_severity: MissionSummary["highestFindingSeverity"];
+  readonly decision_state: string | null;
+  readonly last_event_type: string | null;
+  readonly last_event_summary: string | null;
+  readonly last_event_at: string | null;
+  readonly budget_json: string | null;
+  readonly budget_usage_json: string | null;
   readonly next_action: string | null;
 }
 
 interface CursorValue {
+  readonly version: 1;
   readonly updatedAt: string;
   readonly id: string;
+  readonly filterHash: string;
+  readonly signature: string;
 }
 
 export interface ListMissionsOptions {
@@ -47,6 +76,17 @@ export interface ListMissionsOptions {
   readonly journey?: Journey;
   readonly status?: string;
   readonly query?: string;
+  readonly engagement?: string;
+  readonly target?: string;
+  readonly agent?: string;
+  readonly provider?: string;
+  readonly updatedFrom?: string;
+  readonly updatedTo?: string;
+  readonly risk?: string;
+  readonly evidence?: "present" | "none";
+  readonly findingSeverity?: string;
+  readonly decisionState?: string;
+  readonly recoveryState?: "recovering" | "blocked" | "none";
 }
 
 export interface CreateMissionOptions {
@@ -88,16 +128,99 @@ function normalizeTarget(target: string): string {
   }
 }
 
+function parseJsonObject(value: string | null | undefined): JsonObject {
+  if (!value) return {};
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? parsed as JsonObject
+      : {};
+  } catch {
+    return {};
+  }
+}
+
+function stringArray(value: unknown): string[] {
+  return Array.isArray(value)
+    ? [...new Set(value.filter((item): item is string => typeof item === "string" && item.trim().length > 0)
+      .map((item) => item.trim()))]
+    : [];
+}
+
+function requiresExecutionTools(request: AutonomousMissionRequest): boolean {
+  const advisoryOnly = new Set(["analysis", "planning", "reporting", "summarization", "documentation"]);
+  return request.contract.allowedActionClasses.some(
+    (actionClass) => !advisoryOnly.has(actionClass.trim().toLocaleLowerCase("en-US")),
+  );
+}
+
 function mapSummary(row: MissionSummaryRow): MissionSummary {
+  const parseArray = (value: string): unknown[] => {
+    try {
+      const parsed = JSON.parse(value) as unknown;
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
+    }
+  };
+  const numericRecord = (value: string | null): Record<string, number> => {
+    const source = parseJsonObject(value);
+    return Object.fromEntries(Object.entries(source).flatMap(([key, candidate]) => (
+      typeof candidate === "number" && Number.isFinite(candidate) && candidate >= 0
+        ? [[key, candidate]]
+        : []
+    )));
+  };
+  const team = parseArray(row.team_json).flatMap((entry) => {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) return [];
+    const item = entry as Record<string, unknown>;
+    return typeof item.id === "string"
+      ? [{ id: item.id, name: typeof item.name === "string" ? item.name : null }]
+      : [];
+  });
+  const allowedTargets = parseArray(row.scope_targets_json)
+    .filter((target): target is string => typeof target === "string");
   return {
     id: row.id,
     title: row.title,
     journey: row.journey,
     status: row.run_status ?? row.mission_status,
+    missionStatus: row.mission_status,
+    authorizationStatus: row.authorization_status,
+    engagementId: row.engagement_id,
+    scope: {
+      allowedTargets,
+      allowedTargetCount: row.allowed_target_count,
+      prohibitedTargetCount: row.prohibited_target_count,
+    },
+    createdAt: row.created_at,
     updatedAt: row.updated_at,
-    ...(row.current_phase ? { currentPhase: row.current_phase } : {}),
-    ...(row.progress === null ? {} : { progress: Math.round(row.progress * 10_000) / 100 }),
-    ...(row.next_action ? { nextAction: row.next_action } : {}),
+    runId: row.run_id,
+    activeRunId: row.active_run_id,
+    runStartedAt: row.run_started_at,
+    runEndedAt: row.run_ended_at,
+    currentPhase: row.current_phase,
+    progress: row.progress === null ? null : Math.round(row.progress * 10_000) / 100,
+    currentOwner: row.current_owner_id
+      ? { id: row.current_owner_id, name: row.current_owner_name }
+      : null,
+    team,
+    provider: row.provider,
+    risk: row.risk,
+    evidenceCount: row.evidence_count,
+    highestFindingSeverity: row.highest_finding_severity,
+    decisionState: row.decision_state,
+    recoveryState: row.run_status === "recovering" || row.run_status === "blocked"
+      ? row.run_status
+      : null,
+    lastMeaningfulEvent: row.last_event_type && row.last_event_summary && row.last_event_at
+      ? { type: row.last_event_type, summary: row.last_event_summary, occurredAt: row.last_event_at }
+      : null,
+    budget: {
+      limits: numericRecord(row.budget_json),
+      usage: numericRecord(row.budget_usage_json),
+    },
+    nextAction: row.next_action,
   };
 }
 
@@ -145,30 +268,77 @@ function contextCandidate(node: MemoryNode): AutonomousContextCandidate {
   };
 }
 
-function decodeCursor(cursor: string | undefined): CursorValue | undefined {
+function cursorSignature(
+  value: Omit<CursorValue, "signature">,
+  secret: string,
+): string {
+  return createHmac("sha256", secret).update(canonicalJson(value), "utf8").digest("hex");
+}
+
+function decodeCursor(
+  cursor: string | undefined,
+  expectedFilterHash: string,
+  secret: string,
+): CursorValue | undefined {
   if (!cursor) return undefined;
   try {
     const value = JSON.parse(Buffer.from(cursor, "base64url").toString("utf8")) as unknown;
     if (!value || typeof value !== "object") throw new Error("invalid cursor");
     const candidate = value as Record<string, unknown>;
     if (
+      candidate.version !== 1 ||
       typeof candidate.updatedAt !== "string" ||
       Number.isNaN(Date.parse(candidate.updatedAt)) ||
       typeof candidate.id !== "string" ||
-      !candidate.id
+      !candidate.id ||
+      typeof candidate.filterHash !== "string" ||
+      candidate.filterHash !== expectedFilterHash ||
+      typeof candidate.signature !== "string" ||
+      !/^[a-f0-9]{64}$/u.test(candidate.signature)
     ) {
       throw new Error("invalid cursor");
     }
-    return { updatedAt: candidate.updatedAt, id: candidate.id };
+    const unsigned = {
+      version: 1 as const,
+      updatedAt: candidate.updatedAt,
+      id: candidate.id,
+      filterHash: candidate.filterHash,
+    };
+    const expected = Buffer.from(cursorSignature(unsigned, secret), "hex");
+    const supplied = Buffer.from(candidate.signature, "hex");
+    if (expected.length !== supplied.length || !timingSafeEqual(expected, supplied)) {
+      throw new Error("invalid cursor signature");
+    }
+    return { ...unsigned, signature: candidate.signature };
   } catch {
     throw new RangeError("cursor is invalid");
   }
 }
 
-function encodeCursor(row: MissionSummaryRow): string {
-  return Buffer.from(JSON.stringify({ updatedAt: row.updated_at, id: row.id }), "utf8").toString(
+function encodeCursor(row: MissionSummaryRow, filterHash: string, secret: string): string {
+  const unsigned = { version: 1 as const, updatedAt: row.updated_at, id: row.id, filterHash };
+  return Buffer.from(canonicalJson({ ...unsigned, signature: cursorSignature(unsigned, secret) }), "utf8").toString(
     "base64url",
   );
+}
+
+function portfolioFilterHash(options: ListMissionsOptions): string {
+  return hashCanonical({
+    journey: options.journey ?? null,
+    status: options.status ?? null,
+    query: options.query ?? null,
+    engagement: options.engagement ?? null,
+    target: options.target ?? null,
+    agent: options.agent ?? null,
+    provider: options.provider ?? null,
+    updatedFrom: options.updatedFrom ?? null,
+    updatedTo: options.updatedTo ?? null,
+    risk: options.risk ?? null,
+    evidence: options.evidence ?? null,
+    findingSeverity: options.findingSeverity ?? null,
+    decisionState: options.decisionState ?? null,
+    recoveryState: options.recoveryState ?? null,
+  });
 }
 
 function parseStoredIdempotency(value: string): StoredIdempotency {
@@ -190,22 +360,100 @@ const SUMMARY_SELECT = `
     m.name AS title,
     m.journey,
     m.status AS mission_status,
+    m.authorization_status,
+    m.engagement_id,
+    m.created_at,
     r.status AS run_status,
+    r.id AS run_id,
+    (SELECT active_run.id FROM runs active_run
+      WHERE active_run.mission_id = m.id
+        AND active_run.status IN ('queued', 'planning', 'awaiting_contract_confirmation', 'running',
+          'waiting_guided_decision', 'blocked', 'recovering')
+      ORDER BY active_run.updated_at DESC, active_run.created_at DESC, active_run.id DESC
+      LIMIT 1) AS active_run_id,
+    r.started_at AS run_started_at,
+    r.ended_at AS run_ended_at,
     m.updated_at,
     ps.phase AS current_phase,
     r.progress,
+    r.current_owner_id,
+    owner.display_name AS current_owner_name,
+    COALESCE((
+      SELECT json_group_array(json_object('id', team.agent_id, 'name', team.display_name))
+      FROM (
+        SELECT DISTINCT a.agent_id, ag.display_name
+        FROM assignments a
+        LEFT JOIN agents ag ON ag.id = a.agent_id
+        WHERE a.run_id = r.id
+        ORDER BY a.agent_id
+      ) team
+    ), '[]') AS team_json,
+    COALESCE((
+      SELECT json_group_array(scope.target)
+      FROM (
+        SELECT mt.target
+        FROM mission_targets mt
+        WHERE mt.mission_id = m.id AND mt.disposition = 'allowed'
+        ORDER BY mt.normalized_target
+      ) scope
+    ), '[]') AS scope_targets_json,
+    (SELECT COUNT(*) FROM mission_targets mt WHERE mt.mission_id = m.id AND mt.disposition = 'allowed') AS allowed_target_count,
+    (SELECT COUNT(*) FROM mission_targets mt WHERE mt.mission_id = m.id AND mt.disposition = 'prohibited') AS prohibited_target_count,
+    (SELECT pt.provider FROM provider_turns pt WHERE pt.run_id = r.id ORDER BY pt.started_at DESC, pt.id DESC LIMIT 1) AS provider,
+    ps.risk_class AS risk,
+    (SELECT COUNT(*) FROM evidence e WHERE e.mission_id = m.id) AS evidence_count,
+    (SELECT f.severity FROM findings f WHERE f.mission_id = m.id ORDER BY
+      CASE f.severity WHEN 'critical' THEN 5 WHEN 'high' THEN 4 WHEN 'medium' THEN 3
+        WHEN 'low' THEN 2 WHEN 'informational' THEN 1 ELSE 0 END DESC,
+      f.updated_at DESC, f.id DESC LIMIT 1) AS highest_finding_severity,
+    (SELECT gd.status FROM guided_decisions gd WHERE gd.run_id = r.id ORDER BY
+      CASE WHEN gd.status = 'pending' THEN 0 ELSE 1 END, gd.created_at DESC, gd.id DESC LIMIT 1) AS decision_state,
+    (SELECT e.event_type FROM events e WHERE e.run_id = r.id AND lower(e.event_type) NOT LIKE '%heartbeat%'
+      ORDER BY e.sequence DESC, e.occurred_at DESC, e.id DESC LIMIT 1) AS last_event_type,
+    (SELECT e.summary FROM events e WHERE e.run_id = r.id AND lower(e.event_type) NOT LIKE '%heartbeat%'
+      ORDER BY e.sequence DESC, e.occurred_at DESC, e.id DESC LIMIT 1) AS last_event_summary,
+    (SELECT e.occurred_at FROM events e WHERE e.run_id = r.id AND lower(e.event_type) NOT LIKE '%heartbeat%'
+      ORDER BY e.sequence DESC, e.occurred_at DESC, e.id DESC LIMIT 1) AS last_event_at,
+    r.budget_json,
+    r.budget_usage_json,
     r.next_action_summary AS next_action
   FROM missions m
   LEFT JOIN ranked_runs r ON r.mission_id = m.id AND r.rank = 1
   LEFT JOIN plan_steps ps ON ps.id = r.current_step_id
+  LEFT JOIN agents owner ON owner.id = r.current_owner_id
 `;
 
 /** Transactional persistence for mission aggregate creation and portfolio reads. */
 export class MissionRepository {
   private readonly events: EventRepository;
+  private portfolioCursorSecret?: string;
 
   constructor(private readonly database: SqliteDatabase) {
     this.events = new EventRepository(database);
+  }
+
+  private cursorSecret(): string {
+    if (this.portfolioCursorSecret) return this.portfolioCursorSecret;
+    this.portfolioCursorSecret = inImmediateTransaction(this.database, () => {
+      const key = "mission.portfolio.cursor-secret.v1";
+      const existing = this.database.prepare("SELECT value_json FROM settings WHERE key = ?")
+        .get(key) as { value_json: string } | undefined;
+      if (existing) {
+        const parsed = parseJsonObject(existing.value_json);
+        if (typeof parsed.secret === "string" && /^[a-f0-9]{64}$/u.test(parsed.secret)) {
+          return parsed.secret;
+        }
+        throw new Error("Mission portfolio cursor secret is corrupt");
+      }
+      const secret = randomBytes(32).toString("hex");
+      const now = new Date().toISOString();
+      this.database.prepare(`
+        INSERT INTO settings (key, value_json, sensitivity, version, updated_by, updated_at)
+        VALUES (?, ?, 'restricted', 1, 'system:mission-portfolio', ?)
+      `).run(key, json({ secret }), now);
+      return secret;
+    });
+    return this.portfolioCursorSecret;
   }
 
   /**
@@ -261,6 +509,197 @@ export class MissionRepository {
       ...listed.filter((candidate) => !selectedSet.has(candidate.id)),
     ].slice(0, Math.max(100, selectedCandidates.length));
     return { candidates, selectedNodeIds, invalidSelectedNodeIds };
+  }
+
+  /**
+   * Projects the secret-free provider, MCP, and specialist inventory that the
+   * runtime most recently materialized into the canonical database. Launch
+   * still reruns live readiness; this projection exists for inspectable team
+   * selection and never substitutes for the enforcing runtime checks.
+   */
+  autonomousExecutionPreview(request: AutonomousMissionRequest): AutonomousExecutionPreview {
+    const now = new Date().toISOString();
+    const providerRows = this.database.prepare(`
+      WITH ranked AS (
+        SELECT component_id, status, metrics_json, message, captured_at,
+          ROW_NUMBER() OVER (
+            PARTITION BY component_id ORDER BY captured_at DESC, id DESC
+          ) AS row_number
+        FROM health_snapshots WHERE component_type = 'provider'
+      )
+      SELECT component_id, status, metrics_json, message, captured_at
+      FROM ranked WHERE row_number = 1 ORDER BY component_id
+    `).all() as Array<{
+      component_id: string;
+      status: "healthy" | "degraded" | "unhealthy" | "unknown";
+      metrics_json: string;
+      message: string | null;
+      captured_at: string;
+    }>;
+    const providers = providerRows.map((row) => {
+      const metrics = parseJsonObject(row.metrics_json);
+      const authenticated = metrics.authenticated === true;
+      const callable = metrics.callable === true;
+      const enforcesAutonomousBoundary = metrics.enforcesAutonomousBoundary === true;
+      const expiresAt = typeof metrics.expiresAt === "string" ? metrics.expiresAt : "";
+      const fresh = Number.isFinite(Date.parse(expiresAt)) && expiresAt >= now;
+      return {
+        id: row.component_id,
+        status: row.status,
+        authenticated,
+        enforcesAutonomousBoundary,
+        reportsExactTokenUsage: metrics.reportsExactTokenUsage === true,
+        reportsExactCostUsage: metrics.reportsExactCostUsage === true,
+        compatible: authenticated
+          && callable
+          && fresh
+          && enforcesAutonomousBoundary
+          && row.status === "healthy",
+        reason: row.message?.trim() || "No provider health explanation was reported.",
+        checkedAt: row.captured_at,
+      } as const;
+    });
+
+    const toolRows = this.database.prepare(`
+      SELECT id, name, status, capabilities_json, policy_json, last_checked_at
+      FROM mcp_servers ORDER BY name, id
+    `).all() as Array<{
+      id: string;
+      name: string;
+      status: "unknown" | "healthy" | "degraded" | "offline" | "quarantined";
+      capabilities_json: string;
+      policy_json: string;
+      last_checked_at: string | null;
+    }>;
+    const projectedTools = toolRows.map((row) => {
+      const policy = parseJsonObject(row.policy_json);
+      return {
+        id: row.id,
+        name: row.name,
+        status: row.status,
+        capabilities: stringArray(JSON.parse(row.capabilities_json) as unknown),
+        assignedAgentIds: stringArray(policy.assignedAgents),
+        enabled: policy.enabled === true,
+        startPermitted: policy.startPermitted === true,
+        riskClass: typeof policy.riskClass === "string" && policy.riskClass.trim()
+          ? policy.riskClass.trim()
+          : "unspecified",
+        ...(row.last_checked_at ? { checkedAt: row.last_checked_at } : {}),
+      };
+    });
+    const needsTools = requiresExecutionTools(request);
+    const agentRows = this.database.prepare(`
+      SELECT id, display_name, role, status, provider_policy_json,
+        tool_policy_json, last_heartbeat_at
+      FROM agents ORDER BY display_name, id
+    `).all() as Array<{
+      id: string;
+      display_name: string;
+      role: string;
+      status: "available" | "busy" | "degraded" | "offline" | "quarantined";
+      provider_policy_json: string;
+      tool_policy_json: string;
+      last_heartbeat_at: string | null;
+    }>;
+    const toolBoundaryByAgent = new Map(agentRows.map((row) => {
+      const toolPolicy = parseJsonObject(row.tool_policy_json);
+      const capabilities = (this.database.prepare(`
+        SELECT capability FROM agent_capabilities
+        WHERE agent_id = ? AND enabled = 1
+          AND source = 'live-route-attestation'
+          AND json_extract(metadata_json, '$.validUntil') >= ?
+        ORDER BY capability
+      `).all(row.id, now) as Array<{ capability: string }>).map((item) => item.capability);
+      return [row.id, {
+        capabilities,
+        capabilitySet: new Set(capabilities),
+        allowed: new Set(stringArray(toolPolicy.allowedTools)),
+        denied: new Set(stringArray(toolPolicy.deniedTools)),
+        approvalRequired: new Set(stringArray(toolPolicy.approvalRequiredTools)),
+      }] as const;
+    }));
+    // This is an Autonomous readiness projection, not a raw MCP catalogue.
+    // Omit every capability that would need a mid-run approval (and every
+    // capability outside the assigned specialist's explicit allowlist).
+    const tools = projectedTools.flatMap((tool) => {
+      const capabilities = tool.capabilities.filter((capability) =>
+        tool.assignedAgentIds.some((agentId) => {
+          const boundary = toolBoundaryByAgent.get(agentId);
+          return Boolean(
+            boundary
+            && boundary.capabilitySet.has(capability)
+            && boundary.allowed.has(capability)
+            && !boundary.denied.has(capability)
+            && !boundary.approvalRequired.has(capability),
+          );
+        }));
+      return capabilities.length > 0 ? [{ ...tool, capabilities }] : [];
+    });
+    const runnableTools = tools.filter((tool) =>
+      tool.status === "healthy"
+      && tool.enabled
+      && tool.startPermitted);
+    const candidates = agentRows.map((row) => {
+      const providerPolicy = parseJsonObject(row.provider_policy_json);
+      const toolPolicy = parseJsonObject(row.tool_policy_json);
+      const boundary = toolBoundaryByAgent.get(row.id)!;
+      const capabilities = boundary.capabilities;
+      const deniedTools = stringArray(toolPolicy.deniedTools);
+      const boundServers = runnableTools.filter((server) => server.assignedAgentIds.includes(row.id));
+      const executableTools = [...new Set(boundServers.flatMap((server) => server.capabilities)
+        .filter((tool) =>
+          boundary.capabilitySet.has(tool)
+          && boundary.allowed.has(tool)
+          && !boundary.denied.has(tool)
+          && !boundary.approvalRequired.has(tool)))].sort();
+      const incompatibilityReasons: string[] = [];
+      if (row.status !== "available") {
+        incompatibilityReasons.push(`Specialist status is ${row.status}; a fresh callable route is required.`);
+      }
+      if (needsTools && executableTools.length === 0) {
+        incompatibilityReasons.push("No approval-free reviewed MCP tool binding is available for this tool-requiring contract.");
+      }
+      return {
+        id: row.id,
+        displayName: row.display_name,
+        role: row.role,
+        status: row.status,
+        capabilities,
+        runnableTools: executableTools,
+        mcpServerIds: boundServers.map((server) => server.id),
+        providerPolicy: {
+          ...(typeof providerPolicy.defaultProvider === "string" && providerPolicy.defaultProvider.trim()
+            ? { defaultProvider: providerPolicy.defaultProvider.trim() }
+            : {}),
+        },
+        toolPolicy: {
+          allowedTools: stringArray(toolPolicy.allowedTools),
+          deniedTools,
+          approvalRequiredTools: stringArray(toolPolicy.approvalRequiredTools),
+        },
+        compatible: incompatibilityReasons.length === 0,
+        incompatibilityReasons,
+        ...(row.last_heartbeat_at ? { lastHeartbeatAt: row.last_heartbeat_at } : {}),
+      };
+    });
+    const candidateById = new Map(candidates.map((candidate) => [candidate.id, candidate]));
+    const selectedAgentIds = [...new Set(request.contract.specialistAgentIds)];
+    const invalidSelectedAgentIds = selectedAgentIds.filter((agentId) =>
+      candidateById.get(agentId)?.compatible !== true);
+    const recommendedAgentIds = candidates.filter((candidate) => candidate.compatible)
+      .map((candidate) => candidate.id);
+    const effectiveAgentIds = selectedAgentIds.filter((agentId) => !invalidSelectedAgentIds.includes(agentId));
+    return {
+      providers,
+      tools,
+      team: {
+        candidates,
+        selectedAgentIds,
+        invalidSelectedAgentIds,
+        recommendedAgentIds,
+        effectiveAgentIds,
+      },
+    };
   }
 
   getIdempotentCreate(
@@ -397,6 +836,7 @@ export class MissionRepository {
             allowedActionClasses: request.contract.allowedActionClasses,
             prohibitedActionClasses: request.contract.prohibitedActionClasses,
             destructivePolicy: request.contract.destructivePolicy,
+            specialistAgentIds: request.contract.specialistAgentIds,
           }),
           now,
         );
@@ -486,6 +926,7 @@ export class MissionRepository {
               retentionPolicy: request.contract.retentionPolicy,
               providerPolicy: request.contract.providerPolicy,
               toolPolicy: request.contract.toolPolicy,
+              specialistAgentIds: request.contract.specialistAgentIds,
               contextNodeIds: request.contract.contextNodeIds,
             }),
             json(budget),
@@ -634,7 +1075,9 @@ export class MissionRepository {
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) {
       throw new RangeError("limit must be an integer between 1 and 100");
     }
-    const cursor = decodeCursor(options.cursor);
+    const filterHash = portfolioFilterHash(options);
+    const cursorSecret = this.cursorSecret();
+    const cursor = decodeCursor(options.cursor, filterHash, cursorSecret);
     const where: string[] = ["m.status != 'archived'"];
     const parameters: unknown[] = [];
     if (cursor) {
@@ -657,6 +1100,72 @@ export class MissionRepository {
       ), lower(?)) > 0`);
       parameters.push(options.query);
     }
+    if (options.engagement) {
+      where.push("lower(COALESCE(m.engagement_id, '')) = lower(?)");
+      parameters.push(options.engagement);
+    }
+    if (options.target) {
+      where.push(`EXISTS (
+        SELECT 1 FROM mission_targets target_filter
+        WHERE target_filter.mission_id = m.id AND instr(lower(
+          target_filter.target || ' ' || target_filter.normalized_target
+        ), lower(?)) > 0
+      )`);
+      parameters.push(options.target);
+    }
+    if (options.agent) {
+      where.push(`(
+        lower(COALESCE(r.current_owner_id, '')) = lower(?) OR EXISTS (
+          SELECT 1 FROM assignments assignment_filter
+          WHERE assignment_filter.run_id = r.id AND lower(assignment_filter.agent_id) = lower(?)
+        )
+      )`);
+      parameters.push(options.agent, options.agent);
+    }
+    if (options.provider) {
+      where.push(`EXISTS (
+        SELECT 1 FROM provider_turns provider_filter
+        WHERE provider_filter.run_id = r.id AND lower(provider_filter.provider) = lower(?)
+      )`);
+      parameters.push(options.provider);
+    }
+    if (options.updatedFrom) {
+      where.push("m.updated_at >= ?");
+      parameters.push(options.updatedFrom);
+    }
+    if (options.updatedTo) {
+      where.push("m.updated_at <= ?");
+      parameters.push(options.updatedTo);
+    }
+    if (options.risk) {
+      where.push("lower(COALESCE(ps.risk_class, '')) = lower(?)");
+      parameters.push(options.risk);
+    }
+    if (options.evidence === "present") {
+      where.push("EXISTS (SELECT 1 FROM evidence evidence_filter WHERE evidence_filter.mission_id = m.id)");
+    } else if (options.evidence === "none") {
+      where.push("NOT EXISTS (SELECT 1 FROM evidence evidence_filter WHERE evidence_filter.mission_id = m.id)");
+    }
+    if (options.findingSeverity) {
+      where.push(`EXISTS (
+        SELECT 1 FROM findings finding_filter
+        WHERE finding_filter.mission_id = m.id AND finding_filter.severity = ?
+      )`);
+      parameters.push(options.findingSeverity);
+    }
+    if (options.decisionState) {
+      where.push(`EXISTS (
+        SELECT 1 FROM guided_decisions decision_filter
+        WHERE decision_filter.run_id = r.id AND decision_filter.status = ?
+      )`);
+      parameters.push(options.decisionState);
+    }
+    if (options.recoveryState === "recovering" || options.recoveryState === "blocked") {
+      where.push("r.status = ?");
+      parameters.push(options.recoveryState);
+    } else if (options.recoveryState === "none") {
+      where.push("COALESCE(r.status, '') NOT IN ('recovering', 'blocked')");
+    }
     parameters.push(limit + 1);
     const rows = this.database
       .prepare(`${SUMMARY_SELECT} WHERE ${where.join(" AND ")} ORDER BY m.updated_at DESC, m.id DESC LIMIT ?`)
@@ -666,7 +1175,9 @@ export class MissionRepository {
     return {
       schemaVersion: "2.1",
       items: visible.map(mapSummary),
-      nextCursor: hasMore && visible.length > 0 ? encodeCursor(visible[visible.length - 1]!) : null,
+      nextCursor: hasMore && visible.length > 0
+        ? encodeCursor(visible[visible.length - 1]!, filterHash, cursorSecret)
+        : null,
     };
   }
 

@@ -4,6 +4,7 @@ import { Icon } from "../../design-system/components/Icon";
 import { AppLink, useNavigation } from "../router/navigation";
 import { isNavigationItemActive, PRIMARY_NAVIGATION } from "../router/routes";
 import { CommandPalette } from "../command-palette/CommandPalette";
+import { NotificationCenter } from "../../features/notifications/NotificationCenter";
 
 export function AppShell({ children }: { children: ReactNode }) {
   const { pathname } = useNavigation();
@@ -55,12 +56,15 @@ export function AppShell({ children }: { children: ReactNode }) {
           <span>Search or run a command</span>
           <kbd>{navigator.platform.toLowerCase().includes("mac") ? "⌘" : "Ctrl"} K</kbd>
         </button>
-        <div
-          className={`os-stream os-stream--${stream.state}`}
-          title={`${streamLabel}${stream.lastEvent?.summary ? ` · ${stream.lastEvent.summary}` : ""}`}
-        >
-          <span aria-hidden="true" />
-          <span>{stream.state === "connected" ? "Live" : stream.state === "fallback" ? "Fallback refresh" : stream.state}</span>
+        <div className="os-topbar-actions">
+          <NotificationCenter />
+          <div
+            className={`os-stream os-stream--${stream.state}`}
+            title={`${streamLabel}${stream.lastEvent?.summary ? ` · ${stream.lastEvent.summary}` : ""}`}
+          >
+            <span aria-hidden="true" />
+            <span>{stream.state === "connected" ? "Live" : stream.state === "fallback" ? "Fallback refresh" : stream.state}</span>
+          </div>
         </div>
         <p className="os-visually-hidden" role="status" aria-live="polite" aria-atomic="true">{streamLabel}</p>
       </header>

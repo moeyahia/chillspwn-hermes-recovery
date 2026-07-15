@@ -16,6 +16,7 @@
  */
 
 import { randomUUID } from "crypto";
+import type { LegacyToolApprovalAttestation } from "../mcp/McpApprovalAttestation";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Shared primitives
@@ -379,6 +380,11 @@ export interface ToolCall {
   status: ToolCallStatus;
   /** Set when the tool requires approval. */
   approvalId?: string;
+  /**
+   * Exact one-time MCP dispatch claim. It contains hashes and provenance only;
+   * raw arguments and credential material are never duplicated here.
+   */
+  mcpApprovalClaim?: LegacyToolApprovalAttestation & { consumedAt?: IsoTimestamp };
   createdAt: IsoTimestamp;
   resolvedAt?: IsoTimestamp;
   result?: ToolResult;

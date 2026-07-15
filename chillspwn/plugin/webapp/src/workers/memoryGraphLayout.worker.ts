@@ -1,16 +1,19 @@
-import type { MemoryNodeSummary } from "../domain/types/brain";
-import { compactGraphLayout, layoutGraph } from "../features/brain/graphUtils";
+import type { MemoryEdgeSummary, MemoryNodeSummary } from "../domain/types/brain";
+import { compactGraphLayout, layoutGraph, relaxGraphLayout } from "../features/brain/graphUtils";
 
 interface LayoutRequest {
   requestId: number;
   nodes: MemoryNodeSummary[];
+  edges: MemoryEdgeSummary[];
   width: number;
   height: number;
   compact: boolean;
+  physics: boolean;
 }
 
 self.onmessage = (event: MessageEvent<LayoutRequest>) => {
-  const { requestId, nodes, width, height, compact } = event.data;
-  const layout = layoutGraph(nodes, width, height);
-  self.postMessage({ requestId, points: compact ? compactGraphLayout(layout, width, height) : layout });
+  const { requestId, nodes, edges, width, height, compact, physics } = event.data;
+  const initial = layoutGraph(nodes, width, height);
+  const weighted = physics ? relaxGraphLayout(initial, edges, width, height) : initial;
+  self.postMessage({ requestId, points: compact ? compactGraphLayout(weighted, width, height) : weighted });
 };

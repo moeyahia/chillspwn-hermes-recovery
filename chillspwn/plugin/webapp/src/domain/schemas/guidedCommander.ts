@@ -59,6 +59,7 @@ function step(value: unknown): GuidedCommanderStep {
     rationale: string(item.rationale, "step.rationale"),
     reversibility: string(item.reversibility, "step.reversibility"),
     representedAction: object(item.representedAction, "step.representedAction"),
+    decisionParameters: item.decisionParameters ?? {},
     actionFingerprint: nonEmpty(item.actionFingerprint, "step.actionFingerprint"),
     guidedDecisionId: nonEmpty(item.guidedDecisionId, "step.guidedDecisionId"),
     guidedDecisionStatus: nonEmpty(item.guidedDecisionStatus, "step.guidedDecisionStatus"),
@@ -82,6 +83,21 @@ export function parseGuidedTranscript(payload: unknown): GuidedTranscript {
   schema(root);
   const mission = object(root.mission, "Guided mission");
   const run = object(root.run, "Guided run");
+  const observation = root.currentObservation == null
+    ? null
+    : object(root.currentObservation, "Guided reviewed observation");
+  const observationSource = observation?.source;
+  if (observation && observationSource !== "paste" && observationSource !== "text_upload") {
+    throw new Error("Guided observation source is invalid");
+  }
+  const verificationState = observation?.verificationState;
+  if (
+    observation &&
+    (typeof verificationState !== "string" ||
+      !new Set(["unverified", "verified", "disputed", "rejected"]).has(verificationState))
+  ) {
+    throw new Error("Guided observation verification state is invalid");
+  }
   return {
     schemaVersion: "2.1",
     mission: {
@@ -99,6 +115,18 @@ export function parseGuidedTranscript(payload: unknown): GuidedTranscript {
       progress: number(run.progress, "run.progress"),
     },
     currentStep: root.currentStep === null ? null : step(root.currentStep),
+    currentObservation: observation ? {
+      evidenceId: nonEmpty(observation.evidenceId, "observation.evidenceId"),
+      contentHash: nonEmpty(observation.contentHash, "observation.contentHash"),
+      source: observationSource as "paste" | "text_upload",
+      mediaType: nonEmpty(observation.mediaType, "observation.mediaType"),
+      fileName: nullableString(observation.fileName, "observation.fileName"),
+      byteSize: number(observation.byteSize, "observation.byteSize"),
+      redactionCount: number(observation.redactionCount, "observation.redactionCount"),
+      interpretationSummary: nonEmpty(observation.interpretationSummary, "observation.interpretationSummary"),
+      verificationState: verificationState as "unverified" | "verified" | "disputed" | "rejected",
+      acquiredAt: nonEmpty(observation.acquiredAt, "observation.acquiredAt"),
+    } : null,
     items: array(root.items, "transcript.items").map(message),
     nextCursor: nullableString(root.nextCursor, "transcript.nextCursor"),
   };

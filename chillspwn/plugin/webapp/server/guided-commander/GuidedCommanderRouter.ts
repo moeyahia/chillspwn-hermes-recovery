@@ -1,6 +1,6 @@
-import { randomUUID } from "node:crypto";
 import { Router, type Request, type Response } from "express";
 import type { SqliteDatabase } from "../db";
+import { attachV2RequestId, sendV2Error } from "../contracts/ApiErrorContract";
 import type { SecondBrainService } from "../memory";
 import { GuidedCommanderRepository } from "./GuidedCommanderRepository";
 import { GuidedCommanderService } from "./GuidedCommanderService";
@@ -23,11 +23,6 @@ export interface GuidedCommanderRouterDependencies {
   readonly options?: GuidedCommanderOptions;
 }
 
-function requestTraceId(request: Request): string {
-  const supplied = request.get("X-Request-ID")?.trim();
-  return supplied && /^[A-Za-z0-9._:-]{1,128}$/u.test(supplied) ? supplied : randomUUID();
-}
-
 function normalizeError(error: unknown): GuidedCommanderError {
   if (error instanceof GuidedCommanderError) return error;
   if (error instanceof TypeError || error instanceof RangeError) {
@@ -45,18 +40,15 @@ function normalizeError(error: unknown): GuidedCommanderError {
 
 function sendError(response: Response, error: unknown, traceId: string): void {
   const normalized = normalizeError(error);
-  response.status(normalized.status).json({
-    error: {
-      code: normalized.code,
-      message: normalized.message,
-      humanMessage: normalized.options.humanMessage ?? normalized.message,
-      retryable: normalized.options.retryable ?? false,
-      category: normalized.options.category ?? "guided_commander",
-      ...(normalized.options.details ? { details: normalized.options.details } : {}),
-      traceId,
-      ...(normalized.options.remediation ? { remediation: normalized.options.remediation } : {}),
-      timestamp: new Date().toISOString(),
-    },
+  sendV2Error(response, traceId, {
+    status: normalized.status,
+    code: normalized.code,
+    message: normalized.message,
+    humanMessage: normalized.options.humanMessage ?? normalized.message,
+    retryable: normalized.options.retryable ?? false,
+    category: normalized.options.category ?? "guided_commander",
+    ...(normalized.options.details === undefined ? {} : { details: normalized.options.details }),
+    ...(normalized.options.remediation ? { remediation: normalized.options.remediation } : {}),
   });
 }
 
@@ -106,8 +98,7 @@ export function createGuidedCommanderRouter(
   const route = (
     handler: (request: Request, response: Response, traceId: string) => void | Promise<void>,
   ) => async (request: Request, response: Response) => {
-    const traceId = requestTraceId(request);
-    response.setHeader("X-Request-ID", traceId);
+    const traceId = attachV2RequestId(request, response);
     try {
       await handler(request, response, traceId);
     } catch (error) {

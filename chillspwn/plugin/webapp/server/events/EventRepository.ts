@@ -7,6 +7,7 @@ import type {
   OutboxRecord,
   RunEvent,
 } from "./types";
+import { NotificationProjector } from "../notifications/NotificationProjector";
 
 interface RunIdentityRow {
   readonly mission_id: string;
@@ -116,6 +117,7 @@ function boundedLimit(limit: number, maximum: number): number {
 
 /** Durable append-only event log paired with a transactional delivery outbox. */
 export class EventRepository {
+  private readonly notifications;
   private readonly findRun;
   private readonly allocateSequence;
   private readonly insertEvent;
@@ -132,6 +134,7 @@ export class EventRepository {
   private readonly releaseStaleClaimsStatement;
 
   constructor(private readonly database: SqliteDatabase) {
+    this.notifications = new NotificationProjector(database);
     this.findRun = database.prepare(
       "SELECT mission_id, journey FROM runs WHERE id = ?",
     );
@@ -279,6 +282,7 @@ export class EventRepository {
         createdAt,
         createdAt,
       );
+      this.notifications.project(event);
       return event;
     });
   }

@@ -288,6 +288,20 @@ export interface ContextPack {
   readonly items: readonly ContextPackItemDisposition[];
 }
 
+/**
+ * Provider-returned memory citations waiting for the runtime's lease-fenced
+ * plan activation transaction. Retrieval may create a candidate context pack,
+ * but no item is marked used and no lesson reuse is attributed until this
+ * disposition is committed with the plan that actually won the run lease.
+ */
+export interface PlanningContextAttribution {
+  readonly contextPackIds: readonly string[];
+  readonly citations: readonly {
+    readonly nodeId: string;
+    readonly influence: string;
+  }[];
+}
+
 export interface ForgetResult {
   readonly nodeId: string;
   readonly suppressionId: string;

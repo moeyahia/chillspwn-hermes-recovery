@@ -1,7 +1,8 @@
 import { createHash, randomUUID } from "node:crypto";
-import { readFileSync, readdirSync } from "node:fs";
-import { basename, relative } from "node:path";
+import { createReadStream, readFileSync, readdirSync, statSync } from "node:fs";
+import { basename, dirname, relative } from "node:path";
 import { Router, type Request, type Response } from "express";
+import { attachV2RequestId, sendV2Error } from "../contracts/ApiErrorContract";
 import type { SqliteDatabase } from "../db/types";
 import { getDatabaseHealth } from "../db/health";
 import { inImmediateTransaction } from "../db/transaction";
@@ -149,25 +150,21 @@ class BrainApiError extends Error {
   }
 }
 
-function traceId(request: Request): string {
-  const supplied = request.get("X-Request-ID")?.trim();
-  return supplied && /^[A-Za-z0-9._:-]{1,128}$/u.test(supplied) ? supplied : randomUUID();
-}
-
 function sendError(response: Response, error: unknown, id: string): void {
   const normalized = normalizeError(error);
-  response.status(normalized.status).json({
-    error: {
-      code: normalized.code,
-      message: normalized.message,
-      humanMessage: normalized.message,
-      retryable: normalized.status >= 500,
-      category: normalized.category,
-      traceId: id,
-      ...(normalized.remediation ? { remediation: normalized.remediation } : {}),
-      timestamp: new Date().toISOString(),
-    },
+  sendV2Error(response, id, {
+    status: normalized.status,
+    code: normalized.code,
+    message: normalized.message,
+    humanMessage: normalized.message,
+    retryable: false,
+    category: normalized.category,
+    ...(normalized.remediation ? { remediation: normalized.remediation } : {}),
   });
+}
+
+function matches(message: string, patterns: readonly RegExp[]): boolean {
+  return patterns.some((pattern) => pattern.test(message));
 }
 
 function normalizeError(error: unknown): BrainApiError {
@@ -182,17 +179,41 @@ function normalizeError(error: unknown): BrainApiError {
     );
   }
   const message = error instanceof Error ? error.message : "Second Brain request failed";
-  if (/not found|does not exist/iu.test(message)) {
-    return new BrainApiError(404, "brain_resource_not_found", message, "not_found");
+  if (matches(message, [
+    /^Memory (?:node|candidate) not found:/u,
+    /^Context pack (?:item )?not found(?::|$)/u,
+    /^Vault connection not found:/u,
+    /^(?:Vault note|Vault attachment mission|Referenced vault attachment) does not exist$/u,
+    /^Portable vault archive was not found$/u,
+    /^Open vault conflict not found$/u,
+  ])) {
+    return new BrainApiError(404, "brain_resource_not_found", "The requested Second Brain resource was not found", "not_found");
   }
-  if (/only pending|conflict|version does not match|already/iu.test(message)) {
-    return new BrainApiError(409, "brain_state_conflict", message, "conflict", "Refresh the record and retry against its current version.");
+  if (matches(message, [
+    /^Only pending candidates can be (?:confirmed|rejected)$/u,
+    /^memory control policy version does not match;/u,
+    /^Context pack memory changed after retrieval$/u,
+    /^Updating an existing memory requires a version-aware sync operation$/u,
+    /^Vault note version does not match the canonical memory version$/u,
+    /^Projected vault attachment conflicts with a non-matching file$/u,
+  ])) {
+    return new BrainApiError(409, "brain_state_conflict", "The Second Brain resource changed or is no longer actionable", "conflict", "Refresh the record and retry against its current version.");
   }
-  if (/cross-engagement|outside.*scope|not permitted|path escapes|path traversal|symbolic links/iu.test(message)) {
-    return new BrainApiError(403, "memory_scope_denied", message, "policy_denied");
+  if (matches(message, [
+    /^Cross-engagement memory edges are not permitted$/u,
+    /^Obsidian synchronization is not permitted by the memory control policy$/u,
+    /^Explicit filesystem permission is required$/u,
+    /^Vault path escapes its configured root$/u,
+    /^Vault is outside its configured root$/u,
+    /^Vault note path traversal is not permitted$/u,
+    /^Symbolic links are not permitted in managed vault paths$/u,
+  ])) {
+    return new BrainApiError(403, "memory_scope_denied", "The requested memory or vault operation is outside the authorized scope", "policy_denied");
   }
-  if (error instanceof TypeError || error instanceof RangeError || /invalid|required|must /iu.test(message)) {
-    return new BrainApiError(400, "invalid_brain_request", message, "invalid_input");
+  if (error instanceof TypeError || error instanceof RangeError || matches(message, [
+    /^(?:Stored|Canonical|Vault|Memory|Mission|Context pack|Edge|Node type|YAML|Obsidian note|Unsupported YAML|Duplicate YAML|Portable ZIP).*(?:invalid|malformed|required|must|does not match|missing|cannot change|exceeds|requires)/u,
+  ])) {
+    return new BrainApiError(400, "invalid_brain_request", "The Second Brain request is invalid", "invalid_input");
   }
   return new BrainApiError(
     500,
@@ -242,6 +263,200 @@ function canonical(value: unknown): string {
     return `{${Object.keys(record).sort().filter((key) => record[key] !== undefined).map((key) => `${JSON.stringify(key)}:${canonical(record[key])}`).join(",")}}`;
   }
   return JSON.stringify(value) ?? "null";
+}
+
+function replayAccessFingerprint(actor: string, access: MemoryAccessPolicy): string {
+  const allEngagements = access.allEngagements === true;
+  return sha256(canonical({
+    actor,
+    maximumSensitivity: access.maximumSensitivity,
+    allowGlobal: access.allowGlobal !== false,
+    allEngagements,
+    engagementIds: allEngagements ? [] : [...new Set(access.engagementIds ?? [])].sort(),
+    missionIds: allEngagements ? [] : [...new Set(access.missionIds ?? [])].sort(),
+  }));
+}
+
+function denyHiddenBrainResource(): never {
+  // Authorization misses are intentionally indistinguishable from absent
+  // Second Brain resources, including cached mutations and portable exports.
+  throw new BrainApiError(
+    404,
+    "brain_resource_not_found",
+    "The requested Second Brain resource was not found",
+    "not_found",
+  );
+}
+
+interface PortableExportAuthorization {
+  readonly schemaVersion: typeof SCHEMA_VERSION;
+  readonly actor: string;
+  readonly accessFingerprint: string;
+  readonly connectionId: string;
+  readonly archiveName: string;
+  readonly nodeIds: readonly string[];
+  readonly nodeSnapshots: readonly {
+    readonly nodeId: string;
+    readonly version: number;
+    readonly projectionHash: string;
+  }[];
+  readonly sha256: string;
+  readonly byteSize: number;
+  readonly createdAt: string;
+}
+
+function portableExportAuthorizationKey(connectionId: string, archiveName: string): string {
+  return `brain.portable_export.authorization.${sha256(`${connectionId}:${archiveName}`)}`;
+}
+
+function validatedPortableArchiveName(value: unknown): string {
+  const archiveName = requiredText(value, "portable archive name", 300);
+  if (!/^chillspwn-brain-[A-Za-z0-9._-]+\.zip$/u.test(archiveName) || basename(archiveName) !== archiveName) {
+    throw new TypeError("Portable vault archive name is invalid");
+  }
+  return archiveName;
+}
+
+function storePortableExportAuthorization(
+  database: SqliteDatabase,
+  authorization: PortableExportAuthorization,
+): void {
+  database.prepare(`
+    INSERT INTO settings (key, value_json, sensitivity, updated_by, updated_at)
+    VALUES (?, ?, 'private', ?, ?)
+  `).run(
+    portableExportAuthorizationKey(authorization.connectionId, authorization.archiveName),
+    canonical(authorization),
+    authorization.actor,
+    authorization.createdAt,
+  );
+}
+
+function requireAuthorizedPortableExport(
+  database: SqliteDatabase,
+  vault: ObsidianVaultBridge,
+  connectionIdValue: unknown,
+  archiveNameValue: unknown,
+  actor: string,
+  access: MemoryAccessPolicy,
+): {
+  archivePath: string;
+  archiveName: string;
+  expectedSha256: string;
+  expectedByteSize: number;
+} {
+  const connectionId = requiredText(connectionIdValue, "vault connection ID", 256);
+  assertIdentifier(connectionId, "vault connection ID");
+  const archiveName = validatedPortableArchiveName(archiveNameValue);
+  const row = database.prepare("SELECT value_json FROM settings WHERE key = ?").get(
+    portableExportAuthorizationKey(connectionId, archiveName),
+  ) as { value_json: string } | undefined;
+  if (!row) denyHiddenBrainResource();
+
+  let authorization: PortableExportAuthorization;
+  try {
+    authorization = JSON.parse(row.value_json) as PortableExportAuthorization;
+  } catch {
+    return denyHiddenBrainResource();
+  }
+  if (
+    authorization.schemaVersion !== SCHEMA_VERSION ||
+    authorization.actor !== actor ||
+    authorization.connectionId !== connectionId ||
+    authorization.archiveName !== archiveName ||
+    authorization.accessFingerprint !== replayAccessFingerprint(actor, access) ||
+    !Array.isArray(authorization.nodeIds) ||
+    !Array.isArray(authorization.nodeSnapshots) ||
+    typeof authorization.sha256 !== "string" ||
+    !/^[a-f0-9]{64}$/u.test(authorization.sha256) ||
+    !Number.isSafeInteger(authorization.byteSize) ||
+    authorization.byteSize < 0
+  ) {
+    denyHiddenBrainResource();
+  }
+  const nodeIds = [...new Set(authorization.nodeIds)];
+  if (nodeIds.length !== authorization.nodeIds.length) denyHiddenBrainResource();
+  if (authorization.nodeSnapshots.length !== nodeIds.length) denyHiddenBrainResource();
+  for (const nodeId of nodeIds) {
+    if (typeof nodeId !== "string") denyHiddenBrainResource();
+    try {
+      assertIdentifier(nodeId, "portable export memory node ID");
+    } catch {
+      denyHiddenBrainResource();
+    }
+  }
+  let connectionAllowed: Set<string>;
+  try {
+    vault.assertVaultSyncAllowed();
+    connectionAllowed = new Set(vault.exportableNodeIds(connectionId));
+  } catch {
+    return denyHiddenBrainResource();
+  }
+  if (nodeIds.some((nodeId) => !connectionAllowed.has(nodeId))) denyHiddenBrainResource();
+  const connection = vault.requireConnection(connectionId);
+  const portableNodeIds = new Set(nodeIds);
+  const snapshotById = new Map<string, { version: number; projectionHash: string }>();
+  for (const snapshot of authorization.nodeSnapshots) {
+    if (
+      !snapshot || typeof snapshot !== "object"
+      || typeof snapshot.nodeId !== "string"
+      || !Number.isSafeInteger(snapshot.version) || snapshot.version < 1
+      || typeof snapshot.projectionHash !== "string"
+      || !/^[a-f0-9]{64}$/u.test(snapshot.projectionHash)
+      || snapshotById.has(snapshot.nodeId)
+    ) denyHiddenBrainResource();
+    snapshotById.set(snapshot.nodeId, {
+      version: snapshot.version,
+      projectionHash: snapshot.projectionHash,
+    });
+  }
+  for (const nodeId of nodeIds) {
+    const expected = snapshotById.get(nodeId);
+    if (!expected) denyHiddenBrainResource();
+    let rendered;
+    try {
+      rendered = vault.renderNode(nodeId, connection, portableNodeIds);
+    } catch {
+      return denyHiddenBrainResource();
+    }
+    if (rendered.node.version !== expected.version) denyHiddenBrainResource();
+    const currentProjectionHash = sha256(rendered.text.replaceAll("\r\n", "\n"));
+    if (currentProjectionHash !== expected.projectionHash) denyHiddenBrainResource();
+  }
+  const nodeAccess = accessSql("mn", access);
+  for (let offset = 0; offset < nodeIds.length; offset += 500) {
+    const batch = nodeIds.slice(offset, offset + 500);
+    const row = database.prepare(`
+      SELECT COUNT(*) AS count FROM memory_nodes mn
+      WHERE mn.id IN (${batch.map(() => "?").join(",")})
+        AND mn.lifecycle_status != 'forgotten'
+        AND ${nodeAccess.sql}
+    `).get(...batch, ...nodeAccess.params) as { count: number };
+    if (Number(row.count) !== batch.length) denyHiddenBrainResource();
+  }
+  return {
+    archivePath: vault.portableExportPath(connectionId, archiveName),
+    archiveName: authorization.archiveName,
+    expectedSha256: authorization.sha256,
+    expectedByteSize: authorization.byteSize,
+  };
+}
+
+async function verifyPortableExportIntegrity(authorized: {
+  archivePath: string;
+  expectedSha256: string;
+  expectedByteSize: number;
+}): Promise<void> {
+  try {
+    const metadata = statSync(authorized.archivePath);
+    if (!metadata.isFile() || metadata.size !== authorized.expectedByteSize) denyHiddenBrainResource();
+    const hash = createHash("sha256");
+    for await (const chunk of createReadStream(authorized.archivePath)) hash.update(chunk);
+    if (hash.digest("hex") !== authorized.expectedSha256) denyHiddenBrainResource();
+  } catch (error) {
+    if (error instanceof BrainApiError) throw error;
+    denyHiddenBrainResource();
+  }
 }
 
 function validatedIdempotencyKey(request: Request): string {
@@ -298,6 +513,61 @@ function accessSql(alias: string, access: MemoryAccessPolicy): { sql: string; pa
     sql: `${alias}.sensitivity IN (${sensitivities.map(() => "?").join(",")}) AND (${scope.length > 0 ? scope.join(" OR ") : "0"})`,
     params,
   };
+}
+
+function accessibleConnectionNodeIds(
+  database: SqliteDatabase,
+  vault: ObsidianVaultBridge,
+  connectionId: string,
+  access: MemoryAccessPolicy,
+): readonly string[] {
+  const connectionIds = vault.exportableNodeIds(connectionId);
+  if (connectionIds.length === 0) return [];
+  const accessClause = accessSql("mn", access);
+  const rows: Array<{ id: string; updated_at: string }> = [];
+  for (let offset = 0; offset < connectionIds.length; offset += 400) {
+    const batch = connectionIds.slice(offset, offset + 400);
+    rows.push(...database.prepare(`
+      SELECT mn.id, mn.updated_at FROM memory_nodes mn
+      WHERE mn.id IN (${batch.map(() => "?").join(",")}) AND ${accessClause.sql}
+    `).all(...batch, ...accessClause.params) as Array<{ id: string; updated_at: string }>);
+  }
+  rows.sort((left, right) => (
+    right.updated_at.localeCompare(left.updated_at) || left.id.localeCompare(right.id)
+  ));
+  return rows.map((row) => row.id);
+}
+
+function vaultAuthorizationFingerprint(
+  vault: ObsidianVaultBridge,
+  connectionId: string,
+  nodeIds: readonly string[],
+): string {
+  const connection = vault.requireConnection(connectionId);
+  const policy = vault.memoryControlPolicy();
+  return sha256(canonical({
+    connectionId,
+    syncScope: connection.syncScope,
+    memoryControlVersion: policy.version,
+    memoryEnabled: policy.enabled,
+    obsidianSyncScope: policy.obsidianSyncScope,
+    nodeIds: [...nodeIds],
+  }));
+}
+
+function assertVaultAuthorizationReplay(
+  database: SqliteDatabase,
+  vault: ObsidianVaultBridge,
+  connectionId: string,
+  access: MemoryAccessPolicy,
+  expectedFingerprint: string,
+): void {
+  const nodeIds = accessibleConnectionNodeIds(database, vault, connectionId, access);
+  if (vaultAuthorizationFingerprint(vault, connectionId, nodeIds) !== expectedFingerprint) {
+    // An idempotent replay must not return a success summary authorized under
+    // an older Memory Control policy, connection scope, or caller scope.
+    denyHiddenBrainResource();
+  }
 }
 
 function canAccess(node: MemoryNode, access: MemoryAccessPolicy): boolean {
@@ -366,16 +636,24 @@ function ftsQuery(source: string): string | undefined {
 function executeIdempotent<T>(
   database: SqliteDatabase,
   actor: string,
+  access: MemoryAccessPolicy,
   key: string,
   requestBody: unknown,
   operation: () => T,
+  authorizeReplay: (response: T) => void,
 ): T {
   const settingKey = `idempotency.brain.${sha256(`${actor}:${key}`)}`;
   const requestHash = sha256(canonical(requestBody));
+  const accessFingerprint = replayAccessFingerprint(actor, access);
   return inImmediateTransaction(database, () => {
     const stored = database.prepare("SELECT value_json FROM settings WHERE key = ?").get(settingKey) as { value_json: string } | undefined;
     if (stored) {
-      const value = JSON.parse(stored.value_json) as { requestHash: string; response: T };
+      const value = JSON.parse(stored.value_json) as {
+        requestHash: string;
+        accessFingerprint?: string;
+        state?: string;
+        response: T;
+      };
       if (value.requestHash !== requestHash) {
         throw new BrainApiError(
           409,
@@ -385,6 +663,9 @@ function executeIdempotent<T>(
           "Generate a new key for the changed request.",
         );
       }
+      if (value.state === "revoked") denyHiddenBrainResource();
+      authorizeReplay(value.response);
+      if (value.accessFingerprint !== accessFingerprint) denyHiddenBrainResource();
       return value.response;
     }
     const response = operation();
@@ -392,7 +673,7 @@ function executeIdempotent<T>(
     database.prepare(`
       INSERT INTO settings (key, value_json, sensitivity, updated_by, updated_at)
       VALUES (?, ?, 'private', ?, ?)
-    `).run(settingKey, canonical({ requestHash, response }), actor, now);
+    `).run(settingKey, canonical({ requestHash, accessFingerprint, response }), actor, now);
     return response;
   });
 }
@@ -400,40 +681,57 @@ function executeIdempotent<T>(
 async function executeIdempotentAsync<T>(
   database: SqliteDatabase,
   actor: string,
+  access: MemoryAccessPolicy,
   key: string,
   requestBody: unknown,
   operation: () => Promise<T>,
+  authorizeReplay: (response: T) => void | Promise<void>,
 ): Promise<T> {
   const settingKey = `idempotency.brain.${sha256(`${actor}:${key}`)}`;
   const requestHash = sha256(canonical(requestBody));
-  const stored = inImmediateTransaction(database, () => {
+  const accessFingerprint = replayAccessFingerprint(actor, access);
+  const pendingValue = canonical({ requestHash, accessFingerprint, state: "pending" });
+  const stored = inImmediateTransaction(database, (): { response: T } | undefined => {
     const row = database.prepare("SELECT value_json FROM settings WHERE key = ?").get(settingKey) as { value_json: string } | undefined;
     if (row) {
-      const value = JSON.parse(row.value_json) as { requestHash: string; state?: string; response?: T };
+      const value = JSON.parse(row.value_json) as {
+        requestHash: string;
+        accessFingerprint?: string;
+        state?: string;
+        response?: T;
+      };
       if (value.requestHash !== requestHash) {
         throw new BrainApiError(409, "idempotency_key_reused", "Idempotency key was already used for a different memory mutation", "conflict", "Generate a new key for the changed request.");
       }
-      if (value.state === "complete" && value.response !== undefined) return value.response;
+      if (value.state === "revoked") denyHiddenBrainResource();
+      if (value.state === "complete" && value.response !== undefined) {
+        if (value.accessFingerprint !== accessFingerprint) denyHiddenBrainResource();
+        return { response: value.response };
+      }
+      if (value.accessFingerprint !== accessFingerprint) denyHiddenBrainResource();
       throw new BrainApiError(409, "brain_mutation_in_progress", "An identical memory mutation is already in progress", "conflict", "Wait for the original request to complete before retrying.");
     }
     const now = new Date().toISOString();
     database.prepare(`
       INSERT INTO settings (key, value_json, sensitivity, updated_by, updated_at)
       VALUES (?, ?, 'private', ?, ?)
-    `).run(settingKey, canonical({ requestHash, state: "pending" }), actor, now);
+    `).run(settingKey, pendingValue, actor, now);
     return undefined;
   });
-  if (stored !== undefined) return stored;
+  if (stored !== undefined) {
+    await authorizeReplay(stored.response);
+    return stored.response;
+  }
   try {
     const response = await operation();
     database.prepare(`
       UPDATE settings SET value_json = ?, updated_by = ?, updated_at = ? WHERE key = ?
-    `).run(canonical({ requestHash, state: "complete", response }), actor, new Date().toISOString(), settingKey);
+    `).run(canonical({ requestHash, accessFingerprint, state: "complete", response }), actor, new Date().toISOString(), settingKey);
     return response;
   } catch (error) {
     database.prepare("DELETE FROM settings WHERE key = ? AND value_json = ?").run(
       settingKey,
-      canonical({ requestHash, state: "pending" }),
+      pendingValue,
     );
     throw error;
   }
@@ -796,6 +1094,42 @@ function canAccessMission(database: SqliteDatabase, missionId: string | null, ac
   return Boolean(mission?.engagement_id && (access.engagementIds ?? []).includes(mission.engagement_id));
 }
 
+const CONTEXT_PACK_MISSION_COLUMNS = [
+  "mcp.mission_id",
+  "linked_run.mission_id",
+  "step_run.mission_id",
+  "linked_action.mission_id",
+  "linked_conversation.mission_id",
+] as const;
+const CONTEXT_PACK_EFFECTIVE_MISSION_SQL = `COALESCE(${CONTEXT_PACK_MISSION_COLUMNS.join(", ")})`;
+const CONTEXT_PACK_CONSISTENT_SCOPE_SQL = CONTEXT_PACK_MISSION_COLUMNS
+  .map((column) => `(${column} IS NULL OR ${column} = ${CONTEXT_PACK_EFFECTIVE_MISSION_SQL})`)
+  .join(" AND ");
+const CONTEXT_PACK_LINK_JOINS_SQL = `
+  LEFT JOIN runs linked_run ON linked_run.id = mcp.run_id
+  LEFT JOIN plan_steps linked_step ON linked_step.id = mcp.step_id
+  LEFT JOIN plans linked_plan ON linked_plan.id = linked_step.plan_id
+  LEFT JOIN runs step_run ON step_run.id = linked_plan.run_id
+  LEFT JOIN actions linked_action ON linked_action.id = mcp.action_id
+  LEFT JOIN messages linked_message ON linked_message.id = mcp.message_id
+  LEFT JOIN conversations linked_conversation ON linked_conversation.id = linked_message.conversation_id
+`;
+
+function contextPackEffectiveMissionId(database: SqliteDatabase, contextPackId: string): string | null | undefined {
+  const row = database.prepare(`
+    SELECT ${CONTEXT_PACK_EFFECTIVE_MISSION_SQL} AS effective_mission_id,
+      CASE WHEN ${CONTEXT_PACK_CONSISTENT_SCOPE_SQL} THEN 1 ELSE 0 END AS scope_consistent
+    FROM memory_context_packs mcp
+    ${CONTEXT_PACK_LINK_JOINS_SQL}
+    WHERE mcp.id = ?
+  `).get(contextPackId) as {
+    effective_mission_id: string | null;
+    scope_consistent: number;
+  } | undefined;
+  if (!row || row.scope_consistent !== 1) return undefined;
+  return row.effective_mission_id;
+}
+
 function brainSummary(database: SqliteDatabase, access: MemoryAccessPolicy) {
   const clause = accessSql("mn", access);
   const rows = database.prepare(`
@@ -821,7 +1155,12 @@ function brainSummary(database: SqliteDatabase, access: MemoryAccessPolicy) {
     JOIN memory_nodes target ON target.id = me.target_node_id
     WHERE ${edgeClauseA.sql} AND ${edgeClauseB.sql} AND me.lifecycle_status != 'forgotten'
   `).get(...edgeClauseA.params, ...edgeClauseB.params) as { count: number }).count;
-  const packRows = database.prepare("SELECT mission_id FROM memory_context_packs").all() as Array<{ mission_id: string | null }>;
+  const packRows = database.prepare(`
+    SELECT ${CONTEXT_PACK_EFFECTIVE_MISSION_SQL} AS mission_id
+    FROM memory_context_packs mcp
+    ${CONTEXT_PACK_LINK_JOINS_SQL}
+    WHERE ${CONTEXT_PACK_CONSISTENT_SCOPE_SQL}
+  `).all() as Array<{ mission_id: string | null }>;
   const vaultRows = database.prepare("SELECT status, last_sync_at FROM vault_connections ORDER BY updated_at DESC").all() as Array<{ status: string; last_sync_at: string | null }>;
   const conflictRows = database.prepare("SELECT node_id FROM vault_conflicts WHERE status = 'open'").all() as Array<{ node_id: string | null }>;
   const conflicts = conflictRows.filter((row) => {
@@ -942,6 +1281,20 @@ function candidateAccessible(candidate: MemoryCandidate, access: MemoryAccessPol
   return canAccess(asNode as MemoryNode, access);
 }
 
+function requireAccessibleCandidate(
+  repository: MemoryRepository,
+  id: string,
+  access: MemoryAccessPolicy,
+): MemoryCandidate {
+  assertIdentifier(id, "memory candidate ID");
+  const candidate = repository.getCandidate(id);
+  // A policy miss is intentionally indistinguishable from an absent record.
+  if (!candidate || !candidateAccessible(candidate, access)) {
+    throw new BrainApiError(404, "memory_candidate_not_found", "Memory candidate was not found", "not_found");
+  }
+  return candidate;
+}
+
 function listCandidates(
   database: SqliteDatabase,
   repository: MemoryRepository,
@@ -953,14 +1306,73 @@ function listCandidates(
   if (!["pending", "confirmed", "edited_confirmed", "merged", "rejected", "suppressed"].includes(status)) {
     throw new TypeError("candidate status filter is invalid");
   }
+  const missionId = optionalText(query.missionId, "mission ID", 256);
+  const runId = optionalText(query.runId, "run ID", 256);
+  if (missionId) assertIdentifier(missionId, "mission ID");
+  if (runId) assertIdentifier(runId, "run ID");
+  if (missionId && !canAccessMission(database, missionId, access)) {
+    return { schemaVersion: SCHEMA_VERSION, items: [], nextCursor: null };
+  }
+  let requestedRunScope: { missionId: string; engagementId: string | null } | undefined;
+  if (runId) {
+    const run = database.prepare(`
+      SELECT r.mission_id AS missionId, m.engagement_id AS engagementId
+      FROM runs r
+      JOIN missions m ON m.id = r.mission_id
+      WHERE r.id = ?
+    `).get(runId) as { missionId: string; engagementId: string | null } | undefined;
+    if (!run || !canAccessMission(database, run.missionId, access) || (missionId && run.missionId !== missionId)) {
+      return { schemaVersion: SCHEMA_VERSION, items: [], nextCursor: null };
+    }
+    requestedRunScope = run;
+  }
   const cursor = decodeCursor(query.cursor);
   const candidateView = `(
     SELECT id, proposed_scope AS scope, engagement_id, mission_id, sensitivity,
-      status, created_at FROM memory_candidates
+      source_json, status, created_at FROM memory_candidates
   )`;
   const accessClause = accessSql("mc", access);
   const clauses = [accessClause.sql, "mc.status = ?"];
   const params: unknown[] = [...accessClause.params, status];
+  if (missionId && !runId) {
+    clauses.push("mc.mission_id = ?");
+    params.push(missionId);
+  }
+  if (runId) {
+    clauses.push("(mc.mission_id IS NULL OR mc.mission_id = ?)");
+    clauses.push("(mc.engagement_id IS NULL OR mc.engagement_id = ?)");
+    params.push(requestedRunScope!.missionId, requestedRunScope!.engagementId);
+    const sourceType = "json_extract(source.value, '$.sourceType')";
+    const sourceId = "json_extract(source.value, '$.sourceId')";
+    clauses.push(`EXISTS (
+      SELECT 1 FROM json_each(mc.source_json, '$.sources') AS source
+      WHERE (${sourceType} IN ('run', 'runtime_run') AND ${sourceId} = ?)
+        OR (${sourceType} = 'run_evaluation' AND EXISTS (
+          SELECT 1 FROM run_evaluations linked WHERE linked.id = ${sourceId} AND linked.run_id = ?
+        ))
+        OR (${sourceType} = 'message' AND EXISTS (
+          SELECT 1 FROM messages linked
+          JOIN conversations conversation ON conversation.id = linked.conversation_id
+          WHERE linked.id = ${sourceId} AND conversation.run_id = ?
+        ))
+        OR (${sourceType} = 'action' AND EXISTS (
+          SELECT 1 FROM actions linked WHERE linked.id = ${sourceId} AND linked.run_id = ?
+        ))
+        OR (${sourceType} = 'evidence' AND EXISTS (
+          SELECT 1 FROM evidence linked WHERE linked.id = ${sourceId} AND linked.run_id = ?
+        ))
+        OR (${sourceType} = 'finding' AND EXISTS (
+          SELECT 1 FROM findings linked WHERE linked.id = ${sourceId} AND linked.run_id = ?
+        ))
+        OR (${sourceType} = 'artifact' AND EXISTS (
+          SELECT 1 FROM artifacts linked WHERE linked.id = ${sourceId} AND linked.run_id = ?
+        ))
+        OR (${sourceType} IN ('context_pack', 'memory_context_pack') AND EXISTS (
+          SELECT 1 FROM memory_context_packs linked WHERE linked.id = ${sourceId} AND linked.run_id = ?
+        ))
+    )`);
+    params.push(runId, runId, runId, runId, runId, runId, runId, runId);
+  }
   if (cursor) {
     clauses.push("(mc.created_at < ? OR (mc.created_at = ? AND mc.id < ?))");
     params.push(cursor.updatedAt, cursor.updatedAt, cursor.id);
@@ -1042,7 +1454,8 @@ function contextPackDetail(
   access: MemoryAccessPolicy,
 ) {
   const pack = repository.requireContextPack(id);
-  if (!canAccessMission(database, pack.missionId ?? null, access)) {
+  const effectiveMissionId = contextPackEffectiveMissionId(database, pack.id);
+  if (effectiveMissionId === undefined || !canAccessMission(database, effectiveMissionId, access)) {
     throw new BrainApiError(404, "context_pack_not_found", "Context pack was not found", "not_found");
   }
   const items = pack.items.map((item) => {
@@ -1053,6 +1466,93 @@ function contextPackDetail(
     return { ...item, node: summaryForNode(database, node.id)! };
   });
   return { schemaVersion: SCHEMA_VERSION, ...pack, items };
+}
+
+function listContextPacks(
+  database: SqliteDatabase,
+  access: MemoryAccessPolicy,
+  query: Record<string, unknown>,
+) {
+  const limit = integer(query.limit, 100, 1, 200, "context pack page limit");
+  const missionId = optionalText(query.missionId, "mission ID", 256);
+  const runId = optionalText(query.runId, "run ID", 256);
+  const stepId = optionalText(query.stepId, "step ID", 256);
+  const actionId = optionalText(query.actionId, "action ID", 256);
+  const messageId = optionalText(query.messageId, "message ID", 256);
+  const journey = optionalText(query.journey, "journey", 20);
+  for (const [label, value] of [["mission ID", missionId], ["run ID", runId], ["step ID", stepId], ["action ID", actionId], ["message ID", messageId]] as const) {
+    if (value) assertIdentifier(value, label);
+  }
+  if (journey && journey !== "autonomous" && journey !== "guided") {
+    throw new TypeError("journey must be autonomous or guided");
+  }
+
+  const effectiveMission = CONTEXT_PACK_EFFECTIVE_MISSION_SQL;
+  const consistentScope = CONTEXT_PACK_CONSISTENT_SCOPE_SQL;
+  const visibility: string[] = [];
+  const visibilityParams: unknown[] = [];
+  if (access.allowGlobal !== false) visibility.push(`${effectiveMission} IS NULL`);
+  if (access.allEngagements) visibility.push(`${effectiveMission} IS NOT NULL`);
+  else {
+    const missions = [...new Set(access.missionIds ?? [])];
+    const engagements = [...new Set(access.engagementIds ?? [])];
+    if (missions.length) {
+      visibility.push(`${effectiveMission} IN (${missions.map(() => "?").join(",")})`);
+      visibilityParams.push(...missions);
+    }
+    if (engagements.length) {
+      visibility.push(`m.engagement_id IN (${engagements.map(() => "?").join(",")})`);
+      visibilityParams.push(...engagements);
+    }
+  }
+  const clauses = [consistentScope, `(${visibility.length ? visibility.join(" OR ") : "0"})`];
+  const params = [...visibilityParams];
+  if (missionId) {
+    clauses.push(`${effectiveMission} = ?`);
+    params.push(missionId);
+  }
+  for (const [column, value] of [
+    ["mcp.run_id", runId], ["mcp.step_id", stepId],
+    ["mcp.action_id", actionId], ["mcp.message_id", messageId], ["mcp.journey", journey],
+  ] as const) {
+    if (value) { clauses.push(`${column} = ?`); params.push(value); }
+  }
+  const rows = database.prepare(`
+    SELECT mcp.id, ${effectiveMission} AS missionId, mcp.run_id AS runId,
+      mcp.step_id AS stepId, mcp.action_id AS actionId, mcp.message_id AS messageId,
+      mcp.journey, mcp.purpose, mcp.context_budget AS contextBudget,
+      mcp.created_by AS createdBy, mcp.created_at AS createdAt,
+      COUNT(mci.node_id) AS retrievedItemCount,
+      SUM(CASE WHEN mci.used = 1 THEN 1 ELSE 0 END) AS usedItemCount,
+      SUM(CASE WHEN mci.corrected = 1 THEN 1 ELSE 0 END) AS correctedItemCount
+    FROM memory_context_packs mcp
+    ${CONTEXT_PACK_LINK_JOINS_SQL}
+    LEFT JOIN missions m ON m.id = ${effectiveMission}
+    LEFT JOIN memory_context_items mci ON mci.context_pack_id = mcp.id
+    WHERE ${clauses.join(" AND ")}
+    GROUP BY mcp.id
+    ORDER BY mcp.created_at DESC, mcp.id DESC LIMIT ?
+  `).all(...params, limit) as Array<Record<string, unknown>>;
+  return {
+    schemaVersion: SCHEMA_VERSION,
+    items: rows.map((row) => ({
+      id: row.id,
+      ...(row.missionId ? { missionId: row.missionId } : {}),
+      ...(row.runId ? { runId: row.runId } : {}),
+      ...(row.stepId ? { stepId: row.stepId } : {}),
+      ...(row.actionId ? { actionId: row.actionId } : {}),
+      ...(row.messageId ? { messageId: row.messageId } : {}),
+      journey: row.journey,
+      purpose: row.purpose,
+      contextBudget: Number(row.contextBudget),
+      createdBy: row.createdBy,
+      createdAt: row.createdAt,
+      retrievedItemCount: Number(row.retrievedItemCount ?? 0),
+      usedItemCount: Number(row.usedItemCount ?? 0),
+      correctedItemCount: Number(row.correctedItemCount ?? 0),
+    })),
+    totalReturned: rows.length,
+  };
 }
 
 function boundedMarkdownFiles(
@@ -1103,8 +1603,7 @@ export function createSecondBrainRouter(dependencies: SecondBrainRouterDependenc
     operation: (actor: string, access: MemoryAccessPolicy) => unknown,
     status = 200,
   ): void => {
-    const requestTraceId = traceId(request);
-    response.setHeader("X-Request-ID", requestTraceId);
+    const requestTraceId = attachV2RequestId(request, response);
     try {
       const { actor, access } = actorAndAccess(request, dependencies);
       response.status(status).json(operation(actor, access));
@@ -1112,10 +1611,11 @@ export function createSecondBrainRouter(dependencies: SecondBrainRouterDependenc
       sendError(response, error, requestTraceId);
     }
   };
-  const mutate = (
+  const mutate = <T>(
     request: Request,
     response: Response,
-    operation: (actor: string, access: MemoryAccessPolicy) => unknown,
+    operation: (actor: string, access: MemoryAccessPolicy) => T,
+    authorizeReplay: (cachedResponse: T, actor: string, access: MemoryAccessPolicy) => void,
     status = 200,
   ): void => {
     handle(request, response, (actor, access) => {
@@ -1123,9 +1623,11 @@ export function createSecondBrainRouter(dependencies: SecondBrainRouterDependenc
       return executeIdempotent(
         dependencies.database,
         actor,
+        access,
         key,
         { path: request.path, params: request.params, body: request.body },
         () => operation(actor, access),
+        (cachedResponse) => authorizeReplay(cachedResponse, actor, access),
       );
     }, status);
   };
@@ -1157,7 +1659,7 @@ export function createSecondBrainRouter(dependencies: SecondBrainRouterDependenc
         policy: object(body.policy, "memory control policy"),
       });
       return { schemaVersion: SCHEMA_VERSION, policy };
-    });
+    }, () => undefined);
   });
 
   router.get("/api/v2/brain/health", (request, response) => {
@@ -1217,8 +1719,7 @@ export function createSecondBrainRouter(dependencies: SecondBrainRouterDependenc
 
   router.post("/api/v2/brain/candidates/:candidateId/confirm", (request, response) => {
     mutate(request, response, (actor, access) => {
-      const candidate = repository.requireCandidate(request.params.candidateId!);
-      if (!candidateAccessible(candidate, access)) throw new BrainApiError(404, "memory_candidate_not_found", "Memory candidate was not found", "not_found");
+      const candidate = requireAccessibleCandidate(repository, request.params.candidateId!, access);
       const control = getMemoryControlPolicy(dependencies.database);
       if (!memoryCandidateAllowed(control, candidate.nodeType)) {
         throw new BrainApiError(403, "memory_retention_disabled", "This memory category is disabled by operator controls", "policy_denied", "Review the Second Brain Memory Control Center before confirming this candidate.");
@@ -1235,19 +1736,23 @@ export function createSecondBrainRouter(dependencies: SecondBrainRouterDependenc
       });
       if (!canAccess(node, access)) throw new BrainApiError(403, "memory_scope_denied", "Confirmed memory falls outside operator scope", "policy_denied");
       return { schemaVersion: SCHEMA_VERSION, node };
+    }, (cachedResponse, _actor, access) => {
+      requireAccessibleCandidate(repository, request.params.candidateId!, access);
+      requireAccessibleNode(repository, cachedResponse.node.id, access);
     }, 201);
   });
 
   router.post("/api/v2/brain/candidates/:candidateId/reject", (request, response) => {
     mutate(request, response, (actor, access) => {
-      const candidate = repository.requireCandidate(request.params.candidateId!);
-      if (!candidateAccessible(candidate, access)) throw new BrainApiError(404, "memory_candidate_not_found", "Memory candidate was not found", "not_found");
+      const candidate = requireAccessibleCandidate(repository, request.params.candidateId!, access);
       const suppressionId = brain.rejectAndDoNotRelearn(
         candidate.id,
         actor,
         requiredText(object(request.body).reason, "candidate rejection reason", 1_000),
       );
       return { schemaVersion: SCHEMA_VERSION, candidateId: candidate.id, suppressionId, status: "suppressed" };
+    }, (_cachedResponse, _actor, access) => {
+      requireAccessibleCandidate(repository, request.params.candidateId!, access);
     });
   });
 
@@ -1259,6 +1764,8 @@ export function createSecondBrainRouter(dependencies: SecondBrainRouterDependenc
       const node = repository.correctNode(current.id, correctionInput(body, actor));
       if (!canAccess(node, access)) throw new BrainApiError(403, "memory_scope_denied", "Corrected memory falls outside operator scope", "policy_denied");
       return { schemaVersion: SCHEMA_VERSION, node };
+    }, (_cachedResponse, _actor, access) => {
+      requireAccessibleNode(repository, request.params.nodeId!, access);
     });
   });
 
@@ -1274,6 +1781,8 @@ export function createSecondBrainRouter(dependencies: SecondBrainRouterDependenc
         changeReason: requiredText(body.reason, "dispute reason", 2_000),
       });
       return { schemaVersion: SCHEMA_VERSION, node };
+    }, (_cachedResponse, _actor, access) => {
+      requireAccessibleNode(repository, request.params.nodeId!, access);
     });
   });
 
@@ -1290,6 +1799,8 @@ export function createSecondBrainRouter(dependencies: SecondBrainRouterDependenc
         changeReason: body.pinned ? "Operator pinned memory" : "Operator unpinned memory",
       });
       return { schemaVersion: SCHEMA_VERSION, node };
+    }, (_cachedResponse, _actor, access) => {
+      requireAccessibleNode(repository, request.params.nodeId!, access);
     });
   });
 
@@ -1308,6 +1819,8 @@ export function createSecondBrainRouter(dependencies: SecondBrainRouterDependenc
         changeReason: requiredText(body.reason ?? "Operator set memory expiry", "expiry reason", 2_000),
       });
       return { schemaVersion: SCHEMA_VERSION, node };
+    }, (_cachedResponse, _actor, access) => {
+      requireAccessibleNode(repository, request.params.nodeId!, access);
     });
   });
 
@@ -1320,7 +1833,17 @@ export function createSecondBrainRouter(dependencies: SecondBrainRouterDependenc
         ? vault.forgetMemory(current.id, actor, optionalText(body.reason, "forget reason", 1_000))
         : brain.forget(current.id, actor, optionalText(body.reason, "forget reason", 1_000));
       return { schemaVersion: SCHEMA_VERSION, result };
+    }, (_cachedResponse, _actor, access) => {
+      requireAccessibleNode(repository, request.params.nodeId!, access, true);
     });
+  });
+
+  router.get("/api/v2/brain/context-packs", (request, response) => {
+    handle(request, response, (_actor, access) => listContextPacks(
+      dependencies.database,
+      access,
+      request.query as Record<string, unknown>,
+    ));
   });
 
   router.get("/api/v2/brain/context-packs/:contextPackId", (request, response) => {
@@ -1394,6 +1917,11 @@ export function createSecondBrainRouter(dependencies: SecondBrainRouterDependenc
           }] : [];
           const node = repository.getNode(String(item.node_id), true);
           if (!node || !canAccess(node, access)) return [];
+          try {
+            vault.assertConnectionNodeAllowed(String(item.connection_id), node.id);
+          } catch {
+            return [];
+          }
           return [{
           id: item.id,
           connectionId: item.connection_id,
@@ -1413,6 +1941,11 @@ export function createSecondBrainRouter(dependencies: SecondBrainRouterDependenc
           if (!item.node_id) return [];
           const node = repository.getNode(String(item.node_id), true);
           if (!node || !canAccess(node, access)) return [];
+          try {
+            vault.assertConnectionNodeAllowed(String(item.connection_id), node.id);
+          } catch {
+            return [];
+          }
           return [{
           id: item.id,
           connectionId: item.connection_id,
@@ -1452,39 +1985,75 @@ export function createSecondBrainRouter(dependencies: SecondBrainRouterDependenc
           vaultPath: pathPolicy ? relative(pathPolicy.allowedRoot, connection.vaultPath) || "." : ".",
         },
       };
+    }, (cachedResponse) => {
+      if (!vault) throw new BrainApiError(503, "vault_bridge_disabled", "Obsidian vault integration is not configured", "dependency_missing");
+      vault.requireConnection(cachedResponse.connection.id);
     }, 201);
   });
 
   router.post("/api/v2/brain/vault/export", (request, response) => {
-    mutate(request, response, (_actor, access) => {
+    mutate(request, response, (actor, access) => {
       if (!vault) throw new BrainApiError(503, "vault_bridge_disabled", "Obsidian vault integration is not configured", "dependency_missing");
       const body = object(request.body);
       vault.assertVaultSyncAllowed();
       const connectionId = requiredText(body.connectionId, "vault connection ID", 256);
+      const connectionNodeIds = accessibleConnectionNodeIds(
+        dependencies.database,
+        vault,
+        connectionId,
+        access,
+      );
+      const allowedTargetIds = new Set(connectionNodeIds);
       const nodeId = optionalText(body.nodeId, "memory node ID", 256);
       if (nodeId) {
         requireAccessibleNode(repository, nodeId, access);
-        return { schemaVersion: SCHEMA_VERSION, result: vault.exportNode(connectionId, nodeId) };
+        vault.assertConnectionNodeAllowed(connectionId, nodeId);
+        const exported = vault.exportNode(connectionId, nodeId, allowedTargetIds);
+        repository.recordNodeExportAudit({ nodeId, actor, connectionId, status: exported.status });
+        const result = {
+          ...exported,
+          authorizationFingerprint: vaultAuthorizationFingerprint(vault, connectionId, connectionNodeIds),
+        };
+        return { schemaVersion: SCHEMA_VERSION, result };
       }
-      const clause = accessSql("mn", access);
-      const lifecycleStatuses = vault.projectionLifecycleStatuses();
-      const lifecyclePlaceholders = lifecycleStatuses.map(() => "?").join(",");
-      const rows = dependencies.database.prepare(`
-        SELECT mn.id FROM memory_nodes mn WHERE ${clause.sql}
-          AND mn.lifecycle_status IN (${lifecyclePlaceholders})
-        ORDER BY mn.updated_at DESC LIMIT 251
-      `).all(...clause.params, ...lifecycleStatuses) as Array<{ id: string }>;
-      const bounded = rows.slice(0, 250);
-      const results = bounded.map((item) => vault.exportNode(connectionId, item.id));
+      const nodeIds = connectionNodeIds;
+      const bounded = nodeIds.slice(0, 250);
+      const results = bounded.map((id) => {
+        const result = vault.exportNode(connectionId, id, allowedTargetIds);
+        repository.recordNodeExportAudit({
+          nodeId: id,
+          actor,
+          connectionId,
+          status: result.status,
+        });
+        return result;
+      });
       const conflictCount = results.filter((item) => item.status === "conflict").length;
       const result = {
         connectionId,
-        status: conflictCount > 0 ? "conflict" : rows.length > 250 ? "partial" : "synced",
-        message: rows.length > 250
+        authorizationFingerprint: vaultAuthorizationFingerprint(vault, connectionId, connectionNodeIds),
+        status: conflictCount > 0 ? "conflict" : nodeIds.length > 250 ? "partial" : "synced",
+        message: nodeIds.length > 250
           ? `Exported the first 250 accessible notes; continue with targeted export for the remaining records.`
           : `Exported ${results.length} accessible canonical notes${conflictCount > 0 ? `; ${conflictCount} require conflict resolution` : ""}.`,
       };
       return { schemaVersion: SCHEMA_VERSION, result };
+    }, (cachedResponse, _actor, access) => {
+      if (!vault) throw new BrainApiError(503, "vault_bridge_disabled", "Obsidian vault integration is not configured", "dependency_missing");
+      vault.assertVaultSyncAllowed();
+      vault.requireConnection(cachedResponse.result.connectionId);
+      assertVaultAuthorizationReplay(
+        dependencies.database,
+        vault,
+        cachedResponse.result.connectionId,
+        access,
+        cachedResponse.result.authorizationFingerprint,
+      );
+      const nodeId = optionalText(object(request.body).nodeId, "memory node ID", 256);
+      if (nodeId) {
+        requireAccessibleNode(repository, nodeId, access);
+        vault.assertConnectionNodeAllowed(cachedResponse.result.connectionId, nodeId);
+      }
     });
   });
 
@@ -1495,6 +2064,13 @@ export function createSecondBrainRouter(dependencies: SecondBrainRouterDependenc
       vault.assertVaultSyncAllowed();
       const connectionId = requiredText(body.connectionId, "vault connection ID", 256);
       const connection = vault.requireConnection(connectionId);
+      const connectionNodeIds = accessibleConnectionNodeIds(
+        dependencies.database,
+        vault,
+        connectionId,
+        access,
+      );
+      const allowedTargetIds = new Set(connectionNodeIds);
       const requestedPath = optionalText(body.relativePath, "vault note path", 1_000);
       const paths = requestedPath ? [requestedPath] : boundedMarkdownFiles(pathPolicy, connection.vaultPath);
       const importOne = (relativePath: string) => {
@@ -1505,27 +2081,34 @@ export function createSecondBrainRouter(dependencies: SecondBrainRouterDependenc
         } catch {
           // The bridge owns malformed-note quarantine; privacy validation cannot
           // inspect malformed content and deliberately delegates only that case.
-          return vault.importNote(connectionId, relativePath, actor);
+          return vault.importNote(connectionId, relativePath, actor, false, allowedTargetIds);
         }
         const policyProbe = { scope: note.scope, sensitivity: note.sensitivity } as MemoryNode;
         if (!canAccess(policyProbe, access)) {
           throw new BrainApiError(403, "memory_scope_denied", "Imported note scope exceeds operator access", "policy_denied");
         }
         const existing = repository.getNode(note.id);
+        if (existing && !canAccess(existing, access)) denyHiddenBrainResource();
+        if (existing) vault.assertConnectionNodeAllowed(connectionId, existing.id);
         if (existing && !relativePath.startsWith("00 Inbox/")) {
           const state = dependencies.database.prepare(`
             SELECT id FROM vault_sync_state WHERE connection_id = ? AND node_id = ?
           `).get(connectionId, existing.id);
           return state
-            ? vault.syncNode(connectionId, existing.id, actor)
-            : vault.exportNode(connectionId, existing.id);
+            ? vault.syncNode(connectionId, existing.id, actor, allowedTargetIds)
+            : vault.exportNode(connectionId, existing.id, allowedTargetIds);
         }
-        return vault.importNote(connectionId, relativePath, actor);
+        return vault.importNote(connectionId, relativePath, actor, false, allowedTargetIds);
       };
       if (requestedPath) {
         const imported = importOne(requestedPath);
         const result = {
           connectionId,
+          authorizationFingerprint: vaultAuthorizationFingerprint(
+            vault,
+            connectionId,
+            accessibleConnectionNodeIds(dependencies.database, vault, connectionId, access),
+          ),
           nodeId: imported.nodeId,
           relativePath: imported.relativePath,
           status: imported.status,
@@ -1542,12 +2125,32 @@ export function createSecondBrainRouter(dependencies: SecondBrainRouterDependenc
       const quarantined = results.filter((item) => item.status === "quarantined").length;
       const result = {
         connectionId,
+        authorizationFingerprint: vaultAuthorizationFingerprint(
+          vault,
+          connectionId,
+          accessibleConnectionNodeIds(dependencies.database, vault, connectionId, access),
+        ),
         status: quarantined > 0 ? "quarantined" : paths.length > 250 ? "partial" : "synced",
         message: paths.length > 250
           ? "Imported the first 250 vault notes; use targeted import for the remaining files."
           : `Processed ${results.length} vault notes${quarantined > 0 ? `; ${quarantined} malformed notes were quarantined` : ""}.`,
       };
       return { schemaVersion: SCHEMA_VERSION, result };
+    }, (cachedResponse, _actor, access) => {
+      if (!vault) throw new BrainApiError(503, "vault_bridge_disabled", "Obsidian vault integration is not configured", "dependency_missing");
+      vault.assertVaultSyncAllowed();
+      vault.requireConnection(cachedResponse.result.connectionId);
+      assertVaultAuthorizationReplay(
+        dependencies.database,
+        vault,
+        cachedResponse.result.connectionId,
+        access,
+        cachedResponse.result.authorizationFingerprint,
+      );
+      if ("nodeId" in cachedResponse.result && typeof cachedResponse.result.nodeId === "string") {
+        requireAccessibleNode(repository, cachedResponse.result.nodeId, access);
+        vault.assertConnectionNodeAllowed(cachedResponse.result.connectionId, cachedResponse.result.nodeId);
+      }
     });
   });
 
@@ -1557,10 +2160,29 @@ export function createSecondBrainRouter(dependencies: SecondBrainRouterDependenc
       const body = object(request.body);
       vault.assertVaultSyncAllowed();
       const connectionId = requiredText(body.connectionId, "vault connection ID", 256);
+      const connectionNodeIds = accessibleConnectionNodeIds(
+        dependencies.database,
+        vault,
+        connectionId,
+        access,
+      );
+      const allowedTargetIds = new Set(connectionNodeIds);
       const nodeId = optionalText(body.nodeId, "memory node ID", 256);
       if (nodeId) {
         requireAccessibleNode(repository, nodeId, access);
-        return { schemaVersion: SCHEMA_VERSION, result: vault.syncNode(connectionId, nodeId, actor) };
+        vault.assertConnectionNodeAllowed(connectionId, nodeId);
+        const synchronized = vault.syncNode(connectionId, nodeId, actor, allowedTargetIds);
+        return {
+          schemaVersion: SCHEMA_VERSION,
+          result: {
+            ...synchronized,
+            authorizationFingerprint: vaultAuthorizationFingerprint(
+              vault,
+              connectionId,
+              accessibleConnectionNodeIds(dependencies.database, vault, connectionId, access),
+            ),
+          },
+        };
       }
       const clause = accessSql("mn", access);
       const lifecycleStatuses = vault.projectionLifecycleStatuses();
@@ -1573,17 +2195,39 @@ export function createSecondBrainRouter(dependencies: SecondBrainRouterDependenc
           AND mn.lifecycle_status IN (${lifecyclePlaceholders})
         ORDER BY COALESCE(vs.last_scanned_at, '') ASC LIMIT 251
       `).all(connectionId, ...clause.params, ...lifecycleStatuses) as Array<{ node_id: string }>;
-      const accessible = rows.map((item) => item.node_id);
-      const results = accessible.slice(0, 250).map((id) => vault.syncNode(connectionId, id, actor));
+      const accessible = rows.map((item) => item.node_id).filter((id) => allowedTargetIds.has(id));
+      const results = accessible.slice(0, 250).map((id) => (
+        vault.syncNode(connectionId, id, actor, allowedTargetIds)
+      ));
       const conflicts = results.filter((item) => item.status === "conflict").length;
       const result = {
         connectionId,
+        authorizationFingerprint: vaultAuthorizationFingerprint(
+          vault,
+          connectionId,
+          accessibleConnectionNodeIds(dependencies.database, vault, connectionId, access),
+        ),
         status: conflicts > 0 ? "conflict" : accessible.length > 250 ? "partial" : "synced",
         message: accessible.length > 250
           ? "Synchronized the first 250 tracked notes; continue with targeted synchronization."
           : `Synchronized ${results.length} tracked notes${conflicts > 0 ? `; ${conflicts} require conflict resolution` : ""}.`,
       };
       return { schemaVersion: SCHEMA_VERSION, result };
+    }, (cachedResponse, _actor, access) => {
+      if (!vault) throw new BrainApiError(503, "vault_bridge_disabled", "Obsidian vault integration is not configured", "dependency_missing");
+      vault.assertVaultSyncAllowed();
+      vault.requireConnection(cachedResponse.result.connectionId);
+      assertVaultAuthorizationReplay(
+        dependencies.database,
+        vault,
+        cachedResponse.result.connectionId,
+        access,
+        cachedResponse.result.authorizationFingerprint,
+      );
+      if ("nodeId" in cachedResponse.result && typeof cachedResponse.result.nodeId === "string") {
+        requireAccessibleNode(repository, cachedResponse.result.nodeId, access);
+        vault.assertConnectionNodeAllowed(cachedResponse.result.connectionId, cachedResponse.result.nodeId);
+      }
     });
   });
 
@@ -1597,6 +2241,7 @@ export function createSecondBrainRouter(dependencies: SecondBrainRouterDependenc
       let relativePath = requestedPath;
       if (nodeId) {
         requireAccessibleNode(repository, nodeId, access);
+        vault.assertConnectionNodeAllowed(connectionId, nodeId);
         const state = dependencies.database.prepare(`
           SELECT relative_path FROM vault_sync_state WHERE connection_id = ? AND node_id = ?
         `).get(connectionId, nodeId) as { relative_path: string } | undefined;
@@ -1607,8 +2252,7 @@ export function createSecondBrainRouter(dependencies: SecondBrainRouterDependenc
   });
 
   router.post("/api/v2/brain/vault/portable-export", async (request, response) => {
-    const requestTraceId = traceId(request);
-    response.setHeader("X-Request-ID", requestTraceId);
+    const requestTraceId = attachV2RequestId(request, response);
     try {
       const idempotencyKey = validatedIdempotencyKey(request);
       if (!vault) throw new BrainApiError(503, "vault_bridge_disabled", "Obsidian vault integration is not configured", "dependency_missing");
@@ -1619,19 +2263,30 @@ export function createSecondBrainRouter(dependencies: SecondBrainRouterDependenc
       const payload = await executeIdempotentAsync(
         dependencies.database,
         actor,
+        access,
         idempotencyKey,
         { path: request.path, params: request.params, body },
         async () => {
           vault.assertVaultSyncAllowed();
-          const clause = accessSql("mn", access);
-          const lifecycleStatuses = vault.projectionLifecycleStatuses();
-          const lifecyclePlaceholders = lifecycleStatuses.map(() => "?").join(",");
-          const rows = dependencies.database.prepare(`
-            SELECT mn.id FROM memory_nodes mn WHERE ${clause.sql}
-              AND mn.lifecycle_status IN (${lifecyclePlaceholders})
-            ORDER BY mn.updated_at DESC, mn.id
-          `).all(...clause.params, ...lifecycleStatuses) as Array<{ id: string }>;
-          const result = await vault.createPortableExport(connectionId, rows.map((row) => row.id), actor);
+          const nodeIds = accessibleConnectionNodeIds(
+            dependencies.database,
+            vault,
+            connectionId,
+            access,
+          );
+          const result = await vault.createPortableExport(connectionId, nodeIds, actor);
+          storePortableExportAuthorization(dependencies.database, {
+            schemaVersion: SCHEMA_VERSION,
+            actor,
+            accessFingerprint: replayAccessFingerprint(actor, access),
+            connectionId,
+            archiveName: result.archiveName,
+            nodeIds,
+            nodeSnapshots: result.nodeSnapshots,
+            sha256: result.sha256,
+            byteSize: result.byteSize,
+            createdAt: result.createdAt,
+          });
           return {
             schemaVersion: SCHEMA_VERSION,
             result: {
@@ -1647,6 +2302,17 @@ export function createSecondBrainRouter(dependencies: SecondBrainRouterDependenc
             },
           };
         },
+        async (cachedResponse) => {
+          const authorized = requireAuthorizedPortableExport(
+            dependencies.database,
+            vault,
+            cachedResponse.result.connectionId,
+            cachedResponse.result.archiveName,
+            actor,
+            access,
+          );
+          await verifyPortableExportIntegrity(authorized);
+        },
       );
       response.json(payload);
     } catch (error) {
@@ -1654,17 +2320,42 @@ export function createSecondBrainRouter(dependencies: SecondBrainRouterDependenc
     }
   });
 
-  router.get("/api/v2/brain/vault/portable-exports/:connectionId/:archiveName", (request, response) => {
-    const requestTraceId = traceId(request);
-    response.setHeader("X-Request-ID", requestTraceId);
+  router.get("/api/v2/brain/vault/portable-exports/:connectionId/:archiveName", async (request, response) => {
+    const requestTraceId = attachV2RequestId(request, response);
     response.setHeader("Cache-Control", "no-store");
     try {
-      actorAndAccess(request, dependencies);
       if (!vault) throw new BrainApiError(503, "vault_bridge_disabled", "Obsidian vault integration is not configured", "dependency_missing");
-      const archiveName = requiredText(request.params.archiveName, "portable archive name", 300);
-      const archivePath = vault.portableExportPath(request.params.connectionId!, archiveName);
-      response.download(archivePath, archiveName, { dotfiles: "deny" }, (error) => {
-        if (error && !response.headersSent) sendError(response, error, requestTraceId);
+      const { actor, access } = actorAndAccess(request, dependencies);
+      const authorized = requireAuthorizedPortableExport(
+        dependencies.database,
+        vault,
+        request.params.connectionId!,
+        request.params.archiveName!,
+        actor,
+        access,
+      );
+      await verifyPortableExportIntegrity(authorized);
+      response.download(authorized.archiveName, authorized.archiveName, {
+        root: dirname(authorized.archivePath),
+        dotfiles: "deny",
+        headers: {
+          "Cache-Control": "no-store",
+          "Content-Disposition": `attachment; filename="${authorized.archiveName}"`,
+          "Content-Type": "application/zip",
+          "Content-Security-Policy": "sandbox",
+          "Cross-Origin-Resource-Policy": "same-origin",
+          "Referrer-Policy": "no-referrer",
+          "X-Content-Type-Options": "nosniff",
+        },
+      }, (error) => {
+        if (error && !response.headersSent) {
+          sendError(response, new BrainApiError(
+            404,
+            "brain_resource_not_found",
+            "The requested Second Brain resource was not found",
+            "not_found",
+          ), requestTraceId);
+        }
       });
     } catch (error) {
       sendError(response, error, requestTraceId);
@@ -1686,6 +2377,11 @@ export function createSecondBrainRouter(dependencies: SecondBrainRouterDependenc
           if (!row.node_id) return [];
           const node = repository.getNode(String(row.node_id));
           if (!node || !canAccess(node, access)) return [];
+          try {
+            vault.assertConnectionNodeAllowed(String(row.connection_id), node.id);
+          } catch {
+            return [];
+          }
           return [{
             id: row.id,
             connectionId: row.connection_id,
@@ -1712,6 +2408,11 @@ export function createSecondBrainRouter(dependencies: SecondBrainRouterDependenc
       if (!row) throw new BrainApiError(404, "vault_conflict_not_found", "Vault conflict was not found", "not_found");
       if (!row.node_id) throw new BrainApiError(404, "vault_conflict_not_found", "Vault conflict was not found", "not_found");
       requireAccessibleNode(repository, String(row.node_id), access);
+      try {
+        vault.assertConnectionNodeAllowed(String(row.connection_id), String(row.node_id));
+      } catch {
+        denyHiddenBrainResource();
+      }
       return {
         schemaVersion: SCHEMA_VERSION,
         conflict: {
@@ -1739,6 +2440,15 @@ export function createSecondBrainRouter(dependencies: SecondBrainRouterDependenc
       ).get(request.params.conflictId!) as { node_id: string | null } | undefined;
       if (!conflict?.node_id) throw new BrainApiError(404, "vault_conflict_not_found", "Open vault conflict was not found", "not_found");
       requireAccessibleNode(repository, conflict.node_id, access);
+      const conflictConnection = dependencies.database.prepare(
+        "SELECT connection_id FROM vault_conflicts WHERE id = ?",
+      ).get(request.params.conflictId!) as { connection_id: string } | undefined;
+      if (!conflictConnection) denyHiddenBrainResource();
+      try {
+        vault.assertConnectionNodeAllowed(conflictConnection.connection_id, conflict.node_id);
+      } catch {
+        denyHiddenBrainResource();
+      }
       const body = object(request.body);
       const resolution = requiredText(body.resolution, "conflict resolution", 30);
       if (resolution !== "database" && resolution !== "vault" && resolution !== "merged") {
@@ -1749,8 +2459,32 @@ export function createSecondBrainRouter(dependencies: SecondBrainRouterDependenc
         resolution,
         actor,
         optionalText(body.mergedText, "merged vault note", 1_000_000),
+        new Set(accessibleConnectionNodeIds(
+          dependencies.database,
+          vault,
+          conflictConnection.connection_id,
+          access,
+        )),
       );
       return { schemaVersion: SCHEMA_VERSION, result };
+    }, (_cachedResponse, _actor, access) => {
+      if (!vault) throw new BrainApiError(503, "vault_bridge_disabled", "Obsidian vault integration is not configured", "dependency_missing");
+      const conflict = dependencies.database.prepare(
+        "SELECT node_id FROM vault_conflicts WHERE id = ?",
+      ).get(request.params.conflictId!) as { node_id: string | null } | undefined;
+      if (!conflict?.node_id) {
+        throw new BrainApiError(404, "vault_conflict_not_found", "Vault conflict was not found", "not_found");
+      }
+      requireAccessibleNode(repository, conflict.node_id, access);
+      const conflictConnection = dependencies.database.prepare(
+        "SELECT connection_id FROM vault_conflicts WHERE id = ?",
+      ).get(request.params.conflictId!) as { connection_id: string } | undefined;
+      if (!conflictConnection) denyHiddenBrainResource();
+      try {
+        vault.assertConnectionNodeAllowed(conflictConnection.connection_id, conflict.node_id);
+      } catch {
+        denyHiddenBrainResource();
+      }
     });
   });
 

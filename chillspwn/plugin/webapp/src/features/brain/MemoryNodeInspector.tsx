@@ -5,7 +5,7 @@ import { Button, ButtonLink, ErrorPanel, LoadingPanel, StatusPill } from "../../
 import { ContextPackPanel } from "./ContextPackPanel";
 import { formatBrainDate, scopeLabel } from "./BrainNav";
 
-export function MemoryNodeInspector({ nodeId, onUseAsRoot }: { nodeId?: string; onUseAsRoot?: (nodeId: string) => void }) {
+export function MemoryNodeInspector({ nodeId, onUseAsRoot, pathStartId, onSetPathStart }: { nodeId?: string; onUseAsRoot?: (nodeId: string) => void; pathStartId?: string; onSetPathStart?: (nodeId?: string) => void }) {
   const detail = useQuery(`brain-node:${nodeId ?? "none"}`, (signal) => nodeId ? fetchMemoryNode(nodeId, signal) : Promise.reject(new Error("No memory selected")), { staleTime: 20_000 });
   const [contextPackId, setContextPackId] = useState<string>();
   const [mutation, setMutation] = useState<{ busy: boolean; message?: string; error?: Error }>({ busy: false });
@@ -34,7 +34,7 @@ export function MemoryNodeInspector({ nodeId, onUseAsRoot }: { nodeId?: string; 
       {contextPackId && <ContextPackPanel packId={contextPackId} />}
       {mutation.message && <p className="brain-mutation-note" role="status">{mutation.message}</p>}
       {mutation.error && <p className="brain-mutation-note is-error" role="alert">{mutation.error.message}</p>}
-      <div className="brain-inspector-actions"><ButtonLink href={`/brain/nodes/${encodeURIComponent(node.id)}`} variant="secondary">Full memory record</ButtonLink>{onUseAsRoot && <Button variant="secondary" onClick={() => onUseAsRoot(node.id)}>Open local graph</Button>}<Button variant="quiet" disabled={mutation.busy} onClick={togglePin}>{node.pinned ? "Unpin" : "Pin"}</Button></div>
+      <div className="brain-inspector-actions"><ButtonLink href={`/brain/nodes/${encodeURIComponent(node.id)}`} variant="secondary">Full memory record</ButtonLink>{onUseAsRoot && <Button variant="secondary" onClick={() => onUseAsRoot(node.id)}>Open local graph</Button>}{onSetPathStart && <Button variant="secondary" onClick={() => onSetPathStart(pathStartId === node.id ? undefined : node.id)}>{pathStartId === node.id ? "Clear path start" : "Set as path start"}</Button>}<Button variant="quiet" disabled={mutation.busy} onClick={togglePin}>{node.pinned ? "Unpin" : "Pin"}</Button></div>
     </aside>
   );
 }

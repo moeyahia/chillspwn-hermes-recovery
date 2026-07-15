@@ -7,7 +7,11 @@ import {
 } from "../db";
 import { MemoryRepository } from "../memory";
 import { redactLegacyText } from "../migration/SecretSafety";
-import { ObsidianVaultBridge } from "./ObsidianVaultBridge";
+import {
+  ObsidianVaultBridge,
+  VaultBulkExportAbortError,
+  VaultBulkExportPolicyError,
+} from "./ObsidianVaultBridge";
 import { VaultPathPolicy } from "./VaultPathPolicy";
 
 interface Args {
@@ -34,6 +38,15 @@ function argumentsFor(argv: readonly string[]): Args {
 function required(args: Args, key: string): string {
   const value = args.values.get(key);
   if (!value?.trim()) throw new Error(`--${key} is required`);
+  return value;
+}
+
+function positiveInteger(args: Args, key: string, fallback: number): number {
+  const source = args.values.get(key);
+  if (source === undefined) return fallback;
+  if (!/^\d+$/u.test(source)) throw new TypeError(`--${key} must be a positive integer`);
+  const value = Number(source);
+  if (!Number.isSafeInteger(value) || value < 1) throw new TypeError(`--${key} must be a positive integer`);
   return value;
 }
 
@@ -72,7 +85,7 @@ function usage(): string {
 
 Usage:
   bun run server/vault/cli.ts import --db PATH --vault-root ROOT [--connection ID] [--path NOTE] [--actor ID]
-  bun run server/vault/cli.ts export --db PATH --vault-root ROOT [--connection ID] [--zip] [--actor ID]
+  bun run server/vault/cli.ts export --db PATH --vault-root ROOT [--connection ID] [--concurrency N] [--progress-interval N] [--quiet] [--zip] [--actor ID]
   bun run server/vault/cli.ts sync-verify --db PATH --vault-root ROOT [--connection ID]
 
 SQLite remains canonical. Import creates a verified DB backup first, inbox notes
@@ -104,15 +117,54 @@ export async function runVaultCli(argv = process.argv.slice(2)): Promise<number>
     }
     if (args.command === "export") {
       bridge.assertVaultSyncAllowed();
-      const lifecycleStatuses = bridge.projectionLifecycleStatuses();
-      const placeholders = lifecycleStatuses.map(() => "?").join(",");
-      const rows = database.prepare(`
-        SELECT id FROM memory_nodes WHERE lifecycle_status IN (${placeholders}) ORDER BY updated_at DESC
-      `).all(...lifecycleStatuses) as Array<{ id: string }>;
-      const results = rows.map((row) => bridge.exportNode(id, row.id));
-      const portable = args.flags.has("zip") ? await bridge.createPortableExport(id, rows.map((row) => row.id), actor) : undefined;
-      process.stdout.write(`${JSON.stringify({ exported: results.length, conflicts: results.filter((item) => item.status === "conflict").length, ...(portable ? { portable: { ...portable, archivePath: relative(policy.allowedRoot, portable.archivePath) } } : {}) }, null, 2)}\n`);
-      return results.some((item) => item.status === "conflict") ? 2 : 0;
+      const nodeIds = bridge.exportableNodeIds(id);
+      const controller = new AbortController();
+      const requestStop = (): void => controller.abort();
+      process.once("SIGINT", requestStop);
+      process.once("SIGTERM", requestStop);
+      try {
+        const result = await bridge.exportNodes(id, nodeIds, {
+          concurrency: positiveInteger(args, "concurrency", 8),
+          progressInterval: positiveInteger(args, "progress-interval", 500),
+          signal: controller.signal,
+          ...(!args.flags.has("quiet") ? {
+            onProgress: (progress) => {
+              process.stderr.write(`${JSON.stringify({ event: "obsidian_export_progress", ...progress })}\n`);
+            },
+          } : {}),
+        });
+        const portable = args.flags.has("zip")
+          ? await bridge.createPortableExport(id, nodeIds, actor)
+          : undefined;
+        process.stdout.write(`${JSON.stringify({
+          status: result.counts.failed > 0
+            ? "failed"
+            : result.counts.conflicts > 0 || result.counts.vaultAhead > 0 || result.counts.quarantined > 0
+              ? "attention_required"
+              : "completed",
+          result,
+          ...(portable ? {
+            portable: { ...portable, archivePath: relative(policy.allowedRoot, portable.archivePath) },
+          } : {}),
+        }, null, 2)}\n`);
+        if (result.counts.failed > 0) return 1;
+        return result.counts.conflicts > 0 || result.counts.vaultAhead > 0 || result.counts.quarantined > 0
+          ? 2
+          : 0;
+      } catch (error) {
+        if (error instanceof VaultBulkExportAbortError) {
+          process.stdout.write(`${JSON.stringify({ status: "aborted", result: error.result }, null, 2)}\n`);
+          return 130;
+        }
+        if (error instanceof VaultBulkExportPolicyError) {
+          process.stdout.write(`${JSON.stringify({ status: "stopped_by_policy", result: error.result }, null, 2)}\n`);
+          return 2;
+        }
+        throw error;
+      } finally {
+        process.off("SIGINT", requestStop);
+        process.off("SIGTERM", requestStop);
+      }
     }
     if (args.command === "sync-verify") {
       const result = bridge.verifyConnection(id);

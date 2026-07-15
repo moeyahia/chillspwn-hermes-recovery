@@ -7,7 +7,7 @@
     "purpose": "process restart and specialist dispatch validation"
   },
   "mcpServers": {
-    "local-selftest": {
+    "sechub-reconnaissance": {
       "enabled": true,
       "runtime": "stdio",
       "command": "/usr/bin/node",

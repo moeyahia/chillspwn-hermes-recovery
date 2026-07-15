@@ -15,6 +15,8 @@ import {
 } from "../missions";
 import { createCommandOsRouter } from "../routes/commandOsRoutes";
 import { RuntimeProjectionService, type RuntimeProjectionInput } from "./RuntimeProjectionService";
+import { createApiContractRouter } from "../contracts";
+import { attachV2RequestId } from "../contracts/ApiErrorContract";
 
 export interface CommandOsApplicationOptions {
   readonly databasePath: string;
@@ -63,6 +65,13 @@ export function createCommandOsApplication(
     createDatabaseReadinessProvider(database),
     ...options.readinessProviders(database),
   ];
+
+  router.use((request, response, next) => {
+    attachV2RequestId(request, response);
+    next();
+  });
+
+  router.use(createApiContractRouter());
 
   router.use(createCommandOsRouter({
     database,

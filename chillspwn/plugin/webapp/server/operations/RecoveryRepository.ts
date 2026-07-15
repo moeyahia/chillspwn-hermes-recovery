@@ -8,7 +8,16 @@ import type {
   RunRecoveryProjection,
 } from "./types";
 import { OPERATIONS_SCHEMA_VERSION } from "./types";
+import { isRecoveryAgentHeartbeatFresh, recoveryAgentHeartbeatMaxAge } from "./recoveryFreshness";
 import { parseJson, sanitizeJson } from "./validation";
+import {
+  recoveryProviderAttestedAt,
+  isRecoveryProviderHealthFresh,
+  parseRecoveryProviderRouteBinding,
+  recoveryProviderCircuitState,
+  recoveryProviderHealthMaxAge,
+  recoveryProviderRouteSettingKey,
+} from "./recoveryProviderRoute";
 
 type Row = Record<string, unknown>;
 
@@ -43,8 +52,17 @@ function recoveryActions(input: {
   status: string;
   hasCheckpoint: boolean;
   replanRemaining: number | null;
+  hasFailedCurrentAction: boolean;
+  canManageRecovery: boolean;
+  reassignmentCandidates: number;
+  providerCandidates: number;
 }): RecoveryActionAvailability[] {
+  const stopped = input.status === "blocked" || input.status === "waiting_guided_decision";
   const resumeAvailable = input.status === "blocked" && input.hasCheckpoint;
+  const replanAvailable = input.canManageRecovery && input.status === "blocked" && input.hasCheckpoint
+    && input.hasFailedCurrentAction && input.replanRemaining !== null && input.replanRemaining > 0;
+  const reassignAvailable = input.canManageRecovery && stopped && input.reassignmentCandidates > 0;
+  const providerAvailable = input.canManageRecovery && stopped && input.providerCandidates > 0;
   return [
     {
       kind: "resume",
@@ -60,25 +78,38 @@ function recoveryActions(input: {
     {
       kind: "replan",
       label: "Request bounded replan",
-      available: false,
-      reason: input.replanRemaining === 0
-        ? "The canonical replan budget is exhausted."
-        : "Replanning is supervisor-owned; no operator replan mutation endpoint is implemented.",
-      command: null,
+      available: replanAvailable,
+      reason: replanAvailable
+        ? "One materially different in-scope strategy can be queued through the supervisor from this exact checkpoint."
+        : !input.canManageRecovery ? "Recovery-management permission is required."
+          : input.replanRemaining === null ? "A finite canonical replan budget is required."
+            : input.replanRemaining === 0 ? "The canonical replan budget is exhausted."
+              : !input.hasCheckpoint ? "A validated durable checkpoint is required."
+                : !input.hasFailedCurrentAction ? "No failed predecessor is linked to the exact current step."
+                  : "A bounded replan may be requested only from a blocked run.",
+      command: replanAvailable ? "replan" : null,
     },
     {
       kind: "reassign",
       label: "Reassign specialist",
-      available: false,
-      reason: "Specialist reassignment has no policy-enforcing operator mutation endpoint yet.",
-      command: null,
+      available: reassignAvailable,
+      reason: reassignAvailable
+        ? `${input.reassignmentCandidates} healthy declared-capable specialist option${input.reassignmentCandidates === 1 ? " is" : "s are"} available at this exact boundary.`
+        : !input.canManageRecovery ? "Recovery-management permission is required."
+          : !stopped ? "Reassignment is allowed only while work is durably stopped."
+            : "No healthy declared-capable in-policy replacement specialist is available.",
+      command: reassignAvailable ? "reassign" : null,
     },
     {
       kind: "change_provider",
       label: "Change provider",
-      available: false,
-      reason: "Provider changes require policy and contract validation; no safe operator mutation endpoint is implemented.",
-      command: null,
+      available: providerAvailable,
+      reason: providerAvailable
+        ? `${input.providerCandidates} healthy callable provider route${input.providerCandidates === 1 ? " is" : "s are"} compatible with this exact boundary.`
+        : !input.canManageRecovery ? "Recovery-management permission is required."
+          : !stopped ? "Provider routing is allowed only while work is durably stopped."
+            : "No healthy callable provider satisfies the journey and budget enforcement boundary.",
+      command: providerAvailable ? "change_provider" : null,
     },
     {
       kind: "terminate",
@@ -94,7 +125,25 @@ function recoveryActions(input: {
 
 /** Scope-enforcing, read-only recovery projection over canonical Command OS state. */
 export class RecoveryRepository {
-  constructor(private readonly database: SqliteDatabase) {}
+  private readonly providerRouteIds: ReadonlySet<string>;
+  private readonly clock: () => Date;
+  private readonly providerHealthMaxAgeMs: number;
+  private readonly agentHeartbeatMaxAgeMs: number;
+
+  constructor(
+    private readonly database: SqliteDatabase,
+    options: {
+      readonly providerRouteIds?: readonly string[];
+      readonly clock?: () => Date;
+      readonly providerHealthMaxAgeMs?: number;
+      readonly agentHeartbeatMaxAgeMs?: number;
+    } = {},
+  ) {
+    this.providerRouteIds = new Set(options.providerRouteIds ?? ["grok-acp"]);
+    this.clock = options.clock ?? (() => new Date());
+    this.providerHealthMaxAgeMs = recoveryProviderHealthMaxAge(options.providerHealthMaxAgeMs);
+    this.agentHeartbeatMaxAgeMs = recoveryAgentHeartbeatMaxAge(options.agentHeartbeatMaxAgeMs);
+  }
 
   getRunRecovery(runId: string, access: OperationsAccessPolicy): RunRecoveryProjection {
     const scope = missionScopeSql("m", access);
@@ -133,7 +182,9 @@ export class RecoveryRepository {
       WHERE run_id = ? AND (
         event_type IN (
           'run.recovery_started', 'run.recovery_blocked', 'run.replan_started',
-          'run.safe_stopped', 'run.cancellation_failed', 'policy.denied'
+          'run.safe_stopped', 'run.autonomous_safe_stopped',
+          'run.continuation_blocked', 'run.cancellation_failed',
+          'action.pre_dispatch_denied', 'policy.denied'
         )
         OR (event_type = 'run.state_changed'
           AND json_extract(payload_json, '$.to') IN ('recovering', 'blocked', 'failed', 'waiting_guided_decision'))
@@ -199,7 +250,7 @@ export class RecoveryRepository {
     const retriesRemaining = remaining(retryCount, retryLimit);
     const replansRemaining = remaining(replanCount, replanLimit);
     const pendingDecision = this.database.prepare(`
-      SELECT id, step_id, rationale, risk_class, expires_at
+      SELECT id, step_id, requested_action_fingerprint, rationale, risk_class, expires_at
       FROM guided_decisions
       WHERE run_id = ? AND status = 'pending'
       ORDER BY created_at DESC, id DESC LIMIT 1
@@ -327,6 +378,152 @@ export class RecoveryRepository {
       })),
     ];
 
+    const boundaryRow = run.current_plan_id === null || run.current_step_id === null ? undefined : this.database.prepare(`
+      SELECT p.id AS plan_id, p.version AS plan_version, ps.id AS step_id,
+        ps.assigned_agent_id AS agent_id, ass.id AS assignment_id,
+        ass.status AS assignment_status,
+        json_extract(mc.value_json, '$.action.kind') AS action_kind
+      FROM plans p
+      JOIN plan_steps ps ON ps.plan_id = p.id AND ps.run_id = p.run_id
+      JOIN assignments ass ON ass.run_id = p.run_id AND ass.step_id = ps.id
+        AND ass.agent_id = ps.assigned_agent_id
+      LEFT JOIN mission_constraints mc ON mc.source = ps.id AND mc.constraint_type = 'represented_action'
+      WHERE p.run_id = ? AND p.id = ? AND p.status = 'active' AND ps.id = ?
+      ORDER BY ass.created_at DESC, ass.id DESC LIMIT 1
+    `).get(runId, run.current_plan_id, run.current_step_id) as Row | undefined;
+    const boundary: RunRecoveryProjection["boundary"] = boundaryRow ? {
+      planId: String(boundaryRow.plan_id),
+      planVersion: Number(boundaryRow.plan_version),
+      stepId: String(boundaryRow.step_id),
+      assignmentId: String(boundaryRow.assignment_id),
+      agentId: String(boundaryRow.agent_id),
+      actionKind: boundaryRow.action_kind === null ? null : String(boundaryRow.action_kind),
+    } : null;
+    const stopped = status === "blocked" || status === "waiting_guided_decision";
+    const inFlight = (this.database.prepare(`
+      SELECT count(*) AS count FROM actions WHERE run_id = ? AND status IN ('queued', 'running')
+    `).get(runId) as { count: number }).count > 0;
+
+    const contractRow = run.contract_id === null ? undefined : this.database.prepare(`
+      SELECT id, version, state, contract_hash, action_policy_json
+      FROM mission_contracts WHERE id = ?
+    `).get(run.contract_id) as Row | undefined;
+    const contractPolicy = contractRow ? record(parseJson(String(contractRow.action_policy_json))) : {};
+    const contractIsExact = run.journey === "guided" || Boolean(
+      contractRow && contractRow.state === "confirmed" &&
+      Number(contractRow.version) === Number(run.contract_version_bound) &&
+      String(contractRow.contract_hash) === String(run.contract_hash_bound),
+    );
+    const signedSpecialists = new Set(
+      (Array.isArray(contractPolicy.specialistAgentIds) ? contractPolicy.specialistAgentIds : [])
+        .filter((value): value is string => typeof value === "string"),
+    );
+    const guidedBoundaryIsExact = run.journey === "autonomous" || Boolean(
+      pendingDecision && boundary && String(pendingDecision.step_id) === boundary.stepId,
+    );
+    const hasRetryableCurrentAction = Boolean(boundary && this.database.prepare(`
+      SELECT 1 FROM actions WHERE run_id = ? AND step_id = ?
+        AND status IN ('failed', 'timed_out') LIMIT 1
+    `).get(runId, boundary.stepId));
+
+    const candidateRows = boundary && stopped && !inFlight && contractIsExact && guidedBoundaryIsExact &&
+      (run.journey === "guided" || hasRetryableCurrentAction)
+      ? this.database.prepare(`
+          SELECT candidate.id AS agent_id, candidate.display_name, candidate.status,
+            candidate.role, candidate.last_heartbeat_at, target_cap.capability
+          FROM agents candidate
+          JOIN agent_capabilities target_cap ON target_cap.agent_id = candidate.id
+            AND target_cap.enabled = 1
+            AND target_cap.source = 'live-route-attestation'
+            AND json_extract(target_cap.metadata_json, '$.validUntil') >= ?
+          JOIN agent_capabilities current_cap ON current_cap.agent_id = ?
+            AND current_cap.capability = target_cap.capability AND current_cap.enabled = 1
+          WHERE candidate.id != ? AND candidate.status = 'available'
+          ORDER BY candidate.display_name, candidate.id, target_cap.capability
+        `).all(this.clock().toISOString(), boundary.agentId, boundary.agentId) as Row[]
+      : [];
+    const candidateMap = new Map<string, {
+      agentId: string; displayName: string; status: "available"; capabilities: string[];
+    }>();
+    for (const candidate of candidateRows) {
+      const agentId = String(candidate.agent_id);
+      if (/commander/iu.test(String(candidate.role)) || /chillspwn/iu.test(agentId)) continue;
+      if (!isRecoveryAgentHeartbeatFresh(
+        candidate.last_heartbeat_at === null ? null : String(candidate.last_heartbeat_at),
+        this.clock().toISOString(),
+        this.agentHeartbeatMaxAgeMs,
+      )) continue;
+      if (run.journey === "autonomous" && !signedSpecialists.has(agentId)) continue;
+      const current = candidateMap.get(agentId) ?? {
+        agentId,
+        displayName: text(candidate.display_name),
+        status: "available" as const,
+        capabilities: [],
+      };
+      const capability = String(candidate.capability);
+      if (!current.capabilities.includes(capability)) current.capabilities.push(capability);
+      candidateMap.set(agentId, current);
+    }
+    const reassignmentCandidates = [...candidateMap.values()];
+
+    const routeSetting = this.database.prepare("SELECT value_json FROM settings WHERE key = ?")
+      .get(recoveryProviderRouteSettingKey(runId)) as { value_json: string } | undefined;
+    const selectedRoute = routeSetting
+      ? parseRecoveryProviderRouteBinding(record(parseJson(routeSetting.value_json)))
+      : null;
+    const currentRouteId = selectedRoute && boundary &&
+      selectedRoute.stepId === boundary.stepId && selectedRoute.assignmentId === boundary.assignmentId
+      ? selectedRoute.providerId
+      : "grok-acp";
+    const tokenBudget = budgetLimit(budget, "providerTokens", "tokenBudget") ?? 0;
+    const costBudget = budgetLimit(budget, "estimatedCost", "costBudget") ?? 0;
+    const providerCandidates: Array<RunRecoveryProjection["providerCandidates"][number]> = [];
+    if (
+      boundary && stopped && !inFlight && contractIsExact && guidedBoundaryIsExact &&
+      (run.journey === "guided" || hasRetryableCurrentAction) &&
+      (boundary.actionKind === "provider_turn" || boundary.actionKind === "delegation")
+    ) {
+      for (const providerId of this.providerRouteIds) {
+        if (providerId === currentRouteId) continue;
+        const health = this.database.prepare(`
+          SELECT status, metrics_json, captured_at FROM health_snapshots
+          WHERE component_type = 'provider' AND component_id = ?
+          ORDER BY captured_at DESC, id DESC LIMIT 1
+        `).get(providerId) as Row | undefined;
+        const metrics = health ? record(parseJson(String(health.metrics_json))) : {};
+        if (
+          health?.status !== "healthy" ||
+          !isRecoveryProviderHealthFresh(
+            recoveryProviderAttestedAt(metrics),
+            this.clock().toISOString(),
+            this.providerHealthMaxAgeMs,
+          ) ||
+          recoveryProviderCircuitState(this.database, runId, providerId) !== "closed" ||
+          metrics.authenticated !== true ||
+          metrics.callable !== true ||
+          (tokenBudget > 0 && metrics.reportsExactTokenUsage !== true) ||
+          (costBudget > 0 && metrics.reportsExactCostUsage !== true) ||
+          (run.journey === "autonomous" && (
+            contractPolicy.providerPolicy !== "automatic_enforcing_only" ||
+            metrics.enforcesAutonomousBoundary !== true
+          )) ||
+          (run.journey === "guided" && metrics.supportsGuided !== true)
+        ) continue;
+        providerCandidates.push({
+          providerId,
+          status: "healthy",
+          supportsGuided: metrics.supportsGuided === true,
+          enforcesAutonomousBoundary: metrics.enforcesAutonomousBoundary === true,
+          reportsExactTokenUsage: metrics.reportsExactTokenUsage === true,
+          reportsExactCostUsage: metrics.reportsExactCostUsage === true,
+        });
+      }
+    }
+    const hasFailedCurrentAction = Boolean(boundary && this.database.prepare(`
+      SELECT 1 FROM actions WHERE run_id = ? AND step_id = ?
+        AND status IN ('failed', 'timed_out', 'denied') LIMIT 1
+    `).get(runId, boundary.stepId));
+
     return {
       schemaVersion: OPERATIONS_SCHEMA_VERSION,
       recoveryRequired,
@@ -336,6 +533,7 @@ export class RecoveryRepository {
         missionName: text(run.mission_name),
         journey: run.journey,
         status,
+        version: Number(run.version),
         statusReason,
         currentStepId: run.current_step_id === null ? null : String(run.current_step_id),
         currentOwnerId: run.current_owner_id === null ? null : String(run.current_owner_id),
@@ -348,6 +546,9 @@ export class RecoveryRepository {
         evidence: eventEvidence,
         failedActions,
       },
+      boundary,
+      reassignmentCandidates,
+      providerCandidates,
       checkpoint,
       attempts: {
         retryCount,
@@ -361,12 +562,21 @@ export class RecoveryRepository {
       guidedDecision: pendingDecision ? {
         id: String(pendingDecision.id),
         stepId: String(pendingDecision.step_id),
+        actionFingerprint: String(pendingDecision.requested_action_fingerprint),
         rationale: text(pendingDecision.rationale),
         riskClass: String(pendingDecision.risk_class),
         expiresAt: String(pendingDecision.expires_at),
       } : null,
       failedAttemptMemories,
-      actions: recoveryActions({ status, hasCheckpoint: checkpoint !== null, replanRemaining: replansRemaining }),
+      actions: recoveryActions({
+        status,
+        hasCheckpoint: checkpoint !== null,
+        replanRemaining: replansRemaining,
+        hasFailedCurrentAction,
+        canManageRecovery: access.canManageRecovery === true,
+        reassignmentCandidates: reassignmentCandidates.length,
+        providerCandidates: providerCandidates.length,
+      }),
     };
   }
 }

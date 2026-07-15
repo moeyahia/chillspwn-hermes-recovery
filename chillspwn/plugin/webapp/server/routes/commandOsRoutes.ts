@@ -1,16 +1,19 @@
-import { randomUUID } from "node:crypto";
 import { Router, type Request, type Response } from "express";
 import type { SqliteDatabase } from "../db";
+import { attachV2RequestId, sendV2Error } from "../contracts/ApiErrorContract";
 import {
   MissionApiError,
+  AutonomousBranchService,
+  MissionPortfolioService,
+  MISSION_PORTFOLIO_LIMITS,
   MissionRepository,
   MissionService,
   OverviewRepository,
   ReadinessService,
   validateIdempotencyKey,
   validateMissionCreateRequest,
-  type ApiErrorEnvelope,
   type Journey,
+  type MissionPortfolioFilterState,
   type ReadinessCheckProvider,
 } from "../missions";
 
@@ -20,37 +23,28 @@ export interface CommandOsRouterDependencies {
   readonly resolveActor: (request: Request) => string;
 }
 
-function traceId(request: Request): string {
-  const supplied = request.get("X-Request-ID")?.trim();
-  return supplied && /^[a-zA-Z0-9._:-]{1,128}$/u.test(supplied) ? supplied : randomUUID();
-}
-
 function sendError(response: Response, error: unknown, requestTraceId: string): void {
-  const timestamp = new Date().toISOString();
   const known = error instanceof MissionApiError;
-  const envelope: ApiErrorEnvelope = known
+  sendV2Error(response, requestTraceId, known
     ? {
+        status: error.status,
         code: error.code,
         message: error.message,
         humanMessage: error.options.humanMessage ?? error.message,
         retryable: error.options.retryable ?? false,
         category: error.options.category ?? "mission",
         ...(error.options.details === undefined ? {} : { details: error.options.details }),
-        traceId: requestTraceId,
         ...(error.options.remediation ? { remediation: error.options.remediation } : {}),
-        timestamp,
       }
     : {
+        status: 500,
         code: "command_os_internal_error",
         message: "Command OS could not complete the request",
         humanMessage: "The mission service encountered an internal error.",
         retryable: false,
         category: "internal",
-        traceId: requestTraceId,
         remediation: "Use the trace ID to inspect structured server logs before retrying.",
-        timestamp,
-      };
-  response.status(known ? error.status : 500).json({ error: envelope });
+      });
 }
 
 function boundedLimit(value: unknown): number | undefined {
@@ -75,6 +69,174 @@ function journeyFilter(value: unknown): Journey | undefined {
   });
 }
 
+function optionalFilter(value: unknown, label: string, maximum: number): string | undefined {
+  if (value === undefined || value === null || value === "") return undefined;
+  if (typeof value !== "string") {
+    throw new MissionApiError(400, "invalid_portfolio_filter", `${label} filter is invalid`, {
+      humanMessage: `${label} must be a text value.`,
+      category: "invalid_input",
+    });
+  }
+  const result = value.trim();
+  if (!result || result.length > maximum || /[\u0000-\u001f\u007f]/u.test(result)) {
+    throw new MissionApiError(400, "invalid_portfolio_filter", `${label} filter is invalid`, {
+      humanMessage: `${label} is empty, too long, or contains control characters.`,
+      category: "invalid_input",
+    });
+  }
+  return result;
+}
+
+function choiceFilter<const T extends string>(
+  value: unknown,
+  label: string,
+  choices: readonly T[],
+): T | undefined {
+  if (value === undefined || value === null || value === "") return undefined;
+  if (typeof value === "string" && choices.includes(value as T)) return value as T;
+  throw new MissionApiError(400, "invalid_portfolio_filter", `${label} filter is invalid`, {
+    humanMessage: `${label} must be one of: ${choices.join(", ")}.`,
+    category: "invalid_input",
+  });
+}
+
+function normalizedDateFilter(value: unknown, label: string, endOfDay = false): string | undefined {
+  const source = optionalFilter(value, label, 40);
+  if (!source) return undefined;
+  const dateOnly = /^\d{4}-\d{2}-\d{2}$/u.test(source);
+  const candidate = dateOnly
+    ? `${source}T${endOfDay ? "23:59:59.999" : "00:00:00.000"}Z`
+    : source;
+  const parsed = Date.parse(candidate);
+  if (!Number.isFinite(parsed)) {
+    throw new MissionApiError(400, "invalid_portfolio_date", `${label} filter is invalid`, {
+      humanMessage: `${label} must be an ISO-8601 date or timestamp.`,
+      category: "invalid_input",
+    });
+  }
+  return new Date(parsed).toISOString();
+}
+
+function nonNegativeVersion(value: unknown, label: string): number {
+  if (!Number.isSafeInteger(value) || Number(value) < 0) {
+    throw new MissionApiError(400, "invalid_version", `${label} is invalid`, {
+      humanMessage: `${label} must be a non-negative integer.`,
+      category: "invalid_input",
+    });
+  }
+  return Number(value);
+}
+
+function portfolioState(value: unknown): MissionPortfolioFilterState {
+  const state = bodyObject(value);
+  const journey = state.journey === "autonomous" || state.journey === "guided" ? state.journey : "";
+  const evidence = choiceFilter(state.evidence, "Evidence", ["present", "none"] as const) ?? "";
+  const recoveryState = choiceFilter(
+    state.recoveryState, "Recovery state", ["recovering", "blocked", "none"] as const,
+  ) ?? "";
+  const updatedFrom = optionalFilter(state.updatedFrom, "Updated from", 40) ?? "";
+  const updatedTo = optionalFilter(state.updatedTo, "Updated to", 40) ?? "";
+  if (updatedFrom && !Number.isFinite(Date.parse(updatedFrom))) {
+    throw new MissionApiError(400, "invalid_saved_view", "Saved view start date is invalid", {
+      humanMessage: "The saved view start date must be ISO-8601.", category: "invalid_input",
+    });
+  }
+  if (updatedTo && !Number.isFinite(Date.parse(updatedTo))) {
+    throw new MissionApiError(400, "invalid_saved_view", "Saved view end date is invalid", {
+      humanMessage: "The saved view end date must be ISO-8601.", category: "invalid_input",
+    });
+  }
+  return {
+    query: optionalFilter(state.query, "Search", 300) ?? "",
+    journey,
+    status: optionalFilter(state.status, "Status", 80) ?? "",
+    engagement: optionalFilter(state.engagement, "Engagement", 240) ?? "",
+    target: optionalFilter(state.target, "Target", 300) ?? "",
+    agent: optionalFilter(state.agent, "Agent", 200) ?? "",
+    provider: optionalFilter(state.provider, "Provider", 200) ?? "",
+    updatedFrom,
+    updatedTo,
+    risk: optionalFilter(state.risk, "Risk", 80) ?? "",
+    evidence,
+    findingSeverity: choiceFilter(
+      state.findingSeverity, "Finding severity", ["informational", "low", "medium", "high", "critical"] as const,
+    ) ?? "",
+    decisionState: choiceFilter(
+      state.decisionState, "Decision state",
+      ["pending", "approved", "manual", "alternative", "rejected", "expired", "cancelled"] as const,
+    ) ?? "",
+    recoveryState,
+    view: state.view === "board" ? "board" : "table",
+  };
+}
+
+function missionSelection(value: unknown): string[] {
+  if (!Array.isArray(value) || value.length < 1 || value.length > MISSION_PORTFOLIO_LIMITS.bulkMissions) {
+    throw new MissionApiError(400, "invalid_mission_selection", "Mission selection is invalid", {
+      humanMessage: `Select between 1 and ${MISSION_PORTFOLIO_LIMITS.bulkMissions} missions.`,
+      category: "invalid_input",
+    });
+  }
+  const ids = value.map((candidate) => stableId(candidate, "Mission ID"));
+  if (new Set(ids).size !== ids.length) {
+    throw new MissionApiError(400, "duplicate_mission_selection", "Mission selection contains duplicates", {
+      humanMessage: "Each mission may appear only once in a bulk operation.",
+      category: "invalid_input",
+    });
+  }
+  return ids;
+}
+
+function bodyObject(value: unknown): Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new MissionApiError(400, "invalid_request", "Request body must be an object", {
+      humanMessage: "The request body must be a JSON object.",
+      category: "invalid_input",
+    });
+  }
+  return value as Record<string, unknown>;
+}
+
+function stableId(value: unknown, label: string): string {
+  if (typeof value !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,255}$/u.test(value)) {
+    throw new MissionApiError(400, "invalid_identifier", `${label} is invalid`, {
+      humanMessage: `${label} is missing or malformed.`,
+      category: "invalid_input",
+    });
+  }
+  return value;
+}
+
+function positiveVersion(value: unknown, label: string): number {
+  if (!Number.isSafeInteger(value) || Number(value) < 1) {
+    throw new MissionApiError(400, "invalid_version", `${label} is invalid`, {
+      humanMessage: `${label} must be a positive integer.`,
+      category: "invalid_input",
+    });
+  }
+  return Number(value);
+}
+
+function branchMode(value: unknown): "unchanged_contract" | "contract_amendment" {
+  if (value === "unchanged_contract" || value === "contract_amendment") return value;
+  throw new MissionApiError(400, "invalid_branch_mode", "Autonomous branch mode is invalid", {
+    humanMessage: "Choose either the unchanged signed contract or a versioned contract amendment.",
+    category: "invalid_input",
+  });
+}
+
+function authenticatedActor(request: Request, dependencies: CommandOsRouterDependencies): string {
+  const actorId = dependencies.resolveActor(request).trim();
+  if (!actorId) {
+    throw new MissionApiError(401, "operator_identity_required", "Operator identity is required", {
+      humanMessage: "An authenticated operator identity is required for this Autonomous contract decision.",
+      category: "authentication_missing",
+      remediation: "Sign in again and retry the operation.",
+    });
+  }
+  return actorId;
+}
+
 /**
  * Mount with `app.use(createCommandOsRouter(deps))`. The factory deliberately
  * requires concrete readiness providers and an authenticated actor resolver.
@@ -89,6 +251,8 @@ export function createCommandOsRouter(
     new OverviewRepository(dependencies.database),
     readiness,
   );
+  const branches = new AutonomousBranchService(dependencies.database, service);
+  const portfolio = new MissionPortfolioService(dependencies.database);
   const router = Router();
 
   router.use((_request, response, next) => {
@@ -97,8 +261,7 @@ export function createCommandOsRouter(
   });
 
   router.get("/api/v2/overview", async (request, response) => {
-    const requestTraceId = traceId(request);
-    response.setHeader("X-Request-ID", requestTraceId);
+    const requestTraceId = attachV2RequestId(request, response);
     try {
       response.json(await service.getOverview());
     } catch (error) {
@@ -107,8 +270,7 @@ export function createCommandOsRouter(
   });
 
   router.get("/api/v2/missions", (request, response) => {
-    const requestTraceId = traceId(request);
-    response.setHeader("X-Request-ID", requestTraceId);
+    const requestTraceId = attachV2RequestId(request, response);
     try {
       const cursor = typeof request.query.cursor === "string" ? request.query.cursor : undefined;
       const status = typeof request.query.status === "string" && request.query.status.trim()
@@ -129,6 +291,14 @@ export function createCommandOsRouter(
           category: "invalid_input",
         });
       }
+      const updatedFrom = normalizedDateFilter(request.query.updatedFrom, "Updated from");
+      const updatedTo = normalizedDateFilter(request.query.updatedTo, "Updated to", true);
+      if (updatedFrom && updatedTo && updatedFrom > updatedTo) {
+        throw new MissionApiError(400, "invalid_portfolio_date_range", "Mission date range is invalid", {
+          humanMessage: "Updated from must be earlier than or equal to updated to.",
+          category: "invalid_input",
+        });
+      }
       response.json(
         service.list({
           cursor,
@@ -136,6 +306,25 @@ export function createCommandOsRouter(
           journey: journeyFilter(request.query.journey),
           status,
           query,
+          engagement: optionalFilter(request.query.engagement, "Engagement", 240),
+          target: optionalFilter(request.query.target, "Target", 300),
+          agent: optionalFilter(request.query.agent, "Agent", 200),
+          provider: optionalFilter(request.query.provider, "Provider", 200),
+          updatedFrom,
+          updatedTo,
+          risk: optionalFilter(request.query.risk, "Risk", 80),
+          evidence: choiceFilter(request.query.evidence, "Evidence", ["present", "none"] as const),
+          findingSeverity: choiceFilter(
+            request.query.findingSeverity, "Finding severity",
+            ["informational", "low", "medium", "high", "critical"] as const,
+          ),
+          decisionState: choiceFilter(
+            request.query.decisionState, "Decision state",
+            ["pending", "approved", "manual", "alternative", "rejected", "expired", "cancelled"] as const,
+          ),
+          recoveryState: choiceFilter(
+            request.query.recoveryState, "Recovery state", ["recovering", "blocked", "none"] as const,
+          ),
         }),
       );
     } catch (error) {
@@ -150,9 +339,98 @@ export function createCommandOsRouter(
     }
   });
 
+  router.get("/api/v2/missions/saved-views", (request, response) => {
+    const requestTraceId = attachV2RequestId(request, response);
+    try {
+      response.json(portfolio.listSavedViews(authenticatedActor(request, dependencies)));
+    } catch (error) {
+      sendError(response, error, requestTraceId);
+    }
+  });
+
+  router.post("/api/v2/missions/saved-views", (request, response) => {
+    const requestTraceId = attachV2RequestId(request, response);
+    try {
+      const actorId = authenticatedActor(request, dependencies);
+      const body = bodyObject(request.body);
+      const name = optionalFilter(body.name, "Saved view name", 80);
+      if (!name) {
+        throw new MissionApiError(400, "invalid_saved_view_name", "Saved view name is required", {
+          humanMessage: "Enter a name for this mission view.", category: "invalid_input",
+        });
+      }
+      response.json(portfolio.saveView({
+        actorId,
+        idempotencyKey: validateIdempotencyKey(request.get("Idempotency-Key")),
+        expectedVersion: nonNegativeVersion(body.expectedVersion, "Saved view version"),
+        name,
+        state: portfolioState(body.state),
+      }));
+    } catch (error) {
+      sendError(response, error, requestTraceId);
+    }
+  });
+
+  router.delete("/api/v2/missions/saved-views/:viewId", (request, response) => {
+    const requestTraceId = attachV2RequestId(request, response);
+    try {
+      const actorId = authenticatedActor(request, dependencies);
+      const body = bodyObject(request.body);
+      response.json(portfolio.deleteView({
+        actorId,
+        idempotencyKey: validateIdempotencyKey(request.get("Idempotency-Key")),
+        expectedVersion: nonNegativeVersion(body.expectedVersion, "Saved view version"),
+        viewId: stableId(request.params.viewId, "Saved view ID"),
+      }));
+    } catch (error) {
+      sendError(response, error, requestTraceId);
+    }
+  });
+
+  router.post("/api/v2/missions/bulk/archive", (request, response) => {
+    const requestTraceId = attachV2RequestId(request, response);
+    try {
+      const actorId = authenticatedActor(request, dependencies);
+      const body = bodyObject(request.body);
+      if (body.confirm !== true) {
+        throw new MissionApiError(400, "bulk_confirmation_required", "Bulk archive requires confirmation", {
+          humanMessage: "Explicitly confirm the exact mission selection before archiving.",
+          category: "invalid_input",
+        });
+      }
+      response.json(portfolio.archive({
+        actorId,
+        idempotencyKey: validateIdempotencyKey(request.get("Idempotency-Key")),
+        missionIds: missionSelection(body.missionIds),
+      }));
+    } catch (error) {
+      sendError(response, error, requestTraceId);
+    }
+  });
+
+  router.post("/api/v2/missions/bulk/export", (request, response) => {
+    const requestTraceId = attachV2RequestId(request, response);
+    try {
+      const actorId = authenticatedActor(request, dependencies);
+      const body = bodyObject(request.body);
+      if (body.confirm !== true) {
+        throw new MissionApiError(400, "bulk_confirmation_required", "Bulk export requires confirmation", {
+          humanMessage: "Explicitly confirm the exact mission selection before exporting metadata.",
+          category: "invalid_input",
+        });
+      }
+      response.json(portfolio.exportMetadata({
+        actorId,
+        idempotencyKey: validateIdempotencyKey(request.get("Idempotency-Key")),
+        missionIds: missionSelection(body.missionIds),
+      }));
+    } catch (error) {
+      sendError(response, error, requestTraceId);
+    }
+  });
+
   router.post("/api/v2/missions/autonomous/preflight", async (request, response) => {
-    const requestTraceId = traceId(request);
-    response.setHeader("X-Request-ID", requestTraceId);
+    const requestTraceId = attachV2RequestId(request, response);
     try {
       const actorId = dependencies.resolveActor(request).trim();
       if (!actorId) {
@@ -175,9 +453,90 @@ export function createCommandOsRouter(
     }
   });
 
+  router.get("/api/v2/missions/:missionId/autonomous-branches/context", (request, response) => {
+    const requestTraceId = attachV2RequestId(request, response);
+    try {
+      authenticatedActor(request, dependencies);
+      const missionId = stableId(request.params.missionId, "Mission ID");
+      const sourceRunId = stableId(request.query.sourceRunId, "Source run ID");
+      response.json(branches.context(missionId, sourceRunId));
+    } catch (error) {
+      sendError(response, error, requestTraceId);
+    }
+  });
+
+  router.post("/api/v2/missions/:missionId/autonomous-branches/preflight", async (request, response) => {
+    const requestTraceId = attachV2RequestId(request, response);
+    try {
+      const actorId = authenticatedActor(request, dependencies);
+      const body = bodyObject(request.body);
+      const mode = branchMode(body.mode);
+      let amendmentRequest;
+      if (mode === "contract_amendment") {
+        amendmentRequest = validateMissionCreateRequest(body.request);
+        if (amendmentRequest.journey !== "autonomous") {
+          throw new MissionApiError(400, "autonomous_contract_required", "Autonomous contract required", {
+            humanMessage: "A contract amendment must remain an Autonomous contract.",
+            category: "invalid_input",
+          });
+        }
+      }
+      const result = await branches.preflight(
+        stableId(request.params.missionId, "Mission ID"),
+        {
+          sourceRunId: stableId(body.sourceRunId, "Source run ID"),
+          sourceRunVersion: positiveVersion(body.sourceRunVersion, "Source run version"),
+          mode,
+          reason: typeof body.reason === "string" ? body.reason : "",
+          ...(amendmentRequest?.journey === "autonomous" ? { request: amendmentRequest } : {}),
+        },
+        validateIdempotencyKey(request.get("Idempotency-Key")),
+        actorId,
+      );
+      response.status(result.contract.state === "draft" ? 201 : 200).json(result);
+    } catch (error) {
+      sendError(response, error, requestTraceId);
+    }
+  });
+
+  router.post("/api/v2/missions/:missionId/autonomous-branches", async (request, response) => {
+    const requestTraceId = attachV2RequestId(request, response);
+    try {
+      const actorId = authenticatedActor(request, dependencies);
+      const body = bodyObject(request.body);
+      const review = body.review && typeof body.review === "object" && !Array.isArray(body.review)
+        ? body.review as Record<string, unknown>
+        : {};
+      const hash = typeof review.hash === "string" ? review.hash : "";
+      if (!/^[a-f0-9]{64}$/u.test(hash)) {
+        throw new MissionApiError(400, "invalid_contract_hash", "Contract review hash is invalid", {
+          humanMessage: "Review and submit the exact server-issued SHA-256 contract digest.",
+          category: "invalid_input",
+        });
+      }
+      const result = await branches.createBranch(
+        stableId(request.params.missionId, "Mission ID"),
+        {
+          sourceRunId: stableId(body.sourceRunId, "Source run ID"),
+          sourceRunVersion: positiveVersion(body.sourceRunVersion, "Source run version"),
+          mode: branchMode(body.mode),
+          reason: typeof body.reason === "string" ? body.reason : "",
+          ...(body.draftContractId === undefined
+            ? {}
+            : { draftContractId: stableId(body.draftContractId, "Draft contract ID") }),
+          review: { version: positiveVersion(review.version, "Contract review version"), hash },
+        },
+        validateIdempotencyKey(request.get("Idempotency-Key")),
+        actorId,
+      );
+      response.status(201).setHeader("Location", result.nextUrl).json(result);
+    } catch (error) {
+      sendError(response, error, requestTraceId);
+    }
+  });
+
   router.post("/api/v2/missions", async (request, response) => {
-    const requestTraceId = traceId(request);
-    response.setHeader("X-Request-ID", requestTraceId);
+    const requestTraceId = attachV2RequestId(request, response);
     try {
       const actorId = dependencies.resolveActor(request).trim();
       if (!actorId) {

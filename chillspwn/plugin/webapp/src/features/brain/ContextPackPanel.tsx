@@ -1,9 +1,11 @@
+import { useId } from "react";
 import { fetchContextPack } from "../../data/api/brain";
 import { useQuery } from "../../data/cache/QueryProvider";
 import { ButtonLink, ErrorPanel, LoadingPanel, StatusPill } from "../../design-system/components/Primitives";
 import { formatBrainDate, scopeLabel } from "./BrainNav";
 
 export function ContextPackPanel({ packId }: { packId: string }) {
+  const titleId = `context-pack-${useId().replaceAll(":", "")}`;
   const pack = useQuery(`brain-context:${packId}`, (signal) => fetchContextPack(packId, signal), { staleTime: 30_000 });
   if (pack.isLoading) return <LoadingPanel label="Loading inspectable context pack" />;
   if (pack.error && !pack.data) return <ErrorPanel title="Context use is unavailable" error={pack.error} onRetry={pack.refresh} />;
@@ -15,8 +17,8 @@ export function ContextPackPanel({ packId }: { packId: string }) {
     ? `/brain/graph?view=local&root=${encodeURIComponent(pathStart)}&selected=${encodeURIComponent(pathEnd ?? pathStart)}`
     : "/brain/graph";
   return (
-    <section className="brain-context-pack" aria-labelledby={`context-${packId}`}>
-      <header><div><p className="os-eyebrow">Context used</p><h3 id={`context-${packId}`}>{pack.data.purpose}</h3></div><StatusPill status={pack.data.journey} /></header>
+    <section className="brain-context-pack" aria-labelledby={titleId}>
+      <header><div><p className="os-eyebrow">Context used</p><h3 id={titleId}>{pack.data.purpose}</h3></div><StatusPill status={pack.data.journey} /></header>
       <p className="brain-context-meta">Created by {pack.data.createdBy} · {formatBrainDate(pack.data.createdAt)} · Budget {pack.data.contextBudget}</p>
       <ButtonLink href={pathUrl} variant="secondary">Show memory path</ButtonLink>
       {pack.data.queryRedacted && <p className="brain-context-query"><strong>Redacted retrieval query</strong>{pack.data.queryRedacted}</p>}

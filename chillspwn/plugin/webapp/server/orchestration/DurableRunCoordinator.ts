@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { SqliteDatabase } from "../db";
 import { inImmediateTransaction } from "../db";
 import { EventRepository } from "../events";
+import { RuntimeContinuationRepository } from "../command-runtime/RuntimeContinuationRepository";
 import {
   CircuitBreaker,
   RunSupervisor,
@@ -38,6 +39,8 @@ export interface DurableRunCoordinatorOptions {
   readonly supervisor?: RunSupervisor;
   readonly now?: () => Date;
   readonly leaseTtlMs?: number;
+  readonly afterActionCommit?: (action: DurableAction) => void;
+  readonly afterCancellationCleanup?: (runId: string) => void;
 }
 
 function bumpedRun(run: SupervisedRun, now: string, reason: string): SupervisedRun {
@@ -96,14 +99,23 @@ function elapsedUsage(run: DurableRun, now: string): BudgetValues {
   return usage;
 }
 
+interface DeniedActionStart {
+  readonly denied: true;
+  readonly code: string;
+  readonly message: string;
+}
+
 export class DurableRunCoordinator {
   private readonly runs: RunRepository;
   private readonly actions: ActionRepository;
   private readonly checkpoints: CheckpointRepository;
   private readonly events: EventRepository;
+  private readonly continuations: RuntimeContinuationRepository;
   private readonly supervisor: RunSupervisor;
   private readonly now: () => Date;
   private readonly leaseTtlMs: number;
+  private readonly afterActionCommit?: (action: DurableAction) => void;
+  private readonly afterCancellationCleanup?: (runId: string) => void;
   private readonly controllers = new Map<string, AbortController>();
 
   constructor(
@@ -115,9 +127,12 @@ export class DurableRunCoordinator {
     this.actions = new ActionRepository(database);
     this.checkpoints = new CheckpointRepository(database, this.actions);
     this.events = new EventRepository(database);
+    this.continuations = new RuntimeContinuationRepository(database);
     this.supervisor = options.supervisor ?? new RunSupervisor();
     this.now = options.now ?? (() => new Date());
     this.leaseTtlMs = options.leaseTtlMs ?? 30_000;
+    this.afterActionCommit = options.afterActionCommit;
+    this.afterCancellationCleanup = options.afterCancellationCleanup;
     if (!Number.isFinite(this.leaseTtlMs) || this.leaseTtlMs <= 0) {
       throw new Error("leaseTtlMs must be positive");
     }
@@ -293,7 +308,7 @@ export class DurableRunCoordinator {
 
   async startAction(input: StartActionInput): Promise<StartActionResult> {
     const now = this.timestamp();
-    const committed = inImmediateTransaction(this.database, () => {
+    const committed: StartActionResult | DeniedActionStart = inImmediateTransaction(this.database, () => {
       const current = this.load(input.lease.runId);
       this.runs.assertLease(current, input.lease, now);
       if (input.intent.runId !== current.run.id || input.intent.missionId !== current.run.missionId) {
@@ -338,7 +353,42 @@ export class DurableRunCoordinator {
         guidedDecision,
       });
       if (!authorization.allowed) {
+        if (
+          current.run.journey === "autonomous" &&
+          authorization.reason.startsWith("autonomous_")
+        ) {
+          return this.persistActionDenial(
+            current,
+            now,
+            input.lease.ownerId,
+            authorization.reason,
+            authorization.humanMessage,
+          );
+        }
         throw new DurableOrchestrationError(authorization.reason, authorization.humanMessage);
+      }
+      if (current.run.journey === "autonomous") {
+        const canonical = this.runs.authorizeAutonomousIntent(current, input.intent);
+        if (!canonical.allowed) {
+          return this.persistActionDenial(
+            current,
+            now,
+            input.lease.ownerId,
+            canonical.code,
+            canonical.humanMessage,
+          );
+        }
+      } else {
+        const canonical = this.runs.authorizeGuidedIntent(current, input.intent);
+        if (!canonical.allowed) {
+          return this.persistActionDenial(
+            current,
+            now,
+            input.lease.ownerId,
+            canonical.code,
+            canonical.humanMessage,
+          );
+        }
       }
 
       const delta = addBudget(startBudget(input.intent.kind), withoutWallClock(input.budgetDelta ?? {}));
@@ -367,6 +417,18 @@ export class DurableRunCoordinator {
         contractId: current.contractId ?? undefined,
         now,
       });
+      if (input.intent.assignmentId) {
+        this.database.prepare(`
+          UPDATE assignments SET status = 'active',
+            started_at = COALESCE(started_at, ?), updated_at = ?
+          WHERE id = ? AND run_id = ? AND step_id = ?
+        `).run(now, now, input.intent.assignmentId, input.intent.runId, input.intent.stepId);
+      }
+      this.database.prepare(`
+        UPDATE plan_steps SET status = 'running',
+          started_at = COALESCE(started_at, ?), updated_at = ?
+        WHERE id = ? AND run_id = ?
+      `).run(now, now, input.intent.stepId, input.intent.runId);
       const persisted = this.runs.persistMutation({
         current,
         nextRun: workingRun,
@@ -414,6 +476,30 @@ export class DurableRunCoordinator {
       };
     });
 
+    if ("denied" in committed) {
+      throw new DurableOrchestrationError(committed.code, committed.message);
+    }
+
+    this.afterActionCommit?.(committed.action);
+
+    // Close the commit-to-dispatch window with one final side-effect-free read
+    // of canonical mission, contract, target, decision, assignment, and tool
+    // policy state. The execution adapter repeats this assertion at the MCP
+    // call boundary because dispatch acceptance itself is asynchronous.
+    const finalAuthorization = this.runs.authorizePersistedAction(
+      this.load(committed.action.runId),
+      committed.action,
+    );
+    if (!finalAuthorization.allowed) {
+      this.denyPersistedActionBeforeDispatch(
+        committed.lease,
+        committed.action,
+        finalAuthorization.code,
+        finalAuthorization.humanMessage,
+      );
+      throw new DurableOrchestrationError(finalAuthorization.code, finalAuthorization.humanMessage);
+    }
+
     try {
       await this.execution.dispatch(committed.action, this.signal(committed.action.runId));
       return committed;
@@ -433,6 +519,116 @@ export class DurableRunCoordinator {
       }).catch(() => undefined);
       throw new DurableOrchestrationError("dispatch_failed", "Persisted action could not be dispatched");
     }
+  }
+
+  private persistActionDenial(
+    current: DurableRun,
+    now: string,
+    actorId: string,
+    code: string,
+    humanMessage: string,
+  ): DeniedActionStart {
+    const reason = current.run.journey === "autonomous"
+      ? `Safe-stopped (outside_contract): ${humanMessage}`
+      : `Guided execution blocked: ${humanMessage}`;
+    const currentStep = this.database.prepare(
+      "SELECT current_step_id FROM runs WHERE id = ?",
+    ).get(current.run.id) as { current_step_id: string | null } | undefined;
+    if (currentStep?.current_step_id) {
+      this.database.prepare(`
+        UPDATE plan_steps SET status = 'blocked', updated_at = ?
+        WHERE id = ? AND run_id = ?
+          AND status NOT IN ('completed', 'failed', 'cancelled', 'skipped')
+      `).run(now, currentStep.current_step_id, current.run.id);
+      this.database.prepare(`
+        UPDATE assignments SET status = 'blocked', updated_at = ?
+        WHERE run_id = ? AND step_id = ?
+          AND status IN ('queued', 'active')
+      `).run(now, current.run.id, currentStep.current_step_id);
+    }
+    const transition = this.supervisor.transition(current.run, "blocked", { reason, now });
+    const persisted = this.runs.persistMutation({
+      current,
+      nextRun: transition.run,
+      control: { ...current.control, recovery: undefined },
+      now,
+      lease: "clear",
+    });
+    const event = this.events.append({
+      missionId: persisted.run.missionId,
+      runId: persisted.run.id,
+      journey: current.run.journey,
+      eventType: current.run.journey === "autonomous"
+        ? "run.autonomous_safe_stopped"
+        : "run.guided_blocked",
+      actorType: "worker",
+      actorId,
+      summary: reason,
+      payload: {
+        code,
+        category: code.includes("authorization") ? "authorization_denied" : "scope_conflict",
+        dispatchAttempted: false,
+        stateVersion: persisted.run.stateVersion,
+      },
+      occurredAt: now,
+      sensitivity: "private",
+    });
+    this.checkpoints.create({ run: persisted, eventSequence: event.sequence, now });
+    return { denied: true, code, message: humanMessage };
+  }
+
+  private denyPersistedActionBeforeDispatch(
+    lease: RunLeaseToken,
+    action: DurableAction,
+    code: string,
+    humanMessage: string,
+  ): void {
+    const now = this.timestamp();
+    inImmediateTransaction(this.database, () => {
+      const current = this.load(lease.runId);
+      this.runs.assertLease(current, lease, now);
+      const row = this.database.prepare(`
+        SELECT status FROM actions WHERE id = ? AND run_id = ?
+      `).get(action.id, action.runId) as { status: string } | undefined;
+      if (row?.status !== "running") return;
+      const reason = current.run.journey === "autonomous"
+        ? `Safe-stopped (outside_contract): ${humanMessage}`
+        : `Guided execution blocked before dispatch: ${humanMessage}`;
+      this.database.prepare(`
+        UPDATE actions SET status = 'denied', result_summary = ?,
+          error_category = ?, ended_at = ?, updated_at = ?
+        WHERE id = ? AND status = 'running'
+      `).run(reason, code.includes("authorization") ? "authorization_denied" : "scope_conflict", now, now, action.id);
+      this.database.prepare(`
+        UPDATE plan_steps SET status = 'blocked', updated_at = ?
+        WHERE id = ? AND run_id = ? AND status = 'running'
+      `).run(now, action.stepId, action.runId);
+      this.database.prepare(`
+        UPDATE assignments SET status = 'blocked', updated_at = ?
+        WHERE id = (SELECT assignment_id FROM actions WHERE id = ?)
+          AND status = 'active'
+      `).run(now, action.id);
+      const transition = this.supervisor.transition(current.run, "blocked", { reason, now });
+      const persisted = this.runs.persistMutation({
+        current,
+        nextRun: transition.run,
+        control: { ...current.control, recovery: undefined },
+        now,
+        lease: "clear",
+      });
+      const event = this.events.append({
+        missionId: action.missionId,
+        runId: action.runId,
+        journey: current.run.journey,
+        eventType: "action.pre_dispatch_denied",
+        actorType: "system",
+        summary: reason,
+        payload: { actionId: action.id, code, dispatchAttempted: false },
+        occurredAt: now,
+        sensitivity: "private",
+      });
+      this.checkpoints.create({ run: persisted, eventSequence: event.sequence, now });
+    });
   }
 
   async completeAction(input: CompleteActionInput): Promise<CompleteActionResult> {
@@ -549,7 +745,15 @@ export class DurableRunCoordinator {
             reason,
           };
         } else if (current.run.journey === "guided") {
-          if (recovery.recovery.kind === "waiting_guided_decision" && replanBudgetAvailable) {
+          if (
+            category === "authorization_denied" ||
+            category === "scope_conflict" ||
+            category === "policy_denied"
+          ) {
+            targetState = "blocked";
+            directive = "blocked";
+            reason = `Guided execution blocked because the approved action is no longer authorized (${category}). Review scope and create a new exact decision.`;
+          } else if (recovery.recovery.kind === "waiting_guided_decision" && replanBudgetAvailable) {
             // A failed Guided action is never silently repeated. Keep the
             // fenced lease long enough for MissionRuntimeEngine to prepare a
             // materially different represented action and publish a new
@@ -582,6 +786,48 @@ export class DurableRunCoordinator {
         progressSignature: evaluation.progress.afterSignature,
         now,
       });
+      let retryAssignmentId: string | null = null;
+      if (directive === "retry") {
+        // A retry is a new action reservation, not a redispatch of the failed
+        // action. Revalidate the now-terminal predecessor while its exact
+        // assignment and step are still active/running, then requeue only that
+        // canonical pair in this same transaction. The next reservation must
+        // still pass startAction's queued/ready boundary and its final
+        // post-reservation dispatch assertion.
+        const retryAuthorization = this.runs.authorizePersistedAction(current, action);
+        if (!retryAuthorization.allowed) {
+          throw new DurableOrchestrationError(
+            retryAuthorization.code,
+            retryAuthorization.humanMessage,
+          );
+        }
+        const predecessor = this.database.prepare(`
+          SELECT assignment_id FROM actions
+          WHERE id = ? AND run_id = ? AND step_id = ?
+            AND status IN ('failed', 'timed_out')
+        `).get(action.id, action.runId, action.stepId) as { assignment_id: string | null } | undefined;
+        if (!predecessor?.assignment_id) {
+          throw new DurableOrchestrationError(
+            "retry_predecessor_not_canonical",
+            "The bounded retry has no exact failed specialist assignment.",
+          );
+        }
+        const assignment = this.database.prepare(`
+          UPDATE assignments SET status = 'queued', updated_at = ?
+          WHERE id = ? AND run_id = ? AND step_id = ? AND status = 'active'
+        `).run(now, predecessor.assignment_id, action.runId, action.stepId);
+        const step = this.database.prepare(`
+          UPDATE plan_steps SET status = 'ready', updated_at = ?
+          WHERE id = ? AND run_id = ? AND status = 'running'
+        `).run(now, action.stepId, action.runId);
+        if (assignment.changes !== 1 || step.changes !== 1) {
+          throw new DurableOrchestrationError(
+            "retry_requeue_fence_lost",
+            "The exact failed assignment or step changed before retry requeue.",
+          );
+        }
+        retryAssignmentId = predecessor.assignment_id;
+      }
       const control: DurableControlState = {
         budget: {
           limits: current.control.budget.limits,
@@ -646,9 +892,44 @@ export class DurableRunCoordinator {
           directive,
           contextPackId: action.contextPackId,
           retryNotBefore: recoveryState?.notBefore ?? null,
+          retryAssignmentId,
         },
       });
       const checkpoint = this.checkpoints.create({ run: persisted, eventSequence: event.sequence, now });
+      if (!input.success && directive === "retry" && recoveryState?.kind === "retry") {
+        this.continuations.enqueue({
+          runId: action.runId,
+          kind: "autonomous_retry_to_dispatch",
+          sourceId: action.id,
+          payload: { actionId: action.id, stepId: action.stepId },
+          now,
+          availableAt: recoveryState.notBefore,
+        });
+      } else if (input.success && directive === "continue") {
+        this.continuations.enqueue({
+          runId: action.runId,
+          kind: "action_result_to_advance",
+          sourceId: action.id,
+          payload: { actionId: action.id, stepId: action.stepId },
+          now,
+        });
+      } else if (!input.success && persisted.run.journey === "guided" && directive === "recover") {
+        this.continuations.enqueue({
+          runId: action.runId,
+          kind: "guided_failure_to_recover",
+          sourceId: action.id,
+          payload: { actionId: action.id, stepId: action.stepId },
+          now,
+        });
+      } else if (persisted.run.state === "failed") {
+        this.continuations.enqueue({
+          runId: action.runId,
+          kind: "evaluation_pending",
+          sourceId: action.id,
+          payload: { terminalStatus: "failed" },
+          now,
+        });
+      }
       return {
         action,
         run: persisted,
@@ -769,7 +1050,7 @@ export class DurableRunCoordinator {
             idempotent: action.idempotent,
             destructive: action.destructive,
             completionKnown: false,
-          }) === "resume_idempotently",
+          }) === "resume_idempotently" && this.runs.authorizePersistedAction(current, action).allowed,
         );
         const canRecover = safe && (
           current.run.state === "running" ||
@@ -838,6 +1119,11 @@ export class DurableRunCoordinator {
       }
       try {
         for (const action of prepared.inFlight) {
+          const current = this.load(action.runId);
+          const authorization = this.runs.authorizePersistedAction(current, action);
+          if (!authorization.allowed) {
+            throw new DurableOrchestrationError(authorization.code, authorization.humanMessage);
+          }
           await this.execution.resume(action, this.signal(action.runId));
         }
         results.push({
@@ -909,7 +1195,19 @@ export class DurableRunCoordinator {
       });
       this.checkpoints.create({ run: persisted, eventSequence: event.sequence, now: requestedAt });
       if (!persisted.lease) throw new DurableOrchestrationError("lease_lost", "Cancellation reservation lost its lease");
-      return persisted.lease;
+      const pending = this.continuations.enqueue({
+        runId: persisted.run.id,
+        kind: "cancellation_finalize_pending",
+        sourceId: event.id,
+        now: requestedAt,
+      });
+      const continuation = this.continuations.claimById({
+        id: pending.id,
+        workerId: input.lease.ownerId,
+        now: requestedAt,
+        leaseTtlMs: this.leaseTtlMs,
+      });
+      return { lease: persisted.lease, continuation };
     });
 
     this.controllers.get(input.lease.runId)?.abort(input.reason);
@@ -918,8 +1216,8 @@ export class DurableRunCoordinator {
     } catch {
       const failedAt = this.timestamp();
       inImmediateTransaction(this.database, () => {
-        const current = this.load(reservation.runId);
-        this.runs.assertLease(current, reservation, failedAt);
+        const current = this.load(reservation.lease.runId);
+        this.runs.assertLease(current, reservation.lease, failedAt);
         const target = allowedRunTransitions(current.run.state, current.run.journey).includes("blocked")
           ? "blocked"
           : "failed";
@@ -940,16 +1238,23 @@ export class DurableRunCoordinator {
           actorType: "system",
           summary: reason,
         });
+        this.continuations.fail({
+          id: reservation.continuation.id,
+          ownerToken: reservation.continuation.leaseOwner!,
+          now: failedAt,
+          error: reason,
+        });
         this.checkpoints.create({ run: persisted, eventSequence: event.sequence, now: failedAt });
       });
       throw new DurableOrchestrationError("cancellation_cleanup_failed", "Execution port did not confirm child cleanup");
     }
 
+    this.afterCancellationCleanup?.(input.lease.runId);
     const completedAt = this.timestamp();
     return inImmediateTransaction(this.database, () => {
-      const current = this.load(reservation.runId);
-      this.runs.assertLease(current, reservation, completedAt);
-      this.actions.cancelActive(current.run.id, input.reason, completedAt);
+      const current = this.load(reservation.lease.runId);
+      this.runs.assertLease(current, reservation.lease, completedAt);
+      this.closeAggregateChildren(current.run.id, input.reason, completedAt);
       const transition = this.supervisor.transition(current.run, "cancelled", {
         reason: input.reason,
         now: completedAt,
@@ -967,6 +1272,14 @@ export class DurableRunCoordinator {
         now: completedAt,
         lease: "clear",
       });
+      this.database.prepare("UPDATE missions SET status = 'cancelled', updated_at = ? WHERE id = ?")
+        .run(completedAt, persisted.run.missionId);
+      this.continuations.complete(
+        reservation.continuation.id,
+        reservation.continuation.leaseOwner!,
+        completedAt,
+      );
+      this.continuations.cancelOpen(current.run.id, completedAt, "Run reached a terminal cancelled state");
       const event = this.events.append({
         missionId: persisted.run.missionId,
         runId: persisted.run.id,
@@ -976,9 +1289,53 @@ export class DurableRunCoordinator {
         summary: `Run cancelled and child work stopped: ${input.reason}`,
         payload: { activeLeaseReleased: true },
       });
+      this.continuations.enqueue({
+        runId: persisted.run.id,
+        kind: "evaluation_pending",
+        sourceId: event.id,
+        payload: { terminalStatus: "cancelled" },
+        now: completedAt,
+      });
       const checkpoint = this.checkpoints.create({ run: persisted, eventSequence: event.sequence, now: completedAt });
       return { run: persisted, eventSequence: event.sequence, checkpointId: checkpoint.id };
     });
+  }
+
+  private closeAggregateChildren(runId: string, reason: string, now: string): void {
+    this.database.prepare(`
+      UPDATE tool_calls SET status = 'cancelled', ended_at = COALESCE(ended_at, ?)
+      WHERE action_id IN (SELECT id FROM actions WHERE run_id = ?)
+        AND status IN ('queued', 'running')
+    `).run(now, runId);
+    this.database.prepare(`
+      UPDATE actions SET status = 'cancelled', result_summary = COALESCE(result_summary, ?),
+        ended_at = COALESCE(ended_at, ?), updated_at = ?
+      WHERE run_id = ? AND status IN ('queued', 'running')
+    `).run(`Cancelled: ${reason}`, now, now, runId);
+    this.database.prepare(`
+      UPDATE guided_decisions SET status = 'cancelled', decision_reason = ?,
+        decided_at = COALESCE(decided_at, ?)
+      WHERE run_id = ? AND status = 'pending'
+    `).run(reason, now, runId);
+    this.database.prepare(`
+      UPDATE approvals SET status = 'cancelled', decided_at = COALESCE(decided_at, ?)
+      WHERE run_id = ? AND status = 'pending'
+    `).run(now, runId);
+    this.database.prepare(`
+      UPDATE plan_steps SET status = 'cancelled', ended_at = COALESCE(ended_at, ?), updated_at = ?
+      WHERE run_id = ? AND status IN (
+        'pending', 'ready', 'running', 'waiting_guided_decision', 'blocked', 'recovering'
+      )
+    `).run(now, now, runId);
+    this.database.prepare(`
+      UPDATE assignments SET status = 'cancelled', ended_at = COALESCE(ended_at, ?),
+        lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
+      WHERE run_id = ? AND status IN ('queued', 'active', 'blocked')
+    `).run(now, now, runId);
+    this.database.prepare(`
+      UPDATE plans SET status = 'abandoned'
+      WHERE run_id = ? AND status IN ('draft', 'active')
+    `).run(runId);
   }
 }
 

@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState, type KeyboardEvent, type PointerEvent, type WheelEvent } from "react";
 import type { MemoryEdgeSummary, MemoryNodeSummary } from "../../domain/types/brain";
-import type { BrainGraphLabelDensity } from "./brainGraphState";
-import { compactGraphLayout, layoutGraph, relatedNodeIds, shortestMemoryPath, type GraphPoint } from "./graphUtils";
+import type { BrainGraphLabelDensity, PinnedGraphPositions } from "./brainGraphState";
+import { collapseGraphClusters, compactGraphLayout, layoutGraph, relatedNodeIds, relaxGraphLayout, shortestMemoryPath, type GraphCluster, type GraphPoint } from "./graphUtils";
 
 const CLUSTER_COLORS: Record<string, string> = {
   operator: "#b8f341", mission: "#61a5ff", attack: "#f3b64b", tool: "#a891ff",
@@ -10,14 +10,24 @@ const CLUSTER_COLORS: Record<string, string> = {
 
 interface Camera { x: number; y: number; zoom: number }
 
-export function MemoryGraphCanvas({ nodes, edges, selectedId, rootNodeId, onSelect, compact, labelDensity }: {
+export function MemoryGraphCanvas({
+  nodes, edges, selectedId, rootNodeId, pathStartNodeId, onSelect, compact, physics, labelDensity,
+  collapsedClusters = [], pinnedPositions = {}, onPinPosition, onClearPinnedPositions, onExpandCluster,
+}: {
   nodes: MemoryNodeSummary[];
   edges: MemoryEdgeSummary[];
   selectedId?: string;
   rootNodeId?: string;
+  pathStartNodeId?: string;
   onSelect: (nodeId?: string) => void;
   compact: boolean;
+  physics: boolean;
   labelDensity: BrainGraphLabelDensity;
+  collapsedClusters?: readonly GraphCluster[];
+  pinnedPositions?: PinnedGraphPositions;
+  onPinPosition?: (nodeId: string, point: { x: number; y: number }) => void;
+  onClearPinnedPositions?: (nodeIds: readonly string[]) => void;
+  onExpandCluster?: (cluster: GraphCluster) => void;
 }) {
   const host = useRef<HTMLDivElement>(null);
   const canvas = useRef<HTMLCanvasElement>(null);
@@ -27,11 +37,16 @@ export function MemoryGraphCanvas({ nodes, edges, selectedId, rootNodeId, onSele
   const [points, setPoints] = useState<GraphPoint[]>([]);
   const [layoutPending, setLayoutPending] = useState(false);
   const layoutRequest = useRef(0);
-  const drag = useRef<{ x: number; y: number; cameraX: number; cameraY: number; moved: boolean } | undefined>(undefined);
+  const panDrag = useRef<{ x: number; y: number; cameraX: number; cameraY: number; moved: boolean } | undefined>(undefined);
+  const nodeDrag = useRef<{ id: string; offsetX: number; offsetY: number; x: number; y: number; moved: boolean } | undefined>(undefined);
+  const projection = useMemo(() => collapseGraphClusters(nodes, edges, new Set(collapsedClusters)), [collapsedClusters, edges, nodes]);
+  const displayNodes = projection.nodes;
+  const displayEdges = projection.edges;
   const pointMap = useMemo(() => new Map(points.map((point) => [point.id, point])), [points]);
-  const nodeMap = useMemo(() => new Map(nodes.map((node) => [node.id, node])), [nodes]);
-  const related = useMemo(() => relatedNodeIds(edges, selectedId), [edges, selectedId]);
-  const path = useMemo(() => rootNodeId && selectedId ? shortestMemoryPath(edges, rootNodeId, selectedId) : [], [edges, rootNodeId, selectedId]);
+  const nodeMap = useMemo(() => new Map(displayNodes.map((node) => [node.id, node])), [displayNodes]);
+  const related = useMemo(() => relatedNodeIds(displayEdges, selectedId), [displayEdges, selectedId]);
+  const pathOrigin = pathStartNodeId ?? rootNodeId;
+  const path = useMemo(() => pathOrigin && selectedId ? shortestMemoryPath(displayEdges, pathOrigin, selectedId) : [], [displayEdges, pathOrigin, selectedId]);
   const pathEdges = useMemo(() => new Set(path.slice(1).map((id, index) => [path[index], id].sort().join("|"))), [path]);
 
   useEffect(() => {
@@ -47,29 +62,35 @@ export function MemoryGraphCanvas({ nodes, edges, selectedId, rootNodeId, onSele
   useEffect(() => {
     const requestId = ++layoutRequest.current;
     setLayoutPending(true);
+    const withPinned = (layout: GraphPoint[]) => layout.map((point) => {
+      const pinned = pinnedPositions[point.id];
+      return pinned ? { ...point, x: pinned.x, y: pinned.y } : point;
+    });
     if (typeof Worker === "undefined") {
-      const layout = layoutGraph(nodes, size.width, size.height);
-      setPoints(compact ? compactGraphLayout(layout, size.width, size.height) : layout);
+      const initial = layoutGraph(displayNodes, size.width, size.height);
+      const layout = physics ? relaxGraphLayout(initial, displayEdges, size.width, size.height) : initial;
+      setPoints(withPinned(compact ? compactGraphLayout(layout, size.width, size.height) : layout));
       setLayoutPending(false);
       return;
     }
     const worker = new Worker(new URL("../../workers/memoryGraphLayout.worker.ts", import.meta.url), { type: "module" });
     worker.onmessage = (event: MessageEvent<{ requestId: number; points: GraphPoint[] }>) => {
       if (event.data.requestId !== requestId || requestId !== layoutRequest.current) return;
-      setPoints(event.data.points);
+      setPoints(withPinned(event.data.points));
       setLayoutPending(false);
       worker.terminate();
     };
     worker.onerror = () => {
       if (requestId !== layoutRequest.current) return;
-      const layout = layoutGraph(nodes, size.width, size.height);
-      setPoints(compact ? compactGraphLayout(layout, size.width, size.height) : layout);
+      const initial = layoutGraph(displayNodes, size.width, size.height);
+      const layout = physics ? relaxGraphLayout(initial, displayEdges, size.width, size.height) : initial;
+      setPoints(withPinned(compact ? compactGraphLayout(layout, size.width, size.height) : layout));
       setLayoutPending(false);
       worker.terminate();
     };
-    worker.postMessage({ requestId, nodes, width: size.width, height: size.height, compact });
+    worker.postMessage({ requestId, nodes: displayNodes, edges: displayEdges, width: size.width, height: size.height, compact, physics });
     return () => worker.terminate();
-  }, [compact, nodes, size.height, size.width]);
+  }, [compact, displayEdges, displayNodes, physics, pinnedPositions, size.height, size.width]);
 
   useEffect(() => {
     const element = canvas.current;
@@ -89,7 +110,7 @@ export function MemoryGraphCanvas({ nodes, edges, selectedId, rootNodeId, onSele
     context.translate(camera.x, camera.y);
     context.scale(camera.zoom, camera.zoom);
 
-    edges.forEach((edge) => {
+    displayEdges.forEach((edge) => {
       const source = pointMap.get(edge.sourceNodeId);
       const target = pointMap.get(edge.targetNodeId);
       if (!source || !target) return;
@@ -128,7 +149,7 @@ export function MemoryGraphCanvas({ nodes, edges, selectedId, rootNodeId, onSele
       context.lineWidth = (selected ? 3 : node.lifecycleStatus === "disputed" ? 2 : 1) / camera.zoom;
       context.strokeStyle = selected ? "#ffffff" : node.lifecycleStatus === "disputed" ? "#ff667a" : "rgba(8,11,13,.8)";
       context.stroke();
-      if (node.pinned) {
+      if (node.pinned || pinnedPositions[point.id]) {
         context.beginPath();
         context.arc(point.x, point.y, point.radius + 4 / camera.zoom, 0, Math.PI * 2);
         context.strokeStyle = "rgba(184,243,65,.7)";
@@ -150,7 +171,15 @@ export function MemoryGraphCanvas({ nodes, edges, selectedId, rootNodeId, onSele
       context.globalAlpha = 1;
     });
     context.restore();
-  }, [camera, edges, hovered, labelDensity, nodeMap, pathEdges, pointMap, points, related, selectedId, size]);
+  }, [camera, displayEdges, hovered, labelDensity, nodeMap, pathEdges, pinnedPositions, pointMap, points, related, selectedId, size]);
+
+  const selectNode = (nodeId?: string) => {
+    if (nodeId?.startsWith("cluster:")) {
+      onExpandCluster?.(nodeId.slice("cluster:".length) as GraphCluster);
+      return;
+    }
+    onSelect(nodeId);
+  };
 
   const screenToWorld = (clientX: number, clientY: number) => {
     const rect = canvas.current!.getBoundingClientRect();
@@ -162,10 +191,33 @@ export function MemoryGraphCanvas({ nodes, edges, selectedId, rootNodeId, onSele
   };
   const handlePointerDown = (event: PointerEvent<HTMLCanvasElement>) => {
     event.currentTarget.setPointerCapture(event.pointerId);
-    drag.current = { x: event.clientX, y: event.clientY, cameraX: camera.x, cameraY: camera.y, moved: false };
+    const nodeId = hit(event.clientX, event.clientY);
+    if (nodeId) {
+      if (nodeId.startsWith("cluster:")) {
+        selectNode(nodeId);
+        return;
+      }
+      const cursor = screenToWorld(event.clientX, event.clientY);
+      const point = pointMap.get(nodeId)!;
+      nodeDrag.current = { id: nodeId, offsetX: cursor.x - point.x, offsetY: cursor.y - point.y, x: point.x, y: point.y, moved: false };
+      selectNode(nodeId);
+      return;
+    }
+    panDrag.current = { x: event.clientX, y: event.clientY, cameraX: camera.x, cameraY: camera.y, moved: false };
   };
   const handlePointerMove = (event: PointerEvent<HTMLCanvasElement>) => {
-    const current = drag.current;
+    const movingNode = nodeDrag.current;
+    if (movingNode) {
+      const cursor = screenToWorld(event.clientX, event.clientY);
+      const next = { x: cursor.x - movingNode.offsetX, y: cursor.y - movingNode.offsetY };
+      const previous = pointMap.get(movingNode.id);
+      if (previous && Math.hypot(next.x - previous.x, next.y - previous.y) > 1) movingNode.moved = true;
+      movingNode.x = next.x;
+      movingNode.y = next.y;
+      setPoints((current) => current.map((point) => point.id === movingNode.id ? { ...point, ...next } : point));
+      return;
+    }
+    const current = panDrag.current;
     if (current) {
       const dx = event.clientX - current.x;
       const dy = event.clientY - current.y;
@@ -174,8 +226,14 @@ export function MemoryGraphCanvas({ nodes, edges, selectedId, rootNodeId, onSele
     } else setHovered(hit(event.clientX, event.clientY));
   };
   const handlePointerUp = (event: PointerEvent<HTMLCanvasElement>) => {
-    if (!drag.current?.moved) onSelect(hit(event.clientX, event.clientY));
-    drag.current = undefined;
+    if (nodeDrag.current) {
+      const moving = nodeDrag.current;
+      if (moving.moved) onPinPosition?.(moving.id, { x: moving.x, y: moving.y });
+      nodeDrag.current = undefined;
+      return;
+    }
+    if (!panDrag.current?.moved) selectNode(hit(event.clientX, event.clientY));
+    panDrag.current = undefined;
   };
   const handleWheel = (event: WheelEvent<HTMLCanvasElement>) => {
     event.preventDefault();
@@ -183,20 +241,21 @@ export function MemoryGraphCanvas({ nodes, edges, selectedId, rootNodeId, onSele
     setCamera((value) => ({ ...value, zoom: next }));
   };
   const handleKeyDown = (event: KeyboardEvent<HTMLCanvasElement>) => {
-    if (event.key === "Escape") { onSelect(undefined); return; }
-    if (!["ArrowRight", "ArrowDown", "ArrowLeft", "ArrowUp", "Enter"].includes(event.key) || nodes.length === 0) return;
+    if (event.key === "Escape") { selectNode(undefined); return; }
+    if (!["ArrowRight", "ArrowDown", "ArrowLeft", "ArrowUp", "Enter"].includes(event.key) || displayNodes.length === 0) return;
     event.preventDefault();
     if (event.key === "Enter" && selectedId) return;
-    const current = nodes.findIndex((node) => node.id === selectedId);
+    const current = displayNodes.findIndex((node) => node.id === selectedId);
     const delta = event.key === "ArrowLeft" || event.key === "ArrowUp" ? -1 : 1;
-    onSelect(nodes[(current + delta + nodes.length) % nodes.length]!.id);
+    selectNode(displayNodes[(current + delta + displayNodes.length) % displayNodes.length]!.id);
   };
 
   return (
     <div ref={host} className="brain-canvas-host">
-      <canvas ref={canvas} tabIndex={0} role="application" aria-busy={layoutPending} aria-label={`Memory graph with ${nodes.length} nodes and ${edges.length} relationships. Use arrow keys to select nodes, Escape to clear, mouse wheel to zoom, and drag to pan.`} onKeyDown={handleKeyDown} onPointerDown={handlePointerDown} onPointerMove={handlePointerMove} onPointerUp={handlePointerUp} onPointerLeave={() => { drag.current = undefined; setHovered(undefined); }} onWheel={handleWheel} />
-      <div className="brain-canvas-controls" aria-label="Graph viewport controls"><button onClick={() => setCamera((value) => ({ ...value, zoom: Math.min(2.8, value.zoom * 1.2) }))} aria-label="Zoom in">+</button><button onClick={() => setCamera((value) => ({ ...value, zoom: Math.max(0.45, value.zoom / 1.2) }))} aria-label="Zoom out">−</button><button onClick={() => setCamera({ x: 0, y: 0, zoom: 1 })}>Fit</button></div>
-      <p className="os-visually-hidden" aria-live="polite">{selectedId ? `Selected ${nodes.find((node) => node.id === selectedId)?.title ?? selectedId}` : "No graph node selected"}</p>
+      <canvas ref={canvas} tabIndex={0} role="application" aria-busy={layoutPending} aria-label={`Memory graph with ${displayNodes.length} nodes and ${displayEdges.length} relationships in the visible projection. Use arrow keys to select nodes, Escape to clear, mouse wheel to zoom, drag empty space to pan, and drag a node to persist its position. Selecting a collapsed cluster expands it.`} onKeyDown={handleKeyDown} onPointerDown={handlePointerDown} onPointerMove={handlePointerMove} onPointerUp={handlePointerUp} onPointerLeave={() => { panDrag.current = undefined; nodeDrag.current = undefined; setHovered(undefined); }} onWheel={handleWheel} />
+      <div className="brain-canvas-controls" aria-label="Graph viewport controls"><button onClick={() => setCamera((value) => ({ ...value, zoom: Math.min(2.8, value.zoom * 1.2) }))} aria-label="Zoom in">+</button><button onClick={() => setCamera((value) => ({ ...value, zoom: Math.max(0.45, value.zoom / 1.2) }))} aria-label="Zoom out">−</button><button onClick={() => setCamera({ x: 0, y: 0, zoom: 1 })}>Fit</button>{onClearPinnedPositions && <button onClick={() => onClearPinnedPositions(nodes.map((node) => node.id))}>Reset layout</button>}</div>
+      <p className="os-visually-hidden" aria-live="polite">{selectedId ? `Selected ${displayNodes.find((node) => node.id === selectedId)?.title ?? selectedId}` : "No graph node selected"}</p>
+      <p className="os-visually-hidden" aria-live="polite">{pathStartNodeId && selectedId ? path.length > 0 ? `Shortest memory path contains ${path.length} nodes` : "No path connects the selected memories in this bounded view" : "No arbitrary memory path selected"}</p>
       <p className="os-visually-hidden" role="status" aria-live="polite">{layoutPending ? "Calculating memory graph layout" : "Memory graph layout ready"}</p>
     </div>
   );

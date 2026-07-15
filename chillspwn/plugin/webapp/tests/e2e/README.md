@@ -17,6 +17,21 @@ Run against an existing build:
 bun run test:e2e:run
 ```
 
+The two large local profiles are intentionally opt-in so the ordinary browser
+gate remains fast. Each creates its own temporary canonical database, refuses
+to combine fixture profiles, and starts a credential-isolated server:
+
+```bash
+bun run test:e2e:brain-scale
+bun run test:e2e:observability-scale
+```
+
+The Observability profile persists 100,000 real append-only events plus a small
+correlated structured-log set. It verifies first/next API and UI cursors,
+duplicate-free pages, trace/event/log semantics, filters, FTS search, bounded
+DOM size, scroll responsiveness, browser long tasks, and console/page errors.
+The fixture module is imported only by the E2E server harness.
+
 The Playwright configuration uses a compatible installed Chromium executable
 when one is available. Otherwise install Playwright-managed Chromium once:
 

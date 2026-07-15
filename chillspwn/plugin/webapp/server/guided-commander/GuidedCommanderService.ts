@@ -5,6 +5,7 @@ import {
   memoryCandidateAllowed,
   SecondBrainService,
   type ContextPack,
+  type ContextPackItemDisposition,
   type MemoryScope,
   type RetrievalPolicy,
 } from "../memory";
@@ -36,6 +37,8 @@ import {
 } from "./validation";
 
 const TERMINAL_RUN_STATES = new Set(["completed", "failed", "cancelled"]);
+const MAX_IN_FLIGHT_PROVIDER_MUTATIONS = 256;
+const DEFAULT_PROVIDER_MUTATION_LEASE_MS = 120_000;
 
 interface ServiceDependencies {
   readonly repository: GuidedCommanderRepository;
@@ -48,6 +51,16 @@ interface PreparedContext {
   readonly pack: ContextPack;
   readonly nodes: readonly GuidedCommanderMemoryContext[];
   readonly presentationPreferences: readonly GuidedPresentationPreference[];
+}
+
+interface ProviderMutationFlight {
+  readonly requestHash: string;
+  readonly promise: Promise<GuidedCommanderReply>;
+}
+
+interface ProviderMutationReservation {
+  readonly ownerToken: string;
+  readonly expiresAt: string;
 }
 
 function asJsonValue<T>(value: T): JsonValue {
@@ -104,6 +117,8 @@ export class GuidedCommanderService {
   readonly #memoryContextBudget: number;
   readonly #memoryContextLimit: number;
   readonly #transcriptContextLimit: number;
+  readonly #providerMutationLeaseMs: number;
+  readonly #providerMutationFlights = new Map<string, ProviderMutationFlight>();
 
   constructor(dependencies: ServiceDependencies) {
     if (
@@ -121,6 +136,8 @@ export class GuidedCommanderService {
     this.#memoryContextBudget = dependencies.options?.memoryContextBudget ?? 6_000;
     this.#memoryContextLimit = dependencies.options?.memoryContextLimit ?? 8;
     this.#transcriptContextLimit = dependencies.options?.transcriptContextLimit ?? 24;
+    this.#providerMutationLeaseMs = dependencies.options?.providerMutationLeaseMs
+      ?? DEFAULT_PROVIDER_MUTATION_LEASE_MS;
     for (const [label, value, maximum] of [
       ["memoryContextBudget", this.#memoryContextBudget, 50_000],
       ["memoryContextLimit", this.#memoryContextLimit, 50],
@@ -129,6 +146,13 @@ export class GuidedCommanderService {
       if (!Number.isSafeInteger(value) || value < 1 || value > maximum) {
         throw new RangeError(`${label} must be an integer from 1 through ${maximum}`);
       }
+    }
+    if (
+      !Number.isSafeInteger(this.#providerMutationLeaseMs) ||
+      this.#providerMutationLeaseMs < 1_000 ||
+      this.#providerMutationLeaseMs > 15 * 60_000
+    ) {
+      throw new RangeError("providerMutationLeaseMs must be an integer from 1,000 through 900,000");
     }
   }
 
@@ -151,14 +175,23 @@ export class GuidedCommanderService {
     signal: AbortSignal;
   }): Promise<GuidedCommanderReply> {
     const identity = contextualIdentity(input.missionId, input.action, input.request);
-    return this.providerMutation({
-      missionId: input.missionId,
-      action: input.action,
-      request: input.request,
-      requestHash: hashCanonical(identity),
+    const requestHash = hashCanonical(identity);
+    const idempotencyScope = `${input.action}:${input.missionId}`;
+    return this.runProviderMutationSingleFlight({
+      idempotencyScope,
       idempotencyKey: input.idempotencyKey,
+      requestHash,
       actorId: input.actorId,
-      signal: input.signal,
+      operation: (reservation) => this.providerMutation({
+        missionId: input.missionId,
+        action: input.action,
+        request: input.request,
+        requestHash,
+        idempotencyKey: input.idempotencyKey,
+        actorId: input.actorId,
+        signal: input.signal,
+        reservation,
+      }),
     });
   }
 
@@ -175,25 +208,29 @@ export class GuidedCommanderService {
       ...resultRequestIdentity(input.request),
     });
     const idempotencyScope = `interpret_result:${input.missionId}`;
-    const replay = this.repository.findIdempotent(idempotencyScope, input.idempotencyKey, requestHash);
-    if (replay !== undefined) return replay as unknown as GuidedCommanderReply;
-    const scope = this.requireActiveScope(input.missionId, input.request);
-    const evidence = this.repository.acquireTextEvidence(
-      scope,
-      input.actorId,
-      safeTextResult(input.request.result),
-    );
-    return this.providerMutation({
-      missionId: input.missionId,
-      action: "interpret_result",
-      request: input.request,
-      requestHash,
+    return this.runProviderMutationSingleFlight({
+      idempotencyScope,
       idempotencyKey: input.idempotencyKey,
+      requestHash,
       actorId: input.actorId,
-      signal: input.signal,
-      existingScope: scope,
-      result: safeTextResult(input.request.result),
-      evidenceId: evidence.id,
+      operation: (reservation) => {
+        const scope = this.requireActiveScope(input.missionId, input.request);
+        const result = safeTextResult(input.request.result);
+        const evidence = this.repository.acquireTextEvidence(scope, input.actorId, result);
+        return this.providerMutation({
+          missionId: input.missionId,
+          action: "interpret_result",
+          request: input.request,
+          requestHash,
+          idempotencyKey: input.idempotencyKey,
+          actorId: input.actorId,
+          signal: input.signal,
+          reservation,
+          existingScope: scope,
+          result,
+          evidenceId: evidence.id,
+        });
+      },
     });
   }
 
@@ -384,13 +421,12 @@ export class GuidedCommanderService {
     idempotencyKey: string;
     actorId: string;
     signal: AbortSignal;
+    reservation: ProviderMutationReservation;
     existingScope?: GuidedScope;
     result?: GuidedTextResult;
     evidenceId?: string;
   }): Promise<GuidedCommanderReply> {
     const idempotencyScope = `${input.action}:${input.missionId}`;
-    const replay = this.repository.findIdempotent(idempotencyScope, input.idempotencyKey, input.requestHash);
-    if (replay !== undefined) return replay as unknown as GuidedCommanderReply;
     const scope = input.existingScope ?? this.requireActiveScope(input.missionId, input.request);
     const context = this.prepareMemoryContext(scope, input.action, input.actorId);
     const recentTranscript = this.repository.recentTranscript(
@@ -400,6 +436,7 @@ export class GuidedCommanderService {
     );
     const turn = this.repository.startProviderTurn(scope, this.#port.providerId, this.#port.model);
     let response;
+    let contextDispositions: readonly ContextPackItemDisposition[];
     try {
       const providerInput: GuidedCommanderPortInput = {
         action: input.action,
@@ -419,7 +456,7 @@ export class GuidedCommanderService {
         },
       };
       response = validatePortResponse(await this.#port.respond(providerInput, input.signal));
-      this.validateAndRecordContextUse(context, response.contextUse ?? []);
+      contextDispositions = this.validateContextUse(context, response.contextUse ?? []);
     } catch (error) {
       const aborted = input.signal.aborted || (error instanceof DOMException && error.name === "AbortError");
       this.repository.finishProviderTurn(
@@ -444,12 +481,20 @@ export class GuidedCommanderService {
     }
     let committed: { value: GuidedCommanderReply; replayed: boolean };
     try {
-      committed = this.repository.commitIdempotent({
+      committed = this.repository.completeProviderMutationReservation({
         scope: idempotencyScope,
         key: input.idempotencyKey,
         requestHash: input.requestHash,
+        ownerToken: input.reservation.ownerToken,
         actorId: input.actorId,
         operation: () => {
+          // Context attribution belongs to the durable response, not merely to a
+          // provider attempt. The reservation owner is fenced before this
+          // callback runs, so a stale worker cannot mark memory as used for a
+          // response that it did not commit.
+          for (const disposition of contextDispositions) {
+            this.secondBrain.recordContextUse(context.pack.id, disposition);
+          }
           const exchange = this.repository.insertExchange({
             scope,
             actorId: input.actorId,
@@ -484,6 +529,20 @@ export class GuidedCommanderService {
             providerTurnId: turn.id,
             ...(input.evidenceId ? { evidenceId: input.evidenceId } : {}),
           });
+          if (input.evidenceId) {
+            this.repository.recordTextEvidenceInterpretation({
+              scope,
+              evidenceId: input.evidenceId,
+              assistantMessageId: exchange.assistantMessage.id,
+              contextPackId: context.pack.id,
+              summary: response.summary,
+              confidence: response.confidence,
+            });
+          }
+          // The winning provider turn and its durable response are one
+          // aggregate. A process crash must not leave a committed message with
+          // a permanently "started" provider turn.
+          this.repository.finishProviderTurn(turn.id, "completed", turn.startedAt);
           return {
             action: input.action,
             ...exchange,
@@ -497,13 +556,154 @@ export class GuidedCommanderService {
       this.repository.finishProviderTurn(turn.id, "failed", turn.startedAt, "persistence_error");
       throw error;
     }
-    this.repository.finishProviderTurn(
-      turn.id,
-      committed.replayed ? "cancelled" : "completed",
-      turn.startedAt,
-      committed.replayed ? "idempotent_replay" : undefined,
-    );
+    if (committed.replayed) {
+      this.repository.finishProviderTurn(
+        turn.id,
+        "cancelled",
+        turn.startedAt,
+        "idempotent_replay",
+      );
+    }
     return committed.value;
+  }
+
+  /**
+   * Coalesces concurrent provider-backed mutations before any evidence, Context
+   * Pack, provider-turn, or conversation side effect is created. Durable replay
+   * remains repository-owned; this bounded in-process layer closes the window
+   * before that durable record can exist.
+   */
+  private runProviderMutationSingleFlight(input: {
+    idempotencyScope: string;
+    idempotencyKey: string;
+    requestHash: string;
+    actorId: string;
+    operation: (reservation: ProviderMutationReservation) => Promise<GuidedCommanderReply>;
+  }): Promise<GuidedCommanderReply> {
+    const replay = this.repository.findIdempotent(
+      input.idempotencyScope,
+      input.idempotencyKey,
+      input.requestHash,
+    );
+    if (replay !== undefined) {
+      return Promise.resolve(replay as unknown as GuidedCommanderReply);
+    }
+
+    const flightKey = hashCanonical({
+      scope: input.idempotencyScope,
+      key: input.idempotencyKey,
+    });
+    const existing = this.#providerMutationFlights.get(flightKey);
+    if (existing) {
+      if (existing.requestHash !== input.requestHash) {
+        throw new GuidedCommanderError(
+          409,
+          "idempotency_key_conflict",
+          "Idempotency key was reused with another request",
+          {
+            humanMessage: "This action key already belongs to another Guided command.",
+            category: "conflict",
+          },
+        );
+      }
+      return existing.promise;
+    }
+
+    if (this.#providerMutationFlights.size >= MAX_IN_FLIGHT_PROVIDER_MUTATIONS) {
+      throw new GuidedCommanderError(
+        503,
+        "guided_commander_busy",
+        "Guided Commander has reached its bounded concurrent request limit",
+        {
+          humanMessage: "Guided Commander is handling the maximum number of active requests.",
+          category: "provider_unavailable",
+          retryable: true,
+          remediation: "Retry with the same Idempotency-Key after an active request completes.",
+        },
+      );
+    }
+
+    // Reserve durably before evidence ingestion, Context Pack creation,
+    // provider turns, or conversation writes. BEGIN IMMEDIATE + settings.key's
+    // primary key makes this fence visible across service processes.
+    const reservationResult = this.repository.reserveProviderMutation({
+      scope: input.idempotencyScope,
+      key: input.idempotencyKey,
+      requestHash: input.requestHash,
+      actorId: input.actorId,
+      leaseMs: this.#providerMutationLeaseMs,
+    });
+    if (reservationResult.status === "replay") {
+      return Promise.resolve(reservationResult.response as unknown as GuidedCommanderReply);
+    }
+    if (reservationResult.status === "in_progress") {
+      const retryAfterMs = Math.max(
+        250,
+        Math.min(
+          this.#providerMutationLeaseMs,
+          Date.parse(reservationResult.expiresAt) - Date.parse(this.repository.now()),
+        ),
+      );
+      throw new GuidedCommanderError(
+        409,
+        "guided_commander_request_in_progress",
+        "An identical Guided provider request is already in progress",
+        {
+          humanMessage: "This Guided request is already being processed by another worker.",
+          category: "conflict",
+          retryable: true,
+          details: { retryAfterMs, expiresAt: reservationResult.expiresAt },
+          remediation: "Retry with the same Idempotency-Key after the bounded lease or completion response.",
+        },
+      );
+    }
+    const reservation: ProviderMutationReservation = reservationResult;
+
+    // Defer side effects until after the local flight is visible. Renewing the
+    // lease prevents a healthy long-running provider turn from being mistaken
+    // for a crashed owner; a real crash naturally stops renewal and permits a
+    // bounded takeover.
+    const promise = Promise.resolve().then(async () => {
+      const heartbeat = setInterval(() => {
+        try {
+          this.repository.renewProviderMutationReservation({
+            scope: input.idempotencyScope,
+            key: input.idempotencyKey,
+            requestHash: input.requestHash,
+            ownerToken: reservation.ownerToken,
+            leaseMs: this.#providerMutationLeaseMs,
+          });
+        } catch {
+          // Completion remains owner-fenced. A failed heartbeat cannot grant
+          // authority and is handled by the atomic completion check.
+        }
+      }, Math.max(250, Math.floor(this.#providerMutationLeaseMs / 3)));
+      heartbeat.unref?.();
+      try {
+        return await input.operation(reservation);
+      } catch (error) {
+        this.repository.releaseProviderMutationReservation({
+          scope: input.idempotencyScope,
+          key: input.idempotencyKey,
+          requestHash: input.requestHash,
+          ownerToken: reservation.ownerToken,
+        });
+        throw error;
+      } finally {
+        clearInterval(heartbeat);
+      }
+    });
+    this.#providerMutationFlights.set(flightKey, {
+      requestHash: input.requestHash,
+      promise,
+    });
+    const clear = () => {
+      if (this.#providerMutationFlights.get(flightKey)?.promise === promise) {
+        this.#providerMutationFlights.delete(flightKey);
+      }
+    };
+    void promise.then(clear, clear);
+    return promise;
   }
 
   private requireActiveScope(missionId: string, request: ContextualActionRequest): GuidedScope {
@@ -583,7 +783,7 @@ export class GuidedCommanderService {
     return { pack, nodes, presentationPreferences };
   }
 
-  private validateAndRecordContextUse(
+  private validateContextUse(
     context: PreparedContext,
     dispositions: readonly {
       nodeId: string;
@@ -592,9 +792,10 @@ export class GuidedCommanderService {
       influenceSummary?: string;
       ignoredReason?: string;
     }[],
-  ): void {
+  ): readonly ContextPackItemDisposition[] {
     const available = new Set(context.nodes.map((node) => node.id));
     const seen = new Set<string>();
+    const normalized: ContextPackItemDisposition[] = [];
     for (const disposition of dispositions) {
       if (!available.has(disposition.nodeId) || seen.has(disposition.nodeId)) {
         throw new GuidedCommanderError(502, "invalid_guided_context_use", "Provider context usage is not part of the persisted context pack", {
@@ -609,26 +810,23 @@ export class GuidedCommanderService {
         });
       }
       seen.add(disposition.nodeId);
+      normalized.push({
+        ...disposition,
+        ...(!disposition.used && !disposition.ignoredReason
+          ? { ignoredReason: "Retrieved context was not needed for this response" }
+          : {}),
+      });
     }
-    this.repository.transaction(() => {
-      for (const disposition of dispositions) {
-        this.secondBrain.recordContextUse(context.pack.id, {
-          ...disposition,
-          ...(!disposition.used && !disposition.ignoredReason
-            ? { ignoredReason: "Retrieved context was not needed for this response" }
-            : {}),
-        });
-      }
-      for (const node of context.nodes) {
-        if (seen.has(node.id)) continue;
-        this.secondBrain.recordContextUse(context.pack.id, {
-          nodeId: node.id,
-          used: false,
-          relevanceReason: "Retrieved for the current mission and represented step",
-          ignoredReason: "The planning-only provider did not use this memory in its response",
-        });
-      }
-    });
+    for (const node of context.nodes) {
+      if (seen.has(node.id)) continue;
+      normalized.push({
+        nodeId: node.id,
+        used: false,
+        relevanceReason: "Retrieved for the current mission and represented step",
+        ignoredReason: "The planning-only provider did not use this memory in its response",
+      });
+    }
+    return normalized;
   }
 
   private memoryScope(scope: GuidedScope, requested: RememberRequest["scope"]): MemoryScope {

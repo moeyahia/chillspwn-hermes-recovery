@@ -3,6 +3,7 @@ import express from "express";
 import type { Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { createDatabaseConnection, migrateDatabase } from "../../db";
+import { AttackChainLearningService } from "../../learning";
 import { hashJson } from "../../orchestration/serialization";
 import { createOperationsRouter } from "../../routes/operationsRoutes";
 import type { OperationsAccessPolicy } from "../types";
@@ -34,9 +35,15 @@ function seed(database: Db): void {
   run.run("run-b", "mission-b", A, C);
   database.prepare(`
     UPDATE runs SET status = 'completed', progress = 1, retry_count = 1,
-      replan_count = 1, status_reason = 'Authorized objective completed', ended_at = ?
+      replan_count = 1, status_reason = 'Authorized objective completed',
+      budget_json = ?, budget_usage_json = ?, started_at = ?, ended_at = ?
     WHERE id = 'run-a'
-  `).run(C);
+  `).run(
+    JSON.stringify({ timeBudgetMinutes: 10, tokenBudget: 100, costBudget: 1, toolCalls: 5, retryBudget: 3, replanBudget: 2 }),
+    JSON.stringify({ wallClockMs: 120_000, providerTokens: 30, estimatedCost: 0, toolCalls: 1, retries: 2, replans: 1 }),
+    A,
+    C,
+  );
 
   const agent = database.prepare(`
     INSERT INTO agents (
@@ -151,6 +158,10 @@ function seed(database: Db): void {
   lessonEvidence.run("lesson-ready", C);
   lessonEvidence.run("lesson-self", C);
   database.prepare(`
+    INSERT INTO lesson_evidence (lesson_id, run_id, relationship, rationale, created_at)
+    VALUES ('lesson-ready', 'run-a', 'counterexample', 'Produced by this exact terminal run', ?)
+  `).run(C);
+  database.prepare(`
     INSERT INTO lesson_usage (
       id, lesson_id, mission_id, run_id, influence_summary, measured_impact_json, used_at
     ) VALUES ('usage-a', 'lesson-ready', 'mission-a', 'run-a', 'Changed the plan', '{"savedActions":2}', ?)
@@ -206,6 +217,53 @@ function seed(database: Db): void {
   `).run(B);
   database.prepare("UPDATE actions SET context_pack_id = 'context-a' WHERE id = 'action-a'").run();
   database.prepare("UPDATE artifacts SET action_id = 'action-a' WHERE id = 'artifact-report-a'").run();
+  database.prepare(`
+    INSERT INTO actions (
+      id, mission_id, run_id, action_type, action_class, fingerprint,
+      normalized_arguments_json, status, intent_summary, result_summary,
+      retry_count, created_at, updated_at
+    ) VALUES (
+      'action-b', 'mission-b', 'run-b', 'scan', 'reconnaissance', ?, '{}',
+      'succeeded', 'Hidden engagement action', 'Hidden engagement result', 0, ?, ?
+    )
+  `).run("e".repeat(64), B, C);
+}
+
+function retainAttackChainDetails(
+  database: Db,
+  lessonId: string,
+  runId: string,
+  evidenceId?: string,
+): void {
+  new AttackChainLearningService(database, { clock: () => new Date(C) }).retainCandidateDetails(
+    lessonId,
+    {
+      title: `Bounded review chain ${lessonId}`,
+      techniqueName: "Scoped service validation",
+      techniqueCategory: "recon",
+      summary: "Correlate authorized observations before selecting the next bounded technique.",
+      prerequisites: ["Confirmed authorization and normalized target scope"],
+      observedSignals: ["A distinct service response is retained as evidence"],
+      orderedSteps: ["Use nmap service detection against <TARGET_HOST>."],
+      tools: ["nmap"],
+      publicReferences: ["https://nmap.org/book/man-version-detection.html"],
+      validationCheckpoints: ["Confirm a retained evidence identifier records the expected response"],
+      failureRecovery: ["If no new evidence is produced, change conditions before one bounded retry"],
+      antiReuseWarnings: ["Do not treat one unverified banner as proof"],
+      expectedOutcome: "Service identity uncertainty is reduced with retained evidence",
+      reuseGuidance: "Apply only when authorization and prerequisite signals match",
+      confidence: 0.85,
+      scope: "mission",
+      sources: [{
+        sourceType: "run_evaluation",
+        sourceId: `evaluation-${lessonId}`,
+        sourceHash: "c".repeat(64),
+        runId,
+        ...(evidenceId ? { evidenceId } : {}),
+      }],
+    },
+    "agent-other",
+  );
 }
 
 async function application() {
@@ -392,12 +450,26 @@ describe("canonical operations HTTP API", () => {
           '{"retryBudget":2,"replanBudget":2}', '{}', 0, 0, ?, ?, ?
         )
       `).run(C, A, C);
+      database.prepare(`
+        INSERT INTO events (
+          id, mission_id, run_id, sequence, event_type, occurred_at, actor_type,
+          summary, payload_json, journey, sensitivity, created_at
+        ) VALUES (
+          'event-auto-safe-stop', 'mission-auto-a', 'run-auto-safe-stop', 1,
+          'run.autonomous_safe_stopped', ?, 'system',
+          'Safe-stopped because no in-contract path remains', '{}',
+          'autonomous', 'internal', ?
+        )
+      `).run(C, C);
       const recovery = await body(await fetch(`${url}/api/v2/operations/runs/run-auto-safe-stop/recovery`));
       expect(recovery).toMatchObject({
         recoveryRequired: true,
         run: { journey: "autonomous", status: "failed" },
         proposedRecovery: { kind: "safe_stop" },
       });
+      expect(recovery.detection.evidence).toEqual([
+        expect.objectContaining({ id: "event-auto-safe-stop", eventType: "run.autonomous_safe_stopped" }),
+      ]);
       expect(recovery.proposedRecovery.impact.scope).toContain("contract remains unchanged");
       expect(recovery.actions.find((item: any) => item.kind === "terminate")).toMatchObject({ available: false, command: null });
     } finally { database.close(); }
@@ -445,6 +517,14 @@ describe("canonical operations HTTP API", () => {
       expect(report.items.map((item: any) => item.id)).toEqual(["artifact-report-a"]);
       expect(report.items[0].storage).toEqual({ scheme: "https", available: true });
       expect(report.items[0].contextPackIds).toEqual(["context-a"]);
+      const actions = await body(await fetch(`${url}/api/v2/operations/actions?runId=run-a`));
+      expect(actions.items).toMatchObject([{
+        id: "action-a", runId: "run-a", journey: "guided", status: "succeeded",
+        intentSummary: "Map approved target", resultSummary: "Unique evidence retained",
+        retryCount: 1, contextPackId: "context-a",
+      }]);
+      expect(JSON.stringify(actions)).not.toContain("action-secret-123");
+      expect(JSON.stringify(await body(await fetch(`${url}/api/v2/operations/actions`)))).not.toContain("action-b");
       expect((await fetch(`${url}/api/v2/reports/artifact-data-a`)).status).toBe(404);
       const providers = await body(await fetch(`${url}/api/v2/system/providers`));
       expect(providers.items).toMatchObject([{ provider: "grok", model: "expert", turnCount: 1 }]);
@@ -458,6 +538,20 @@ describe("canonical operations HTTP API", () => {
         prior: null,
         metrics: [],
       });
+      expect(evaluations.items[0].budget.metrics).toMatchObject([
+        { key: "wallClockMs", limit: 600_000, usage: 120_000, usageStatus: "recorded_exact", status: "within_limit" },
+        { key: "providerTokens", limit: 100, usage: 30, usageStatus: "recorded_exact", status: "within_limit" },
+        { key: "estimatedCost", limit: 1, usage: 0, usageStatus: "recorded_estimate", status: "within_limit" },
+        { key: "toolCalls", limit: 5, usage: 1, usageStatus: "recorded_exact", status: "within_limit" },
+        { key: "retries", limit: 3, usage: 2, usageStatus: "recorded_exact", status: "within_limit" },
+        { key: "replans", limit: 2, usage: 1, usageStatus: "recorded_exact", status: "within_limit" },
+      ]);
+
+      database.prepare("UPDATE runs SET budget_usage_json = '{}' WHERE id = 'run-a'").run();
+      database.prepare("UPDATE provider_turns SET input_tokens = NULL WHERE id = 'turn-a'").run();
+      const unknownUsage = await body(await fetch(`${url}/api/v2/learning/evaluations?runId=run-a`));
+      expect(unknownUsage.items[0].budget.metrics.find((metric: any) => metric.key === "providerTokens"))
+        .toMatchObject({ limit: 100, usage: null, usageStatus: "unknown", status: "unknown_usage", usageSource: null });
       const combined = JSON.stringify({ events, logs, agent, evidence, policies, mcp, report });
       for (const secret of [
         "provider-secret-123", "tool-secret-123", "event-secret-123", "event-bearer-secret",
@@ -529,6 +623,8 @@ describe("canonical operations HTTP API", () => {
         terminalStatusMatch: true,
         metrics: [{ key: "durationMs", current: 60_000, prior: 120_000, movement: "favorable" }],
       });
+      expect(response.items[0].budget.metrics.find((metric: any) => metric.key === "providerTokens"))
+        .toMatchObject({ limit: null, usage: null, usageStatus: "unknown", status: "unknown_usage" });
       expect(response.items[0].comparison.summary).toContain("does not establish that the system improved");
     } finally { database.close(); }
   });
@@ -565,6 +661,105 @@ describe("canonical operations HTTP API", () => {
     } finally { database.close(); }
   });
 
+  test("finding and lesson gates ignore hidden, foreign-mission, and foreign-run support", async () => {
+    const { database, url } = await application();
+    try {
+      database.prepare(`
+        INSERT INTO runs (id, mission_id, journey, status, created_at, updated_at)
+        VALUES ('run-a-other', 'mission-a', 'guided', 'completed', ?, ?)
+      `).run(A, C);
+      const evidence = database.prepare(`
+        INSERT INTO evidence (
+          id, mission_id, run_id, source, acquired_at, evidence_type,
+          content_hash, provenance_json, confidence, sensitivity,
+          verification_state, summary, created_by, created_at
+        ) VALUES (?, ?, ?, 'specialist', ?, 'service', ?, '{}', 0.9, ?,
+          'verified', ?, 'agent-one', ?)
+      `);
+      evidence.run("evidence-a-restricted", "mission-a", "run-a", C, "d".repeat(64), "restricted", "Exact but restricted support", C);
+      evidence.run("evidence-a-other-run", "mission-a", "run-a-other", C, "e".repeat(64), "private", "Different run support", C);
+
+      const finding = database.prepare(`
+        INSERT INTO findings (
+          id, mission_id, run_id, title, severity, confidence, affected_scope,
+          description, impact, review_status, created_at, updated_at
+        ) VALUES (?, 'mission-a', 'run-a', ?, 'high', 0.9, 'lab.internal',
+          'Adversarial support fixture', 'Authorized impact', 'under_review', ?, ?)
+      `);
+      finding.run("finding-hidden-support", "Hidden exact support", B, B);
+      finding.run("finding-foreign-support", "Foreign engagement support", B, B);
+      finding.run("finding-other-run-support", "Other run support", B, B);
+      const findingEvidence = database.prepare(`
+        INSERT INTO finding_evidence (finding_id, evidence_id, relationship, added_at)
+        VALUES (?, ?, 'supports', ?)
+      `);
+      findingEvidence.run("finding-hidden-support", "evidence-a-restricted", C);
+      findingEvidence.run("finding-foreign-support", "evidence-b", C);
+      findingEvidence.run("finding-other-run-support", "evidence-a-other-run", C);
+
+      const reviewFinding = (id: string, key: string, all = false) => fetch(
+        `${url}/api/v2/intelligence/findings/${id}/review`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Idempotency-Key": key,
+            ...(all ? { "X-Test-Access": "all" } : {}),
+          },
+          body: JSON.stringify({
+            expectedVersion: 1,
+            status: "verified",
+            reason: "Adversarial scope-bound review",
+            operatorOverride: false,
+          }),
+        },
+      );
+      expect((await reviewFinding("finding-hidden-support", "finding-hidden-default-001")).status).toBe(409);
+      expect((await reviewFinding("finding-hidden-support", "finding-hidden-all-001", true)).status).toBe(200);
+      expect((await reviewFinding("finding-foreign-support", "finding-foreign-all-001", true)).status).toBe(409);
+      expect((await reviewFinding("finding-other-run-support", "finding-other-run-all-001", true)).status).toBe(409);
+
+      const lesson = database.prepare(`
+        INSERT INTO lessons (
+          id, statement, lesson_type, applicability_scope, engagement_id, mission_id,
+          confidence, expected_benefit, risk, status, authoring_agent_id, created_at, updated_at
+        ) VALUES (?, ?, 'strategy', ?, ?, ?, 0.8, 'Bounded reuse', 'Low',
+          'under_review', 'agent-other', ?, ?)
+      `);
+      lesson.run("lesson-global-hidden", "Global lesson with hidden support", "global", null, null, B, B);
+      lesson.run("lesson-foreign-evidence", "Mission lesson with foreign evidence", "mission", "eng-a", "mission-a", B, B);
+      lesson.run("lesson-foreign-run", "Mission lesson with foreign run", "mission", "eng-a", "mission-a", B, B);
+      lesson.run("lesson-run-only", "Mission lesson with an exact supporting run", "mission", "eng-a", "mission-a", B, B);
+      const lessonEvidence = database.prepare(`
+        INSERT INTO lesson_evidence (
+          lesson_id, evidence_id, run_id, relationship, rationale, created_at
+        ) VALUES (?, ?, ?, 'supports', 'Adversarial support fixture', ?)
+      `);
+      lessonEvidence.run("lesson-global-hidden", "evidence-b", null, C);
+      lessonEvidence.run("lesson-foreign-evidence", "evidence-b", null, C);
+      lessonEvidence.run("lesson-foreign-run", null, "run-b", C);
+      lessonEvidence.run("lesson-run-only", null, "run-a", C);
+
+      const reviewLesson = (id: string, key: string, all = false) => fetch(
+        `${url}/api/v2/learning/lessons/${id}/review`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Idempotency-Key": key,
+            ...(all ? { "X-Test-Access": "all" } : {}),
+          },
+          body: JSON.stringify({ expectedUpdatedAt: B, status: "verified", reason: "Independent scope-bound review" }),
+        },
+      );
+      expect((await reviewLesson("lesson-global-hidden", "lesson-global-hidden-001")).status).toBe(409);
+      expect((await reviewLesson("lesson-foreign-evidence", "lesson-foreign-evidence-001", true)).status).toBe(409);
+      expect((await reviewLesson("lesson-foreign-run", "lesson-foreign-run-001", true)).status).toBe(409);
+      const runOnly = await body(await reviewLesson("lesson-run-only", "lesson-run-only-001"));
+      expect(runOnly.lesson).toMatchObject({ status: "verified", supportingEvidenceCount: 1 });
+    } finally { database.close(); }
+  });
+
   test("lesson verification requires support and denies author self-approval", async () => {
     const { database, url } = await application();
     try {
@@ -595,8 +790,83 @@ describe("canonical operations HTTP API", () => {
       expect(await body(await fetch(`${url}/api/v2/learning/lessons/lesson-ready/review`, request))).toEqual(first);
       const list = await body(await fetch(`${url}/api/v2/learning/lessons`));
       expect(list.items.map((item: any) => item.id)).not.toContain("lesson-b");
+      const exactRun = await body(await fetch(`${url}/api/v2/learning/lessons?runId=run-a`));
+      expect(exactRun.items.map((item: any) => item.id)).toEqual(["lesson-ready"]);
+      const inaccessibleRun = await body(await fetch(`${url}/api/v2/learning/lessons?runId=run-b`));
+      expect(inaccessibleRun.items).toEqual([]);
       const usage = await body(await fetch(`${url}/api/v2/learning/usage`));
       expect(usage.items.map((item: any) => item.id)).toEqual(["usage-a"]);
+    } finally { database.close(); }
+  });
+
+  test("attack-chain verification requires visible verified evidence and exact-context chain sources", async () => {
+    const { database, url } = await application();
+    try {
+      database.prepare(`
+        INSERT INTO evidence (
+          id, mission_id, run_id, source, acquired_at, evidence_type,
+          content_hash, provenance_json, confidence, sensitivity,
+          verification_state, summary, created_by, created_at
+        ) VALUES ('evidence-a-unverified', 'mission-a', 'run-a', 'specialist', ?,
+          'service', ?, '{}', 0.8, 'private', 'unverified',
+          'Not independently verified', 'agent-one', ?)
+      `).run(C, "f".repeat(64), C);
+      const lesson = database.prepare(`
+        INSERT INTO lessons (
+          id, statement, lesson_type, applicability_scope, engagement_id, mission_id,
+          confidence, expected_benefit, risk, status, authoring_agent_id, created_at, updated_at
+        ) VALUES (?, ?, 'attack_chain', 'mission', 'eng-a', 'mission-a', 0.85,
+          'Bounded executable reuse', 'Independent review required', 'under_review',
+          'agent-other', ?, ?)
+      `);
+      lesson.run("lesson-chain-unverified", "Chain backed only by unverified evidence", B, B);
+      lesson.run("lesson-chain-foreign-source", "Chain whose normalized source crosses engagement", B, B);
+      lesson.run("lesson-chain-ready", "Chain with exact verified provenance", B, B);
+
+      retainAttackChainDetails(database, "lesson-chain-unverified", "run-a");
+      retainAttackChainDetails(database, "lesson-chain-foreign-source", "run-b", "evidence-b");
+      retainAttackChainDetails(database, "lesson-chain-ready", "run-a", "evidence-a-new");
+
+      const unverifiedDetail = database.prepare(`
+        SELECT id FROM lesson_attack_chain_details
+        WHERE lesson_id = 'lesson-chain-unverified' ORDER BY version DESC LIMIT 1
+      `).get() as { id: string };
+      database.prepare(`
+        INSERT INTO lesson_attack_chain_sources (
+          id, lesson_id, detail_id, source_type, source_id, evidence_id,
+          provenance_json, created_at
+        ) VALUES ('chain-source-unverified', 'lesson-chain-unverified', ?, 'operator',
+          'unverified-evidence-source', 'evidence-a-unverified', '{}', ?)
+      `).run(unverifiedDetail.id, C);
+
+      const support = database.prepare(`
+        INSERT INTO lesson_evidence (
+          lesson_id, evidence_id, run_id, relationship, rationale, created_at
+        ) VALUES (?, ?, ?, 'supports', 'Canonical review support', ?)
+      `);
+      support.run("lesson-chain-unverified", "evidence-a-unverified", null, C);
+      support.run("lesson-chain-unverified", null, "run-a", C);
+      support.run("lesson-chain-foreign-source", "evidence-a-new", null, C);
+      support.run("lesson-chain-foreign-source", null, "run-a", C);
+      support.run("lesson-chain-ready", "evidence-a-new", null, C);
+      support.run("lesson-chain-ready", null, "run-a", C);
+
+      const review = (id: string, key: string, all = false) => fetch(
+        `${url}/api/v2/learning/lessons/${id}/review`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Idempotency-Key": key,
+            ...(all ? { "X-Test-Access": "all" } : {}),
+          },
+          body: JSON.stringify({ expectedUpdatedAt: B, status: "verified", reason: "Independent chain review" }),
+        },
+      );
+      expect((await review("lesson-chain-unverified", "chain-unverified-001")).status).toBe(409);
+      expect((await review("lesson-chain-foreign-source", "chain-foreign-source-001", true)).status).toBe(409);
+      const ready = await body(await review("lesson-chain-ready", "chain-ready-001"));
+      expect(ready.lesson).toMatchObject({ status: "verified", supportingEvidenceCount: 2 });
     } finally { database.close(); }
   });
 
@@ -624,6 +894,7 @@ describe("canonical operations HTTP API", () => {
       expect(exported.actions).toMatchObject([{ id: "action-a", retryCount: 1 }]);
       expect(exported.decisions).toMatchObject([{ id: "approval-a", decisionType: "administrative", status: "approved" }]);
       expect(exported.memoryContext).toMatchObject([{ id: "context-a", purpose: "Select verified lesson" }]);
+      expect(exported.lessons.proposedOrVerified.map((item: any) => item.id)).toEqual(["lesson-ready"]);
       expect(exported.integrity.digest).toMatch(/^[a-f0-9]{64}$/u);
       expect(exported.events[0]).not.toHaveProperty("payload");
       expect(exported.evidence[0]).not.toHaveProperty("extractedText");

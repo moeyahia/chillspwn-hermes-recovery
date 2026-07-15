@@ -95,7 +95,7 @@
   top: 0;
   height: 64px;
   display: grid;
-  grid-template-columns: auto minmax(220px, 1fr) minmax(260px, 420px) minmax(90px, 1fr);
+  grid-template-columns: minmax(220px, 1fr) minmax(260px, 420px) minmax(140px, 1fr);
   align-items: center;
   gap: var(--os-space-5);
   padding: 0 var(--os-space-6);
@@ -103,6 +103,8 @@
   background: rgba(8, 11, 13, 0.93);
   backdrop-filter: blur(16px);
 }
+
+.os-topbar-actions { position: relative; justify-self: end; display: flex; align-items: center; gap: var(--os-space-3); }
 
 .os-brand {
   display: flex;
@@ -157,6 +159,65 @@
 .os-stream--reconnecting > span:first-child, .os-stream--connecting > span:first-child { background: var(--os-warning); }
 .os-stream--fallback > span:first-child { background: var(--os-warning); box-shadow: 0 0 0 4px color-mix(in srgb, var(--os-warning) 16%, transparent); }
 .os-stream--offline > span:first-child { background: var(--os-danger); }
+
+.os-notification-center { position: relative; }
+.os-notification-trigger { position: relative; border-color: var(--os-line-soft); background: var(--os-surface-1); }
+.os-notification-badge {
+  position: absolute;
+  top: 2px;
+  right: 1px;
+  min-width: 18px;
+  height: 18px;
+  display: inline-grid;
+  place-items: center;
+  padding: 0 4px;
+  border: 2px solid var(--os-canvas);
+  border-radius: 999px;
+  background: var(--os-warning);
+  color: #080b0d;
+  font: 700 0.58rem/1 var(--os-font-mono);
+}
+.os-notification-panel {
+  position: absolute;
+  z-index: calc(var(--os-z-topbar) + 2);
+  top: calc(100% + var(--os-space-2));
+  right: 0;
+  width: min(420px, calc(100vw - 1.5rem));
+  max-height: min(680px, calc(100dvh - 82px));
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--os-line-strong);
+  border-radius: var(--os-radius-lg);
+  background: var(--os-surface-1);
+  box-shadow: var(--os-shadow-panel);
+  overflow: hidden;
+}
+.os-notification-panel > header { min-height: 58px; display: flex; align-items: center; justify-content: space-between; gap: var(--os-space-3); padding: var(--os-space-2) var(--os-space-3) var(--os-space-2) var(--os-space-5); border-bottom: 1px solid var(--os-line-soft); }
+.os-notification-panel > header > div { display: flex; flex-direction: column; }
+.os-notification-panel > header strong { font-size: 0.86rem; }
+.os-notification-panel > header span { color: var(--os-text-muted); font-size: 0.66rem; }
+.os-notification-read-all { min-height: 44px; padding: 0 var(--os-space-5); border: 0; border-bottom: 1px solid var(--os-line-soft); background: transparent; color: var(--os-accent); text-align: left; font-size: 0.7rem; cursor: pointer; }
+.os-notification-read-all:hover { background: var(--os-accent-soft); }
+.os-notification-read-all:disabled { cursor: wait; opacity: 0.55; }
+.os-notification-list { min-height: 0; display: grid; margin: 0; padding: 0; overflow-y: auto; list-style: none; }
+.os-notification-list li { position: relative; display: grid; grid-template-columns: 8px minmax(0, 1fr) auto; gap: var(--os-space-3); align-items: start; padding: var(--os-space-4) var(--os-space-4); border-bottom: 1px solid var(--os-line-soft); }
+.os-notification-list li.is-unread { background: color-mix(in srgb, var(--os-accent) 3%, var(--os-surface-1)); }
+.os-notification-list li > a { display: grid; gap: 3px; color: var(--os-text) !important; text-decoration: none; }
+.os-notification-list li > a:hover strong { color: var(--os-accent); }
+.os-notification-list strong { font-size: 0.78rem; }
+.os-notification-list p { color: var(--os-text-secondary); font-size: 0.7rem; }
+.os-notification-list li > a > span, .os-notification-list time { color: var(--os-text-muted); font-size: 0.62rem; }
+.os-notification-list li > button { min-width: 44px; min-height: 44px; padding: 0 var(--os-space-2); border: 0; background: transparent; color: var(--os-text-muted); font-size: 0.62rem; cursor: pointer; }
+.os-notification-list li > button:hover { color: var(--os-text); }
+.os-notification-severity { width: 7px; height: 7px; margin-top: 6px; border-radius: 999px; background: var(--os-info); }
+.os-notification-severity--warning { background: var(--os-warning); }
+.os-notification-severity--error, .os-notification-severity--critical { background: var(--os-danger); }
+.os-notification-state { padding: var(--os-space-8) var(--os-space-5); color: var(--os-text-muted); font-size: 0.75rem; }
+.os-notification-load-more { min-height: 44px; padding: 0 var(--os-space-5); border: 0; border-top: 1px solid var(--os-line-soft); background: var(--os-surface-2); color: var(--os-text-secondary); text-align: center; font-size: 0.7rem; cursor: pointer; }
+.os-notification-load-more:hover { color: var(--os-accent); background: var(--os-accent-soft); }
+.os-notification-load-more:disabled { cursor: wait; opacity: 0.6; }
+.os-notification-page-error { padding: var(--os-space-3) var(--os-space-5); border-top: 1px solid var(--os-line-soft); color: var(--os-danger); font-size: 0.67rem; }
+.os-notification-channel { padding: var(--os-space-3) var(--os-space-5); border-top: 1px solid var(--os-line-soft); color: var(--os-text-muted); font-size: 0.6rem; }
 
 .os-frame { min-height: calc(100dvh - 64px); display: grid; grid-template-columns: 232px minmax(0, 1fr); }
 .command-os .os-sidebar {
@@ -635,11 +696,13 @@
 }
 
 @media (max-width: 820px) {
-  .os-topbar { grid-template-columns: auto minmax(0, 1fr) auto; gap: var(--os-space-2); padding-inline: var(--os-space-3); }
+  .os-topbar { grid-template-columns: auto minmax(0, 1fr) auto auto; gap: var(--os-space-2); padding-inline: var(--os-space-3); }
   .os-menu-button { display: inline-grid; }
   .os-command-trigger { justify-self: end; width: 44px; min-width: 44px; padding: 0; justify-content: center; }
   .os-command-trigger span, .os-command-trigger kbd { display: none; }
   .os-stream { display: none; }
+  .os-topbar-actions { gap: 0; }
+  .os-notification-panel { position: fixed; top: 58px; right: var(--os-space-3); }
   .os-frame { display: block; }
   /* The legacy stylesheet has a broad `[class*=sidebar] { position: relative }`
      rule. Keep this selector deliberately scoped/specific so the off-canvas

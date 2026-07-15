@@ -209,6 +209,38 @@ export interface MemoryContextPack {
   items: ContextPackItem[];
 }
 
+export interface MemoryContextPackSummary {
+  id: string;
+  missionId?: string;
+  runId?: string;
+  stepId?: string;
+  actionId?: string;
+  messageId?: string;
+  journey: "autonomous" | "guided";
+  purpose: string;
+  contextBudget: number;
+  createdBy: string;
+  createdAt: string;
+  retrievedItemCount: number;
+  usedItemCount: number;
+  correctedItemCount: number;
+}
+
+export interface MemoryContextPackPage {
+  items: MemoryContextPackSummary[];
+  totalReturned: number;
+}
+
+export interface MemoryContextPackQuery {
+  missionId?: string;
+  runId?: string;
+  stepId?: string;
+  actionId?: string;
+  messageId?: string;
+  journey?: "autonomous" | "guided";
+  limit?: number;
+}
+
 export interface VaultConnection {
   id: string;
   vaultPath: string;

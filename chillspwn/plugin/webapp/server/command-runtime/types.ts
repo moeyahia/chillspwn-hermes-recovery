@@ -1,4 +1,5 @@
 import type { JsonValue } from "../events";
+import type { PlanningContextAttribution } from "../memory";
 import type {
   DurableAction,
   DurableActionKind,
@@ -73,6 +74,8 @@ export interface MissionPlanDraft {
   readonly steps: readonly PlannedStep[];
   /** Runtime-only exact provider usage; never part of the provider JSON schema. */
   readonly providerUsage?: ProviderUsageReport;
+  /** Runtime-only citations committed only with lease-fenced plan activation. */
+  readonly planningAttribution?: PlanningContextAttribution;
 }
 
 /** Exact usage as reported by the provider. Values are never estimated. */
@@ -201,6 +204,21 @@ export interface MissionRuntimeOptions {
   readonly decisionTtlMs?: number;
   readonly maxPlanSteps?: number;
   readonly now?: () => Date;
+  /** Test-only fault injection immediately after a durable predecessor commit. */
+  readonly crashAfterCommit?: (
+    point:
+      | "plan_ready_to_dispatch"
+      | "action_reserved_before_dispatch"
+      | "guided_approval_to_dispatch"
+      | "action_result_to_advance"
+      | "manual_result_to_advance"
+      | "guided_failure_to_recover"
+      | "step_advance_to_evaluation"
+      | "cancellation_cleanup_before_finalize"
+      | "pause_projection_committed"
+      | "resume_projection_committed",
+    context: Readonly<{ runId: string; sourceId?: string }>,
+  ) => void;
 }
 
 export interface StoredPlanStep {

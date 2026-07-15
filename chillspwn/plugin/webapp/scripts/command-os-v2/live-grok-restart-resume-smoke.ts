@@ -27,6 +27,8 @@ import { dirname, join, resolve } from "node:path";
 import { Database } from "bun:sqlite";
 import {
   REVIEWED_SELFTEST_PATH,
+  REVIEWED_SELFTEST_ATTESTATION_ENV,
+  REVIEWED_SELFTEST_ATTESTATION_TOKEN,
   REVIEWED_SELFTEST_SERVER,
   REVIEWED_SELFTEST_SHA256,
   REVIEWED_SELFTEST_TOOL,
@@ -45,6 +47,8 @@ interface ManagedServer {
   readonly exit: Promise<{ code: number | null; signal: NodeJS.Signals | null }>;
   exitResult?: { code: number | null; signal: NodeJS.Signals | null };
   spawnError?: Error;
+  shutdown?: Promise<void>;
+  containment?: Promise<void>;
 }
 
 const projectRoot = resolve(import.meta.dir, "../..");
@@ -173,42 +177,104 @@ function processGroupAlive(pid: number): boolean {
   }
 }
 
+async function waitForProcessGroupExit(pid: number, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (processGroupAlive(pid) && Date.now() < deadline) await Bun.sleep(50);
+  return !processGroupAlive(pid);
+}
+
+function signalProcessGroupBestEffort(pid: number, signal: NodeJS.Signals): void {
+  try {
+    process.kill(-pid, signal);
+  } catch (error: any) {
+    if (error?.code !== "ESRCH") throw error;
+  }
+}
+
 async function killAtCrashBoundary(server: ManagedServer): Promise<void> {
-  const pid = server.child.pid;
-  if (!pid) throw new Error("The isolated server has no process ID");
-  signalGroup(server, "SIGKILL");
-  const result = await waitForExit(server, 10_000);
-  if (result.signal !== "SIGKILL") throw new Error("The first server did not terminate at the required SIGKILL boundary");
-  if (processGroupAlive(pid)) throw new Error("The SIGKILL server process group left child work alive");
+  if (!server.shutdown) {
+    server.shutdown = (async () => {
+      const pid = server.child.pid;
+      if (!pid) throw new Error("The isolated server has no process ID");
+      signalGroup(server, "SIGKILL");
+      const result = await waitForExit(server, 10_000);
+      if (result.signal !== "SIGKILL") throw new Error("The first server did not terminate at the required SIGKILL boundary");
+      if (processGroupAlive(pid)) throw new Error("The SIGKILL server process group left child work alive");
+    })();
+  }
+  await server.shutdown;
 }
 
 async function stopGracefully(server: ManagedServer): Promise<void> {
-  const pid = server.child.pid;
-  if (!pid || server.exitResult) return;
-  signalGroup(server, "SIGTERM");
-  try {
-    const result = await waitForExit(server, 20_000);
-    if (result.code !== 0 && result.signal !== "SIGTERM") {
-      throw new Error("The restarted server did not finish graceful shutdown cleanly");
-    }
-  } catch (error) {
-    if (!server.exitResult) {
-      try { signalGroup(server, "SIGKILL"); } catch { /* best-effort containment */ }
-      await waitForExit(server, 5_000).catch(() => undefined);
-    }
-    throw error;
+  if (!server.shutdown) {
+    server.shutdown = (async () => {
+      const pid = server.child.pid;
+      if (!pid || server.exitResult) return;
+      signalGroup(server, "SIGTERM");
+      try {
+        const result = await waitForExit(server, 20_000);
+        if (result.code !== 0 && result.signal !== "SIGTERM") {
+          throw new Error("The restarted server did not finish graceful shutdown cleanly");
+        }
+      } catch (error) {
+        if (!server.exitResult) {
+          try { signalGroup(server, "SIGKILL"); } catch { /* best-effort containment */ }
+          await waitForExit(server, 5_000).catch(() => undefined);
+        }
+        throw error;
+      }
+      if (processGroupAlive(pid)) throw new Error("Graceful shutdown left a child process group alive");
+    })();
   }
-  if (processGroupAlive(pid)) throw new Error("Graceful shutdown left a child process group alive");
+  await server.shutdown;
 }
 
 async function stopBestEffort(server: ManagedServer | undefined): Promise<void> {
-  if (!server || server.exitResult) return;
-  try { signalGroup(server, "SIGTERM"); } catch { return; }
-  await waitForExit(server, 10_000).catch(async () => {
-    try { signalGroup(server, "SIGKILL"); } catch { return; }
-    await waitForExit(server, 3_000).catch(() => undefined);
+  if (!server) return;
+  if (!server.containment) {
+    server.containment = (async () => {
+      if (server.shutdown) await server.shutdown.catch(() => undefined);
+      const pid = server.child.pid;
+      if (!pid || !processGroupAlive(pid)) return;
+      try { signalProcessGroupBestEffort(pid, "SIGTERM"); } catch { return; }
+      if (await waitForProcessGroupExit(pid, 10_000)) return;
+      try { signalProcessGroupBestEffort(pid, "SIGKILL"); } catch { return; }
+      await waitForProcessGroupExit(pid, 3_000);
+    })();
+  }
+  await server.containment.catch(() => undefined);
+}
+
+let tempRoot: string | undefined;
+let activeServer: ManagedServer | undefined;
+let isolatedCleanup: Promise<void> | undefined;
+let terminatingSignal: "SIGINT" | "SIGTERM" | undefined;
+
+function cleanupIsolatedState(): Promise<void> {
+  if (!isolatedCleanup) {
+    isolatedCleanup = (async () => {
+      const server = activeServer;
+      activeServer = undefined;
+      await stopBestEffort(server);
+      const disposableRoot = tempRoot;
+      tempRoot = undefined;
+      if (disposableRoot) rmSync(disposableRoot, { recursive: true, force: true });
+    })();
+  }
+  return isolatedCleanup;
+}
+
+function terminateFromSignal(signal: "SIGINT" | "SIGTERM"): void {
+  if (terminatingSignal) return;
+  terminatingSignal = signal;
+  const exitCode = signal === "SIGINT" ? 130 : 143;
+  void cleanupIsolatedState().finally(() => {
+    process.exit(exitCode);
   });
 }
+
+process.on("SIGINT", () => terminateFromSignal("SIGINT"));
+process.on("SIGTERM", () => terminateFromSignal("SIGTERM"));
 
 async function request(path: string, init: RequestInit = {}, timeoutMs = 30_000): Promise<JsonObject> {
   const response = await fetch(`${baseUrl}${path}`, {
@@ -243,6 +309,63 @@ async function waitForServer(server: ManagedServer, timeoutMs = 90_000): Promise
     catch { await Bun.sleep(250); }
   }
   throw new Error("The isolated loopback server did not become ready");
+}
+
+async function waitForRuntimeReadiness(server: ManagedServer, timeoutMs = 120_000): Promise<JsonObject> {
+  const deadline = Date.now() + timeoutMs;
+  let lastState = "no readiness response";
+  while (Date.now() < deadline) {
+    assertServerAlive(server);
+    try {
+      const overview = await request("/api/v2/overview", {}, 5_000);
+      const checks = Array.isArray(overview.readiness?.checks) ? overview.readiness.checks : [];
+      const status = (id: string) => String(
+        checks.find((check: JsonObject) => check.id === id)?.status || "missing",
+      );
+      const mcp = await request("/api/v2/system/mcp?limit=100", {}, 5_000);
+      const selftest = Array.isArray(mcp.items)
+        ? mcp.items.find((item: JsonObject) => item.name === REVIEWED_SELFTEST_SERVER)
+        : undefined;
+      lastState = [
+        `provider=${status("provider_execution_autonomous")}`,
+        `boundary=${status("execution_boundary_autonomous")}`,
+        `specialists=${status("specialist_fleet")}`,
+        `mcp=${String(selftest?.status || "missing")}`,
+      ].join(", ");
+      if (
+        status("provider_execution_autonomous") === "pass"
+        && status("execution_boundary_autonomous") === "pass"
+        && status("specialist_fleet") === "pass"
+        && selftest?.status === "healthy"
+      ) return overview;
+    } catch {
+      lastState = "runtime readiness endpoint temporarily unavailable";
+    }
+    await Bun.sleep(500);
+  }
+  throw new Error(`The isolated runtime did not complete live readiness attestation: ${lastState}`);
+}
+
+async function waitForRunState(
+  runId: string,
+  accepted: ReadonlySet<string>,
+  server: ManagedServer,
+  timeoutMs = 240_000,
+): Promise<{ snapshot: JsonObject; observed: string[] }> {
+  const deadline = Date.now() + timeoutMs;
+  const observed: string[] = [];
+  while (Date.now() < deadline) {
+    assertServerAlive(server);
+    const snapshot = await request(`/api/v2/runs/${encodeURIComponent(runId)}`);
+    const status = String(snapshot.run?.status || "unknown");
+    if (observed.at(-1) !== status) observed.push(status);
+    if (accepted.has(status)) return { snapshot, observed };
+    if (terminalStatuses.has(status)) {
+      throw new Error(`Guided acceptance ended before its represented decision: ${status}`);
+    }
+    await Bun.sleep(500);
+  }
+  throw new Error(`Guided acceptance timed out after states: ${observed.join(" -> ") || "none"}`);
 }
 
 function readonlyDatabase(path: string): Database {
@@ -319,7 +442,90 @@ async function waitForRecoveryEvent(runId: string, server: ManagedServer, timeou
   throw new Error("Restart did not expose a durable run.recovery_started event");
 }
 
-async function waitForCompletion(runId: string, server: ManagedServer, timeoutMs = 420_000): Promise<{ snapshot: JsonObject; observed: string[] }> {
+function safeRepairAttempt(value: unknown): 0 | 1 | "1/2" | "2/2" {
+  if (value === "1/2" || value === "2/2") return value;
+  return value === 1 ? 1 : 0;
+}
+
+function safePlanningFailureDiagnostic(databasePath: string, runId: string): JsonObject {
+  const database = readonlyDatabase(databasePath);
+  try {
+    const providerTurns = database.query(`
+      SELECT status, COALESCE(error_category, 'none') AS error_category, COUNT(*) AS count
+      FROM provider_turns WHERE run_id = ? GROUP BY status, error_category
+      ORDER BY status, error_category
+    `).all(runId) as Array<{ status: string; error_category: string; count: number }>;
+    const plannerLogs = database.query(`
+      SELECT attributes_json FROM structured_logs
+      WHERE run_id = ? AND domain = 'command-runtime.planner'
+      ORDER BY occurred_at, id LIMIT 10
+    `).all(runId).map((row: any) => {
+      let attributes: JsonObject = {};
+      try { attributes = JSON.parse(String(row.attributes_json || "{}")) as JsonObject; } catch {}
+      return {
+        code: String(attributes.code || "unknown"),
+        validationField: String(attributes.validationField || "unknown"),
+        validationRule: String(attributes.validationRule || "unknown"),
+        repairAttempt: safeRepairAttempt(attributes.repairAttempt),
+      };
+    });
+    const evaluatorLogs = database.query(`
+      SELECT attributes_json FROM structured_logs
+      WHERE run_id = ? AND domain = 'command-runtime.evaluator'
+      ORDER BY occurred_at, id LIMIT 10
+    `).all(runId).map((row: any) => {
+      let attributes: JsonObject = {};
+      try { attributes = JSON.parse(String(row.attributes_json || "{}")) as JsonObject; } catch {}
+      return {
+        code: String(attributes.code || "unknown"),
+        validationField: String(attributes.validationField || "unknown"),
+        validationRule: String(attributes.validationRule || "unknown"),
+        repairAttempt: safeRepairAttempt(attributes.repairAttempt),
+      };
+    });
+    const toolCallStatusCounts = database.query(`
+      SELECT tc.status, COUNT(*) AS count
+      FROM tool_calls tc JOIN actions a ON a.id = tc.action_id
+      WHERE a.run_id = ? GROUP BY tc.status ORDER BY tc.status
+    `).all(runId).map((row: any) => ({
+      status: String(row.status || "unknown"),
+      count: Number(row.count || 0),
+    }));
+    const actionStatusCounts = database.query(`
+      SELECT status, COUNT(*) AS count FROM actions
+      WHERE run_id = ? GROUP BY status ORDER BY status
+    `).all(runId).map((row: any) => ({
+      status: String(row.status || "unknown"),
+      count: Number(row.count || 0),
+    }));
+    return {
+      providerTurns,
+      plannerLogs,
+      evaluatorLogs,
+      planCount: count(database, "SELECT COUNT(*) AS count FROM plans WHERE run_id = ?", runId),
+      actionCount: count(database, "SELECT COUNT(*) AS count FROM actions WHERE run_id = ?", runId),
+      verifiedEvidenceCount: count(database, `
+        SELECT COUNT(*) AS count FROM evidence
+        WHERE run_id = ? AND verification_state = 'verified'
+      `, runId),
+      unverifiedEvidenceCount: count(database, `
+        SELECT COUNT(*) AS count FROM evidence
+        WHERE run_id = ? AND verification_state = 'unverified'
+      `, runId),
+      toolCallStatusCounts,
+      actionStatusCounts,
+    };
+  } finally {
+    database.close();
+  }
+}
+
+async function waitForCompletion(
+  runId: string,
+  server: ManagedServer,
+  databasePath: string,
+  timeoutMs = 420_000,
+): Promise<{ snapshot: JsonObject; observed: string[] }> {
   const deadline = Date.now() + timeoutMs;
   const observed: string[] = [];
   while (Date.now() < deadline) {
@@ -330,7 +536,7 @@ async function waitForCompletion(runId: string, server: ManagedServer, timeoutMs
     if (status === "waiting_guided_decision") throw new Error("Autonomous recovery entered waiting_guided_decision");
     if (terminalStatuses.has(status)) {
       if (status !== "completed") {
-        throw new Error(`Recovered Autonomous run ended in ${status}: ${String(snapshot.run?.statusReason || "no reason")}`);
+        throw new Error(`Recovered Autonomous run ended in ${status}: ${String(snapshot.run?.statusReason || "no reason")}; canonical diagnostic=${JSON.stringify(safePlanningFailureDiagnostic(databasePath, runId))}`);
       }
       return { snapshot, observed };
     }
@@ -342,6 +548,266 @@ async function waitForCompletion(runId: string, server: ManagedServer, timeoutMs
 function count(database: Database, sql: string, ...parameters: any[]): number {
   const row = database.query(sql).get(...parameters) as { count: number };
   return Number(row.count);
+}
+
+interface GuidedBoundarySnapshot {
+  readonly missionId: string;
+  readonly runStatus: string;
+  readonly currentPlanId: string;
+  readonly currentStepId: string;
+  readonly planDigest: string;
+  readonly planCount: number;
+  readonly actionCount: number;
+  readonly toolCallCount: number;
+}
+
+function guidedBoundarySnapshot(databasePath: string, runId: string): GuidedBoundarySnapshot {
+  const database = readonlyDatabase(databasePath);
+  try {
+    const run = database.query(`
+      SELECT mission_id, status, current_plan_id, current_step_id
+      FROM runs WHERE id = ? AND journey = 'guided'
+    `).get(runId) as {
+      mission_id: string;
+      status: string;
+      current_plan_id: string | null;
+      current_step_id: string | null;
+    } | null;
+    if (!run?.current_plan_id || !run.current_step_id) {
+      throw new Error("Guided acceptance has no durable current plan and represented step");
+    }
+    const plans = database.query(`
+      SELECT id, version, status, strategy_summary, rationale_summary, plan_hash,
+        created_by, created_at, activated_at
+      FROM plans WHERE run_id = ? ORDER BY version, id
+    `).all(runId);
+    const steps = database.query(`
+      SELECT id, plan_id, ordinal, phase, title, objective, status,
+        success_criteria_json, dependencies_json, action_class, risk_class,
+        assigned_agent_id, started_at, ended_at, created_at, updated_at
+      FROM plan_steps WHERE run_id = ? ORDER BY plan_id, ordinal, id
+    `).all(runId);
+    const representations = database.query(`
+      SELECT source, value_json FROM mission_constraints
+      WHERE mission_id = ? AND constraint_type = 'represented_action'
+        AND source IN (SELECT id FROM plan_steps WHERE run_id = ?)
+      ORDER BY source
+    `).all(run.mission_id, runId);
+    return {
+      missionId: run.mission_id,
+      runStatus: run.status,
+      currentPlanId: run.current_plan_id,
+      currentStepId: run.current_step_id,
+      planDigest: createHash("sha256")
+        .update(JSON.stringify({ plans, steps, representations }), "utf8")
+        .digest("hex"),
+      planCount: plans.length,
+      actionCount: count(database, "SELECT COUNT(*) AS count FROM actions WHERE run_id = ?", runId),
+      toolCallCount: count(database, `
+        SELECT COUNT(*) AS count FROM tool_calls tc
+        JOIN actions a ON a.id = tc.action_id WHERE a.run_id = ?
+      `, runId),
+    };
+  } finally {
+    database.close();
+  }
+}
+
+async function runGuidedAcceptance(
+  databasePath: string,
+  server: ManagedServer,
+): Promise<{
+  missionId: string;
+  runId: string;
+  decisionId: string;
+  stepId: string;
+  waitingStatus: "waiting_guided_decision";
+  cancelledStatus: "cancelled";
+}> {
+  const created = await request("/api/v2/missions", mutation({
+    journey: "guided",
+    launch: true,
+    authorizationConfirmed: true,
+    title: `Live Grok Guided restart-harness acceptance ${new Date().toISOString()}`,
+    objective: "Explain how to validate the reviewed no-network selftest boundary without executing a tool",
+    target: "127.0.0.1",
+    explanationDepth: "concise",
+    executionPreference: "manual",
+    evidenceExpectations: ["One bounded explanation with no execution or plan mutation"],
+  }, "live-restart-guided-create"));
+  const missionId = String(created.mission?.id || "");
+  const runId = String(created.run?.id || "");
+  if (!missionId || !runId) throw new Error("Guided acceptance did not return durable mission and run IDs");
+
+  let decisionId = "";
+  let stepId = "";
+  try {
+    const waiting = await waitForRunState(
+      runId,
+      new Set(["waiting_guided_decision"]),
+      server,
+    );
+    if (waiting.snapshot.run?.journey !== "guided") {
+      throw new Error("Guided acceptance returned a run with the wrong journey");
+    }
+    const decisions = await request(
+      `/api/v2/decisions?runId=${encodeURIComponent(runId)}&status=pending&limit=10`,
+    );
+    if (!Array.isArray(decisions.items) || decisions.items.length !== 1) {
+      throw new Error("Guided planning did not create exactly one pending represented decision");
+    }
+    const decision = decisions.items[0] as JsonObject;
+    decisionId = String(decision.id || "");
+    stepId = String(decision.stepId || "");
+    const actionFingerprint = String(decision.actionFingerprint || "");
+    const requestedParameters = decision.requestedParameters;
+    if (
+      !decisionId
+      || String(decision.missionId || "") !== missionId
+      || String(decision.runId || "") !== runId
+      || !stepId
+      || !/^[a-f0-9]{64}$/u.test(actionFingerprint)
+      || !requestedParameters
+      || typeof requestedParameters !== "object"
+      || Array.isArray(requestedParameters)
+    ) {
+      throw new Error("Guided decision did not preserve the exact mission, run, step, fingerprint, and normalized parameters");
+    }
+    const representedParameters = JSON.stringify(requestedParameters);
+    const before = guidedBoundarySnapshot(databasePath, runId);
+    if (
+      before.missionId !== missionId
+      || before.runStatus !== "waiting_guided_decision"
+      || before.currentStepId !== stepId
+      || before.planCount !== 1
+      || before.actionCount !== 0
+      || before.toolCallCount !== 0
+    ) {
+      throw new Error("Guided acceptance was not paused at one clean represented-step boundary");
+    }
+
+    const canonicalDecision = readonlyDatabase(databasePath);
+    try {
+      const row = canonicalDecision.query(`
+        SELECT mission_id, run_id, step_id, requested_action_fingerprint,
+          requested_parameters_json, status
+        FROM guided_decisions WHERE id = ?
+      `).get(decisionId) as {
+        mission_id: string;
+        run_id: string;
+        step_id: string;
+        requested_action_fingerprint: string;
+        requested_parameters_json: string;
+        status: string;
+      } | null;
+      if (
+        !row
+        || row.mission_id !== missionId
+        || row.run_id !== runId
+        || row.step_id !== stepId
+        || row.requested_action_fingerprint !== actionFingerprint
+        || JSON.stringify(JSON.parse(row.requested_parameters_json)) !== representedParameters
+        || row.status !== "pending"
+      ) throw new Error("Guided API decision differs from its canonical exact-step record");
+    } finally {
+      canonicalDecision.close();
+    }
+
+    const reply = await request(
+      `/api/v2/guided/${encodeURIComponent(missionId)}/commander/show-next-step`,
+      mutation({
+        runId,
+        stepId,
+        expectedFingerprint: actionFingerprint,
+      }, "live-restart-guided-show-next-step"),
+      120_000,
+    );
+    const structured = reply.result?.assistantMessage?.structuredContent || {};
+    if (
+      String(reply.result?.actionFingerprint || "") !== actionFingerprint
+      || structured.executionPerformed !== false
+      || structured.planMutated !== false
+      || structured.nextConsequentialActionRequiresDecision !== true
+    ) throw new Error("Guided Commander violated the planning-only response boundary");
+
+    const after = guidedBoundarySnapshot(databasePath, runId);
+    if (
+      after.runStatus !== "waiting_guided_decision"
+      || after.currentPlanId !== before.currentPlanId
+      || after.currentStepId !== before.currentStepId
+      || after.planDigest !== before.planDigest
+      || after.planCount !== before.planCount
+      || after.actionCount !== 0
+      || after.toolCallCount !== 0
+    ) throw new Error("Guided explanation advanced execution or mutated the durable represented plan");
+
+    const pendingAfter = await request(
+      `/api/v2/decisions?runId=${encodeURIComponent(runId)}&status=pending&limit=10`,
+    );
+    if (
+      !Array.isArray(pendingAfter.items)
+      || pendingAfter.items.length !== 1
+      || String(pendingAfter.items[0]?.id || "") !== decisionId
+      || String(pendingAfter.items[0]?.missionId || "") !== missionId
+      || String(pendingAfter.items[0]?.runId || "") !== runId
+      || String(pendingAfter.items[0]?.stepId || "") !== stepId
+      || String(pendingAfter.items[0]?.actionFingerprint || "") !== actionFingerprint
+      || JSON.stringify(pendingAfter.items[0]?.requestedParameters) !== representedParameters
+    ) throw new Error("Guided explanation changed the pending exact-step decision");
+  } finally {
+    const snapshot = await request(`/api/v2/runs/${encodeURIComponent(runId)}`).catch(() => undefined);
+    if (snapshot && !terminalStatuses.has(String(snapshot.run?.status || ""))) {
+      await request(
+        `/api/v2/runs/${encodeURIComponent(runId)}/cancel`,
+        mutation({ reason: "Guided live acceptance completed without execution" }, "live-restart-guided-cancel"),
+      );
+    }
+  }
+
+  const cancelled = await waitForRunState(runId, new Set(["cancelled"]), server, 30_000);
+  if (cancelled.snapshot.run?.status !== "cancelled") {
+    throw new Error("Guided acceptance did not reach its terminal cancelled state");
+  }
+  const database = readonlyDatabase(databasePath);
+  try {
+    const pendingDecisionCount = count(database, `
+      SELECT COUNT(*) AS count FROM guided_decisions WHERE run_id = ? AND status = 'pending'
+    `, runId);
+    const cancelledDecisionCount = count(database, `
+      SELECT COUNT(*) AS count FROM guided_decisions WHERE run_id = ? AND status = 'cancelled'
+    `, runId);
+    const ghostRunCount = count(database, `
+      SELECT COUNT(*) AS count FROM runs
+      WHERE id = ? AND status IN ('queued','planning','awaiting_contract_confirmation',
+        'running','waiting_guided_decision','blocked','recovering')
+    `, runId);
+    const openAssignmentCount = count(database, `
+      SELECT COUNT(*) AS count FROM assignments
+      WHERE run_id = ? AND status IN ('queued','active','blocked')
+    `, runId);
+    const activeProviderTurnCount = count(database, `
+      SELECT COUNT(*) AS count FROM provider_turns WHERE run_id = ? AND status = 'started'
+    `, runId);
+    const actionCount = count(database, "SELECT COUNT(*) AS count FROM actions WHERE run_id = ?", runId);
+    if (
+      pendingDecisionCount !== 0
+      || cancelledDecisionCount !== 1
+      || ghostRunCount !== 0
+      || openAssignmentCount !== 0
+      || activeProviderTurnCount !== 0
+      || actionCount !== 0
+    ) throw new Error("Guided cancellation left a pending decision, action, assignment, provider turn, or ghost-active run");
+  } finally {
+    database.close();
+  }
+  return {
+    missionId,
+    runId,
+    decisionId,
+    stepId,
+    waitingStatus: "waiting_guided_decision",
+    cancelledStatus: "cancelled",
+  };
 }
 
 function finalDurabilitySnapshot(databasePath: string, runId: string, crashTurnId: string): FinalDurabilitySnapshot {
@@ -413,7 +879,7 @@ function finalDurabilitySnapshot(databasePath: string, runId: string, crashTurnI
       completedActionEventCount: count(database, "SELECT COUNT(*) AS count FROM events WHERE run_id = ? AND event_type = 'action.completed'", runId),
       verifiedSelftestEvidenceCount: count(database, `
         SELECT COUNT(*) AS count FROM evidence
-        WHERE run_id = ? AND source = 'mcp:local-selftest.quick_scan' AND verification_state = 'verified'
+        WHERE run_id = ? AND source = 'mcp:sechub-reconnaissance.quick_scan' AND verification_state = 'verified'
       `, runId),
       evaluationCount: Number(evaluation.count),
       evaluationEvidenceCoverage: Number(evaluation.coverage),
@@ -425,9 +891,6 @@ function finalDurabilitySnapshot(databasePath: string, runId: string, crashTurnI
     database.close();
   }
 }
-
-let tempRoot: string | undefined;
-let activeServer: ManagedServer | undefined;
 
 try {
   validateReviewedSelftestConfig(JSON.parse(readFileSync(fixturePath, "utf8")));
@@ -454,29 +917,39 @@ try {
   }
   prepareLegacyBoard(join(paths.hermesHome, "kanban.db"));
   const serverEnvironment = buildIsolatedServerEnvironment(process.env, gate, paths);
+  // This child-only capability is added only after the harness independently
+  // validated the committed config and both root-controlled reviewed files.
+  serverEnvironment[REVIEWED_SELFTEST_ATTESTATION_ENV] = REVIEWED_SELFTEST_ATTESTATION_TOKEN;
 
   activeServer = launchServer(serverEnvironment);
-  const firstOverview = await waitForServer(activeServer);
+  await waitForServer(activeServer);
+  const firstOverview = await waitForRuntimeReadiness(activeServer);
   const readinessChecks = Array.isArray(firstOverview.readiness?.checks) ? firstOverview.readiness.checks : [];
   if (!readinessChecks.some((check: JsonObject) => (
-    check.id === "provider_execution_autonomous" && check.status !== "fail"
+    check.id === "provider_execution_autonomous" && check.status === "pass"
   )) || !readinessChecks.some((check: JsonObject) => (
     check.id === "execution_boundary_autonomous" && check.status === "pass"
+  )) || !readinessChecks.some((check: JsonObject) => (
+    check.id === "specialist_fleet" && check.status === "pass"
   ))) {
     throw new Error("The isolated server does not report an enforceable Grok OAuth provider boundary");
   }
   const mcp = await request("/api/v2/system/mcp?limit=100");
   if (!Array.isArray(mcp.items) || mcp.items.length !== 1 || mcp.items[0]?.name !== REVIEWED_SELFTEST_SERVER
-      || !["healthy", "degraded"].includes(String(mcp.items[0]?.status))) {
-    throw new Error("The isolated server exposed an MCP other than the reviewed local-selftest");
+      || mcp.items[0]?.status !== "healthy") {
+    throw new Error("The isolated server exposed an MCP other than the reviewed no-network selftest alias");
   }
+
+  // Run the real Guided planning-only boundary first. It must finish cleanly
+  // before the same isolated process begins the Autonomous crash/restart slice.
+  const guided = await runGuidedAcceptance(paths.databasePath, activeServer);
 
   const created = await request("/api/v2/missions", mutation({
     journey: "autonomous",
     launch: true,
     title: `Live Grok restart/resume smoke ${new Date().toISOString()}`,
-    objective: "Use the reviewed local-selftest MCP quick_scan exactly once after durable process recovery. This is a no-op deployment check and must not perform a network scan.",
-    successCriteria: ["Verified evidence states that the local-selftest bridge execute path is OK and no scan was performed"],
+    objective: "Use the reviewed no-network selftest bound to sechub-reconnaissance.quick_scan exactly once after durable process recovery. This is a no-op deployment check and must not perform a network scan.",
+    successCriteria: ["Verified evidence states that the reviewed selftest bridge execute path is OK and no scan was performed"],
     authorization: {
       allowedTargets: ["127.0.0.1"],
       prohibitedTargets: [],
@@ -487,7 +960,7 @@ try {
       allowedActionClasses: ["reconnaissance"],
       prohibitedActionClasses: ["destructive", "credential_access", "persistence"],
       destructivePolicy: "prohibited",
-      evidenceRequirements: ["Verified local-selftest MCP result"],
+      evidenceRequirements: ["Verified reviewed-selftest MCP result"],
       timeBudgetMinutes: 10,
       retryBudget: 1,
       replanBudget: 1,
@@ -500,9 +973,10 @@ try {
       retentionPolicy: "operator_managed",
       providerPolicy: "automatic_enforcing_only",
       toolPolicy: "contract_allowlist",
+      specialistAgentIds: ["ReconScout"],
       memoryScopes: [],
       contextNodeIds: [],
-      safeStopConditions: ["Any action other than local-selftest.quick_scan", "Any network-capable MCP action"],
+      safeStopConditions: ["Any action other than sechub-reconnaissance.quick_scan", "Any network-capable MCP action"],
       deliverables: ["Completion evaluation and immutable evidence receipt"],
     },
   }, "live-restart-autonomous-create"));
@@ -517,8 +991,9 @@ try {
 
   activeServer = launchServer(serverEnvironment);
   await waitForServer(activeServer);
+  await waitForRuntimeReadiness(activeServer);
   const recoveryEvent = await waitForRecoveryEvent(runId, activeServer);
-  const completed = await waitForCompletion(runId, activeServer);
+  const completed = await waitForCompletion(runId, activeServer, paths.databasePath);
 
   const plans = await request(`/api/v2/runs/${encodeURIComponent(runId)}/plans`);
   const steps = Array.isArray(plans.items)
@@ -528,13 +1003,13 @@ try {
       && step.action?.kind === "tool"
       && step.action?.arguments?.mcpServer === REVIEWED_SELFTEST_SERVER
       && step.action?.arguments?.toolName === REVIEWED_SELFTEST_TOOL)) {
-    throw new Error("The recovered plan did not preserve the reviewed ReconScout local-selftest binding");
+    throw new Error("The recovered plan did not preserve the reviewed ReconScout selftest alias binding");
   }
   const evidence = await request(`/api/v2/intelligence/evidence?runId=${encodeURIComponent(runId)}&verificationState=verified&limit=20`);
   if (!Array.isArray(evidence.items) || !evidence.items.some((item: JsonObject) => (
     item.source === `mcp:${REVIEWED_SELFTEST_SERVER}.${REVIEWED_SELFTEST_TOOL}`
     && item.verificationState === "verified"
-  ))) throw new Error("Verified local-selftest evidence is not visible through the operations API");
+  ))) throw new Error("Verified reviewed-selftest evidence is not visible through the operations API");
   const evaluations = await request(`/api/v2/learning/evaluations?runId=${encodeURIComponent(runId)}&limit=20`);
   if (!Array.isArray(evaluations.items) || evaluations.items.length !== 1) {
     throw new Error("The evidence-backed terminal evaluation is not visible through the operations API");
@@ -548,6 +1023,7 @@ try {
   activeServer = undefined;
   process.stdout.write(`${JSON.stringify({
     passed: true,
+    guided,
     missionId,
     runId,
     crashProviderTurnId: crashBoundary.id,
@@ -561,6 +1037,5 @@ try {
     evaluationCount: durable.evaluationCount,
   }, null, 2)}\n`);
 } finally {
-  await stopBestEffort(activeServer);
-  if (tempRoot) rmSync(tempRoot, { recursive: true, force: true });
+  await cleanupIsolatedState();
 }

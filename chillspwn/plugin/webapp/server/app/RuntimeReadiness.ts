@@ -11,6 +11,11 @@ export interface ProviderReadiness {
   readonly id: string;
   readonly health: ComponentHealth;
   readonly authenticated: boolean;
+  /** True only after a fresh live provider/ACP route attestation. */
+  readonly callable: boolean;
+  readonly attestedAt?: string;
+  readonly expiresAt?: string;
+  readonly circuitState?: "closed" | "open" | "probing";
   readonly supportsGuided: boolean;
   readonly enforcesAutonomousBoundary: boolean;
   readonly reportsExactTokenUsage: boolean;
@@ -167,20 +172,22 @@ export function createRuntimeReadinessProviders(
         const value = snapshot();
         const autonomous = value.providers.filter(
           (provider) => provider.authenticated
+            && provider.callable
             && provider.enforcesAutonomousBoundary
-            && provider.health !== "unhealthy",
+            && provider.health === "healthy",
         );
         const guided = value.providers.filter(
           (provider) => provider.authenticated
+            && provider.callable
             && provider.supportsGuided
-            && provider.health !== "unhealthy",
+            && provider.health === "healthy",
         );
         return [
           autonomous.length > 0
             ? check(
                 "provider_execution_autonomous",
                 "Autonomous provider enforcement",
-                autonomous.some((provider) => provider.health === "healthy") ? "pass" : "warn",
+                "pass",
                 ["autonomous"],
                 `${autonomous.length} authenticated provider path${autonomous.length === 1 ? " is" : "s are"} compatible with the enforceable Autonomous boundary.`,
               )
@@ -196,7 +203,7 @@ export function createRuntimeReadinessProviders(
             ? check(
                 "provider_execution_guided",
                 "Guided provider connection",
-                guided.some((provider) => provider.health === "healthy") ? "pass" : "warn",
+                "pass",
                 ["guided"],
                 `${guided.length} authenticated provider path${guided.length === 1 ? " is" : "s are"} available for Guided explanation and interpretation.`,
               )
@@ -218,7 +225,8 @@ export function createRuntimeReadinessProviders(
       evaluate(context) {
         const request = autonomousRequest(context);
         const enforcing = snapshot().providers.filter((provider) =>
-          provider.authenticated && provider.enforcesAutonomousBoundary && provider.health !== "unhealthy");
+          provider.authenticated && provider.callable
+          && provider.enforcesAutonomousBoundary && provider.health === "healthy");
         const tokenRequired = (request?.contract.tokenBudget ?? 0) > 0;
         const costRequired = (request?.contract.costBudget ?? 0) > 0;
         const tokenSupported = enforcing.some((provider) => provider.reportsExactTokenUsage);
@@ -275,15 +283,15 @@ export function createRuntimeReadinessProviders(
               "Specialist fleet",
               "pass",
               ["autonomous", "guided"],
-              `${count} policy-declared specialist${count === 1 ? " is" : "s are"} available for assignment.`,
+              `${count} specialist${count === 1 ? " has" : "s have"} a fresh provider and MCP route attestation.`,
             )
           : check(
               "specialist_fleet",
               "Specialist fleet",
               "fail",
               ["autonomous", "guided"],
-              "No policy-declared specialist can own mission work.",
-              "Restore the reviewed specialist roster before mission launch.",
+              "No specialist has both a fresh live provider route and a live-attested MCP capability.",
+              "Restore provider authentication and the reviewed MCP tools/list routes before mission launch.",
             );
       },
     },

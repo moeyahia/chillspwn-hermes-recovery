@@ -4,7 +4,10 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Database } from "bun:sqlite";
+import { seedSecondBrainScaleFixtures } from "./seed-brain-scale";
 import { seedCanonicalE2eFixtures } from "./seed-canonical";
+import { seedObservabilityScaleFixtures } from "./seed-observability-scale";
+import { E2E_LIVE_ATTESTATION_FIXTURE_TOKEN } from "../../../server/app/E2eLiveAttestationFixture";
 
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
 const isolatedRoot = mkdtempSync(join(tmpdir(), "chillspwn-command-os-e2e-"));
@@ -66,7 +69,24 @@ legacyBoard.exec(`
 `);
 legacyBoard.close();
 
-if (process.env.CHILLSPWN_E2E_SEED_CANONICAL === "1") {
+const enabledFixtureProfiles = [
+  process.env.CHILLSPWN_E2E_SEED_CANONICAL === "1" ? "populated" : null,
+  process.env.CHILLSPWN_E2E_BRAIN_SCALE === "1" ? "brain-scale" : null,
+  process.env.CHILLSPWN_E2E_OBSERVABILITY_SCALE === "1" ? "observability-scale" : null,
+].filter((profile): profile is string => profile !== null);
+if (enabledFixtureProfiles.length > 1) {
+  throw new Error(
+    `E2E fixture profiles require separate isolated databases: ${enabledFixtureProfiles.join(", ")}`,
+  );
+}
+
+if (process.env.CHILLSPWN_E2E_BRAIN_SCALE === "1") {
+  console.log("[e2e-only:brain-scale] preparing isolated 50,000-node browser profile");
+  seedSecondBrainScaleFixtures(commandOsDatabase);
+} else if (process.env.CHILLSPWN_E2E_OBSERVABILITY_SCALE === "1") {
+  console.log("[e2e-only:observability-scale] preparing isolated 100,000-event browser profile");
+  seedObservabilityScaleFixtures(commandOsDatabase);
+} else if (process.env.CHILLSPWN_E2E_SEED_CANONICAL === "1") {
   seedCanonicalE2eFixtures(commandOsDatabase);
 }
 
@@ -99,6 +119,7 @@ Object.assign(childEnvironment, {
   CLAUDE_BIN: join(isolatedRoot, "unavailable", "claude-bin"),
   GROK_AUTH_PATH: join(isolatedRoot, "unavailable", "grok-auth.json"),
   GROK_BIN: join(isolatedRoot, "unavailable", "grok"),
+  CHILLSPWN_E2E_GUIDED_FIXTURE: "1",
   HERMES_PYTHON: join(isolatedRoot, "unavailable", "python"),
   ALLOWED_WORKSPACE_ROOTS: workspace,
   ENABLE_TERMINAL: "false",
@@ -116,6 +137,15 @@ Object.assign(childEnvironment, {
   OPENROUTER_API_KEY: "",
   GEMINI_API_KEY: "",
 });
+
+// Only the populated product-journey profile receives a deterministic exact
+// attestation. It performs no provider/network work and exists solely to let
+// the composer exercise compatible specialist selection. The empty profile
+// omits this token and continues to validate real fail-closed readiness.
+if (process.env.CHILLSPWN_E2E_SEED_CANONICAL === "1") {
+  childEnvironment.CHILLSPWN_E2E_LIVE_ATTESTATION_FIXTURE = E2E_LIVE_ATTESTATION_FIXTURE_TOKEN;
+  console.log("[e2e-only:live-attestation] using exact no-network provider/MCP readiness fixture");
+}
 
 const server = spawn(process.execPath, ["run", "server/index.ts"], {
   cwd: projectRoot,

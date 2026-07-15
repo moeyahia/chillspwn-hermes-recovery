@@ -4,9 +4,11 @@ import { inImmediateTransaction } from "../db";
 import { conflict, forbidden, notFound } from "./errors";
 import { lessonScopeSql, missionScopeSql, sensitivitySql } from "./scope";
 import type {
+  ActionProjection,
   AgentProjection,
   ArtifactProjection,
   AssignmentProjection,
+  EvaluationBudgetMetricProjection,
   EvaluationProjection,
   EvaluationComparisonProjection,
   EventProjection,
@@ -34,6 +36,7 @@ import {
   isSensitiveSettingKey,
   parseJson,
   sanitizeJson,
+  sanitizeJsonWithRedaction,
   sha256,
   type CursorValue,
 } from "./validation";
@@ -87,6 +90,126 @@ function rounded(value: unknown, digits = 2): number | null {
   if (value === null || value === undefined || !Number.isFinite(Number(value))) return null;
   const multiplier = 10 ** digits;
   return Math.round(Number(value) * multiplier) / multiplier;
+}
+
+function objectValue(value: unknown): Record<string, unknown> {
+  const parsed = typeof value === "string" ? parseJson(value) : value;
+  return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+    ? parsed as Record<string, unknown>
+    : {};
+}
+
+function nonNegativeNumber(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : null;
+}
+
+function firstNumber(source: Record<string, unknown>, keys: readonly string[]): number | null {
+  for (const key of keys) {
+    const value = nonNegativeNumber(source[key]);
+    if (value !== null) return value;
+  }
+  return null;
+}
+
+function measuredDuration(row: Row, metrics: Record<string, unknown>, usage: Record<string, unknown>): {
+  readonly value: number | null;
+  readonly source: EvaluationBudgetMetricProjection["usageSource"];
+} {
+  const terminalUsage = nonNegativeNumber(usage.wallClockMs);
+  if (terminalUsage !== null) return { value: terminalUsage, source: "terminal_run" };
+  const evaluated = nonNegativeNumber(metrics.durationMs);
+  if (evaluated !== null) return { value: evaluated, source: "run_evaluation" };
+  const started = typeof row.run_started_at === "string" ? Date.parse(row.run_started_at) : Number.NaN;
+  const ended = typeof row.run_ended_at === "string" ? Date.parse(row.run_ended_at) : Number.NaN;
+  return Number.isFinite(started) && Number.isFinite(ended) && ended >= started
+    ? { value: ended - started, source: "terminal_run" }
+    : { value: null, source: null };
+}
+
+function budgetMetric(input: {
+  readonly key: EvaluationBudgetMetricProjection["key"];
+  readonly label: string;
+  readonly unit: EvaluationBudgetMetricProjection["unit"];
+  readonly limit: number | null;
+  readonly usage: number | null;
+  readonly usageStatus: EvaluationBudgetMetricProjection["usageStatus"];
+  readonly usageSource: EvaluationBudgetMetricProjection["usageSource"];
+}): EvaluationBudgetMetricProjection {
+  const status: EvaluationBudgetMetricProjection["status"] = input.usage === null
+    ? "unknown_usage"
+    : input.limit === null
+      ? "not_configured"
+      : input.usage > input.limit
+        ? "limit_exceeded"
+        : input.usage === input.limit
+          ? "limit_reached"
+          : "within_limit";
+  return {
+    ...input,
+    limitStatus: input.limit === null ? "not_configured" : "configured",
+    limitSource: input.limit === null ? null : "terminal_run_budget",
+    status,
+  };
+}
+
+function evaluationBudget(row: Row): { readonly metrics: readonly EvaluationBudgetMetricProjection[] } {
+  const limits = objectValue(row.budget_json);
+  const usage = objectValue(row.budget_usage_json);
+  const metrics = objectValue(row.metrics_json);
+  const wallClockLimit = firstNumber(limits, ["wallClockMs"])
+    ?? (firstNumber(limits, ["timeBudgetMinutes"]) !== null
+      ? firstNumber(limits, ["timeBudgetMinutes"])! * 60_000
+      : null);
+  const duration = measuredDuration(row, metrics, usage);
+
+  const providerTurnCount = Math.max(0, Number(row.provider_turn_count ?? 0));
+  const tokenCompleteCount = Math.max(0, Number(row.provider_token_complete_count ?? 0));
+  const costCompleteCount = Math.max(0, Number(row.provider_cost_complete_count ?? 0));
+  const evaluatedProviderTurnCount = nonNegativeNumber(metrics.providerTurnCount);
+  const explicitTokens = nonNegativeNumber(usage.providerTokens);
+  const exactTokens = explicitTokens !== null
+    ? explicitTokens
+    : providerTurnCount > 0 && tokenCompleteCount === providerTurnCount
+      ? Number(row.provider_token_sum ?? 0)
+      : providerTurnCount === 0 && evaluatedProviderTurnCount === 0
+        ? 0
+      : null;
+  const explicitCost = nonNegativeNumber(usage.estimatedCost);
+  const recordedCost = explicitCost !== null
+    ? explicitCost
+    : providerTurnCount > 0 && costCompleteCount === providerTurnCount
+      ? Number(row.provider_cost_sum ?? 0)
+      : providerTurnCount === 0 && evaluatedProviderTurnCount === 0
+        ? 0
+      : null;
+
+  const measured = (
+    usageKey: string,
+    metricKey: string,
+    fallback: number,
+  ): { readonly value: number; readonly source: EvaluationBudgetMetricProjection["usageSource"] } => {
+    const terminal = nonNegativeNumber(usage[usageKey]);
+    if (terminal !== null) return { value: terminal, source: "terminal_run" };
+    const evaluated = nonNegativeNumber(metrics[metricKey]);
+    if (evaluated !== null) return { value: evaluated, source: "run_evaluation" };
+    return { value: Math.max(0, fallback), source: "canonical_records" };
+  };
+  const toolCalls = measured("toolCalls", "toolCallCount", Number(row.tool_call_count ?? 0));
+  const retries = measured(
+    "retries",
+    "retryCount",
+    Number(row.run_retry_count ?? 0) + Number(row.action_retry_count ?? 0),
+  );
+  const replans = measured("replans", "replanCount", Number(row.run_replan_count ?? 0));
+
+  return { metrics: [
+    budgetMetric({ key: "wallClockMs", label: "Wall-clock time", unit: "milliseconds", limit: wallClockLimit, usage: duration.value, usageStatus: duration.value === null ? "unknown" : "recorded_exact", usageSource: duration.source }),
+    budgetMetric({ key: "providerTokens", label: "Provider tokens", unit: "count", limit: firstNumber(limits, ["providerTokens", "tokenBudget"]), usage: exactTokens, usageStatus: exactTokens === null ? "unknown" : "recorded_exact", usageSource: exactTokens === null ? null : explicitTokens === null ? "canonical_records" : "terminal_run" }),
+    budgetMetric({ key: "estimatedCost", label: "Estimated cost", unit: "cost", limit: firstNumber(limits, ["estimatedCost", "costBudget"]), usage: recordedCost, usageStatus: recordedCost === null ? "unknown" : "recorded_estimate", usageSource: recordedCost === null ? null : explicitCost === null ? "canonical_records" : "terminal_run" }),
+    budgetMetric({ key: "toolCalls", label: "Tool calls", unit: "count", limit: firstNumber(limits, ["toolCalls"]), usage: toolCalls.value, usageStatus: "recorded_exact", usageSource: toolCalls.source }),
+    budgetMetric({ key: "retries", label: "Retries", unit: "count", limit: firstNumber(limits, ["retries", "retryBudget"]), usage: retries.value, usageStatus: "recorded_exact", usageSource: retries.source }),
+    budgetMetric({ key: "replans", label: "Replans", unit: "count", limit: firstNumber(limits, ["replans", "replanBudget"]), usage: replans.value, usageStatus: "recorded_exact", usageSource: replans.source }),
+  ] };
 }
 
 function collectPages<T>(
@@ -504,6 +627,63 @@ export class OperationsRepository {
     };
   }
 
+  listActions(
+    access: OperationsAccessPolicy,
+    options: PageOptions & {
+      readonly missionId?: string;
+      readonly runId?: string;
+      readonly stepId?: string;
+      readonly status?: string;
+      readonly actionType?: string;
+    },
+  ): OperationsPage<ActionProjection> {
+    const scope = missionScopeSql("m", access);
+    const cursorPart = cursorClause(decodeCursor(options.cursor), "a.updated_at", "a.id");
+    const clauses = [scope.sql, cursorPart.sql];
+    const params: unknown[] = [...scope.params, ...cursorPart.params];
+    if (options.missionId) { clauses.push("a.mission_id = ?"); params.push(options.missionId); }
+    if (options.runId) { clauses.push("a.run_id = ?"); params.push(options.runId); }
+    if (options.stepId) { clauses.push("a.step_id = ?"); params.push(options.stepId); }
+    if (options.status) { clauses.push("a.status = ?"); params.push(options.status); }
+    if (options.actionType) { clauses.push("a.action_type = ?"); params.push(options.actionType); }
+    const rows = this.database.prepare(`
+      SELECT a.*, a.updated_at AS sort_at, m.name AS mission_name, r.journey,
+        ps.phase AS step_phase, ps.title AS step_title,
+        COALESCE(ass.agent_id, ps.assigned_agent_id) AS agent_id
+      FROM actions a
+      JOIN missions m ON m.id = a.mission_id
+      JOIN runs r ON r.id = a.run_id
+      LEFT JOIN plan_steps ps ON ps.id = a.step_id
+      LEFT JOIN assignments ass ON ass.id = a.assignment_id
+      WHERE ${clauses.join(" AND ")}
+      ORDER BY a.updated_at DESC, a.id DESC LIMIT ?
+    `).all(...params, options.limit + 1) as Row[];
+    return page(rows, options.limit, (row) => ({
+      id: row.id,
+      mission: { id: row.mission_id, name: row.mission_name },
+      runId: row.run_id,
+      journey: row.journey,
+      step: row.step_id ? { id: row.step_id, phase: row.step_phase, title: row.step_title } : null,
+      agentId: row.agent_id,
+      actionType: row.action_type,
+      actionClass: row.action_class,
+      target: row.scoped_target,
+      status: row.status,
+      intentSummary: String(sanitizeJson(row.intent_summary)),
+      resultSummary: row.result_summary ? String(sanitizeJson(row.result_summary)) : null,
+      errorCategory: row.error_category,
+      retryCount: Number(row.retry_count ?? 0),
+      guidedDecisionId: row.guided_decision_id,
+      contractId: row.contract_id,
+      contextPackId: row.context_pack_id,
+      correlation: { traceId: row.trace_id, spanId: row.span_id },
+      startedAt: row.started_at,
+      endedAt: row.ended_at,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+    }));
+  }
+
   listEvents(
     access: OperationsAccessPolicy,
     options: PageOptions & {
@@ -548,7 +728,7 @@ export class OperationsRepository {
       sequence: row.sequence,
       actor: { type: row.actor_type, id: row.actor_id },
       summary: sanitizeJson(row.summary),
-      payload: json(row.payload_json),
+      payload: sanitizeJsonWithRedaction(parseJson(row.payload_json), parseJson(row.redaction_json)),
       schemaVersion: row.schema_version,
       journey: row.journey,
       correlation: { traceId: row.trace_id, spanId: row.span_id, contextPackId: row.context_pack_id },
@@ -654,6 +834,28 @@ export class OperationsRepository {
     if (options.journey) { clauses.push("re.journey = ?"); params.push(options.journey); }
     const rows = this.database.prepare(`
       SELECT re.*, re.created_at AS sort_at, m.name AS mission_name, r.status AS run_status,
+        r.budget_json, r.budget_usage_json, r.retry_count AS run_retry_count,
+        r.replan_count AS run_replan_count, r.started_at AS run_started_at,
+        r.ended_at AS run_ended_at,
+        (SELECT COUNT(*) FROM provider_turns pt WHERE pt.run_id = re.run_id) AS provider_turn_count,
+        (SELECT COUNT(*) FROM provider_turns pt
+          WHERE pt.run_id = re.run_id AND pt.input_tokens IS NOT NULL AND pt.output_tokens IS NOT NULL
+        ) AS provider_token_complete_count,
+        (SELECT COUNT(*) FROM provider_turns pt
+          WHERE pt.run_id = re.run_id AND pt.estimated_cost IS NOT NULL
+        ) AS provider_cost_complete_count,
+        (SELECT COALESCE(SUM(pt.input_tokens + pt.output_tokens), 0) FROM provider_turns pt
+          WHERE pt.run_id = re.run_id AND pt.input_tokens IS NOT NULL AND pt.output_tokens IS NOT NULL
+        ) AS provider_token_sum,
+        (SELECT COALESCE(SUM(pt.estimated_cost), 0) FROM provider_turns pt
+          WHERE pt.run_id = re.run_id AND pt.estimated_cost IS NOT NULL
+        ) AS provider_cost_sum,
+        (SELECT COUNT(*) FROM tool_calls tc
+          JOIN actions action ON action.id = tc.action_id WHERE action.run_id = re.run_id
+        ) AS tool_call_count,
+        (SELECT COALESCE(SUM(action.retry_count), 0) FROM actions action
+          WHERE action.run_id = re.run_id
+        ) AS action_retry_count,
         rec.comparison_status, rec.basis AS comparison_basis,
         rec.reason AS comparison_reason,
         rec.prior_evaluation_id AS comparison_prior_evaluation_id,
@@ -684,6 +886,7 @@ export class OperationsRepository {
       evidenceCoverage: rounded(row.evidence_coverage, 4),
       createdBy: row.created_by,
       createdAt: row.created_at,
+      budget: evaluationBudget(row),
       comparison: this.mapEvaluationComparison(row, access),
     }));
   }
@@ -749,7 +952,7 @@ export class OperationsRepository {
 
   listLessons(
     access: OperationsAccessPolicy,
-    options: PageOptions & { readonly status?: string; readonly lessonType?: string; readonly missionId?: string; readonly query?: string },
+    options: PageOptions & { readonly status?: string; readonly lessonType?: string; readonly missionId?: string; readonly runId?: string; readonly query?: string },
   ): OperationsPage<LessonProjection> {
     const scope = lessonScopeSql("l", access);
     const cursorPart = cursorClause(decodeCursor(options.cursor), "l.updated_at", "l.id");
@@ -758,6 +961,16 @@ export class OperationsRepository {
     if (options.status) { clauses.push("l.status = ?"); params.push(options.status); }
     if (options.lessonType) { clauses.push("l.lesson_type = ?"); params.push(options.lessonType); }
     if (options.missionId) { clauses.push("l.mission_id = ?"); params.push(options.missionId); }
+    if (options.runId) {
+      const linkedRunScope = missionScopeSql("run_mission", access);
+      clauses.push(`EXISTS (
+        SELECT 1 FROM lesson_evidence run_link
+        JOIN runs linked_run ON linked_run.id = run_link.run_id
+        JOIN missions run_mission ON run_mission.id = linked_run.mission_id
+        WHERE run_link.lesson_id = l.id AND run_link.run_id = ? AND ${linkedRunScope.sql}
+      )`);
+      params.push(options.runId, ...linkedRunScope.params);
+    }
     if (options.query) { clauses.push("l.rowid IN (SELECT rowid FROM lessons_fts WHERE lessons_fts MATCH ?)"); params.push(ftsQuery(options.query)); }
     const rows = this.database.prepare(`
       SELECT l.*, l.updated_at AS sort_at, m.name AS mission_name,
@@ -1040,7 +1253,12 @@ export class OperationsRepository {
     const findingPage = collectPages((cursor) => this.listFindings(access, { runId, limit: 100, cursor }));
     const artifactPage = collectPages((cursor) => this.listArtifacts(access, { runId, limit: 100, cursor }));
     const evaluationPage = collectPages((cursor) => this.listEvaluations(access, { runId, limit: 100, cursor }));
-    const lessonPage = collectPages((cursor) => this.listLessons(access, { missionId: row.mission_id, limit: 100, cursor }));
+    const lessonPage = collectPages((cursor) => this.listLessons(access, {
+      missionId: row.mission_id,
+      runId,
+      limit: 100,
+      cursor,
+    }));
     const lessonUsagePage = collectPages((cursor) => this.listLessonUsage(access, { runId, limit: 100, cursor }));
     const eventPage = collectPages((cursor) => this.listEvents(access, { runId, limit: 100, cursor }));
 

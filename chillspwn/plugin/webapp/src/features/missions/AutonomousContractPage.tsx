@@ -21,7 +21,7 @@ interface FormState {
   authorizationConfirmed: boolean;
   allowedActionClasses: string;
   prohibitedActionClasses: string;
-  destructivePolicy: string;
+  destructivePolicy: "prohibited" | "contract_only";
   evidenceRequirements: string;
   safeStopConditions: string;
   timeBudgetMinutes: number;
@@ -32,6 +32,7 @@ interface FormState {
   concurrencyLimit: number;
   evidenceStorageBudgetMb: number;
   artifactStorageBudgetMb: number;
+  specialistAgentIds: string[];
   contextNodeIds: string[];
 }
 
@@ -58,6 +59,7 @@ const INITIAL_STATE: FormState = {
   concurrencyLimit: 3,
   evidenceStorageBudgetMb: 64,
   artifactStorageBudgetMb: 256,
+  specialistAgentIds: [],
   contextNodeIds: [],
 };
 
@@ -82,6 +84,9 @@ function validateStep(step: number, form: FormState): string[] {
     if (!Number.isSafeInteger(form.evidenceStorageBudgetMb) || form.evidenceStorageBudgetMb < 1) errors.push("Evidence storage budget must be at least 1 MiB.");
     if (!Number.isSafeInteger(form.artifactStorageBudgetMb) || form.artifactStorageBudgetMb < 1) errors.push("Artifact storage budget must be at least 1 MiB.");
   }
+  if (step === 3 && form.specialistAgentIds.length === 0) {
+    errors.push("Select at least one compatible specialist for the signed assignment pool.");
+  }
   return errors;
 }
 
@@ -97,6 +102,7 @@ export default function AutonomousContractPage() {
   const [preflighting, setPreflighting] = useState(false);
   const [preflightError, setPreflightError] = useState<Error>();
   const [contextCandidates, setContextCandidates] = useState<AutonomousContextCandidate[]>([]);
+  const [executionPreview, setExecutionPreview] = useState<AutonomousMissionPreflight["execution"]>();
   const [contractReview, setContractReview] = useState<AutonomousMissionPreflight>();
   const idempotencyKey = useRef(requestKey());
   const readinessChecks = overview.data?.readiness.checks.filter((check) => check.journeys.includes("autonomous")) ?? [];
@@ -148,6 +154,7 @@ export default function AutonomousContractPage() {
       retentionPolicy: "operator_managed",
       providerPolicy: "automatic_enforcing_only",
       toolPolicy: "contract_allowlist",
+      specialistAgentIds: form.specialistAgentIds,
       memoryScopes,
       contextNodeIds: selectedContext.map((candidate) => candidate.id),
       safeStopConditions: lines(form.safeStopConditions),
@@ -155,12 +162,19 @@ export default function AutonomousContractPage() {
     },
     ...(review ? { contractReview: review } : {}),
   });
-  const runPreflight = async (forReview: boolean): Promise<boolean> => {
+  const runPreflight = async (forReview: boolean, discoverTeam = false): Promise<boolean> => {
     setPreflighting(true);
     setPreflightError(undefined);
     try {
       const result = await preflightAutonomousMission(request());
       setContextCandidates(result.context.candidates);
+      setExecutionPreview(result.execution);
+      if (discoverTeam && form.specialistAgentIds.length === 0 && result.execution.team.recommendedAgentIds.length > 0) {
+        setForm((current) => ({
+          ...current,
+          specialistAgentIds: [...result.execution.team.recommendedAgentIds],
+        }));
+      }
       if (forReview) setContractReview(result);
       if (result.readiness.status === "blocked") {
         const contextFailures = result.readiness.checks.filter((check) => (
@@ -171,6 +185,16 @@ export default function AutonomousContractPage() {
           setErrors(contextFailures.map((check) => `${check.label}: ${check.impact}`));
           return false;
         }
+      }
+      if (!discoverTeam && (
+        result.execution.team.selectedAgentIds.length === 0 ||
+        result.execution.team.invalidSelectedAgentIds.length > 0 ||
+        result.execution.team.effectiveAgentIds.length === 0
+      )) {
+        setErrors(result.readiness.checks.filter((check) => (
+          check.status === "fail" && check.id === "contract_specialist_selection"
+        )).map((check) => `${check.label}: ${check.impact}`));
+        return false;
       }
       setErrors([]);
       return true;
@@ -185,6 +209,7 @@ export default function AutonomousContractPage() {
     const validation = validateStep(step, form);
     setErrors(validation);
     if (validation.length > 0) return;
+    if (step === 2 && !(await runPreflight(false, true))) return;
     if (step === 3 && !(await runPreflight(false))) return;
     if (step === 4 && !(await runPreflight(true))) return;
     setStep(next);
@@ -245,7 +270,7 @@ export default function AutonomousContractPage() {
             {step === 2 && <fieldset><legend>Autonomous operating contract</legend><p className="os-field-intro">The runtime may adapt its plan, but cannot expand these permissions or budgets.</p>
               <label>Pre-authorized action classes <span>One per line</span><textarea value={form.allowedActionClasses} onChange={(event) => set("allowedActionClasses", event.target.value)} rows={4} required /></label>
               <label>Prohibited action classes <span>One per line</span><textarea value={form.prohibitedActionClasses} onChange={(event) => set("prohibitedActionClasses", event.target.value)} rows={3} /></label>
-              <label>Destructive-action policy<select value={form.destructivePolicy} onChange={(event) => set("destructivePolicy", event.target.value)}><option value="prohibited">Prohibited</option><option value="contract_only">Allowed only where explicitly described in this contract</option></select></label>
+              <label>Destructive-action policy<select value={form.destructivePolicy} onChange={(event) => set("destructivePolicy", event.target.value as FormState["destructivePolicy"])}><option value="prohibited">Prohibited</option><option value="contract_only">Allowed only where explicitly described in this contract</option></select></label>
               <label>Evidence requirements <span>One per line</span><textarea value={form.evidenceRequirements} onChange={(event) => set("evidenceRequirements", event.target.value)} rows={3} /></label>
               <label>Safe-stop conditions <span>One per line</span><textarea value={form.safeStopConditions} onChange={(event) => set("safeStopConditions", event.target.value)} rows={4} required /></label>
               <div className="os-field-grid os-field-grid--three">
@@ -275,10 +300,19 @@ export default function AutonomousContractPage() {
               {overview.data && <>
                 <div className="os-readiness-summary"><span><strong>{overview.data.readiness.score}</strong>/100</span><div><h3>{overview.data.readiness.status}</h3><p>{readinessChecks.filter((check) => check.status === "fail").length} Autonomous blockers detected.</p></div><StatusPill status={readinessBlocked ? "blocked" : "ready"} /></div>
                 <ul className="os-review-list">{readinessChecks.map((check) => <li key={check.id}><StatusPill status={check.status} /><span><strong>{check.label}</strong><small>{check.impact}</small>{check.remediation && check.status !== "pass" && <small>{check.remediation}</small>}</span></li>)}</ul>
-                <h3>Available fleet</h3>{overview.data.agents.length === 0 ? <p className="os-muted">No agent capabilities were reported.</p> : <ul className="os-review-list">{overview.data.agents.map((agent) => <li key={agent.id}><StatusPill status={agent.status} /><span><strong>{agent.name}</strong><small>{agent.assignment ?? "Available for policy-driven assignment"}</small></span></li>)}</ul>}
+                <h3>Inspected enforcing provider paths</h3>
+                {!executionPreview || executionPreview.providers.length === 0 ? <p className="os-muted">No canonical provider projection is available. Autonomous launch remains blocked.</p> : <ul className="os-review-list" aria-label="Autonomous enforcing provider paths">{executionPreview.providers.map((provider) => <li key={provider.id}><StatusPill status={provider.compatible ? "ready" : provider.status} /><span><strong>{provider.id}</strong><small>{provider.reason}</small><small>{provider.authenticated ? "Authenticated" : "Not authenticated"} · {provider.enforcesAutonomousBoundary ? "Autonomous boundary enforced" : "Advisory only"} · token accounting {provider.reportsExactTokenUsage ? "exact" : "unavailable"} · cost accounting {provider.reportsExactCostUsage ? "exact" : "unavailable"}</small><small>Checked {new Date(provider.checkedAt).toLocaleString()}</small></span></li>)}</ul>}
+                <h3>Signed specialist pool</h3>
+                <p className="os-field-intro">The checked specialists become an exact signed allowlist. Planning and execution cannot assign work outside it.</p>
+                {!executionPreview || executionPreview.team.candidates.length === 0 ? <p className="os-muted">No projected specialist inventory is available.</p> : <ul className="os-review-list" aria-label="Compatible Autonomous specialists">{executionPreview.team.candidates.map((agent) => <li key={agent.id}>
+                  <label className="os-check-field"><input type="checkbox" disabled={!agent.compatible} checked={form.specialistAgentIds.includes(agent.id)} onChange={(event) => set("specialistAgentIds", event.target.checked ? [...form.specialistAgentIds, agent.id] : form.specialistAgentIds.filter((id) => id !== agent.id))} /><span><strong>{agent.displayName}</strong><small>{agent.role} · {agent.status} · ID {agent.id}</small><small>Provider policy: {agent.providerPolicy.defaultProvider ?? "automatic enforcing path"}</small><small>Runnable reviewed tools: {agent.runnableTools.length > 0 ? agent.runnableTools.join(", ") : "none"}</small><small>Allowed: {agent.toolPolicy.allowedTools.length > 0 ? agent.toolPolicy.allowedTools.join(", ") : "none declared"} · denied: {agent.toolPolicy.deniedTools.length > 0 ? agent.toolPolicy.deniedTools.join(", ") : "none"} · approval-gated: {agent.toolPolicy.approvalRequiredTools.length > 0 ? agent.toolPolicy.approvalRequiredTools.join(", ") : "none"}</small>{agent.incompatibilityReasons.map((reason) => <small key={reason}>{reason}</small>)}</span></label>
+                  <StatusPill status={agent.compatible ? "ready" : "blocked"} />
+                </li>)}</ul>}
+                <h3>Reviewed MCP bindings</h3>
+                {!executionPreview || executionPreview.tools.length === 0 ? <p className="os-muted">No MCP server is projected for this contract.</p> : <ul className="os-review-list" aria-label="Reviewed MCP bindings">{executionPreview.tools.map((tool) => <li key={tool.id}><StatusPill status={tool.status} /><span><strong>{tool.name}</strong><small>{tool.capabilities.length} capabilities · risk {tool.riskClass} · {tool.startPermitted ? "startup permitted" : "startup denied"}</small><small>Assigned specialists: {tool.assignedAgentIds.length > 0 ? tool.assignedAgentIds.join(", ") : "none"}</small></span></li>)}</ul>}
               </>}
             </fieldset>}
-            {step === 4 && <fieldset><legend>Context and memory</legend><p className="os-field-intro">Select exact confirmed preferences and independently verified lessons. No unlisted memory will be retrieved for this Autonomous run.</p>
+            {step === 4 && <fieldset><legend>Context and memory</legend><p className="os-field-intro">Select exact confirmed preferences and independently verified lessons. Preflight validates and signs these node IDs; the durable Context Pack is created from only those permitted nodes when planning begins.</p>
               {preflighting && <p role="status">Loading eligible canonical memory…</p>}
               {!preflighting && contextCandidates.length === 0 && <p className="os-muted">No eligible confirmed preference or verified lesson is available for this global or engagement scope. The mission can proceed without retained context.</p>}
               {contextCandidates.length > 0 && <ul className="os-review-list" aria-label="Eligible Autonomous context">
@@ -290,7 +324,7 @@ export default function AutonomousContractPage() {
               <p className="os-policy-note">Selected IDs are revalidated at launch. Stale, expired, restricted, unconfirmed, or cross-engagement nodes fail preflight. Secrets, raw confidential payloads, and candidate personal preferences are excluded.</p>
             </fieldset>}
             {step === 5 && <fieldset><legend>Contract review</legend><p className="os-field-intro">Launching creates the durable mission and run. The system must recover in-contract or safe-stop; it will not wait for routine approval.</p>
-              <dl className="os-review-grid"><div><dt>Mission</dt><dd>{form.title}</dd></div><div><dt>Objective</dt><dd>{form.objective}</dd></div><div><dt>Allowed targets</dt><dd>{lines(form.allowedTargets).join(", ")}</dd></div><div><dt>Success criteria</dt><dd>{lines(form.successCriteria).length}</dd></div><div><dt>Time budget</dt><dd>{form.timeBudgetMinutes} minutes</dd></div><div><dt>Retries / replans</dt><dd>{form.retryBudget} / {form.replanBudget}</dd></div><div><dt>Concurrency</dt><dd>{form.concurrencyLimit}</dd></div><div><dt>Storage</dt><dd>{form.evidenceStorageBudgetMb} MiB evidence / {form.artifactStorageBudgetMb} MiB artifacts</dd></div><div><dt>Selected memory</dt><dd>{selectedContext.length}</dd></div><div><dt>Contract version</dt><dd>{contractReview?.contract.version ?? "Not issued"}</dd></div><div><dt>Contract SHA-256</dt><dd><code>{contractReview?.contract.hash ?? "Run preflight to issue"}</code></dd></div></dl>
+              <dl className="os-review-grid"><div><dt>Mission</dt><dd>{form.title}</dd></div><div><dt>Objective</dt><dd>{form.objective}</dd></div><div><dt>Allowed targets</dt><dd>{lines(form.allowedTargets).join(", ")}</dd></div><div><dt>Success criteria</dt><dd>{lines(form.successCriteria).length}</dd></div><div><dt>Time budget</dt><dd>{form.timeBudgetMinutes} minutes</dd></div><div><dt>Retries / replans</dt><dd>{form.retryBudget} / {form.replanBudget}</dd></div><div><dt>Concurrency</dt><dd>{form.concurrencyLimit}</dd></div><div><dt>Storage</dt><dd>{form.evidenceStorageBudgetMb} MiB evidence / {form.artifactStorageBudgetMb} MiB artifacts</dd></div><div><dt>Signed specialists</dt><dd>{form.specialistAgentIds.length}</dd></div><div><dt>Selected memory nodes</dt><dd>{selectedContext.length}; Context Pack created at planning</dd></div><div><dt>Contract version</dt><dd>{contractReview?.contract.version ?? "Not issued"}</dd></div><div><dt>Contract SHA-256</dt><dd><code>{contractReview?.contract.hash ?? "Run preflight to issue"}</code></dd></div></dl>
               {contractReview && <><h3>Provider, tool, delivery, and retention summary</h3><dl className="os-review-grid"><div><dt>Provider</dt><dd>{contractReview.policySummary.provider}</dd></div><div><dt>Tools</dt><dd>{contractReview.policySummary.tools}</dd></div><div><dt>Notifications</dt><dd>{contractReview.policySummary.notifications}</dd></div><div><dt>Reporting</dt><dd>{contractReview.policySummary.reporting}</dd></div><div><dt>Retention</dt><dd>{contractReview.policySummary.retention}</dd></div><div><dt>Storage</dt><dd>{contractReview.policySummary.storage}</dd></div></dl></>}
               {contractReview && contractReview.readiness.checks.some((check) => check.status === "fail") && <><h3>Launch blockers</h3><ul className="os-review-list">{contractReview.readiness.checks.filter((check) => check.status === "fail").map((check) => <li key={check.id}><StatusPill status="fail" /><span><strong>{check.label}</strong><small>{check.impact}</small>{check.remediation && <small>{check.remediation}</small>}</span></li>)}</ul></>}
               <div className="os-launch-contract"><StatusPill status={readinessBlocked || contractReview?.readiness.status === "blocked" ? "blocked" : "ready"} /><div><strong>{readinessBlocked || contractReview?.readiness.status === "blocked" ? "Launch is blocked" : "Contract is ready to launch"}</strong><p>{readinessBlocked || contractReview?.readiness.status === "blocked" ? "Resolve readiness failures and rerun preflight before Autonomous execution." : "The reviewed version and digest bind execution authority to this exact contract."}</p></div></div>

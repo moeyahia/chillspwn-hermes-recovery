@@ -1,8 +1,16 @@
-import { createContext, type MouseEvent, type ReactNode, useContext, useEffect, useMemo, useState } from "react";
+import { createContext, type MouseEvent, type ReactNode, useCallback, useContext, useEffect, useMemo, useState } from "react";
 
 interface NavigationContextValue {
   pathname: string;
+  search: string;
+  hash: string;
   navigate: (path: string, options?: { replace?: boolean }) => void;
+}
+
+interface LocationSnapshot {
+  pathname: string;
+  search: string;
+  hash: string;
 }
 
 const NavigationContext = createContext<NavigationContextValue | null>(null);
@@ -12,25 +20,35 @@ function safeInternalPath(path: string): string {
   return path;
 }
 
+function currentLocation(): LocationSnapshot {
+  return {
+    pathname: window.location.pathname,
+    search: window.location.search,
+    hash: window.location.hash,
+  };
+}
+
 export function NavigationProvider({ children }: { children: ReactNode }) {
-  const [pathname, setPathname] = useState(() => window.location.pathname);
+  const [location, setLocation] = useState(currentLocation);
 
   useEffect(() => {
-    const onPopState = () => setPathname(window.location.pathname);
+    const onPopState = () => setLocation(currentLocation());
     window.addEventListener("popstate", onPopState);
     return () => window.removeEventListener("popstate", onPopState);
   }, []);
 
-  const value = useMemo<NavigationContextValue>(() => ({
-    pathname,
-    navigate: (path, options) => {
-      const target = safeInternalPath(path);
-      if (target === window.location.pathname) return;
-      window.history[options?.replace ? "replaceState" : "pushState"]({}, "", target);
-      setPathname(target);
-      window.scrollTo({ top: 0, behavior: "instant" });
-    },
-  }), [pathname]);
+  const navigate = useCallback((path: string, options?: { replace?: boolean }) => {
+    const requested = safeInternalPath(path);
+    const parsed = new URL(requested, window.location.origin);
+    const target = `${parsed.pathname}${parsed.search}${parsed.hash}`;
+    const current = `${window.location.pathname}${window.location.search}${window.location.hash}`;
+    if (target === current) return;
+    window.history[options?.replace ? "replaceState" : "pushState"]({}, "", target);
+    setLocation({ pathname: parsed.pathname, search: parsed.search, hash: parsed.hash });
+    window.scrollTo({ top: 0, behavior: "instant" });
+  }, []);
+
+  const value = useMemo<NavigationContextValue>(() => ({ ...location, navigate }), [location, navigate]);
 
   return <NavigationContext.Provider value={value}>{children}</NavigationContext.Provider>;
 }

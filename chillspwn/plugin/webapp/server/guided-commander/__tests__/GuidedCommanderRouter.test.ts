@@ -1,12 +1,17 @@
 import { createHash } from "node:crypto";
 import { afterEach, describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import express from "express";
 import type { Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { createDatabaseConnection, migrateDatabase, type SqliteDatabase } from "../../db";
 import { MemoryRepository } from "../../memory";
 import { canonicalJson } from "../../missions/canonical";
+import { GuidedCommanderRepository } from "../GuidedCommanderRepository";
 import { createGuidedCommanderRouter } from "../GuidedCommanderRouter";
+import { GuidedCommanderService } from "../GuidedCommanderService";
 import type {
   GuidedCommanderPort,
   GuidedCommanderPortInput,
@@ -57,6 +62,100 @@ class PlanningOnlyPort implements GuidedCommanderPort {
         used: true,
         relevanceReason: "Confirmed preference applies to Guided explanations",
         influenceSummary: "Kept the explanation concise and evidence-led",
+      }] : [],
+    };
+  }
+}
+
+class DeferredPlanningOnlyPort implements GuidedCommanderPort {
+  readonly kind = "planning_only" as const;
+  readonly supportsToolExecution = false as const;
+  readonly providerId = "guided-deferred-test-provider";
+  readonly model = "guided-deferred-test-model";
+  readonly calls: GuidedCommanderPortInput[] = [];
+  readonly started: Promise<void>;
+  readonly #pending: Array<(response: GuidedCommanderPortResponse) => void> = [];
+  #resolveStarted!: () => void;
+
+  constructor() {
+    this.started = new Promise<void>((resolve) => {
+      this.#resolveStarted = resolve;
+    });
+  }
+
+  respond(input: GuidedCommanderPortInput, signal: AbortSignal): Promise<GuidedCommanderPortResponse> {
+    if (signal.aborted) return Promise.reject(new DOMException("Aborted", "AbortError"));
+    this.calls.push(input);
+    this.#resolveStarted();
+    return new Promise<GuidedCommanderPortResponse>((resolve, reject) => {
+      signal.addEventListener(
+        "abort",
+        () => reject(new DOMException("Aborted", "AbortError")),
+        { once: true },
+      );
+      this.#pending.push(resolve);
+    });
+  }
+
+  releaseAll(): void {
+    const response: GuidedCommanderPortResponse = {
+      body: "The submitted output is interpreted once while the exact Guided step remains operator-controlled.",
+      summary: "Interpreted one coalesced Guided result",
+      confidence: 0.9,
+      observations: ["Concurrent retries produced no duplicate operational state"],
+      recommendedNextStep: "Review the same represented action card.",
+      contextUse: [],
+    };
+    for (const resolve of this.#pending.splice(0)) resolve(response);
+  }
+}
+
+class ExpiringOwnerPort implements GuidedCommanderPort {
+  readonly kind = "planning_only" as const;
+  readonly supportsToolExecution = false as const;
+  readonly providerId = "guided-expired-owner-test-provider";
+  readonly calls: GuidedCommanderPortInput[] = [];
+  readonly firstStarted: Promise<void>;
+  #resolveFirstStarted!: () => void;
+  #resolveFirst?: () => void;
+
+  constructor() {
+    this.firstStarted = new Promise<void>((resolve) => { this.#resolveFirstStarted = resolve; });
+  }
+
+  respond(input: GuidedCommanderPortInput): Promise<GuidedCommanderPortResponse> {
+    this.calls.push(input);
+    if (this.calls.length === 1) {
+      this.#resolveFirstStarted();
+      return new Promise<GuidedCommanderPortResponse>((resolve) => {
+        this.#resolveFirst = () => resolve(this.response(
+          "Expired owner returned after its reservation was replaced.",
+          input.memoryContext[0]?.id,
+        ));
+      });
+    }
+    return Promise.resolve(this.response(
+      "Recovered owner completed after the expired lease.",
+      input.memoryContext[0]?.id,
+    ));
+  }
+
+  releaseFirst(): void {
+    this.#resolveFirst?.();
+  }
+
+  private response(body: string, nodeId?: string): GuidedCommanderPortResponse {
+    return {
+      body,
+      summary: "One durable owner committed the Guided response",
+      confidence: 0.9,
+      observations: ["The idempotency reservation fenced the final exchange"],
+      recommendedNextStep: "Review the existing exact action card.",
+      contextUse: nodeId ? [{
+        nodeId,
+        used: true,
+        relevanceReason: "Confirmed preference applies to this Guided response",
+        influenceSummary: "Kept the response concise and evidence-led",
       }] : [],
     };
   }
@@ -300,6 +399,295 @@ describe("Guided Commander durable HTTP boundary", () => {
         "assistant",
       ]);
     } finally {
+      database.close();
+    }
+  });
+
+  test("coalesces concurrent result interpretation before evidence, context, provider, or exchange side effects", async () => {
+    const port = new DeferredPlanningOnlyPort();
+    const { database, url } = await application(port);
+    const key = "guided-concurrent-interpret-0001";
+    const resultText = "443/tcp open https\nserver: bounded-lab";
+    const request = mutation(key, actionBody({
+      result: {
+        source: "paste",
+        mediaType: "text/plain",
+        byteSize: Buffer.byteLength(resultText, "utf8"),
+        text: resultText,
+      },
+    }));
+    const counts = () => ({
+      evidence: (database.prepare("SELECT COUNT(*) AS count FROM evidence").get() as { count: number }).count,
+      contextPacks: (database.prepare("SELECT COUNT(*) AS count FROM memory_context_packs").get() as { count: number }).count,
+      providerTurns: (database.prepare("SELECT COUNT(*) AS count FROM provider_turns").get() as { count: number }).count,
+      messages: (database.prepare("SELECT COUNT(*) AS count FROM messages").get() as { count: number }).count,
+    });
+    try {
+      const endpoint = `${url}/api/v2/guided/${IDS.mission}/commander/interpret-result`;
+      const firstPending = fetch(endpoint, request);
+      await port.started;
+      expect(port.calls).toHaveLength(1);
+      expect(counts()).toEqual({ evidence: 1, contextPacks: 1, providerTurns: 1, messages: 1 });
+
+      const identicalPending = fetch(endpoint, request);
+      const beforeConflict = counts();
+      const conflictingText = "8443/tcp open https-alt";
+      const conflictResponse = await fetch(endpoint, mutation(key, actionBody({
+        result: {
+          source: "paste",
+          mediaType: "text/plain",
+          byteSize: Buffer.byteLength(conflictingText, "utf8"),
+          text: conflictingText,
+        },
+      })));
+      expect(conflictResponse.status).toBe(409);
+      expect(await conflictResponse.json()).toMatchObject({
+        error: { code: "idempotency_key_conflict", retryable: false },
+      });
+      expect(port.calls).toHaveLength(1);
+      expect(counts()).toEqual(beforeConflict);
+
+      port.releaseAll();
+      const [firstResponse, identicalResponse] = await Promise.all([firstPending, identicalPending]);
+      expect(firstResponse.status).toBe(200);
+      expect(identicalResponse.status).toBe(200);
+      const [first, identical] = await Promise.all([
+        responseJson(firstResponse),
+        responseJson(identicalResponse),
+      ]);
+      expect(identical).toEqual(first);
+      expect(port.calls).toHaveLength(1);
+      expect(counts()).toEqual({ evidence: 1, contextPacks: 1, providerTurns: 1, messages: 3 });
+      expect(database.prepare("SELECT status FROM provider_turns").get()).toEqual({ status: "completed" });
+      expect(database.prepare(`
+        SELECT COUNT(*) AS count FROM messages WHERE role IN ('operator', 'assistant')
+          AND id != ?
+      `).get(IDS.initialMessage)).toEqual({ count: 2 });
+    } finally {
+      port.releaseAll();
+      database.close();
+    }
+  });
+
+  test("durably fences two Guided service instances before provider or conversation side effects", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "guided-commander-reservation-"));
+    const filename = join(directory, "command-os.db");
+    const database = createDatabaseConnection({ filename });
+    migrateDatabase(database);
+    seedGuidedRuntime(database);
+    const secondDatabase = createDatabaseConnection({ filename });
+    const port = new DeferredPlanningOnlyPort();
+    const firstService = new GuidedCommanderService({
+      repository: new GuidedCommanderRepository(database),
+      port,
+    });
+    const secondService = new GuidedCommanderService({
+      repository: new GuidedCommanderRepository(secondDatabase),
+      port,
+    });
+    const request = {
+      runId: IDS.run,
+      stepId: IDS.step,
+      expectedFingerprint: FINGERPRINT,
+    };
+    const key = "guided-cross-process-reservation-0001";
+    const invoke = (service: GuidedCommanderService, note?: string) => service.respond({
+      missionId: IDS.mission,
+      action: "explain_more",
+      request: { ...request, ...(note ? { note } : {}) },
+      idempotencyKey: key,
+      actorId: "operator-test",
+      signal: new AbortController().signal,
+    });
+    const counts = () => ({
+      contextPacks: (database.prepare("SELECT COUNT(*) AS count FROM memory_context_packs").get() as { count: number }).count,
+      providerTurns: (database.prepare("SELECT COUNT(*) AS count FROM provider_turns").get() as { count: number }).count,
+      messages: (database.prepare("SELECT COUNT(*) AS count FROM messages").get() as { count: number }).count,
+      events: (database.prepare("SELECT COUNT(*) AS count FROM events WHERE event_type = 'guided.commander.explain_more'").get() as { count: number }).count,
+    });
+    try {
+      const firstPending = invoke(firstService);
+      await port.started;
+      expect(port.calls).toHaveLength(1);
+      expect(counts()).toEqual({ contextPacks: 1, providerTurns: 1, messages: 1, events: 0 });
+
+      await expect(invoke(secondService)).rejects.toMatchObject({
+        status: 409,
+        code: "guided_commander_request_in_progress",
+        options: { retryable: true, details: { retryAfterMs: expect.any(Number) } },
+      });
+      await expect(invoke(secondService, "A conflicting request")).rejects.toMatchObject({
+        status: 409,
+        code: "idempotency_key_conflict",
+      });
+      expect(port.calls).toHaveLength(1);
+      expect(counts()).toEqual({ contextPacks: 1, providerTurns: 1, messages: 1, events: 0 });
+
+      port.releaseAll();
+      const first = await firstPending;
+      const replay = await invoke(secondService);
+      expect(replay).toEqual(first);
+      expect(port.calls).toHaveLength(1);
+      expect(counts()).toEqual({ contextPacks: 1, providerTurns: 1, messages: 3, events: 1 });
+    } finally {
+      port.releaseAll();
+      secondDatabase.close();
+      database.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("a failed durable owner releases only its own reservation so the same key can retry", async () => {
+    const database = createDatabaseConnection({ filename: ":memory:" });
+    migrateDatabase(database);
+    seedGuidedRuntime(database);
+    const port = new PlanningOnlyPort();
+    port.response = () => {
+      if (port.calls.length === 1) throw new Error("bounded provider failure");
+      return {
+        body: "The retry completed under a new durable owner without executing the represented action.",
+        summary: "Guided explanation completed after a safe retry",
+        confidence: 0.9,
+        contextUse: [],
+      };
+    };
+    const service = new GuidedCommanderService({
+      repository: new GuidedCommanderRepository(database),
+      port,
+    });
+    const request = {
+      missionId: IDS.mission,
+      action: "explain_more" as const,
+      request: { runId: IDS.run, stepId: IDS.step, expectedFingerprint: FINGERPRINT },
+      idempotencyKey: "guided-owner-failure-release-0001",
+      actorId: "operator-test",
+      signal: new AbortController().signal,
+    };
+    try {
+      await expect(service.respond(request)).rejects.toMatchObject({
+        code: "guided_commander_provider_failed",
+      });
+      expect(database.prepare(`
+        SELECT COUNT(*) AS count FROM settings
+        WHERE key LIKE 'idempotency.guided-commander.%'
+      `).get()).toEqual({ count: 0 });
+
+      const completed = await service.respond(request);
+      expect(completed.action).toBe("explain_more");
+      expect(port.calls).toHaveLength(2);
+      expect(database.prepare(`
+        SELECT COUNT(*) AS count FROM settings
+        WHERE key LIKE 'idempotency.guided-commander.%'
+      `).get()).toEqual({ count: 1 });
+      expect(database.prepare("SELECT COUNT(*) AS count FROM messages").get()).toEqual({ count: 3 });
+    } finally {
+      database.close();
+    }
+  });
+
+  test("an expired Guided provider reservation is taken over and the stale owner cannot duplicate completion", async () => {
+    const database = createDatabaseConnection({ filename: ":memory:" });
+    migrateDatabase(database);
+    seedGuidedRuntime(database);
+    let nowMs = Date.parse("2026-07-15T10:00:00.000Z");
+    const clock = () => new Date(nowMs);
+    const port = new ExpiringOwnerPort();
+    const firstRepository = new GuidedCommanderRepository(database, { clock });
+    const secondRepository = new GuidedCommanderRepository(database, { clock });
+    const firstService = new GuidedCommanderService({
+      repository: firstRepository,
+      port,
+      options: { providerMutationLeaseMs: 1_000 },
+    });
+    const secondService = new GuidedCommanderService({
+      repository: secondRepository,
+      port,
+      options: { providerMutationLeaseMs: 1_000 },
+    });
+    const request = {
+      missionId: IDS.mission,
+      action: "show_next_step" as const,
+      request: { runId: IDS.run, stepId: IDS.step, expectedFingerprint: FINGERPRINT },
+      idempotencyKey: "guided-expired-reservation-0001",
+      actorId: "operator-test",
+      signal: new AbortController().signal,
+    };
+    try {
+      const stalePending = firstService.respond(request);
+      await port.firstStarted;
+      expect(port.calls).toHaveLength(1);
+
+      nowMs += 1_001;
+      const recovered = await secondService.respond(request);
+      expect(port.calls).toHaveLength(2);
+      expect(database.prepare(`
+        SELECT COUNT(*) AS count FROM events
+        WHERE event_type = 'guided.commander.show_next_step'
+      `).get()).toEqual({ count: 1 });
+      expect(database.prepare("SELECT COUNT(*) AS count FROM messages").get()).toEqual({ count: 3 });
+
+      port.releaseFirst();
+      const stale = await stalePending;
+      expect(stale).toEqual(recovered);
+      expect(database.prepare("SELECT COUNT(*) AS count FROM messages").get()).toEqual({ count: 3 });
+      expect(database.prepare(`
+        SELECT status, error_category FROM provider_turns ORDER BY rowid
+      `).all()).toEqual([
+        { status: "cancelled", error_category: "idempotent_replay" },
+        { status: "completed", error_category: null },
+      ]);
+      expect(database.prepare(`
+        SELECT p.message_id, i.used, i.influence_summary
+        FROM memory_context_packs p
+        JOIN memory_context_items i ON i.context_pack_id = p.id
+        ORDER BY p.rowid
+      `).all()).toEqual([
+        { message_id: null, used: 0, influence_summary: null },
+        { message_id: expect.any(String), used: 1, influence_summary: expect.any(String) },
+      ]);
+
+      // A stale owner cannot release a newer in-progress takeover.
+      const directKey = "guided-owner-release-fence-0001";
+      const directHash = "d".repeat(64);
+      const oldOwner = firstRepository.reserveProviderMutation({
+        scope: `explain_more:${IDS.mission}`,
+        key: directKey,
+        requestHash: directHash,
+        actorId: "operator-test",
+        leaseMs: 1_000,
+      });
+      expect(oldOwner.status).toBe("reserved");
+      nowMs += 1_001;
+      const newOwner = secondRepository.reserveProviderMutation({
+        scope: `explain_more:${IDS.mission}`,
+        key: directKey,
+        requestHash: directHash,
+        actorId: "operator-test",
+        leaseMs: 1_000,
+      });
+      expect(newOwner.status).toBe("reserved");
+      if (oldOwner.status !== "reserved" || newOwner.status !== "reserved") throw new Error("reservation fixture failed");
+      expect(firstRepository.releaseProviderMutationReservation({
+        scope: `explain_more:${IDS.mission}`,
+        key: directKey,
+        requestHash: directHash,
+        ownerToken: oldOwner.ownerToken,
+      })).toBe(false);
+      expect(secondRepository.reserveProviderMutation({
+        scope: `explain_more:${IDS.mission}`,
+        key: directKey,
+        requestHash: directHash,
+        actorId: "operator-test",
+        leaseMs: 1_000,
+      })).toMatchObject({ status: "in_progress" });
+      expect(secondRepository.releaseProviderMutationReservation({
+        scope: `explain_more:${IDS.mission}`,
+        key: directKey,
+        requestHash: directHash,
+        ownerToken: newOwner.ownerToken,
+      })).toBe(true);
+    } finally {
+      port.releaseFirst();
       database.close();
     }
   });

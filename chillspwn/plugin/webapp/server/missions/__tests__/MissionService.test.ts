@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { randomUUID } from "node:crypto";
 import { createDatabaseConnection, migrateDatabase } from "../../db";
 import { MemoryRepository, type MemoryNodeType, type MemoryScope } from "../../memory";
 import {
@@ -49,6 +50,7 @@ function autonomousRequest(overrides: Partial<AutonomousMissionRequest> = {}): A
       retentionPolicy: "operator_managed",
       providerPolicy: "automatic_enforcing_only",
       toolPolicy: "contract_allowlist",
+      specialistAgentIds: ["agent-recon"],
       memoryScopes: ["verified_lessons"],
       contextNodeIds: [],
       safeStopConditions: ["Target resolves outside approved scope"],
@@ -97,6 +99,45 @@ function service(
   database: ReturnType<typeof createDatabaseConnection>,
   readinessProviders: readonly ReadinessCheckProvider[] = [provider()],
 ): MissionService {
+  const now = new Date().toISOString();
+  const validUntil = new Date(Date.now() + 5 * 60_000).toISOString();
+  database.prepare(`
+    INSERT OR IGNORE INTO agents (
+      id, role, display_name, status, provider_policy_json, tool_policy_json,
+      configuration_json, version, last_heartbeat_at, created_at, updated_at
+    ) VALUES ('agent-recon', 'reconnaissance', 'Recon specialist', 'available',
+      '{"defaultProvider":"xai-grok-oauth"}',
+      '{"allowedTools":["nmap"],"deniedTools":[],"approvalRequiredTools":[]}',
+      '{}', '2.1', ?, ?, ?)
+  `).run(now, now, now);
+  database.prepare(`
+    INSERT OR IGNORE INTO agent_capabilities (
+      agent_id, capability, source, enabled, metadata_json
+    ) VALUES ('agent-recon', 'nmap', 'live-route-attestation', 1, ?)
+  `).run(JSON.stringify({ validUntil, attestedAt: now, providerIds: ["xai-grok-oauth"] }));
+  database.prepare(`
+    INSERT OR IGNORE INTO mcp_servers (
+      id, name, transport, endpoint_redacted, status, capabilities_json,
+      policy_json, last_checked_at, created_at, updated_at
+    ) VALUES ('mcp:nmap', 'nmap', 'stdio', 'local stdio', 'healthy', '["nmap"]',
+      '{"enabled":true,"assignedAgents":["agent-recon"],"startPermitted":true,"riskClass":"medium"}',
+      ?, ?, ?)
+  `).run(now, now, now);
+  database.prepare(`
+    INSERT INTO health_snapshots (
+      id, component_type, component_id, status, metrics_json, message, captured_at
+    ) VALUES (?, 'provider', 'xai-grok-oauth', 'healthy',
+      ?,
+      'OAuth and Autonomous boundary verified', ?)
+  `).run(`health-${randomUUID()}`, JSON.stringify({
+    authenticated: true,
+    callable: true,
+    attestedAt: now,
+    expiresAt: validUntil,
+    enforcesAutonomousBoundary: true,
+    reportsExactTokenUsage: true,
+    reportsExactCostUsage: true,
+  }), now);
   return new MissionService(
     new MissionRepository(database),
     new OverviewRepository(database),
@@ -178,6 +219,16 @@ describe("Command OS mission vertical slice", () => {
     ).toThrow(MissionValidationError);
   });
 
+  test("accepts only closed destructive-action policy values", () => {
+    expect(validateMissionCreateRequest(autonomousRequest({
+      contract: { ...autonomousRequest().contract, destructivePolicy: "contract_only" },
+    })).contract.destructivePolicy).toBe("contract_only");
+    expect(() => validateMissionCreateRequest({
+      ...autonomousRequest(),
+      contract: { ...autonomousRequest().contract, destructivePolicy: "ask_operator" },
+    })).toThrow(MissionValidationError);
+  });
+
   test("rejects cross-engagement memory use without an engagement boundary and canonical target overlap", () => {
     expect(() =>
       validateMissionCreateRequest({
@@ -240,6 +291,7 @@ describe("Command OS mission vertical slice", () => {
         reportingFormat: "command_os_json",
         providerPolicy: "automatic_enforcing_only",
         toolPolicy: "contract_allowlist",
+        specialistAgentIds: ["agent-recon"],
       });
       expect(JSON.parse(persisted.budgets_json)).toMatchObject({
         evidenceBytes: 64 * 1024 * 1024,
@@ -302,6 +354,104 @@ describe("Command OS mission vertical slice", () => {
         JOIN mission_contracts mc ON mc.id = r.contract_id WHERE r.id = ?
       `).get(created.run.id) as { action_policy_json: string };
       expect(JSON.parse(policy.action_policy_json).contextNodeIds).toEqual(["mem-preference", "mem-lesson"]);
+    } finally {
+      database.close();
+    }
+  });
+
+  test("inspects real provider, MCP, and specialist policy then rejects an incompatible signed pool", async () => {
+    const database = createDatabaseConnection({ filename: ":memory:" });
+    try {
+      migrateDatabase(database);
+      const missionService = service(database);
+      const preview = await missionService.preflightAutonomous(autonomousRequest());
+      expect(preview.readiness.status).toBe("ready");
+      expect(preview.execution.providers).toEqual([
+        expect.objectContaining({
+          id: "xai-grok-oauth",
+          authenticated: true,
+          enforcesAutonomousBoundary: true,
+          compatible: true,
+        }),
+      ]);
+      expect(preview.execution.tools).toEqual([
+        expect.objectContaining({
+          id: "mcp:nmap",
+          status: "healthy",
+          assignedAgentIds: ["agent-recon"],
+          capabilities: ["nmap"],
+        }),
+      ]);
+      expect(preview.execution.team).toMatchObject({
+        selectedAgentIds: ["agent-recon"],
+        invalidSelectedAgentIds: [],
+        effectiveAgentIds: ["agent-recon"],
+      });
+      expect(preview.execution.team.candidates).toEqual([
+        expect.objectContaining({
+          id: "agent-recon",
+          compatible: true,
+          runnableTools: ["nmap"],
+          providerPolicy: { defaultProvider: "xai-grok-oauth" },
+        }),
+      ]);
+
+      const unknown = await missionService.preflightAutonomous(autonomousRequest({
+        contract: { ...autonomousRequest().contract, specialistAgentIds: ["agent-unknown"] },
+      }));
+      expect(unknown.readiness.status).toBe("blocked");
+      expect(unknown.contract.hash).not.toBe(preview.contract.hash);
+      expect(unknown.execution.team.invalidSelectedAgentIds).toEqual(["agent-unknown"]);
+      expect(unknown.readiness.checks).toContainEqual(expect.objectContaining({
+        id: "contract_specialist_selection",
+        status: "fail",
+      }));
+
+      database.prepare("UPDATE mcp_servers SET status = 'offline' WHERE id = 'mcp:nmap'").run();
+      const unavailable = await missionService.preflightAutonomous(autonomousRequest());
+      expect(unavailable.readiness.status).toBe("blocked");
+      expect(unavailable.execution.team.invalidSelectedAgentIds).toEqual(["agent-recon"]);
+      expect(unavailable.execution.team.candidates[0]).toMatchObject({
+        compatible: false,
+        runnableTools: [],
+      });
+    } finally {
+      database.close();
+    }
+  });
+
+  test("excludes approval-required tools from Autonomous readiness and blocks an approval-only specialist", async () => {
+    const database = createDatabaseConnection({ filename: ":memory:" });
+    try {
+      migrateDatabase(database);
+      const missionService = service(database);
+      database.prepare(`
+        UPDATE agents SET tool_policy_json = ? WHERE id = 'agent-recon'
+      `).run(JSON.stringify({
+        allowedTools: ["nmap"],
+        deniedTools: [],
+        approvalRequiredTools: ["nmap"],
+      }));
+
+      const preview = await missionService.preflightAutonomous(autonomousRequest());
+      expect(preview.readiness.status).toBe("blocked");
+      expect(preview.execution.tools).toEqual([]);
+      expect(preview.execution.team.candidates).toEqual([
+        expect.objectContaining({
+          id: "agent-recon",
+          compatible: false,
+          runnableTools: [],
+          incompatibilityReasons: [
+            "No approval-free reviewed MCP tool binding is available for this tool-requiring contract.",
+          ],
+          toolPolicy: expect.objectContaining({ approvalRequiredTools: ["nmap"] }),
+        }),
+      ]);
+      expect(preview.execution.team.invalidSelectedAgentIds).toEqual(["agent-recon"]);
+      expect(preview.readiness.checks).toContainEqual(expect.objectContaining({
+        id: "contract_specialist_selection",
+        status: "fail",
+      }));
     } finally {
       database.close();
     }
@@ -444,8 +594,12 @@ describe("Command OS mission vertical slice", () => {
       expect(overview.summary.activeMissions).toBe(3);
       expect(overview.missions).toHaveLength(3);
       expect(overview.system.database).toBe("healthy");
-      expect(overview.system.providers).toBe("unknown");
-      expect(overview.agents).toEqual([]);
+      expect(overview.system.providers).toBe("healthy");
+      expect(overview.agents).toEqual([{
+        id: "agent-recon",
+        name: "Recon specialist",
+        status: "available",
+      }]);
     } finally {
       database.close();
     }

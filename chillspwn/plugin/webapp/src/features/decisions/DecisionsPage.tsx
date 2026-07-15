@@ -1,28 +1,159 @@
 import { type FormEvent, useState } from "react";
-import { fetchOverview } from "../../data/api/commandOs";
+import { operationsApi } from "../../data/api/operations";
 import { runtimeV2Api } from "../../data/api/runtimeV2";
 import { useQuery } from "../../data/cache/QueryProvider";
+import type {
+  AdministrativeApprovalInboxRecord,
+  AutonomousContractInboxRecord,
+  AutonomousExceptionInboxRecord,
+  DecisionInboxKind,
+  DecisionInboxRecord,
+  GuidedDecisionInboxRecord,
+} from "../../domain/types/operations";
 import type { GuidedDecision, GuidedDecisionControl } from "../../domain/types/runtimeV2";
 import { Button, ButtonLink, Card, ErrorPanel, PageHeader, StatusPill } from "../../design-system/components/Primitives";
-import { DegradedNotice, FilterForm, formatTime, JsonDetails, QueryBoundary, SelectFilter, StreamState, useActionState, useUrlFilters } from "../runs/OperationalSurface";
+import { CursorControls, FilterForm, formatTime, JsonDetails, QueryBoundary, SelectFilter, StreamState, useActionState, useUrlFilters } from "../runs/OperationalSurface";
+
+const SECTION_ORDER: DecisionInboxKind[] = [
+  "autonomous_exception",
+  "administrative_approval",
+  "guided_decision",
+  "autonomous_contract",
+];
+
+const SECTION_LABELS: Record<DecisionInboxKind, { title: string; description: string }> = {
+  autonomous_exception: {
+    title: "Autonomous safe stops and exceptions",
+    description: "Explicit canonical exception events. These records never become mid-run approval prompts.",
+  },
+  administrative_approval: {
+    title: "Administrative approvals",
+    description: "Future policy, configuration, and review decisions. Resolving one never resumes Autonomous execution.",
+  },
+  guided_decision: {
+    title: "Guided exact-step decisions",
+    description: "One fingerprint-bound operator choice for each represented consequential Guided step.",
+  },
+  autonomous_contract: {
+    title: "Autonomous mission contracts",
+    description: "Versioned authority and boundary records, including signed and historical contract lineage.",
+  },
+};
 
 export default function DecisionsPage() {
-  const filters = useUrlFilters({ status: "pending", limit: "100" });
-  const decisions = useQuery(`guided-decisions:${filters.key}`, (signal) => runtimeV2Api.decisions({ status: filters.values.status, runId: filters.values.runId, limit: Number(filters.values.limit ?? 100) }, signal), { staleTime: 0 });
-  const overview = useQuery("command-os-overview", fetchOverview, { staleTime: 0 });
-  const exceptions = overview.data?.attention.filter((item) => /safe|block|recover|policy|budget|fail/iu.test(`${item.type} ${item.severity} ${item.title}`)) ?? [];
+  const filters = useUrlFilters({ limit: "50" });
+  const inbox = useQuery(`decision-inbox:${filters.key}`, (signal) => operationsApi.decisionInbox({
+    kind: filters.values.kind,
+    status: filters.values.status,
+    missionId: filters.values.missionId,
+    runId: filters.values.runId,
+    query: filters.values.query,
+    cursor: filters.values.cursor,
+    limit: Number(filters.values.limit ?? 50),
+  }, signal), { staleTime: 0 });
   return <div className="os-page"><PageHeader eyebrow="Deliberate control" title="Decisions" description="Exact Guided-step decisions and real Autonomous exceptions. Autonomous runs never wait here for routine approval." actions={<StreamState />} />
-    <FilterForm filters={filters} searchKey="runId" searchLabel="Run ID"><SelectFilter filters={filters} name="status" label="Decision state" options={["pending", "approved", "manual", "alternative", "rejected", "expired", "cancelled"].map((value) => ({ value, label: value }))} /></FilterForm>
-    {overview.error && <DegradedNotice>Autonomous exception summary is unavailable; Guided decisions remain authoritative.</DegradedNotice>}
-    {exceptions.length > 0 && <section><h2>Autonomous exceptions and system attention</h2><div className="os-attention-list">{exceptions.map((item) => <Card key={item.id}><div className="os-card-heading"><h3>{item.title}</h3><StatusPill status={item.severity} /></div><p>{item.summary}</p>{item.missionId && <ButtonLink variant="secondary" href={`/missions/${encodeURIComponent(item.missionId)}`}>Open mission</ButtonLink>}</Card>)}</div></section>}
-    <section><h2>Guided step decisions</h2><QueryBoundary data={decisions.data?.items} error={decisions.error} isLoading={decisions.isLoading} onRetry={decisions.refresh} emptyTitle="No Guided decisions match" emptyDescription="Guided missions will create one exact, expiring decision for each consequential represented action.">{(items) => <div className="os-decision-grid">{items.map((decision) => <DecisionCard key={decision.id} decision={decision} onChanged={decisions.refresh} />)}</div>}</QueryBoundary></section>
+    <FilterForm filters={filters} searchKey="query" searchLabel="Mission, run, record, or event">
+      <SelectFilter filters={filters} name="kind" label="Record type" options={SECTION_ORDER.map((kind) => ({ value: kind, label: SECTION_LABELS[kind].title }))} />
+      <SelectFilter filters={filters} name="status" label="State" options={["pending", "attention", "post_run", "draft", "confirmed", "superseded", "revoked", "approved", "manual", "alternative", "rejected", "expired", "cancelled"].map((value) => ({ value, label: value.replaceAll("_", " ") }))} />
+      <label><span>Mission ID</span><input value={filters.values.missionId ?? ""} onChange={(event) => filters.set({ missionId: event.target.value || undefined })} /></label>
+      <label><span>Run ID</span><input value={filters.values.runId ?? ""} onChange={(event) => filters.set({ runId: event.target.value || undefined })} /></label>
+    </FilterForm>
+    <QueryBoundary data={inbox.data?.items} error={inbox.error} isLoading={inbox.isLoading} onRetry={inbox.refresh} emptyTitle="No canonical decision records match" emptyDescription="No signed contract, explicit exception, administrative approval, or exact Guided decision matches these filters.">{(items) => <DecisionInboxSections items={items} onChanged={inbox.refresh} />}</QueryBoundary>
+    <CursorControls nextCursor={inbox.data?.nextCursor ?? null} cursor={filters.values.cursor} onChange={(cursor) => filters.set({ cursor }, { resetCursor: false, replace: false })} />
   </div>;
+}
+
+export function DecisionInboxSections({ items, onChanged }: { items: DecisionInboxRecord[]; onChanged: () => void }) {
+  return <>{SECTION_ORDER.map((kind) => {
+    const records = items.filter((item) => item.kind === kind);
+    if (!records.length) return null;
+    const section = SECTION_LABELS[kind];
+    return <section key={kind} aria-labelledby={`decision-section-${kind}`}>
+      <div className="os-section-heading"><div><h2 id={`decision-section-${kind}`}>{section.title}</h2><p>{section.description}</p></div><StatusPill status="canonical">{records.length} on this page</StatusPill></div>
+      <div className="os-decision-grid">{records.map((record) => <DecisionInboxCard key={`${record.kind}:${record.id}`} record={record} onChanged={onChanged} />)}</div>
+    </section>;
+  })}</>;
+}
+
+function DecisionInboxCard({ record, onChanged }: { record: DecisionInboxRecord; onChanged: () => void }) {
+  if (record.kind === "guided_decision") return <GuidedInboxCard record={record} onChanged={onChanged} />;
+  if (record.kind === "autonomous_contract") return <ContractCard record={record} />;
+  if (record.kind === "autonomous_exception") return <ExceptionCard record={record} />;
+  return <AdministrativeApprovalCard record={record} onChanged={onChanged} />;
+}
+
+function GuidedInboxCard({ record, onChanged }: { record: GuidedDecisionInboxRecord; onChanged: () => void }) {
+  const decision: GuidedDecision = {
+    id: record.id,
+    missionId: record.mission.id,
+    runId: record.run.id,
+    stepId: record.exactStep.stepId,
+    status: record.status as GuidedDecision["status"],
+    actionFingerprint: record.exactStep.actionFingerprint,
+    requestedParameters: record.exactStep.requestedParameters,
+    rationale: record.exactStep.rationale,
+    riskClass: record.exactStep.riskClass,
+    reversibility: record.exactStep.reversibility,
+    expiresAt: record.expiresAt ?? record.createdAt,
+    createdAt: record.createdAt,
+  };
+  return <DecisionCard decision={decision} onChanged={onChanged} />;
+}
+
+function ContractCard({ record }: { record: AutonomousContractInboxRecord }) {
+  return <Card>
+    <div className="os-card-heading"><div><p className="os-eyebrow">Mission contract · v{record.contract.version}</p><h3>{record.title}</h3></div><StatusPill status={record.contract.state} /></div>
+    <p>{record.summary}</p>
+    <dl className="os-key-values"><div><dt>Mission</dt><dd>{record.mission.name}</dd></div><div><dt>Contract hash</dt><dd className="os-mono">{record.contract.hash.slice(0, 16)}…</dd></div><div><dt>Confirmed by</dt><dd>{record.contract.confirmedBy ?? "Not confirmed"}</dd></div><div><dt>Confirmed</dt><dd>{formatTime(record.contract.confirmedAt)}</dd></div></dl>
+    <ButtonLink variant="secondary" href={record.deepLink}>Open contract settings</ButtonLink>
+  </Card>;
+}
+
+function ExceptionCard({ record }: { record: AutonomousExceptionInboxRecord }) {
+  return <Card>
+    <div className="os-card-heading"><div><p className="os-eyebrow">{record.exception.phase === "post_run" ? "Post-run exception" : "Active safe stop"}</p><h3>{record.title}</h3></div><StatusPill status={record.status} /></div>
+    <p>{record.summary}</p>
+    <dl className="os-key-values"><div><dt>Mission</dt><dd>{record.mission.name}</dd></div><div><dt>Run state</dt><dd>{record.run.status}</dd></div><div><dt>Event</dt><dd className="os-mono">{record.exception.eventType} #{record.exception.sequence}</dd></div><div><dt>Category</dt><dd>{record.exception.category ?? record.exception.code ?? "Not classified"}</dd></div></dl>
+    <p className="os-muted">This is an immutable exception record, not an approval request. Continue only through an in-contract recovery, a new run, or a versioned contract amendment.</p>
+    <JsonDetails label="Redacted exception detail" value={record.exception.details} />
+    <ButtonLink variant="secondary" href={record.deepLink}>Open run recovery</ButtonLink>
+  </Card>;
+}
+
+export function AdministrativeApprovalCard({ record, onChanged }: { record: AdministrativeApprovalInboxRecord; onChanged: () => void }) {
+  const [reason, setReason] = useState("");
+  const action = useActionState();
+  const submit = (status: "approved" | "rejected", event: { preventDefault(): void }): void => {
+    event.preventDefault();
+    void action.run(
+      () => operationsApi.reviewAdministrativeApproval(
+        record.id,
+        { status, reason },
+        `administrative-review-${crypto.randomUUID()}`,
+      ).then(onChanged),
+      status === "approved"
+        ? "Administrative record approved. No runtime work was resumed."
+        : "Administrative record rejected. No runtime work was changed.",
+    );
+  };
+  return <Card>
+    <div className="os-card-heading"><div><p className="os-eyebrow">Administrative · {record.approval.approvalType.replaceAll("_", " ")}</p><h3>{record.title}</h3></div><StatusPill status={record.status} /></div>
+    <p>{record.summary}</p>
+    <dl className="os-key-values"><div><dt>Requested by</dt><dd>{record.approval.requestedBy}</dd></div><div><dt>Policy rule</dt><dd>{record.approval.policyRule ?? "Not specified"}</dd></div><div><dt>Mission</dt><dd>{record.mission?.name ?? "System-wide"}</dd></div><div><dt>Expires</dt><dd>{formatTime(record.expiresAt)}</dd></div></dl>
+    <JsonDetails label="Redacted administrative request" value={record.approval.request} />
+    {record.approval.reviewAvailable ? <form onSubmit={(event) => submit("approved", event)}>
+      <label><span>Required administrative decision reason</span><input required minLength={2} maxLength={2000} value={reason} onChange={(event) => setReason(event.target.value)} /></label>
+      <div className="os-inline-actions"><Button disabled={action.pending || reason.trim().length < 2}>Approve for future/admin effect</Button><Button type="button" variant="danger" disabled={action.pending || reason.trim().length < 2} onClick={(event) => submit("rejected", event)}>Reject</Button></div>
+      <p className="os-muted">This review updates only the administrative record and audit chain. It cannot authorize or resume an Autonomous action.</p>
+    </form> : <p className="os-muted">{record.approval.reviewUnavailableReason ?? "This record is read only."}</p>}
+    <ButtonLink variant="secondary" href={record.deepLink}>Open related context</ButtonLink>
+    {action.error && <ErrorPanel error={action.error} />}{action.message && <p className="os-success-note" role="status">{action.message}</p>}
+  </Card>;
 }
 
 export function DecisionCard({ decision, onChanged }: { decision: GuidedDecision; onChanged: () => void }) {
   const [authorizationNote, setAuthorizationNote] = useState("");
   const [rejectionReason, setRejectionReason] = useState("");
-  const [completionSummary, setCompletionSummary] = useState("");
   const [skipReason, setSkipReason] = useState("");
   const [stopReason, setStopReason] = useState("");
   const [stopConfirmed, setStopConfirmed] = useState(false);
@@ -38,9 +169,7 @@ export function DecisionCard({ decision, onChanged }: { decision: GuidedDecision
       expectedFingerprint: decision.actionFingerprint,
       expectedParameters: decision.requestedParameters,
     };
-    const body = operation === "manual-result"
-      ? { ...exact, summary: completionSummary }
-      : operation === "reject"
+    const body = operation === "reject"
         ? { ...exact, reason: rejectionReason }
         : operation === "stop"
           ? { ...exact, reason: stopReason }
@@ -51,9 +180,7 @@ export function DecisionCard({ decision, onChanged }: { decision: GuidedDecision
       ? "Exact step authorized."
       : operation === "reject"
         ? "Step rejected; the runtime will form a new represented approach."
-        : operation === "manual-result"
-          ? "Exact step completed from the reviewed manual result; canonical execution advanced."
-          : operation === "stop"
+        : operation === "stop"
             ? "Mission stopped; open work was cancelled and the exact-step control was audited."
             : "Exact step skipped; canonical execution moved to the next valid checkpoint.";
     void action.run(
@@ -77,18 +204,15 @@ export function DecisionCard({ decision, onChanged }: { decision: GuidedDecision
         <form onSubmit={(event) => submit("approve", event)}>
           <label><span>Optional authorization note</span><input maxLength={2000} value={authorizationNote} onChange={(event) => setAuthorizationNote(event.target.value)} /></label>
           {manualOnly
-            ? <p className="os-muted">This operator-run step cannot be dispatched through MCP. Perform only the represented procedure, then use the separate completion control below.</p>
+            ? <p className="os-muted">This operator-run step cannot be dispatched through MCP. Perform only the represented procedure, then open the Guided result review below.</p>
             : <Button disabled={action.pending}>Run this exact step</Button>}
         </form>
       </section>
 
       <section className="os-decision-completion" aria-labelledby={`complete-${decision.id}`}>
-        <h4 id={`complete-${decision.id}`}>Complete and advance after manual execution</h4>
-        <p id={`complete-warning-${decision.id}`}><strong>This is not interpretation.</strong> It attests that you performed this exact represented action, records verified result evidence, marks the step complete, and advances canonical execution.</p>
-        <form onSubmit={(event) => submit("manual-result", event)}>
-          <label><span>Reviewed result summary</span><textarea required maxLength={16_000} value={completionSummary} onChange={(event) => setCompletionSummary(event.target.value)} aria-describedby={`complete-warning-${decision.id}`} /></label>
-          <Button variant="secondary" disabled={action.pending || !completionSummary.trim()}>Complete exact step and advance</Button>
-        </form>
+        <h4 id={`complete-${decision.id}`}>I ran it — submit and interpret output</h4>
+        <p>Manual completion is evidence-gated. Submit bounded output in the Guided workspace, review the persisted Commander interpretation, then deliberately accept that evidence to advance.</p>
+        <ButtonLink variant="secondary" href={`/guided/${encodeURIComponent(decision.missionId)}`}>Open Guided result review</ButtonLink>
       </section>
 
       <section aria-labelledby={`change-${decision.id}`}>

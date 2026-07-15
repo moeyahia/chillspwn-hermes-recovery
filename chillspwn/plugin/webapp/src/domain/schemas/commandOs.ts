@@ -2,16 +2,25 @@ import type {
   AgentSummary,
   AttentionItem,
   AutonomousContextCandidate,
+  AutonomousBranchContext,
+  AutonomousBranchPreflight,
+  AutonomousBranchResult,
+  AutonomousMissionRequest,
   AutonomousMissionPreflight,
   CreatedMission,
   Journey,
   MissionRecord,
   MissionPage,
+  MissionBulkArchiveResult,
+  MissionBulkExportResult,
+  MissionPortfolioFilterState,
   MissionSummary,
   OperationalEvent,
   OverviewSnapshot,
   ReadinessCheck,
   RunStatus,
+  SavedMissionViewCollection,
+  VersionedAutonomousMissionPreflight,
 } from "../types/commandOs";
 
 type UnknownRecord = Record<string, unknown>;
@@ -32,8 +41,29 @@ function optionalText(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value : undefined;
 }
 
+function nullableText(value: unknown): string | null {
+  return typeof value === "string" && value.trim() ? value : null;
+}
+
 function finiteNumber(value: unknown, label: string): number {
   if (typeof value !== "number" || !Number.isFinite(value)) throw new Error(`${label} must be a number`);
+  return value;
+}
+
+function nonNegativeInteger(value: unknown, label: string): number {
+  const result = finiteNumber(value, label);
+  if (!Number.isSafeInteger(result) || result < 0) throw new Error(`${label} must be a non-negative integer`);
+  return result;
+}
+
+function sha256Text(value: unknown, label: string): string {
+  const result = text(value, label);
+  if (!/^[a-f0-9]{64}$/u.test(result)) throw new Error(`${label} must be a SHA-256 digest`);
+  return result;
+}
+
+function booleanValue(value: unknown, label: string): boolean {
+  if (typeof value !== "boolean") throw new Error(`${label} must be a boolean`);
   return value;
 }
 
@@ -80,17 +110,76 @@ function parseReadiness(value: unknown): OverviewSnapshot["readiness"] {
 
 function parseMission(value: unknown): MissionSummary {
   const item = record(value, "mission summary");
+  const scope = item.scope && typeof item.scope === "object" && !Array.isArray(item.scope)
+    ? item.scope as UnknownRecord : {};
+  const owner = item.currentOwner && typeof item.currentOwner === "object" && !Array.isArray(item.currentOwner)
+    ? item.currentOwner as UnknownRecord : undefined;
+  const lastEvent = item.lastMeaningfulEvent && typeof item.lastMeaningfulEvent === "object" && !Array.isArray(item.lastMeaningfulEvent)
+    ? item.lastMeaningfulEvent as UnknownRecord : undefined;
+  const budget = item.budget && typeof item.budget === "object" && !Array.isArray(item.budget)
+    ? item.budget as UnknownRecord : {};
+  const numericRecord = (value: unknown): Record<string, number> => {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+    return Object.fromEntries(Object.entries(value as UnknownRecord).flatMap(([key, candidate]) => (
+      typeof candidate === "number" && Number.isFinite(candidate) && candidate >= 0
+        ? [[key, candidate]]
+        : []
+    )));
+  };
   const progress = typeof item.progress === "number" && Number.isFinite(item.progress)
-    ? Math.max(0, Math.min(100, item.progress)) : undefined;
+    ? Math.max(0, Math.min(100, item.progress)) : null;
+  const highestFindingSeverity = ["informational", "low", "medium", "high", "critical"].includes(String(item.highestFindingSeverity))
+    ? item.highestFindingSeverity as MissionSummary["highestFindingSeverity"] : null;
+  const recoveryState = item.recoveryState === "recovering" || item.recoveryState === "blocked"
+    ? item.recoveryState : null;
+  const updatedAt = text(item.updatedAt, "mission updatedAt");
   return {
     id: text(item.id, "mission id"),
     title: text(item.title, "mission title"),
     journey: journey(item.journey, "mission journey"),
     status: text(item.status, "mission status"),
-    updatedAt: text(item.updatedAt, "mission updatedAt"),
-    currentPhase: optionalText(item.currentPhase),
+    missionStatus: optionalText(item.missionStatus) ?? text(item.status, "mission status"),
+    authorizationStatus: optionalText(item.authorizationStatus) ?? "unknown",
+    engagementId: nullableText(item.engagementId),
+    scope: {
+      allowedTargets: list(scope.allowedTargets).flatMap((target) => typeof target === "string" ? [target] : []),
+      allowedTargetCount: typeof scope.allowedTargetCount === "number" && Number.isSafeInteger(scope.allowedTargetCount)
+        ? Math.max(0, scope.allowedTargetCount) : 0,
+      prohibitedTargetCount: typeof scope.prohibitedTargetCount === "number" && Number.isSafeInteger(scope.prohibitedTargetCount)
+        ? Math.max(0, scope.prohibitedTargetCount) : 0,
+    },
+    createdAt: optionalText(item.createdAt) ?? updatedAt,
+    updatedAt,
+    runId: nullableText(item.runId),
+    activeRunId: nullableText(item.activeRunId),
+    runStartedAt: nullableText(item.runStartedAt),
+    runEndedAt: nullableText(item.runEndedAt),
+    currentPhase: nullableText(item.currentPhase),
     progress,
-    nextAction: optionalText(item.nextAction),
+    currentOwner: owner && typeof owner.id === "string"
+      ? { id: owner.id, name: nullableText(owner.name) }
+      : null,
+    team: list(item.team).flatMap((candidate) => {
+      if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return [];
+      const member = candidate as UnknownRecord;
+      return typeof member.id === "string" ? [{ id: member.id, name: nullableText(member.name) }] : [];
+    }),
+    provider: nullableText(item.provider),
+    risk: nullableText(item.risk),
+    evidenceCount: typeof item.evidenceCount === "number" && Number.isSafeInteger(item.evidenceCount)
+      ? Math.max(0, item.evidenceCount) : 0,
+    highestFindingSeverity,
+    decisionState: nullableText(item.decisionState),
+    recoveryState,
+    lastMeaningfulEvent: lastEvent && typeof lastEvent.type === "string"
+      && typeof lastEvent.summary === "string" && typeof lastEvent.occurredAt === "string"
+      ? { type: lastEvent.type, summary: lastEvent.summary, occurredAt: lastEvent.occurredAt }
+      : null,
+    budget: {
+      limits: numericRecord(budget.limits),
+      usage: numericRecord(budget.usage),
+    },
+    nextAction: nullableText(item.nextAction),
   };
 }
 
@@ -178,23 +267,105 @@ function parseContextCandidate(value: unknown): AutonomousContextCandidate {
   };
 }
 
-export function parseAutonomousMissionPreflight(payload: unknown): AutonomousMissionPreflight {
+function parseProviderCandidate(value: unknown): AutonomousMissionPreflight["execution"]["providers"][number] {
+  const item = record(value, "Autonomous provider candidate");
+  if (item.status !== "healthy" && item.status !== "degraded" && item.status !== "unhealthy" && item.status !== "unknown") {
+    throw new Error("Autonomous provider status is invalid");
+  }
+  return {
+    id: text(item.id, "provider candidate id"),
+    status: item.status,
+    authenticated: booleanValue(item.authenticated, "provider authentication state"),
+    enforcesAutonomousBoundary: booleanValue(item.enforcesAutonomousBoundary, "provider enforcement state"),
+    reportsExactTokenUsage: booleanValue(item.reportsExactTokenUsage, "provider token accounting state"),
+    reportsExactCostUsage: booleanValue(item.reportsExactCostUsage, "provider cost accounting state"),
+    compatible: booleanValue(item.compatible, "provider compatibility"),
+    reason: text(item.reason, "provider health explanation"),
+    checkedAt: text(item.checkedAt, "provider checkedAt"),
+  };
+}
+
+function parseToolCandidate(value: unknown): AutonomousMissionPreflight["execution"]["tools"][number] {
+  const item = record(value, "Autonomous tool candidate");
+  if (item.status !== "unknown" && item.status !== "healthy" && item.status !== "degraded" && item.status !== "offline" && item.status !== "quarantined") {
+    throw new Error("Autonomous tool server status is invalid");
+  }
+  return {
+    id: text(item.id, "tool server id"),
+    name: text(item.name, "tool server name"),
+    status: item.status,
+    capabilities: list(item.capabilities).map((entry) => text(entry, "tool capability")),
+    assignedAgentIds: list(item.assignedAgentIds).map((entry) => text(entry, "tool assigned agent ID")),
+    enabled: booleanValue(item.enabled, "tool server enabled state"),
+    startPermitted: booleanValue(item.startPermitted, "tool server start policy"),
+    riskClass: text(item.riskClass, "tool server risk class"),
+    checkedAt: optionalText(item.checkedAt),
+  };
+}
+
+function parseSpecialistCandidate(value: unknown): AutonomousMissionPreflight["execution"]["team"]["candidates"][number] {
+  const item = record(value, "Autonomous specialist candidate");
+  const providerPolicy = record(item.providerPolicy, "specialist provider policy");
+  const toolPolicy = record(item.toolPolicy, "specialist tool policy");
+  if (item.status !== "available" && item.status !== "busy" && item.status !== "degraded" && item.status !== "offline" && item.status !== "quarantined") {
+    throw new Error("Autonomous specialist status is invalid");
+  }
+  return {
+    id: text(item.id, "specialist id"),
+    displayName: text(item.displayName, "specialist display name"),
+    role: text(item.role, "specialist role"),
+    status: item.status,
+    capabilities: list(item.capabilities).map((entry) => text(entry, "specialist capability")),
+    runnableTools: list(item.runnableTools).map((entry) => text(entry, "specialist runnable tool")),
+    mcpServerIds: list(item.mcpServerIds).map((entry) => text(entry, "specialist MCP server ID")),
+    providerPolicy: { defaultProvider: optionalText(providerPolicy.defaultProvider) },
+    toolPolicy: {
+      allowedTools: list(toolPolicy.allowedTools).map((entry) => text(entry, "specialist allowed tool")),
+      deniedTools: list(toolPolicy.deniedTools).map((entry) => text(entry, "specialist denied tool")),
+      approvalRequiredTools: list(toolPolicy.approvalRequiredTools).map((entry) => text(entry, "specialist approval tool")),
+    },
+    compatible: booleanValue(item.compatible, "specialist compatibility"),
+    incompatibilityReasons: list(item.incompatibilityReasons).map((entry) => text(entry, "specialist incompatibility reason")),
+    lastHeartbeatAt: optionalText(item.lastHeartbeatAt),
+  };
+}
+
+function parseAutonomousPreflight(
+  payload: unknown,
+  requireInitialVersion: boolean,
+): VersionedAutonomousMissionPreflight {
   const value = record(unwrap(payload), "Autonomous preflight");
   const contract = record(value.contract, "Autonomous contract review");
   const context = record(value.context, "Autonomous context preview");
+  const execution = record(value.execution, "Autonomous execution preview");
+  const team = record(execution.team, "Autonomous specialist team preview");
   const summary = record(value.policySummary, "Autonomous policy summary");
   if (value.schemaVersion !== "2.1") throw new Error("unsupported Autonomous preflight schema version");
-  if (contract.version !== 1) throw new Error("Autonomous contract version is invalid");
+  const version = finiteNumber(contract.version, "Autonomous contract version");
+  if (!Number.isSafeInteger(version) || version < 1 || (requireInitialVersion && version !== 1)) {
+    throw new Error("Autonomous contract version is invalid");
+  }
   const hash = text(contract.hash, "Autonomous contract hash");
   if (!/^[a-f0-9]{64}$/u.test(hash)) throw new Error("Autonomous contract hash is invalid");
   return {
     schemaVersion: "2.1",
-    contract: { version: 1, hash },
+    contract: { version, hash },
     readiness: parseReadiness(value.readiness),
     context: {
       candidates: list(context.candidates).map(parseContextCandidate),
       selectedNodeIds: list(context.selectedNodeIds).map((item) => text(item, "selected context node ID")),
       invalidSelectedNodeIds: list(context.invalidSelectedNodeIds).map((item) => text(item, "invalid context node ID")),
+    },
+    execution: {
+      providers: list(execution.providers).map(parseProviderCandidate),
+      tools: list(execution.tools).map(parseToolCandidate),
+      team: {
+        candidates: list(team.candidates).map(parseSpecialistCandidate),
+        selectedAgentIds: list(team.selectedAgentIds).map((item) => text(item, "selected specialist ID")),
+        invalidSelectedAgentIds: list(team.invalidSelectedAgentIds).map((item) => text(item, "invalid specialist ID")),
+        recommendedAgentIds: list(team.recommendedAgentIds).map((item) => text(item, "recommended specialist ID")),
+        effectiveAgentIds: list(team.effectiveAgentIds).map((item) => text(item, "effective specialist ID")),
+      },
     },
     policySummary: {
       provider: text(summary.provider, "provider policy summary"),
@@ -207,6 +378,197 @@ export function parseAutonomousMissionPreflight(payload: unknown): AutonomousMis
   };
 }
 
+export function parseAutonomousMissionPreflight(payload: unknown): AutonomousMissionPreflight {
+  return parseAutonomousPreflight(payload, true) as AutonomousMissionPreflight;
+}
+
+function parseNullableText(value: unknown, label: string): string | null {
+  return value === null ? null : text(value, label);
+}
+
+function stringList(value: unknown, label: string): string[] {
+  return list(value).map((item) => text(item, label));
+}
+
+function parseAutonomousRequest(value: unknown): AutonomousMissionRequest {
+  const root = record(value, "Autonomous branch request");
+  const authorization = record(root.authorization, "Autonomous branch authorization");
+  const contract = record(root.contract, "Autonomous branch contract");
+  if (root.journey !== "autonomous" || root.launch !== true) throw new Error("branch request is not Autonomous");
+  if (authorization.authorizationConfirmed !== true) throw new Error("branch authorization is not confirmed");
+  const requiredLiteral = <T extends string>(candidate: unknown, expected: T, label: string): T => {
+    if (candidate !== expected) throw new Error(`${label} is invalid`);
+    return expected;
+  };
+  const destructivePolicy = contract.destructivePolicy;
+  if (destructivePolicy !== "prohibited" && destructivePolicy !== "contract_only") {
+    throw new Error("branch destructive policy is invalid");
+  }
+  const optionalNumber = (candidate: unknown, label: string): number | undefined => (
+    candidate === undefined || candidate === null ? undefined : finiteNumber(candidate, label)
+  );
+  return {
+    journey: "autonomous",
+    launch: true,
+    title: text(root.title, "branch mission title"),
+    objective: text(root.objective, "branch mission objective"),
+    successCriteria: stringList(root.successCriteria, "branch success criterion"),
+    authorization: {
+      ...(optionalText(authorization.engagementId) ? { engagementId: optionalText(authorization.engagementId) } : {}),
+      allowedTargets: stringList(authorization.allowedTargets, "branch allowed target"),
+      prohibitedTargets: stringList(authorization.prohibitedTargets, "branch prohibited target"),
+      authorizationConfirmed: true,
+      ...(optionalText(authorization.timeWindow) ? { timeWindow: optionalText(authorization.timeWindow) } : {}),
+      ...(optionalText(authorization.dataHandling) ? { dataHandling: optionalText(authorization.dataHandling) } : {}),
+    },
+    contract: {
+      allowedActionClasses: stringList(contract.allowedActionClasses, "branch allowed action class"),
+      prohibitedActionClasses: stringList(contract.prohibitedActionClasses, "branch prohibited action class"),
+      destructivePolicy,
+      evidenceRequirements: stringList(contract.evidenceRequirements, "branch evidence requirement"),
+      timeBudgetMinutes: finiteNumber(contract.timeBudgetMinutes, "branch time budget"),
+      ...(optionalNumber(contract.tokenBudget, "branch token budget") === undefined ? {} : { tokenBudget: optionalNumber(contract.tokenBudget, "branch token budget") }),
+      ...(optionalNumber(contract.costBudget, "branch cost budget") === undefined ? {} : { costBudget: optionalNumber(contract.costBudget, "branch cost budget") }),
+      retryBudget: finiteNumber(contract.retryBudget, "branch retry budget"),
+      replanBudget: finiteNumber(contract.replanBudget, "branch replan budget"),
+      concurrencyLimit: finiteNumber(contract.concurrencyLimit, "branch concurrency limit"),
+      evidenceStorageBudgetBytes: finiteNumber(contract.evidenceStorageBudgetBytes, "branch evidence storage budget"),
+      artifactStorageBudgetBytes: finiteNumber(contract.artifactStorageBudgetBytes, "branch artifact storage budget"),
+      notificationPolicy: requiredLiteral(contract.notificationPolicy, "in_app_only", "branch notification policy"),
+      reportingFormat: requiredLiteral(contract.reportingFormat, "command_os_json", "branch reporting format"),
+      dataHandlingPolicy: requiredLiteral(contract.dataHandlingPolicy, "local_private", "branch data handling policy"),
+      retentionPolicy: requiredLiteral(contract.retentionPolicy, "operator_managed", "branch retention policy"),
+      providerPolicy: requiredLiteral(contract.providerPolicy, "automatic_enforcing_only", "branch provider policy"),
+      toolPolicy: requiredLiteral(contract.toolPolicy, "contract_allowlist", "branch tool policy"),
+      specialistAgentIds: stringList(contract.specialistAgentIds, "branch specialist ID"),
+      memoryScopes: stringList(contract.memoryScopes, "branch memory scope"),
+      contextNodeIds: stringList(contract.contextNodeIds, "branch context node ID"),
+      safeStopConditions: stringList(contract.safeStopConditions, "branch safe-stop condition"),
+      deliverables: stringList(contract.deliverables, "branch deliverable"),
+    },
+  };
+}
+
+function parseBranchMode(value: unknown): AutonomousBranchPreflight["mode"] {
+  if (value === "unchanged_contract" || value === "contract_amendment") return value;
+  throw new Error("Autonomous branch mode is invalid");
+}
+
+function parseVersionedPreflight(value: unknown): VersionedAutonomousMissionPreflight {
+  return parseAutonomousPreflight(value, false);
+}
+
+export function parseAutonomousBranchContext(payload: unknown): AutonomousBranchContext {
+  const root = record(unwrap(payload), "Autonomous branch context");
+  const mission = record(root.mission, "branch mission");
+  const sourceRun = record(root.sourceRun, "branch source run");
+  const contract = record(root.contract, "branch contract");
+  if (root.schemaVersion !== "2.1") throw new Error("unsupported branch context schema version");
+  const hash = text(contract.hash, "branch contract hash");
+  if (!/^[a-f0-9]{64}$/u.test(hash)) throw new Error("branch contract hash is invalid");
+  return {
+    schemaVersion: "2.1",
+    mission: {
+      id: text(mission.id, "branch mission ID"),
+      name: text(mission.name, "branch mission name"),
+      version: finiteNumber(mission.version, "branch mission version"),
+    },
+    sourceRun: {
+      id: text(sourceRun.id, "branch source run ID"),
+      status: text(sourceRun.status, "branch source run status"),
+      statusReason: parseNullableText(sourceRun.statusReason, "branch source reason"),
+      version: finiteNumber(sourceRun.version, "branch source version"),
+      safeToBranch: booleanValue(sourceRun.safeToBranch, "branch source safety"),
+      safeToBranchReason: text(sourceRun.safeToBranchReason, "branch source safety reason"),
+    },
+    contract: {
+      id: text(contract.id, "branch contract ID"),
+      version: finiteNumber(contract.version, "branch contract version"),
+      state: text(contract.state, "branch contract state"),
+      hash,
+    },
+    request: parseAutonomousRequest(root.request),
+    history: list(root.history).map((value) => {
+      const item = record(value, "branch contract history");
+      const itemHash = text(item.hash, "history contract hash");
+      if (!/^[a-f0-9]{64}$/u.test(itemHash)) throw new Error("history contract hash is invalid");
+      return {
+        id: text(item.id, "history contract ID"),
+        version: finiteNumber(item.version, "history contract version"),
+        state: text(item.state, "history contract state"),
+        hash: itemHash,
+        sourceContractId: parseNullableText(item.sourceContractId, "history source contract ID"),
+        confirmedBy: parseNullableText(item.confirmedBy, "history confirmer"),
+        confirmedAt: parseNullableText(item.confirmedAt, "history confirmation time"),
+        createdAt: text(item.createdAt, "history creation time"),
+      };
+    }),
+  };
+}
+
+export function parseAutonomousBranchPreflight(payload: unknown): AutonomousBranchPreflight {
+  const root = record(unwrap(payload), "Autonomous branch preflight");
+  const contract = record(root.contract, "branch preflight contract");
+  if (root.schemaVersion !== "2.1") throw new Error("unsupported branch preflight schema version");
+  if (contract.state !== "confirmed" && contract.state !== "draft" && contract.state !== "unpersisted") {
+    throw new Error("branch preflight contract state is invalid");
+  }
+  const hash = text(contract.hash, "branch preflight contract hash");
+  if (!/^[a-f0-9]{64}$/u.test(hash)) throw new Error("branch preflight contract hash is invalid");
+  return {
+    schemaVersion: "2.1",
+    mode: parseBranchMode(root.mode),
+    sourceRunId: text(root.sourceRunId, "branch preflight source run ID"),
+    sourceRunVersion: finiteNumber(root.sourceRunVersion, "branch preflight source version"),
+    safeToBranch: booleanValue(root.safeToBranch, "branch preflight source safety"),
+    safeToBranchReason: text(root.safeToBranchReason, "branch preflight safety reason"),
+    contract: {
+      id: contract.id === null ? null : text(contract.id, "branch preflight contract ID"),
+      version: finiteNumber(contract.version, "branch preflight contract version"),
+      state: contract.state,
+      hash,
+      sourceContractId: text(contract.sourceContractId, "branch source contract ID"),
+    },
+    request: parseAutonomousRequest(root.request),
+    preflight: parseVersionedPreflight(root.preflight),
+  };
+}
+
+export function parseAutonomousBranchResult(payload: unknown): AutonomousBranchResult {
+  const root = record(unwrap(payload), "Autonomous branch result");
+  const run = record(root.run, "Autonomous branch run");
+  const contract = record(root.contract, "Autonomous branch confirmed contract");
+  if (root.schemaVersion !== "2.1" || run.journey !== "autonomous" || run.status !== "planning" || contract.state !== "confirmed") {
+    throw new Error("Autonomous branch result is invalid");
+  }
+  const hash = text(contract.hash, "confirmed branch contract hash");
+  if (!/^[a-f0-9]{64}$/u.test(hash)) throw new Error("confirmed branch contract hash is invalid");
+  const nextUrl = text(root.nextUrl, "Autonomous branch next URL");
+  if (!nextUrl.startsWith("/missions/") || nextUrl.startsWith("//") || nextUrl.includes("\\")) {
+    throw new Error("Autonomous branch next URL is invalid");
+  }
+  return {
+    schemaVersion: "2.1",
+    sourceRunId: text(root.sourceRunId, "Autonomous branch source run ID"),
+    branchMode: parseBranchMode(root.branchMode),
+    run: {
+      id: text(run.id, "Autonomous branch run ID"),
+      missionId: text(run.missionId, "Autonomous branch mission ID"),
+      journey: "autonomous",
+      status: "planning",
+      contractId: text(run.contractId, "Autonomous branch contract ID"),
+      createdAt: text(run.createdAt, "Autonomous branch creation time"),
+    },
+    contract: {
+      id: text(contract.id, "confirmed branch contract ID"),
+      version: finiteNumber(contract.version, "confirmed branch contract version"),
+      state: "confirmed",
+      hash,
+    },
+    nextUrl,
+  };
+}
+
 export function parseMissionPage(payload: unknown): MissionPage {
   const value = record(unwrap(payload), "mission page");
   if (value.schemaVersion !== "2.1") throw new Error("unsupported mission page schema version");
@@ -214,6 +576,136 @@ export function parseMissionPage(payload: unknown): MissionPage {
     schemaVersion: "2.1",
     items: list(value.items).map(parseMission),
     nextCursor: value.nextCursor === null ? null : text(value.nextCursor, "mission page cursor"),
+  };
+}
+
+function parsePortfolioState(value: unknown): MissionPortfolioFilterState {
+  const item = record(value, "mission portfolio state");
+  return {
+    query: optionalText(item.query) ?? "",
+    journey: item.journey === "autonomous" || item.journey === "guided" ? item.journey : "",
+    status: optionalText(item.status) ?? "",
+    engagement: optionalText(item.engagement) ?? "",
+    target: optionalText(item.target) ?? "",
+    agent: optionalText(item.agent) ?? "",
+    provider: optionalText(item.provider) ?? "",
+    updatedFrom: optionalText(item.updatedFrom) ?? "",
+    updatedTo: optionalText(item.updatedTo) ?? "",
+    risk: optionalText(item.risk) ?? "",
+    evidence: item.evidence === "present" || item.evidence === "none" ? item.evidence : "",
+    findingSeverity: optionalText(item.findingSeverity) ?? "",
+    decisionState: optionalText(item.decisionState) ?? "",
+    recoveryState: item.recoveryState === "recovering" || item.recoveryState === "blocked" || item.recoveryState === "none"
+      ? item.recoveryState : "",
+    view: item.view === "board" ? "board" : "table",
+  };
+}
+
+export function parseSavedMissionViewCollection(payload: unknown): SavedMissionViewCollection {
+  const value = record(unwrap(payload), "saved mission views");
+  if (value.schemaVersion !== "2.1") throw new Error("unsupported saved mission view schema version");
+  const version = finiteNumber(value.version, "saved mission view version");
+  if (!Number.isSafeInteger(version) || version < 0) throw new Error("saved mission view version is invalid");
+  return {
+    schemaVersion: "2.1",
+    version,
+    items: list(value.items).map((candidate) => {
+      const item = record(candidate, "saved mission view");
+      return {
+        id: text(item.id, "saved mission view id"),
+        name: text(item.name, "saved mission view name"),
+        state: parsePortfolioState(item.state),
+        createdAt: text(item.createdAt, "saved mission view createdAt"),
+        updatedAt: text(item.updatedAt, "saved mission view updatedAt"),
+      };
+    }),
+  };
+}
+
+function parseBulkOutcome(value: unknown): MissionBulkArchiveResult["outcomes"][number] {
+  const item = record(value, "mission bulk outcome");
+  if (item.status !== "archived" && item.status !== "exported" && item.status !== "ineligible" && item.status !== "not_found") {
+    throw new Error("mission bulk outcome status is invalid");
+  }
+  return {
+    missionId: text(item.missionId, "mission bulk outcome ID"),
+    status: item.status,
+    reason: text(item.reason, "mission bulk outcome reason"),
+  };
+}
+
+export function parseMissionBulkArchive(payload: unknown): MissionBulkArchiveResult {
+  const value = record(unwrap(payload), "mission archive result");
+  if (value.schemaVersion !== "2.1") throw new Error("unsupported mission archive schema version");
+  return {
+    schemaVersion: "2.1",
+    selectionHash: sha256Text(value.selectionHash, "mission archive selection hash"),
+    outcomes: list(value.outcomes).map(parseBulkOutcome),
+    archivedCount: nonNegativeInteger(value.archivedCount, "archived mission count"),
+  };
+}
+
+export function parseMissionBulkExport(payload: unknown): MissionBulkExportResult {
+  const value = record(unwrap(payload), "mission export result");
+  const policy = record(value.policy, "mission export policy");
+  if (value.schemaVersion !== "2.1") throw new Error("unsupported mission export schema version");
+  if (policy.evidenceBlobsIncluded !== false || policy.confidentialPayloadsIncluded !== false) {
+    throw new Error("mission export policy must exclude evidence and confidential payloads");
+  }
+  return {
+    schemaVersion: "2.1",
+    generatedAt: text(value.generatedAt, "mission export generatedAt"),
+    selectionHash: sha256Text(value.selectionHash, "mission export selection hash"),
+    exportSha256: sha256Text(value.exportSha256, "mission export hash"),
+    records: list(value.records).map((candidate) => {
+      const item = record(candidate, "mission export record");
+      const engagement = record(item.engagement, "mission export engagement");
+      const scope = record(item.scope, "mission export scope");
+      const findingCounts = item.findingCounts && typeof item.findingCounts === "object" && !Array.isArray(item.findingCounts)
+        ? item.findingCounts as UnknownRecord : {};
+      const latest = item.latestRun === null ? null : record(item.latestRun, "mission export latest run");
+      return {
+        missionId: text(item.missionId, "mission export mission ID"),
+        titlePreview: text(item.titlePreview, "mission export title preview"),
+        titleSha256: sha256Text(item.titleSha256, "mission export title hash"),
+        titleTruncated: booleanValue(item.titleTruncated, "mission export title truncation"),
+        journey: journey(item.journey, "mission export journey"),
+        missionStatus: text(item.missionStatus, "mission export status"),
+        authorizationStatus: text(item.authorizationStatus, "mission export authorization status"),
+        createdAt: text(item.createdAt, "mission export createdAt"),
+        updatedAt: text(item.updatedAt, "mission export updatedAt"),
+        engagement: {
+          present: booleanValue(engagement.present, "mission export engagement presence"),
+          sha256: engagement.sha256 === null ? null : sha256Text(engagement.sha256, "mission export engagement hash"),
+        },
+        scope: {
+          allowedTargetCount: nonNegativeInteger(scope.allowedTargetCount, "mission export allowed target count"),
+          prohibitedTargetCount: nonNegativeInteger(scope.prohibitedTargetCount, "mission export prohibited target count"),
+          targetSetSha256: sha256Text(scope.targetSetSha256, "mission export target-set hash"),
+        },
+        latestRun: latest ? {
+          id: text(latest.id, "mission export run ID"),
+          status: text(latest.status, "mission export run status"),
+          progress: finiteNumber(latest.progress, "mission export run progress"),
+          phase: nullableText(latest.phase),
+          ownerId: nullableText(latest.ownerId),
+          startedAt: nullableText(latest.startedAt),
+          endedAt: nullableText(latest.endedAt),
+        } : null,
+        evidenceCount: nonNegativeInteger(item.evidenceCount, "mission export evidence count"),
+        findingCounts: Object.fromEntries(Object.entries(findingCounts).map(([severity, count]) => [
+          severity,
+          nonNegativeInteger(count, `mission export ${severity} finding count`),
+        ])),
+      };
+    }),
+    outcomes: list(value.outcomes).map(parseBulkOutcome),
+    policy: {
+      maxBatch: nonNegativeInteger(policy.maxBatch, "mission export maximum batch"),
+      evidenceBlobsIncluded: false,
+      confidentialPayloadsIncluded: false,
+      titlePreviewLimit: nonNegativeInteger(policy.titlePreviewLimit, "mission export title preview limit"),
+    },
   };
 }
 

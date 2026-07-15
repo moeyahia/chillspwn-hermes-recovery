@@ -1,5 +1,14 @@
 export { MissionRuntimeEngine, createMissionRuntime } from "./MissionRuntimeEngine";
 export { RuntimeRepository } from "./RuntimeRepository";
+export {
+  RuntimeContinuationRepository,
+  RUNTIME_CONTINUATION_KINDS,
+} from "./RuntimeContinuationRepository";
+export type {
+  RuntimeContinuation,
+  RuntimeContinuationKind,
+  RuntimeContinuationStatus,
+} from "./RuntimeContinuationRepository";
 export { validateMissionPlanDraft } from "./validation";
 export type {
   CompletionCriterion,

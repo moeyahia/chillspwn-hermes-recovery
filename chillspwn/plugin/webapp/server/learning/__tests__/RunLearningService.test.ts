@@ -171,10 +171,16 @@ describe("RunLearningService", () => {
         repeatedActionAvoidance: 0.5,
       });
       expect(first.metrics).toMatchObject({
+        timeToFirstMeaningfulEvidenceMs: 300_000,
         actionCount: 2,
+        actionsWithMeaningfulProgress: 0,
+        noProgressActionCount: 2,
         uniqueActionFingerprints: 1,
         verifiedEvidenceCount: 1,
         autonomousUserWaitCount: 0,
+        operatorInterventionCount: 0,
+        memoryContextPrecision: null,
+        preferenceCorrectionRate: null,
       });
       expect(first.comparison).toMatchObject({
         status: "insufficient_data",

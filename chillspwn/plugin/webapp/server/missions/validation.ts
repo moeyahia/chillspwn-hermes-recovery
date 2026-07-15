@@ -51,6 +51,17 @@ function requiredLiteral<const T extends string>(
   return expected;
 }
 
+function requiredChoice<const T extends string>(
+  value: unknown,
+  allowed: readonly T[],
+  path: string,
+  issues: string[],
+): T {
+  if (typeof value === "string" && allowed.includes(value as T)) return value as T;
+  issues.push(`${path} must be one of: ${allowed.join(", ")}`);
+  return allowed[0]!;
+}
+
 function stringList(
   value: unknown,
   path: string,
@@ -229,6 +240,14 @@ function parseAutonomous(root: UnknownRecord, issues: string[]): AutonomousMissi
     issues,
     240,
   );
+  const specialistAgentIds = stringList(
+    contract.specialistAgentIds,
+    "contract.specialistAgentIds",
+    issues,
+  );
+  if (specialistAgentIds.some((id) => !/^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,199}$/u.test(id))) {
+    issues.push("contract.specialistAgentIds contains an invalid stable specialist ID");
+  }
   const memoryScopes = stringList(contract.memoryScopes, "contract.memoryScopes", issues);
   const contextNodeIds = stringList(contract.contextNodeIds, "contract.contextNodeIds", issues);
   if (contextNodeIds.some((id) => !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/u.test(id))) {
@@ -280,8 +299,9 @@ function parseAutonomous(root: UnknownRecord, issues: string[]): AutonomousMissi
     contract: {
       allowedActionClasses,
       prohibitedActionClasses,
-      destructivePolicy: requiredText(
+      destructivePolicy: requiredChoice(
         contract.destructivePolicy,
+        ["prohibited", "contract_only"] as const,
         "contract.destructivePolicy",
         issues,
       ),
@@ -334,6 +354,7 @@ function parseAutonomous(root: UnknownRecord, issues: string[]): AutonomousMissi
         "contract.toolPolicy",
         issues,
       ),
+      specialistAgentIds,
       memoryScopes,
       contextNodeIds,
       safeStopConditions: stringList(

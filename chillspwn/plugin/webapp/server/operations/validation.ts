@@ -145,6 +145,24 @@ export function requiredText(value: unknown, label: string, maximum = 4_000): st
   return value.trim();
 }
 
+/**
+ * Validate operator-authored text before it crosses an immutable audit/event
+ * boundary. Rejection is intentional: redacting only the audit copy would make
+ * the persisted reason differ from the operator's deliberate authorization.
+ */
+export function requiredSafeReason(value: unknown, label: string, maximum = 2_000): string {
+  const reason = requiredText(value, label, maximum);
+  if (redactString(reason) !== reason) {
+    throw new OperationsApiError(422, "sensitive_material_not_retained", "Sensitive material was rejected", {
+      humanMessage: `${label} appears to contain authentication or credential material and was not retained.`,
+      category: "policy_denied",
+      details: { field: label, rejection: "credential_like_material" },
+      remediation: "Remove the sensitive value and reference the protected credential by an opaque identifier instead.",
+    });
+  }
+  return reason;
+}
+
 export function requiredPositiveInteger(value: unknown, label: string): number {
   if (!Number.isSafeInteger(value) || Number(value) < 1) {
     throw new OperationsApiError(400, "invalid_request", `${label} is invalid`, {
@@ -190,6 +208,41 @@ export function sanitizeJson(value: unknown, depth = 0): unknown {
     return safe;
   }
   return value;
+}
+
+function configuredRedactionPaths(metadata: unknown): readonly string[] {
+  if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) return [];
+  const record = metadata as Record<string, unknown>;
+  const configured = Array.isArray(record.paths)
+    ? record.paths
+    : Array.isArray(record.fields)
+      ? record.fields
+      : [];
+  return configured
+    .filter((entry): entry is string => typeof entry === "string")
+    .map((entry) => entry.trim())
+    .filter(Boolean)
+    .slice(0, 200);
+}
+
+function redactConfiguredPath(value: unknown, segments: readonly string[]): unknown {
+  if (segments.length === 0 || !value || typeof value !== "object" || Array.isArray(value)) return value;
+  const [head, ...tail] = segments;
+  if (!head || !Object.prototype.hasOwnProperty.call(value, head)) return value;
+  const record = value as Record<string, unknown>;
+  return {
+    ...record,
+    [head]: tail.length === 0 ? "[REDACTED]" : redactConfiguredPath(record[head], tail),
+  };
+}
+
+/** Apply producer-declared redaction paths in addition to projection-level secret defense. */
+export function sanitizeJsonWithRedaction(value: unknown, metadata: unknown): unknown {
+  let result = sanitizeJson(value);
+  for (const path of configuredRedactionPaths(metadata)) {
+    result = redactConfiguredPath(result, path.split(".").filter(Boolean));
+  }
+  return result;
 }
 
 export function isSensitiveSettingKey(key: string): boolean {

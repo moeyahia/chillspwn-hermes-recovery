@@ -4,6 +4,7 @@ import {
   lstatSync,
   mkdirSync,
   readFileSync,
+  readdirSync,
   renameSync,
   rmSync,
   statSync,
@@ -18,6 +19,10 @@ import {
 } from "../memory/MemoryControlPolicy";
 import {
   assertReusableMemoryText,
+  MEMORY_LIFECYCLE_STATES,
+  MEMORY_NODE_TYPES,
+  MEMORY_SCOPE_KINDS,
+  MEMORY_SENSITIVITIES,
   MemoryRepository,
   REUSABLE_MEMORY_LIMITS,
   ReusableMemorySafetyError,
@@ -32,11 +37,20 @@ import {
   renderObsidianNote,
   vaultRelativePath,
 } from "./ObsidianMarkdown";
-import { safeVaultSegment, VaultPathPolicy } from "./VaultPathPolicy";
+import {
+  safeVaultSegment,
+  VaultDestinationChangedError,
+  VaultPathPolicy,
+} from "./VaultPathPolicy";
 import { obsidianDeepLink } from "./ObsidianDeepLink";
 import { writePortableZip, type PortableZipEntry } from "./PortableZip";
 import type {
   VaultConnection,
+  VaultBulkExportCounts,
+  VaultBulkExportIssue,
+  VaultBulkExportOptions,
+  VaultBulkExportProgress,
+  VaultBulkExportResult,
   VaultImportResult,
   VaultNote,
   VaultPortableExport,
@@ -76,6 +90,8 @@ interface BridgeOptions {
   readonly createId?: (prefix: string) => string;
 }
 
+type Mutable<T> = { -readonly [Key in keyof T]: T[Key] };
+
 interface CanonicalVaultAttachment {
   readonly artifactId: string;
   readonly missionId: string;
@@ -102,6 +118,9 @@ interface ArtifactRow {
 
 const MAX_ATTACHMENT_BYTES = 32 * 1024 * 1024;
 const MAX_ATTACHMENTS_PER_NOTE = 32;
+const MAX_BULK_EXPORT_NOTES = 50_000;
+const MAX_BULK_EXPORT_CONCURRENCY = 32;
+const MAX_BULK_EXPORT_ISSUES = 100;
 const ATTACHMENT_EXTENSIONS = new Map<string, string>([
   [".avif", "image/avif"],
   [".csv", "text/csv"],
@@ -173,6 +192,66 @@ function connectionFromRow(row: ConnectionRow): VaultConnection {
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
+}
+
+function boundedExportError(error: unknown): string {
+  const message = error instanceof Error ? error.message.toLowerCase() : "";
+  if (error instanceof ReusableMemorySafetyError || message.includes("reusable-memory safety")) {
+    return "Canonical memory content was rejected by the reusable-memory safety policy";
+  }
+  if (message.includes("outside the vault connection")) {
+    return "Canonical memory is outside this vault connection's explicit sync scope";
+  }
+  if (message.includes("synchronization is not permitted") || message.includes("memory control policy")) {
+    return "Obsidian synchronization is disabled by the current memory control policy";
+  }
+  if (message.includes("symbolic link") || message.includes("symlink")) {
+    return "Managed vault path safety validation rejected a symbolic link";
+  }
+  if (message.includes("traversal") || message.includes("escapes") || message.includes("outside its configured root")) {
+    return "Managed vault path safety validation rejected an out-of-scope path";
+  }
+  if (message.includes("attachment")) {
+    return "Canonical attachment projection failed integrity or scope validation";
+  }
+  if (message.includes("memory node not found")) {
+    return "Canonical memory node was not found";
+  }
+  return "Canonical note export failed validation; inspect restricted server diagnostics";
+}
+
+class VaultCanonicalChangedError extends Error {
+  constructor() {
+    super("Canonical memory changed while an atomic projection was being prepared");
+    this.name = "VaultCanonicalChangedError";
+  }
+}
+
+class VaultSyncPolicyRevokedError extends Error {
+  constructor() {
+    super("Obsidian synchronization was disabled while bulk export was running");
+    this.name = "VaultSyncPolicyRevokedError";
+  }
+}
+
+export class VaultBulkExportAbortError extends Error {
+  readonly result: VaultBulkExportResult;
+
+  constructor(result: VaultBulkExportResult) {
+    super(`Obsidian vault export aborted after ${result.processed} of ${result.total} notes`);
+    this.name = "AbortError";
+    this.result = result;
+  }
+}
+
+export class VaultBulkExportPolicyError extends Error {
+  readonly result: VaultBulkExportResult;
+
+  constructor(result: VaultBulkExportResult) {
+    super(`Obsidian vault export stopped by policy after ${result.processed} of ${result.total} notes`);
+    this.name = "VaultBulkExportPolicyError";
+    this.result = result;
+  }
 }
 
 /**
@@ -307,7 +386,11 @@ export class ObsidianVaultBridge {
     return obsidianDeepLink(connection, relativePath);
   }
 
-  renderNode(nodeId: string): {
+  renderNode(
+    nodeId: string,
+    connection?: VaultConnection,
+    allowedTargetIds?: ReadonlySet<string>,
+  ): {
     node: MemoryNode;
     text: string;
     relativePath: string;
@@ -317,18 +400,29 @@ export class ObsidianVaultBridge {
     const sources = this.#database.prepare(`
       SELECT source_id AS sourceId FROM memory_sources WHERE node_id = ? ORDER BY acquired_at
     `).all(nodeId) as Array<{ sourceId: string }>;
+    const now = this.#now();
     const rows = this.#database.prepare(`
-      SELECT target_node_id FROM memory_edges
-      WHERE source_node_id = ? AND lifecycle_status IN ('confirmed', 'verified')
-        AND (expires_at IS NULL OR expires_at > ?)
-      ORDER BY created_at
-    `).all(nodeId, this.#now()) as Array<{ target_node_id: string }>;
-    const outgoing = this.#memory.listEdges(nodeId)
-      .filter((edge) => edge.sourceNodeId === nodeId)
-      .flatMap((edge) => {
-        const target = this.#memory.getNode(edge.targetNodeId);
-        return target ? [{ edge, target }] : [];
-      });
+      SELECT edge.target_node_id
+      FROM memory_edges edge
+      JOIN memory_nodes target ON target.id = edge.target_node_id
+      WHERE edge.source_node_id = ?
+        AND edge.lifecycle_status IN ('confirmed', 'verified')
+        AND (edge.expires_at IS NULL OR edge.expires_at > ?)
+        AND target.lifecycle_status IN ('confirmed', 'verified')
+        AND (target.expires_at IS NULL OR target.expires_at > ?)
+      ORDER BY edge.created_at
+    `).all(nodeId, now, now) as Array<{ target_node_id: string }>;
+    const permittedTargetIds = new Set(rows.map((row) => row.target_node_id));
+    const outgoing = rows.length === 0
+      ? []
+      : this.#memory.listEdges(nodeId)
+        .filter((edge) => edge.sourceNodeId === nodeId && permittedTargetIds.has(edge.targetNodeId))
+        .flatMap((edge) => {
+          const target = this.#memory.getNode(edge.targetNodeId);
+          if (!target || (allowedTargetIds && !allowedTargetIds.has(target.id))) return [];
+          if (connection && !this.#connectionProjectionMatches(connection, target)) return [];
+          return [{ edge, target }];
+        });
     // `rows` intentionally causes SQLite to use the directed adjacency index;
     // the repository mapping above supplies validated domain records.
     void rows;
@@ -352,15 +446,30 @@ export class ObsidianVaultBridge {
     };
   }
 
-  exportNode(connectionId: string, nodeId: string): VaultSyncResult {
+  exportNode(
+    connectionId: string,
+    nodeId: string,
+    allowedTargetIds?: ReadonlySet<string>,
+  ): VaultSyncResult {
+    return this.#exportNodeSync(connectionId, nodeId, 0, allowedTargetIds);
+  }
+
+  #exportNodeSync(
+    connectionId: string,
+    nodeId: string,
+    raceRetry: number,
+    allowedTargetIds?: ReadonlySet<string>,
+  ): VaultSyncResult {
     const connection = this.requireConnection(connectionId);
-    const rendered = this.renderNode(nodeId);
+    const rendered = this.renderNode(nodeId, connection, allowedTargetIds);
     this.#assertProjectionAllowed(rendered.node);
+    this.#assertConnectionProjectionAllowed(connection, rendered.node);
     const state = this.#stateForNode(connectionId, nodeId);
     const relativePath = state?.relative_path ?? rendered.relativePath;
     const filePath = this.#paths.resolveRelative(connection.vaultPath, relativePath, true);
     const databaseHash = hashText(rendered.text);
-    const vaultText = existsSync(filePath) ? readFileSync(filePath, "utf8") : undefined;
+    const vaultBytes = existsSync(filePath) ? readFileSync(filePath) : undefined;
+    const vaultText = vaultBytes?.toString("utf8");
     if (vaultText !== undefined) {
       const quarantined = this.#quarantineUnsafeVaultSource(connection, rendered.node, relativePath, vaultText);
       if (quarantined) return quarantined;
@@ -389,7 +498,29 @@ export class ObsidianVaultBridge {
     }
 
     this.#projectAttachments(connection, rendered.attachments);
-    this.#paths.atomicWrite(connection.vaultPath, relativePath, rendered.text);
+    try {
+      this.#paths.atomicWrite(
+        connection.vaultPath,
+        relativePath,
+        rendered.text,
+        vaultBytes
+          ? {
+              exists: true,
+              sha256: createHash("sha256").update(vaultBytes).digest("hex"),
+              beforeRename: () => this.#assertBulkRenameStillAllowed(connection, rendered.node),
+            }
+          : {
+              exists: false,
+              beforeRename: () => this.#assertBulkRenameStillAllowed(connection, rendered.node),
+            },
+      );
+    } catch (error) {
+      if (
+        (error instanceof VaultDestinationChangedError || error instanceof VaultCanonicalChangedError)
+        && raceRetry < 1
+      ) return this.#exportNodeSync(connectionId, nodeId, raceRetry + 1, allowedTargetIds);
+      throw error;
+    }
     this.#upsertSyncedState(connectionId, rendered.node, relativePath, databaseHash);
     this.#touchConnection(connectionId);
     return {
@@ -401,15 +532,546 @@ export class ObsidianVaultBridge {
     };
   }
 
-  syncNode(connectionId: string, nodeId: string, actor: string): VaultSyncResult {
+  /**
+   * Select canonical notes permitted by both the live memory policy and this
+   * connection's explicit scope. The result is stable and bounded for a single
+   * resumable export invocation.
+   */
+  exportableNodeIds(connectionId: string): readonly string[] {
     const connection = this.requireConnection(connectionId);
-    const rendered = this.renderNode(nodeId);
+    this.assertVaultSyncAllowed();
+    this.#purgeRevokedConnectionProjections(connection);
+    const lifecycleStatuses = this.#connectionScopeValues(
+      connection,
+      "lifecycleStatuses",
+      MEMORY_LIFECYCLE_STATES,
+    ) ?? this.projectionLifecycleStatuses();
+    const permittedLifecycle = lifecycleStatuses.filter((item) =>
+      this.projectionLifecycleStatuses().includes(item as MemoryNode["lifecycleStatus"])
+    );
+    if (permittedLifecycle.length === 0) return [];
+
+    const clauses = [`lifecycle_status IN (${permittedLifecycle.map(() => "?").join(",")})`];
+    const parameters: string[] = [...permittedLifecycle];
+    const addScopeClause = (key: string, column: string, allowed?: readonly string[]): void => {
+      const values = this.#connectionScopeValues(connection, key, allowed);
+      if (!values) return;
+      if (values.length === 0) {
+        clauses.push("0 = 1");
+        return;
+      }
+      clauses.push(`${column} IN (${values.map(() => "?").join(",")})`);
+      parameters.push(...values);
+    };
+    addScopeClause("nodeTypes", "node_type", MEMORY_NODE_TYPES);
+    addScopeClause("scopeKinds", "scope", MEMORY_SCOPE_KINDS);
+    addScopeClause("sensitivities", "sensitivity", MEMORY_SENSITIVITIES);
+    addScopeClause("engagementIds", "engagement_id");
+    addScopeClause("missionIds", "mission_id");
+
+    const rows = this.#database.prepare(`
+      SELECT id FROM memory_nodes
+      WHERE ${clauses.join(" AND ")}
+      ORDER BY updated_at DESC, id
+      LIMIT ${MAX_BULK_EXPORT_NOTES + 1}
+    `).all(...parameters) as Array<{ id: string }>;
+    if (rows.length > MAX_BULK_EXPORT_NOTES) {
+      throw new Error(`A single Obsidian export is limited to ${MAX_BULK_EXPORT_NOTES} canonical notes`);
+    }
+    return rows.map((row) => row.id);
+  }
+
+  #purgeRevokedConnectionProjections(connection: VaultConnection): void {
+    const lifecycleStatuses = this.projectionLifecycleStatuses();
+    const rows = this.#database.prepare(`
+      SELECT node_id, relative_path FROM vault_sync_state
+      WHERE connection_id = ? AND node_id IS NOT NULL
+    `).all(connection.id) as Array<{ node_id: string; relative_path: string }>;
+    const revoked = rows.filter((row) => {
+      const node = this.#memory.getNode(row.node_id, true);
+      return !node
+        || !lifecycleStatuses.includes(node.lifecycleStatus)
+        || !this.#connectionProjectionMatches(connection, node);
+    });
+    if (revoked.length === 0) return;
+
+    const deleteConflicts = this.#database.prepare(`
+      DELETE FROM vault_conflicts WHERE sync_state_id IN (
+        SELECT id FROM vault_sync_state WHERE connection_id = ? AND relative_path = ?
+      )
+    `);
+    const deleteState = this.#database.prepare(`
+      DELETE FROM vault_sync_state WHERE connection_id = ? AND relative_path = ?
+    `);
+    for (const row of revoked) {
+      const path = this.#paths.resolveRelative(connection.vaultPath, row.relative_path);
+      if (existsSync(path)) {
+        const metadata = lstatSync(path);
+        if (!metadata.isFile() && !metadata.isSymbolicLink()) {
+          throw new Error("Revoked vault projection is not a removable file");
+        }
+        rmSync(path, { force: true });
+      }
+      deleteConflicts.run(connection.id, row.relative_path);
+      deleteState.run(connection.id, row.relative_path);
+    }
+
+    // Scope changes invalidate every portable snapshot for this connection.
+    const exportDirectory = this.#paths.resolveRelative(connection.vaultPath, ".chillspwn/exports", true);
+    if (existsSync(exportDirectory)) {
+      for (const archiveName of readdirSync(exportDirectory)) {
+        if (!/^chillspwn-brain-[A-Za-z0-9._-]+\.zip$/u.test(archiveName) || basename(archiveName) !== archiveName) continue;
+        const archivePath = this.#paths.resolveRelative(
+          connection.vaultPath,
+          `.chillspwn/exports/${archiveName}`,
+        );
+        const metadata = lstatSync(archivePath);
+        if (!metadata.isFile() && !metadata.isSymbolicLink()) {
+          throw new Error("Revoked portable vault archive is not a removable file");
+        }
+        rmSync(archivePath, { force: true });
+      }
+    }
+  }
+
+  /**
+   * Bounded, async, individually atomic bulk projection. SQLite sync rows are
+   * committed after each successful note, so rerunning after abort or process
+   * loss skips current versions and resumes without rewriting completed files.
+   */
+  async exportNodes(
+    connectionId: string,
+    nodeIds: readonly string[],
+    options: VaultBulkExportOptions = {},
+  ): Promise<VaultBulkExportResult> {
+    const connection = this.requireConnection(connectionId);
+    this.assertVaultSyncAllowed();
+    const uniqueNodeIds = [...new Set(nodeIds)];
+    if (uniqueNodeIds.length > MAX_BULK_EXPORT_NOTES) {
+      throw new RangeError(`A single Obsidian export is limited to ${MAX_BULK_EXPORT_NOTES} canonical notes`);
+    }
+    const concurrency = options.concurrency ?? 8;
+    if (!Number.isSafeInteger(concurrency) || concurrency < 1 || concurrency > MAX_BULK_EXPORT_CONCURRENCY) {
+      throw new RangeError(`Vault export concurrency must be between 1 and ${MAX_BULK_EXPORT_CONCURRENCY}`);
+    }
+    const progressInterval = options.progressInterval ?? 100;
+    if (!Number.isSafeInteger(progressInterval) || progressInterval < 1 || progressInterval > 10_000) {
+      throw new RangeError("Vault export progress interval must be between 1 and 10000");
+    }
+
+    const startedAt = this.#now();
+    const startedClock = performance.now();
+    const counts: Mutable<VaultBulkExportCounts> = {
+      synced: 0,
+      skipped: 0,
+      databaseAhead: 0,
+      vaultAhead: 0,
+      conflicts: 0,
+      quarantined: 0,
+      failed: 0,
+    };
+    const issues: VaultBulkExportIssue[] = [];
+    let issueSampleTruncated = false;
+    let processed = 0;
+    let nextIndex = 0;
+    let progressQueue = Promise.resolve();
+    let progressFailure: unknown;
+    let policyRevoked = false;
+
+    const progress = (): VaultBulkExportProgress => ({
+      connectionId,
+      total: uniqueNodeIds.length,
+      processed,
+      remaining: uniqueNodeIds.length - processed,
+      counts: { ...counts },
+      elapsedMs: performance.now() - startedClock,
+    });
+    const addIssue = (issue: VaultBulkExportIssue): void => {
+      if (issues.length < MAX_BULK_EXPORT_ISSUES) issues.push(issue);
+      else issueSampleTruncated = true;
+    };
+    const emitProgress = (): Promise<void> => {
+      if (!options.onProgress) return Promise.resolve();
+      const snapshot = progress();
+      progressQueue = progressQueue.then(async () => {
+        if (progressFailure) return;
+        try {
+          await options.onProgress?.(snapshot);
+        } catch (error) {
+          progressFailure = error;
+        }
+      });
+      return progressQueue;
+    };
+    const worker = async (): Promise<void> => {
+      while (!options.signal?.aborted && !progressFailure && !policyRevoked) {
+        if (!this.vaultSyncEnabled()) {
+          policyRevoked = true;
+          return;
+        }
+        const index = nextIndex;
+        nextIndex += 1;
+        if (index >= uniqueNodeIds.length) return;
+        const nodeId = uniqueNodeIds[index]!;
+        try {
+          const exported = await this.#exportNodeAsync(connection, nodeId);
+          if (exported.skipped) counts.skipped += 1;
+          else if (exported.result.status === "synced") counts.synced += 1;
+          else if (exported.result.status === "database_ahead") {
+            counts.databaseAhead += 1;
+            addIssue(this.#bulkIssue(exported.result));
+          } else if (exported.result.status === "vault_ahead") {
+            counts.vaultAhead += 1;
+            addIssue(this.#bulkIssue(exported.result));
+          } else if (exported.result.status === "conflict") {
+            counts.conflicts += 1;
+            addIssue(this.#bulkIssue(exported.result));
+          } else {
+            counts.quarantined += 1;
+            addIssue(this.#bulkIssue(exported.result));
+          }
+        } catch (error) {
+          if (error instanceof VaultSyncPolicyRevokedError) {
+            policyRevoked = true;
+            return;
+          }
+          counts.failed += 1;
+          addIssue({ nodeId, category: "failed", message: boundedExportError(error) });
+        }
+        processed += 1;
+        if (processed % progressInterval === 0) {
+          await emitProgress();
+          await new Promise<void>((resolve) => setImmediate(resolve));
+        }
+      }
+    };
+
+    await Promise.all(Array.from(
+      { length: Math.min(concurrency, Math.max(1, uniqueNodeIds.length)) },
+      () => worker(),
+    ));
+    await progressQueue;
+    if (policyRevoked) this.markConnectionHealth(connectionId, "degraded");
+    else if (
+      processed > 0
+      && counts.failed === processed
+      && counts.synced === 0
+      && counts.skipped === 0
+    ) this.markConnectionHealth(connectionId, "error");
+    else if (
+      counts.failed > 0
+      || counts.databaseAhead > 0
+      || counts.vaultAhead > 0
+      || counts.conflicts > 0
+      || counts.quarantined > 0
+    ) this.markConnectionHealth(connectionId, "degraded");
+    else if (processed > 0) this.#touchConnection(connectionId);
+    const result: VaultBulkExportResult = {
+      ...progress(),
+      startedAt,
+      completedAt: this.#now(),
+      issues,
+      issueSampleTruncated,
+    };
+    if (progressFailure) throw progressFailure;
+    if (policyRevoked) throw new VaultBulkExportPolicyError(result);
+    if (options.signal?.aborted) throw new VaultBulkExportAbortError(result);
+    if (processed !== uniqueNodeIds.length) {
+      throw new Error(`Obsidian vault export stopped after ${processed} of ${uniqueNodeIds.length} notes`);
+    }
+    await emitProgress();
+    await progressQueue;
+    return { ...result, ...progress(), completedAt: this.#now() };
+  }
+
+  #connectionScopeValues(
+    connection: VaultConnection,
+    key: string,
+    allowed?: readonly string[],
+  ): readonly string[] | undefined {
+    const value = connection.syncScope[key];
+    if (value === undefined) return undefined;
+    if (!Array.isArray(value) || value.some((item) => typeof item !== "string" || !item.trim())) {
+      throw new Error(`Vault connection sync scope ${key} must be a string array`);
+    }
+    const values = [...new Set(value as string[])];
+    if (allowed && values.some((item) => !allowed.includes(item))) {
+      throw new Error(`Vault connection sync scope ${key} contains an unsupported value`);
+    }
+    return values;
+  }
+
+  #connectionProjectionMismatch(
+    connection: VaultConnection,
+    node: Pick<MemoryNode, "lifecycleStatus" | "nodeType" | "scope" | "sensitivity">,
+  ): string | undefined {
+    const checks: Array<[string, string | undefined, readonly string[] | undefined]> = [
+      ["lifecycleStatuses", node.lifecycleStatus, MEMORY_LIFECYCLE_STATES],
+      ["nodeTypes", node.nodeType, MEMORY_NODE_TYPES],
+      ["scopeKinds", node.scope.kind, MEMORY_SCOPE_KINDS],
+      ["sensitivities", node.sensitivity, MEMORY_SENSITIVITIES],
+      ["engagementIds", node.scope.engagementId, undefined],
+      ["missionIds", node.scope.missionId, undefined],
+    ];
+    for (const [key, actual, allowed] of checks) {
+      const values = this.#connectionScopeValues(connection, key, allowed);
+      if (values && (!actual || !values.includes(actual))) {
+        return key;
+      }
+    }
+    return undefined;
+  }
+
+  #connectionProjectionMatches(
+    connection: VaultConnection,
+    node: Pick<MemoryNode, "lifecycleStatus" | "nodeType" | "scope" | "sensitivity">,
+  ): boolean {
+    return this.#connectionProjectionMismatch(connection, node) === undefined;
+  }
+
+  #assertConnectionProjectionAllowed(
+    connection: VaultConnection,
+    node: Pick<MemoryNode, "lifecycleStatus" | "nodeType" | "scope" | "sensitivity">,
+  ): void {
+    const mismatch = this.#connectionProjectionMismatch(connection, node);
+    if (mismatch) {
+      throw new Error(`Memory node is outside the vault connection ${mismatch} scope`);
+    }
+  }
+
+  /** Revalidate live memory policy and a connection's explicit projection scope. */
+  assertConnectionNodeAllowed(connectionId: string, nodeId: string): MemoryNode {
+    const connection = this.requireConnection(connectionId);
+    const node = this.#memory.requireNode(nodeId);
+    this.#assertProjectionAllowed(node);
+    this.#assertConnectionProjectionAllowed(connection, node);
+    return node;
+  }
+
+  #bulkIssue(result: VaultSyncResult): VaultBulkExportIssue {
+    const category = result.status === "database_ahead"
+      ? "database_ahead"
+      : result.status === "vault_ahead"
+        ? "vault_ahead"
+        : result.status === "conflict"
+          ? "conflict"
+          : "quarantined";
+    return {
+      nodeId: result.nodeId,
+      category,
+      message: result.message,
+      relativePath: result.relativePath,
+      ...(result.conflictId ? { conflictId: result.conflictId } : {}),
+    };
+  }
+
+  async #exportNodeAsync(
+    connection: VaultConnection,
+    nodeId: string,
+    raceRetry = 0,
+  ): Promise<{ readonly result: VaultSyncResult; readonly skipped: boolean }> {
+    if (!this.vaultSyncEnabled()) throw new VaultSyncPolicyRevokedError();
+    const rendered = this.renderNode(nodeId, connection);
     this.#assertProjectionAllowed(rendered.node);
-    const state = this.#stateForNode(connectionId, nodeId);
-    if (!state) return this.exportNode(connectionId, nodeId);
+    this.#assertConnectionProjectionAllowed(connection, rendered.node);
+    const state = this.#stateForNode(connection.id, nodeId);
+    const relativePath = state?.relative_path ?? rendered.relativePath;
+    const filePath = this.#paths.resolveRelative(connection.vaultPath, relativePath, true);
+    const databaseHash = hashText(rendered.text);
+    const vaultBytes = existsSync(filePath) ? readFileSync(filePath) : undefined;
+    const vaultText = vaultBytes?.toString("utf8");
+    if (vaultText !== undefined) {
+      const quarantined = this.#quarantineUnsafeVaultSource(
+        connection,
+        rendered.node,
+        relativePath,
+        vaultText,
+      );
+      if (quarantined) return { result: quarantined, skipped: false };
+    }
+    const vaultHash = vaultText === undefined ? undefined : hashText(vaultText);
+
+    if (!state && vaultText !== undefined && vaultHash !== databaseHash) {
+      return {
+        result: this.#createConflict(
+          connection,
+          undefined,
+          rendered.node,
+          relativePath,
+          rendered.text,
+          vaultText,
+        ),
+        skipped: false,
+      };
+    }
+    if (state) {
+      const databaseChanged = state.database_content_hash !== databaseHash;
+      const vaultChanged = vaultHash !== undefined && state.vault_content_hash !== vaultHash;
+      if (databaseChanged && vaultChanged && vaultHash !== databaseHash && vaultText !== undefined) {
+        return {
+          result: this.#createConflict(
+            connection,
+            state,
+            rendered.node,
+            relativePath,
+            rendered.text,
+            vaultText,
+          ),
+          skipped: false,
+        };
+      }
+      if (!databaseChanged && vaultChanged && vaultText !== undefined) {
+        this.#updateState(
+          state.id,
+          "vault_ahead",
+          rendered.node.version,
+          databaseHash,
+          vaultHash,
+          undefined,
+          false,
+        );
+        return {
+          result: {
+            connectionId: connection.id,
+            nodeId,
+            relativePath,
+            status: "vault_ahead",
+            message: "The Obsidian note changed and is ready to import",
+          },
+          skipped: false,
+        };
+      }
+      if (
+        state.status === "synced"
+        && state.database_version === rendered.node.version
+        && state.database_content_hash === databaseHash
+        && state.vault_content_hash === databaseHash
+        && vaultHash === databaseHash
+      ) {
+        return {
+          result: {
+            connectionId: connection.id,
+            nodeId,
+            relativePath,
+            status: "synced",
+            message: "Current canonical memory version is already synchronized",
+          },
+          skipped: true,
+        };
+      }
+    }
+
+    this.#projectAttachments(connection, rendered.attachments);
+    try {
+      const expectation = vaultBytes
+        ? {
+            exists: true as const,
+            sha256: createHash("sha256").update(vaultBytes).digest("hex"),
+              beforeRename: () => this.#assertBulkRenameStillAllowed(connection, rendered.node),
+          }
+        : {
+            exists: false as const,
+            beforeRename: () => this.#assertBulkRenameStillAllowed(connection, rendered.node),
+          };
+      await this.#paths.atomicWriteAsync(
+        connection.vaultPath,
+        relativePath,
+        rendered.text,
+        expectation,
+      );
+    } catch (error) {
+      if (error instanceof VaultDestinationChangedError && raceRetry < 1) {
+        return this.#exportNodeAsync(connection, nodeId, raceRetry + 1);
+      }
+      if (error instanceof VaultCanonicalChangedError) {
+        return this.#databaseAheadAfterRace(connection, nodeId, raceRetry);
+      }
+      throw error;
+    }
+    this.#upsertSyncedState(connection.id, rendered.node, relativePath, databaseHash);
+    return {
+      result: {
+        connectionId: connection.id,
+        nodeId,
+        relativePath,
+        status: "synced",
+        message: "Memory note exported atomically",
+      },
+      skipped: false,
+    };
+  }
+
+  #assertBulkRenameStillAllowed(connection: VaultConnection, renderedNode: MemoryNode): void {
+    if (!this.vaultSyncEnabled()) throw new VaultSyncPolicyRevokedError();
+    const current = this.#memory.requireNode(renderedNode.id);
+    if (current.version !== renderedNode.version) throw new VaultCanonicalChangedError();
+    this.#assertProjectionAllowed(current);
+    this.#assertConnectionProjectionAllowed(connection, current);
+  }
+
+  async #databaseAheadAfterRace(
+    connection: VaultConnection,
+    nodeId: string,
+    raceRetry: number,
+  ): Promise<{ readonly result: VaultSyncResult; readonly skipped: boolean }> {
+    const current = this.renderNode(nodeId, connection);
+    this.#assertProjectionAllowed(current.node);
+    this.#assertConnectionProjectionAllowed(connection, current.node);
+    const state = this.#stateForNode(connection.id, nodeId);
+    if (!state) {
+      if (raceRetry >= 1) throw new VaultCanonicalChangedError();
+      return this.#exportNodeAsync(connection, nodeId, raceRetry + 1);
+    }
     const path = this.#paths.resolveRelative(connection.vaultPath, state.relative_path);
-    if (!existsSync(path)) return this.exportNode(connectionId, nodeId);
-    const vaultText = readFileSync(path, "utf8");
+    const vaultText = existsSync(path) ? readFileSync(path, "utf8") : undefined;
+    if (vaultText !== undefined) {
+      const quarantined = this.#quarantineUnsafeVaultSource(
+        connection,
+        current.node,
+        state.relative_path,
+        vaultText,
+      );
+      if (quarantined) return { result: quarantined, skipped: false };
+    }
+    const databaseHash = hashText(current.text);
+    const vaultHash = vaultText === undefined ? undefined : hashText(vaultText);
+    this.#updateState(
+      state.id,
+      "database_ahead",
+      current.node.version,
+      databaseHash,
+      vaultHash,
+      undefined,
+      false,
+    );
+    return {
+      result: {
+        connectionId: connection.id,
+        nodeId,
+        relativePath: state.relative_path,
+        status: "database_ahead",
+        message: "Canonical memory changed during projection and is ready for a safe resume",
+      },
+      skipped: false,
+    };
+  }
+
+  syncNode(
+    connectionId: string,
+    nodeId: string,
+    actor: string,
+    allowedTargetIds?: ReadonlySet<string>,
+  ): VaultSyncResult {
+    const connection = this.requireConnection(connectionId);
+    const rendered = this.renderNode(nodeId, connection, allowedTargetIds);
+    this.#assertProjectionAllowed(rendered.node);
+    this.#assertConnectionProjectionAllowed(connection, rendered.node);
+    const state = this.#stateForNode(connectionId, nodeId);
+    if (!state) return this.exportNode(connectionId, nodeId, allowedTargetIds);
+    const path = this.#paths.resolveRelative(connection.vaultPath, state.relative_path);
+    if (!existsSync(path)) return this.exportNode(connectionId, nodeId, allowedTargetIds);
+    const vaultBytes = readFileSync(path);
+    const vaultText = vaultBytes.toString("utf8");
     const quarantined = this.#quarantineUnsafeVaultSource(
       connection,
       rendered.node,
@@ -425,7 +1087,7 @@ export class ObsidianVaultBridge {
       return this.#createConflict(connection, state, rendered.node, state.relative_path, rendered.text, vaultText);
     }
     if (vaultChanged && !databaseChanged) {
-      const imported = this.importNote(connectionId, state.relative_path, actor, true);
+      const imported = this.importNote(connectionId, state.relative_path, actor, true, allowedTargetIds);
       if (imported.status === "quarantined") {
         return {
           connectionId,
@@ -435,10 +1097,38 @@ export class ObsidianVaultBridge {
           message: "Malformed vault note was quarantined",
         };
       }
-      const normalized = this.renderNode(nodeId);
+      const normalized = this.renderNode(nodeId, connection, allowedTargetIds);
       const normalizedHash = hashText(normalized.text);
       this.#projectAttachments(connection, normalized.attachments);
-      this.#paths.atomicWrite(connection.vaultPath, state.relative_path, normalized.text);
+      try {
+        this.#paths.atomicWrite(connection.vaultPath, state.relative_path, normalized.text, {
+          exists: true,
+          sha256: createHash("sha256").update(vaultBytes).digest("hex"),
+          beforeRename: () => this.#assertBulkRenameStillAllowed(connection, normalized.node),
+        });
+      } catch (error) {
+        if (error instanceof VaultDestinationChangedError) {
+          return this.#refreshImportedVaultRace(
+            connection,
+            nodeId,
+            state.relative_path,
+            vaultHash,
+            "The vault note changed again while its imported edit was being normalized",
+            allowedTargetIds,
+          );
+        }
+        if (error instanceof VaultCanonicalChangedError) {
+          return this.#refreshImportedVaultRace(
+            connection,
+            nodeId,
+            state.relative_path,
+            vaultHash,
+            "Canonical memory changed while an imported vault edit was being normalized",
+            allowedTargetIds,
+          );
+        }
+        throw error;
+      }
       this.#upsertSyncedState(connectionId, normalized.node, state.relative_path, normalizedHash);
       this.#touchConnection(connectionId);
       return {
@@ -454,11 +1144,99 @@ export class ObsidianVaultBridge {
     return this.exportNode(connectionId, nodeId);
   }
 
+  /**
+   * Reconcile the watcher-critical window after a vault edit has already been
+   * versioned in SQLite but before its normalized Markdown projection could be
+   * published. A second vault edit becomes an explicit conflict; an unchanged
+   * imported source with a newer canonical version is truthfully database-ahead.
+   */
+  #refreshImportedVaultRace(
+    connection: VaultConnection,
+    nodeId: string,
+    relativePath: string,
+    importedVaultHash: string,
+    reason: string,
+    allowedTargetIds?: ReadonlySet<string>,
+  ): VaultSyncResult {
+    const rendered = this.renderNode(nodeId, connection, allowedTargetIds);
+    this.#assertProjectionAllowed(rendered.node);
+    this.#assertConnectionProjectionAllowed(connection, rendered.node);
+    const state = this.#stateForNode(connection.id, nodeId);
+    if (!state) throw new Error("Vault synchronization state disappeared during imported-edit recovery");
+    const databaseHash = hashText(rendered.text);
+    const path = this.#paths.resolveRelative(connection.vaultPath, relativePath);
+    if (!existsSync(path)) {
+      this.#updateState(
+        state.id,
+        "database_ahead",
+        rendered.node.version,
+        databaseHash,
+        undefined,
+        reason,
+        false,
+      );
+      return {
+        connectionId: connection.id,
+        nodeId,
+        relativePath,
+        status: "database_ahead",
+        message: "The vault note disappeared after its edit was versioned; canonical memory is ready for a safe resume",
+      };
+    }
+    const vaultText = readFileSync(path, "utf8");
+    const quarantined = this.#quarantineUnsafeVaultSource(
+      connection,
+      rendered.node,
+      relativePath,
+      vaultText,
+    );
+    if (quarantined) return quarantined;
+    const currentVaultHash = hashText(vaultText);
+    if (currentVaultHash === databaseHash) {
+      this.#upsertSyncedState(connection.id, rendered.node, relativePath, databaseHash);
+      this.#touchConnection(connection.id);
+      return {
+        connectionId: connection.id,
+        nodeId,
+        relativePath,
+        status: "synced",
+        message: "The concurrent projection already matches canonical memory",
+      };
+    }
+    if (currentVaultHash === importedVaultHash) {
+      this.#updateState(
+        state.id,
+        "database_ahead",
+        rendered.node.version,
+        databaseHash,
+        currentVaultHash,
+        reason,
+        false,
+      );
+      return {
+        connectionId: connection.id,
+        nodeId,
+        relativePath,
+        status: "database_ahead",
+        message: "The imported vault edit is preserved and canonical memory is ready for a safe resume",
+      };
+    }
+    return this.#createConflict(
+      connection,
+      state,
+      rendered.node,
+      relativePath,
+      rendered.text,
+      vaultText,
+    );
+  }
+
   importNote(
     connectionId: string,
     relativePath: string,
     actor: string,
     allowExistingUpdate = false,
+    allowedTargetIds?: ReadonlySet<string>,
   ): VaultImportResult {
     const memoryPolicy = this.assertVaultSyncAllowed();
     const connection = this.requireConnection(connectionId);
@@ -507,6 +1285,8 @@ export class ObsidianVaultBridge {
       );
       return { relativePath, status: "quarantined", quarantinePath };
     }
+    this.#assertConnectionProjectionAllowed(connection, note);
+    this.#assertImportedEdgesAllowed(connection, note, allowedTargetIds);
     const existing = this.#memory.getNode(note.id);
     const candidateImport = !existing || relativePath.startsWith("00 Inbox/");
     if (candidateImport && !memoryCandidateAllowed(memoryPolicy, note.nodeType)) {
@@ -556,6 +1336,7 @@ export class ObsidianVaultBridge {
       throw new Error("Updating an existing memory requires a version-aware sync operation");
     }
     this.#assertProjectionAllowed(existing);
+    this.#assertConnectionProjectionAllowed(connection, existing);
     if (note.nodeType !== existing.nodeType || JSON.stringify(note.scope) !== JSON.stringify(existing.scope)) {
       throw new Error("Node type and memory scope cannot be changed through automatic vault sync");
     }
@@ -587,7 +1368,7 @@ export class ObsidianVaultBridge {
       authorId: actor,
       changeReason: "Operator edited synchronized Obsidian note",
     });
-    this.#importEdges(updated, note, provenance, actor);
+    this.#importEdges(updated, note, provenance, actor, connection, allowedTargetIds);
     return { relativePath, status: "updated", nodeId: updated.id };
   }
 
@@ -629,9 +1410,17 @@ export class ObsidianVaultBridge {
     const uniqueIds = [...new Set(nodeIds)];
     const entries: PortableZipEntry[] = [];
     const portableAttachments = new Map<string, PortableZipEntry>();
+    const nodeSnapshots: Array<{ nodeId: string; version: number; projectionHash: string }> = [];
+    const portableNodeIds = new Set(uniqueIds);
     for (const nodeId of uniqueIds) {
-      const rendered = this.renderNode(nodeId);
+      const rendered = this.renderNode(nodeId, connection, portableNodeIds);
       this.#assertProjectionAllowed(rendered.node);
+      this.#assertConnectionProjectionAllowed(connection, rendered.node);
+      nodeSnapshots.push({
+        nodeId,
+        version: rendered.node.version,
+        projectionHash: hashText(rendered.text),
+      });
       entries.push({ name: rendered.relativePath, data: rendered.text });
       for (const attachment of rendered.attachments) {
         if (portableAttachments.has(attachment.contentHash)) continue;
@@ -670,6 +1459,7 @@ export class ObsidianVaultBridge {
       byteSize: result.byteSize,
       fileCount: result.fileCount,
       createdAt,
+      nodeSnapshots,
     };
   }
 
@@ -704,7 +1494,7 @@ export class ObsidianVaultBridge {
       if (!node || node.lifecycleStatus === "forgotten") {
         return { relativePath: state.relative_path, nodeId: state.node_id, status: existsSync(path) ? "vault_ahead" : "missing" };
       }
-      const rendered = this.renderNode(node.id);
+      const rendered = this.renderNode(node.id, connection);
       const databaseHash = hashText(rendered.text);
       if (!existsSync(path)) return { relativePath: state.relative_path, nodeId: node.id, status: "missing" };
       const vaultHash = hashText(readFileSync(path, "utf8"));
@@ -964,11 +1754,39 @@ export class ObsidianVaultBridge {
     return [...sources.values()];
   }
 
-  #importEdges(source: MemoryNode, note: VaultNote, provenance: MemoryProvenance, actor: string): void {
+  #assertImportedEdgesAllowed(
+    connection: VaultConnection,
+    note: VaultNote,
+    allowedTargetIds?: ReadonlySet<string>,
+  ): void {
+    for (const noteEdge of note.edges) {
+      const target = this.#memory.getNode(noteEdge.targetNodeId);
+      if (!target) continue;
+      if (
+        !this.#connectionProjectionMatches(connection, target)
+        || (allowedTargetIds && !allowedTargetIds.has(target.id))
+      ) {
+        throw new Error("Vault note relationship target is outside the permitted memory scope");
+      }
+    }
+  }
+
+  #importEdges(
+    source: MemoryNode,
+    note: VaultNote,
+    provenance: MemoryProvenance,
+    actor: string,
+    connection: VaultConnection,
+    allowedTargetIds?: ReadonlySet<string>,
+  ): void {
     const existing = this.#memory.listEdges(source.id);
     for (const noteEdge of note.edges) {
       const target = this.#memory.getNode(noteEdge.targetNodeId);
       if (!target) continue;
+      if (
+        !this.#connectionProjectionMatches(connection, target)
+        || (allowedTargetIds && !allowedTargetIds.has(target.id))
+      ) continue;
       if (existing.some((edge) =>
         edge.sourceNodeId === source.id && edge.targetNodeId === target.id && edge.edgeType === noteEdge.edgeType
       )) continue;
@@ -1169,6 +1987,7 @@ export class ObsidianVaultBridge {
     resolution: "database" | "vault" | "merged",
     actor: string,
     mergedText?: string,
+    allowedTargetIds?: ReadonlySet<string>,
   ): VaultSyncResult {
     this.assertVaultSyncAllowed();
     const row = this.#database.prepare(`
@@ -1181,12 +2000,53 @@ export class ObsidianVaultBridge {
     const nodeId = String(row.node_id);
     this.#assertProjectionAllowed(this.#memory.requireNode(nodeId));
     const connection = this.requireConnection(connectionId);
+    this.#assertConnectionProjectionAllowed(connection, this.#memory.requireNode(nodeId));
     const relativePath = String(row.relative_path);
+    const projectionPath = this.#paths.resolveRelative(connection.vaultPath, relativePath);
+    if (!existsSync(projectionPath) || !lstatSync(projectionPath).isFile()) {
+      throw new Error("Vault conflict projection is missing; reload synchronization state before resolving");
+    }
+    const capturedVaultBytes = readFileSync(projectionPath);
+    const capturedVaultText = capturedVaultBytes.toString("utf8");
+    this.#assertVaultSourceSafe(capturedVaultText);
+    const capturedDatabase = this.renderNode(nodeId, connection, allowedTargetIds);
+    if (
+      hashText(capturedVaultText) !== String(row.vault_hash)
+      || hashText(capturedDatabase.text) !== String(row.database_hash)
+    ) {
+      this.#refreshOpenConflict(
+        conflictId,
+        connection,
+        nodeId,
+        relativePath,
+        "Conflict inputs changed after the operator opened the review",
+        allowedTargetIds,
+      );
+      throw new Error("Vault conflict changed after review began; reload it before resolving");
+    }
     let result: VaultSyncResult;
     if (resolution === "database") {
-      const rendered = this.renderNode(nodeId);
+      const rendered = this.renderNode(nodeId, connection, allowedTargetIds);
       this.#projectAttachments(connection, rendered.attachments);
-      this.#paths.atomicWrite(connection.vaultPath, relativePath, rendered.text);
+      try {
+        this.#paths.atomicWrite(connection.vaultPath, relativePath, rendered.text, {
+          exists: true,
+          sha256: createHash("sha256").update(capturedVaultBytes).digest("hex"),
+          beforeRename: () => this.#assertBulkRenameStillAllowed(connection, rendered.node),
+        });
+      } catch (error) {
+        if (error instanceof VaultDestinationChangedError || error instanceof VaultCanonicalChangedError) {
+          return this.#refreshOpenConflict(
+            conflictId,
+            connection,
+            nodeId,
+            relativePath,
+            "Vault or canonical memory changed during conflict publication",
+            allowedTargetIds,
+          );
+        }
+        throw error;
+      }
       const hash = hashText(rendered.text);
       this.#upsertSyncedState(connectionId, rendered.node, relativePath, hash);
       result = {
@@ -1204,6 +2064,7 @@ export class ObsidianVaultBridge {
       // creates a new immutable memory version attributed to the resolver.
       const note = parseObsidianNote(selectedText);
       this.#assertVaultNoteSafe(note);
+      this.#assertImportedEdgesAllowed(connection, note, allowedTargetIds);
       const current = this.#memory.requireNode(nodeId);
       if (note.id !== current.id || note.nodeType !== current.nodeType || JSON.stringify(note.scope) !== JSON.stringify(current.scope)) {
         throw new Error("Conflict resolution cannot change stable identity, node type, or memory scope");
@@ -1235,11 +2096,29 @@ export class ObsidianVaultBridge {
           sourceHash: hashText(selectedText),
           acquiredAt: this.#now(),
         }],
-      }, actor);
-      const normalized = this.renderNode(nodeId);
+      }, actor, connection, allowedTargetIds);
+      const normalized = this.renderNode(nodeId, connection, allowedTargetIds);
       const hash = hashText(normalized.text);
       this.#projectAttachments(connection, normalized.attachments);
-      this.#paths.atomicWrite(connection.vaultPath, relativePath, normalized.text);
+      try {
+        this.#paths.atomicWrite(connection.vaultPath, relativePath, normalized.text, {
+          exists: true,
+          sha256: createHash("sha256").update(capturedVaultBytes).digest("hex"),
+          beforeRename: () => this.#assertBulkRenameStillAllowed(connection, normalized.node),
+        });
+      } catch (error) {
+        if (error instanceof VaultDestinationChangedError || error instanceof VaultCanonicalChangedError) {
+          return this.#refreshOpenConflict(
+            conflictId,
+            connection,
+            nodeId,
+            relativePath,
+            "Vault or canonical memory changed after conflict content was versioned",
+            allowedTargetIds,
+          );
+        }
+        throw error;
+      }
       this.#upsertSyncedState(connectionId, normalized.node, relativePath, hash);
       result = {
         connectionId,
@@ -1260,18 +2139,116 @@ export class ObsidianVaultBridge {
     return result;
   }
 
+  #refreshOpenConflict(
+    conflictId: string,
+    connection: VaultConnection,
+    nodeId: string,
+    relativePath: string,
+    reason: string,
+    allowedTargetIds?: ReadonlySet<string>,
+  ): VaultSyncResult {
+    const rendered = this.renderNode(nodeId, connection, allowedTargetIds);
+    const databaseHash = hashText(rendered.text);
+    const state = this.#stateForNode(connection.id, nodeId);
+    if (!state) throw new Error("Vault conflict sync state is missing");
+    const path = this.#paths.resolveRelative(connection.vaultPath, relativePath);
+    if (!existsSync(path)) {
+      this.#updateState(
+        state.id,
+        "database_ahead",
+        rendered.node.version,
+        databaseHash,
+        undefined,
+        reason,
+        false,
+      );
+      return {
+        connectionId: connection.id,
+        nodeId,
+        relativePath,
+        status: "database_ahead",
+        conflictId,
+        message: "Conflict publication stopped because the vault note disappeared; canonical memory remains ahead",
+      };
+    }
+    const vaultText = readFileSync(path, "utf8");
+    const quarantined = this.#quarantineUnsafeVaultSource(
+      connection,
+      rendered.node,
+      relativePath,
+      vaultText,
+    );
+    if (quarantined) return { ...quarantined, conflictId };
+    const vaultHash = hashText(vaultText);
+    inImmediateTransaction(this.#database, () => {
+      this.#updateState(
+        state.id,
+        "conflict",
+        rendered.node.version,
+        databaseHash,
+        vaultHash,
+        reason,
+        false,
+      );
+      this.#database.prepare(`
+        UPDATE vault_conflicts SET
+          database_hash = ?, vault_hash = ?, database_version_json = ?,
+          vault_version_text = ?, resolution_reason = NULL,
+          resolved_by = NULL, resolved_at = NULL
+        WHERE id = ? AND status = 'open'
+      `).run(
+        databaseHash,
+        vaultHash,
+        JSON.stringify({ node: rendered.node, markdown: rendered.text }),
+        vaultText,
+        conflictId,
+      );
+    });
+    return {
+      connectionId: connection.id,
+      nodeId,
+      relativePath,
+      status: "conflict",
+      conflictId,
+      message: "Conflict changed during resolution; the latest database and vault versions require review",
+    };
+  }
+
   /** Stages synchronized files, erases canonical memory, then removes stages. */
   forgetMemory(nodeId: string, actor: string, reason?: string): ForgetResult {
-    const projections = this.#database.prepare(`
-      SELECT vs.connection_id, vs.relative_path, vc.vault_path
-      FROM vault_sync_state vs JOIN vault_connections vc ON vc.id = vs.connection_id
-      WHERE vs.node_id = ?
-    `).all(nodeId) as Array<{ connection_id: string; relative_path: string; vault_path: string }>;
+    const projections = this.#memory.vaultProjectionsForNode(nodeId);
     const staged: Array<{ original: string; staged: string }> = [];
     try {
+      // A portable archive can contain a forgotten node indirectly through a
+      // relationship label. Conservatively revoke every bridge-managed ZIP on
+      // any forget operation, including archives created by the CLI rather than
+      // the HTTP authorization layer.
+      const connections = this.#database.prepare("SELECT id FROM vault_connections").all() as Array<{ id: string }>;
+      for (const connectionRow of connections) {
+        const connection = this.requireConnection(connectionRow.id);
+        const exportDirectory = this.#paths.resolveRelative(connection.vaultPath, ".chillspwn/exports", true);
+        if (!existsSync(exportDirectory)) continue;
+        for (const archiveName of readdirSync(exportDirectory)) {
+          if (!/^chillspwn-brain-[A-Za-z0-9._-]+\.zip$/u.test(archiveName) || basename(archiveName) !== archiveName) {
+            continue;
+          }
+          const original = this.#paths.resolveRelative(
+            connection.vaultPath,
+            `.chillspwn/exports/${archiveName}`,
+          );
+          const metadata = lstatSync(original);
+          if (metadata.isSymbolicLink() || !metadata.isFile()) {
+            throw new Error("Portable vault archive is not a regular file");
+          }
+          const stagedRelative = `.chillspwn/forget-staging/${safeVaultSegment(nodeId, "node")}-${randomUUID()}.zip`;
+          const stagedPath = this.#paths.resolveRelative(connection.vaultPath, stagedRelative, true);
+          renameSync(original, stagedPath);
+          staged.push({ original, staged: stagedPath });
+        }
+      }
       for (const projection of projections) {
-        const connection = this.requireConnection(projection.connection_id);
-        const original = this.#paths.resolveRelative(connection.vaultPath, projection.relative_path);
+        const connection = this.requireConnection(projection.connectionId);
+        const original = this.#paths.resolveRelative(connection.vaultPath, projection.relativePath);
         if (!existsSync(original)) continue;
         const stagedRelative = `.chillspwn/forget-staging/${safeVaultSegment(nodeId, "node")}-${randomUUID()}.md`;
         const stagedPath = this.#paths.resolveRelative(connection.vaultPath, stagedRelative, true);

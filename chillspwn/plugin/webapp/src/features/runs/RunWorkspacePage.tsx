@@ -10,6 +10,7 @@ import { CompletionReview } from "./CompletionReview";
 import { RecoveryPanel } from "./RecoveryPanel";
 import { MissionWorkspace } from "../missions/MissionWorkspace";
 import { ContextUsedDisclosure } from "../brain/ContextUsedDisclosure";
+import { ActionActivity } from "./ActionActivity";
 
 export default function RunWorkspacePage({ missionId, runId }: { missionId?: string; runId?: string; guided?: boolean }) {
   const mission = useQuery(`mission-runtime:${missionId ?? "none"}`, (signal) => missionId ? runtimeV2Api.mission(missionId, signal) : Promise.resolve(undefined), { staleTime: 0 });
@@ -70,7 +71,7 @@ export function RunCockpit({ run, missionSuccessCriteria = [], showRunChrome = t
     {["blocked", "recovering", "failed", "waiting_guided_decision"].includes(authoritative.status) && <RecoveryPanel runId={authoritative.id} onChanged={() => { current.refresh(); plans.refresh(); events.refresh(); }} />}
     <div className="os-live-layout"><section><h2>Plan and agent ownership</h2>{plans.isLoading && <LoadingPanel label="Loading versioned plan" />}{plans.error && !plans.data && <ErrorPanel error={plans.error} onRetry={plans.refresh} />}{activePlan ? <><Card className="os-plan-summary"><div className="os-card-heading"><div><p className="os-eyebrow">Plan v{activePlan.version}</p><h3>{activePlan.strategySummary}</h3></div><StatusPill status={activePlan.status} /></div>{activePlan.rationaleSummary && <p>{activePlan.rationaleSummary}</p>}</Card><ol className="os-step-rail">{activePlan.steps.map((step) => <li key={step.id} className={step.id === authoritative.currentStepId ? "is-current" : undefined}><div className="os-step-index">{step.ordinal + 1}</div><article><header><div><span>{step.phase}</span><h3>{step.title}</h3></div><StatusPill status={step.status} /></header><p>{step.explanation || step.objective}</p><KeyValueGrid items={[{ label: "Owner", value: step.assignedAgentId || "Unassigned" }, { label: "Risk", value: step.riskClass || "Not classified" }, { label: "Target", value: step.action.target }, { label: "Reversibility", value: step.reversibility || "Not reported" }]} /><p className="os-intent"><strong>Intent:</strong> {step.action.intentSummary}</p><JsonDetails label="Normalized action detail" value={step.action} /></article></li>)}</ol></> : !plans.isLoading && <Card><EmptyState title="No plan available" description="The run has not persisted a versioned plan yet." /></Card>}</section>
       <aside><h2>Meaningful activity</h2><QueryBoundary data={events.data?.items} error={events.error} isLoading={events.isLoading} onRetry={events.refresh} emptyTitle="No semantic events" emptyDescription="The run has not emitted an authorized state change yet.">{(items) => <ol className="os-timeline">{items.map((event) => <li key={event.id}><strong>{event.summary}</strong><span>{event.eventType} · {formatTime(event.occurredAt)}</span>{event.correlation.contextPackId && <ContextUsedDisclosure packId={event.correlation.contextPackId} />}<JsonDetails label="Technical event detail" value={{ payload: event.payload, correlation: event.correlation }} /></li>)}</ol>}</QueryBoundary></aside>
-    </div>
+    </div><ActionActivity runId={authoritative.id} />
   </>;
 }
 

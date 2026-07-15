@@ -64,6 +64,50 @@ export interface VaultSyncResult {
   readonly message: string;
 }
 
+export interface VaultBulkExportCounts {
+  readonly synced: number;
+  readonly skipped: number;
+  readonly databaseAhead: number;
+  readonly vaultAhead: number;
+  readonly conflicts: number;
+  readonly quarantined: number;
+  readonly failed: number;
+}
+
+export interface VaultBulkExportIssue {
+  readonly nodeId: string;
+  readonly category: "database_ahead" | "vault_ahead" | "conflict" | "quarantined" | "failed";
+  readonly message: string;
+  readonly relativePath?: string;
+  readonly conflictId?: string;
+}
+
+export interface VaultBulkExportProgress {
+  readonly connectionId: string;
+  readonly total: number;
+  readonly processed: number;
+  readonly remaining: number;
+  readonly counts: VaultBulkExportCounts;
+  readonly elapsedMs: number;
+}
+
+export interface VaultBulkExportResult extends VaultBulkExportProgress {
+  readonly startedAt: string;
+  readonly completedAt: string;
+  /** A bounded diagnostic sample; aggregate counts always cover every item. */
+  readonly issues: readonly VaultBulkExportIssue[];
+  readonly issueSampleTruncated: boolean;
+}
+
+export interface VaultBulkExportOptions {
+  /** Number of note writes allowed in flight. Defaults to 8; maximum 32. */
+  readonly concurrency?: number;
+  readonly signal?: AbortSignal;
+  /** Progress cadence by completed notes. Defaults to 100. */
+  readonly progressInterval?: number;
+  readonly onProgress?: (progress: VaultBulkExportProgress) => void | Promise<void>;
+}
+
 export interface VaultImportResult {
   readonly relativePath: string;
   readonly status: "candidate" | "updated" | "unchanged" | "quarantined";
@@ -80,6 +124,11 @@ export interface VaultPortableExport {
   readonly byteSize: number;
   readonly fileCount: number;
   readonly createdAt: string;
+  readonly nodeSnapshots: readonly {
+    readonly nodeId: string;
+    readonly version: number;
+    readonly projectionHash: string;
+  }[];
 }
 
 export interface VaultSyncVerificationItem {

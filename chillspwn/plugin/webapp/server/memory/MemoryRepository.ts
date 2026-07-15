@@ -29,6 +29,7 @@ import {
   validateCreateEdge,
   validateCreateNode,
   validateLifecycle,
+  validateJourney,
   validateNodeType,
   validateProvenance,
   validateScope,
@@ -39,6 +40,11 @@ import {
   assertReusableMemoryUnknown,
   REUSABLE_MEMORY_LIMITS,
 } from "./ReusableMemorySafety";
+import {
+  assertCanonicalMemoryScope,
+  memoryNodeMatchesPolicy,
+  requireCanonicalMissionScope,
+} from "./MemoryScopePolicy";
 
 interface NodeRow {
   id: string;
@@ -132,6 +138,16 @@ function canonicalJson(value: unknown): string {
     return `{${Object.keys(record).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson(record[key])}`).join(",")}}`;
   }
   return JSON.stringify(value) ?? "null";
+}
+
+function jsonContainsExactString(value: unknown, expected: string): boolean {
+  if (value === expected) return true;
+  if (Array.isArray(value)) return value.some((item) => jsonContainsExactString(item, expected));
+  if (value && typeof value === "object") {
+    return Object.values(value as Record<string, unknown>)
+      .some((item) => jsonContainsExactString(item, expected));
+  }
+  return false;
 }
 
 function sha256(value: string): string {
@@ -353,6 +369,7 @@ export class MemoryRepository {
   createNode(input: CreateMemoryNodeInput): MemoryNode {
     assertNodeContentSafe(input);
     validateCreateNode(input);
+    assertCanonicalMemoryScope(this.#database, input.scope);
     const id = input.id ?? this.createId("mem");
     assertIdentifier(id, "memory node ID");
     const now = this.now();
@@ -438,6 +455,7 @@ export class MemoryRepository {
         : current.provenance;
       validateProvenance(provenance);
       const scope = input.scope ?? current.scope;
+      assertCanonicalMemoryScope(this.#database, scope);
       const title = input.title?.trim() ?? current.title;
       const summary = input.summary?.trim() ?? current.summary;
       assertNonEmpty(title, "memory title", 500);
@@ -527,19 +545,43 @@ export class MemoryRepository {
   createEdge(input: CreateMemoryEdgeInput): MemoryEdge {
     assertEdgeContentSafe(input);
     validateCreateEdge(input);
+    assertCanonicalMemoryScope(this.#database, input.scope);
     const source = this.requireNode(input.sourceNodeId);
     const target = this.requireNode(input.targetNodeId);
-    if (
-      source.scope.engagementId && target.scope.engagementId &&
-      source.scope.engagementId !== target.scope.engagementId
-    ) {
+    const canonicalScope = (node: MemoryNode): {
+      readonly engagementId: string | null;
+      readonly missionId: string | null;
+    } => {
+      if (node.scope.kind === "global") return { engagementId: null, missionId: null };
+      if (node.scope.kind === "engagement") {
+        return { engagementId: node.scope.engagementId ?? null, missionId: null };
+      }
+      const mission = requireCanonicalMissionScope(this.#database, node.scope.missionId ?? "");
+      return { engagementId: mission.engagementId, missionId: node.scope.missionId ?? null };
+    };
+    const sourceCanonical = canonicalScope(source);
+    const targetCanonical = canonicalScope(target);
+    if (source.scope.kind !== "global" && target.scope.kind !== "global" &&
+        sourceCanonical.engagementId !== targetCanonical.engagementId) {
       throw new Error("Cross-engagement memory edges are not permitted");
     }
     if (input.scope.kind === "engagement") {
       const allowed = input.scope.engagementId;
-      if ((source.scope.engagementId && source.scope.engagementId !== allowed) ||
-          (target.scope.engagementId && target.scope.engagementId !== allowed)) {
+      if ((source.scope.kind !== "global" && sourceCanonical.engagementId !== allowed) ||
+          (target.scope.kind !== "global" && targetCanonical.engagementId !== allowed)) {
         throw new Error("Edge scope does not match its nodes");
+      }
+    }
+    if (input.scope.kind === "mission") {
+      const edgeMissionId = input.scope.missionId ?? "";
+      const edgeMission = requireCanonicalMissionScope(this.#database, edgeMissionId);
+      for (const node of [sourceCanonical, targetCanonical]) {
+        if (node.missionId && node.missionId !== edgeMissionId) {
+          throw new Error("Mission edge scope does not match its nodes");
+        }
+        if (node.engagementId && node.engagementId !== edgeMission.engagementId) {
+          throw new Error("Mission edge engagement does not match its nodes");
+        }
       }
     }
     const id = input.id ?? this.createId("medge");
@@ -598,6 +640,7 @@ export class MemoryRepository {
     assertNonEmpty(input.title, "candidate title", 500);
     assertNonEmpty(input.summary, "candidate summary", 4_000);
     validateScope(input.scope);
+    assertCanonicalMemoryScope(this.#database, input.scope);
     validateSensitivity(input.sensitivity);
     validateConfidence(input.confidence);
     validateProvenance(input.provenance);
@@ -698,11 +741,66 @@ export class MemoryRepository {
         candidate.nodeType, reason, reviewer, now,
       );
       this.#database.prepare(`
-        UPDATE memory_candidates SET status = 'suppressed', reviewed_by = ?, reviewed_at = ?
+        UPDATE memory_candidates SET status = 'suppressed', reviewed_by = ?, reviewed_at = ?,
+          title = '[Suppressed candidate]', summary = '', body = '', confidence = 0,
+          source_json = ?
         WHERE id = ?
-      `).run(reviewer, now, id);
+      `).run(
+        reviewer,
+        now,
+        canonicalJson({ method: "suppressed", explanation: "Content removed", sources: [] }),
+        id,
+      );
       return suppressionId;
     });
+  }
+
+  /**
+   * Locate both canonical projections and the original Inbox note that produced
+   * a subsequently confirmed candidate. The latter still has a NULL node_id in
+   * vault_sync_state, so provenance is the durable privacy link.
+   */
+  vaultProjectionsForNode(id: string): readonly {
+    readonly connectionId: string;
+    readonly relativePath: string;
+  }[] {
+    assertIdentifier(id, "memory node ID");
+    const results = new Map<string, { connectionId: string; relativePath: string }>();
+    const add = (connectionId: string, relativePath: string): void => {
+      if (!connectionId || !relativePath) return;
+      results.set(`${connectionId}\0${relativePath}`, { connectionId, relativePath });
+    };
+    const direct = this.#database.prepare(`
+      SELECT connection_id, relative_path FROM vault_sync_state WHERE node_id = ?
+    `).all(id) as Array<{ connection_id: string; relative_path: string }>;
+    for (const row of direct) add(row.connection_id, row.relative_path);
+
+    const connections = this.#database.prepare("SELECT id FROM vault_connections").all() as Array<{ id: string }>;
+    const candidates = this.#database.prepare(`
+      SELECT source_json FROM memory_candidates WHERE proposed_node_id = ?
+    `).all(id) as Array<{ source_json: string }>;
+    for (const candidate of candidates) {
+      let provenance: MemoryProvenance;
+      try {
+        provenance = JSON.parse(candidate.source_json) as MemoryProvenance;
+      } catch {
+        continue;
+      }
+      for (const source of provenance.sources ?? []) {
+        if (source.sourceType !== "obsidian_note") continue;
+        for (const connection of connections) {
+          const prefix = `${connection.id}:`;
+          if (!source.sourceId.startsWith(prefix)) continue;
+          const relativePath = source.sourceId.slice(prefix.length);
+          const tracked = this.#database.prepare(`
+            SELECT 1 AS present FROM vault_sync_state
+            WHERE connection_id = ? AND relative_path = ?
+          `).get(connection.id, relativePath) as { present: number } | undefined;
+          if (tracked) add(connection.id, relativePath);
+        }
+      }
+    }
+    return [...results.values()];
   }
 
   /**
@@ -717,9 +815,10 @@ export class MemoryRepository {
       const node = this.requireNode(id);
       const suppressionHash = memoryContentHash(node);
       const now = this.now();
-      const projections = this.#database.prepare(`
-        SELECT connection_id, relative_path FROM vault_sync_state WHERE node_id = ?
-      `).all(id) as Array<{ connection_id: string; relative_path: string }>;
+      const projections = this.vaultProjectionsForNode(id);
+      const linkedCandidates = this.#database.prepare(`
+        SELECT id, source_json FROM memory_candidates WHERE proposed_node_id = ?
+      `).all(id) as Array<{ id: string; source_json: string }>;
 
       this.#database.prepare("DELETE FROM vault_conflicts WHERE node_id = ?").run(id);
       this.#database.prepare(`
@@ -727,6 +826,18 @@ export class MemoryRepository {
           database_content_hash = NULL, vault_content_hash = NULL, error_message = NULL,
           last_scanned_at = ? WHERE node_id = ?
       `).run(now, id);
+      const deleteProjectionConflicts = this.#database.prepare(`
+        DELETE FROM vault_conflicts WHERE sync_state_id IN (
+          SELECT id FROM vault_sync_state WHERE connection_id = ? AND relative_path = ?
+        )
+      `);
+      const deleteProjectionState = this.#database.prepare(`
+        DELETE FROM vault_sync_state WHERE connection_id = ? AND relative_path = ?
+      `);
+      for (const projection of projections) {
+        deleteProjectionConflicts.run(projection.connectionId, projection.relativePath);
+        deleteProjectionState.run(projection.connectionId, projection.relativePath);
+      }
       const contextItems = this.#database.prepare("DELETE FROM memory_context_items WHERE node_id = ?").run(id).changes;
       const edges = this.#database.prepare("DELETE FROM memory_edges WHERE source_node_id = ? OR target_node_id = ?").run(id, id).changes;
       const embeddings = this.#database.prepare("DELETE FROM memory_embeddings WHERE node_id = ?").run(id).changes;
@@ -759,9 +870,86 @@ export class MemoryRepository {
       `).run(now, id);
       this.#database.prepare(`
         UPDATE memory_candidates SET proposed_node_id = NULL,
-          status = CASE WHEN status IN ('confirmed', 'edited_confirmed') THEN 'suppressed' ELSE status END
+          title = '[Forgotten candidate]', summary = '', body = '', confidence = 0,
+          source_json = ?, status = 'suppressed', reviewed_by = ?, reviewed_at = ?
         WHERE proposed_node_id = ?
-      `).run(id);
+      `).run(
+        canonicalJson({ method: "forgotten", explanation: "Content removed", sources: [] }),
+        actor,
+        now,
+        id,
+      );
+
+      // Idempotency responses can contain a complete node snapshot. Portable
+      // export authorizations contain node IDs while their cached response
+      // points at the corresponding archive. Erasure revokes both without
+      // retaining caller text or relying on a substring match.
+      const settingRows = this.#database.prepare(`
+        SELECT key, value_json FROM settings
+        WHERE key LIKE 'idempotency.brain.%'
+           OR key LIKE 'brain.portable_export.authorization.%'
+      `).all() as Array<{ key: string; value_json: string }>;
+      const settingValues = new Map<string, unknown>();
+      const revokedArchives: Array<{ connectionId: string; archiveName: string }> = [];
+      const erasedIdentifiers = [
+        id,
+        ...linkedCandidates.map((candidate) => candidate.id),
+        ...projections.map((projection) => projection.relativePath),
+      ];
+      for (const row of settingRows) {
+        let value: unknown;
+        try {
+          value = JSON.parse(row.value_json) as unknown;
+        } catch {
+          // A malformed private cache cannot be trusted to be content-free.
+          settingValues.set(row.key, undefined);
+          continue;
+        }
+        if (!erasedIdentifiers.some((identifier) => jsonContainsExactString(value, identifier))) continue;
+        settingValues.set(row.key, value);
+        if (row.key.startsWith("brain.portable_export.authorization.") && value && typeof value === "object") {
+          const record = value as Record<string, unknown>;
+          if (typeof record.connectionId === "string" && typeof record.archiveName === "string") {
+            revokedArchives.push({ connectionId: record.connectionId, archiveName: record.archiveName });
+          }
+        }
+      }
+      for (const row of settingRows) {
+        if (!row.key.startsWith("idempotency.brain.")) continue;
+        let value: unknown;
+        try {
+          value = JSON.parse(row.value_json) as unknown;
+        } catch {
+          settingValues.set(row.key, undefined);
+          continue;
+        }
+        if (revokedArchives.some(({ connectionId, archiveName }) => (
+          jsonContainsExactString(value, connectionId) && jsonContainsExactString(value, archiveName)
+        ))) settingValues.set(row.key, value);
+      }
+      const deleteSetting = this.#database.prepare("DELETE FROM settings WHERE key = ?");
+      const revokeIdempotency = this.#database.prepare(`
+        UPDATE settings SET value_json = ?, updated_by = ?, updated_at = ? WHERE key = ?
+      `);
+      for (const [key, value] of settingValues) {
+        if (!key.startsWith("idempotency.brain.")) {
+          deleteSetting.run(key);
+          continue;
+        }
+        const record = value && typeof value === "object" && !Array.isArray(value)
+          ? value as Record<string, unknown>
+          : {};
+        const revoked = {
+          requestHash: typeof record.requestHash === "string"
+            ? record.requestHash
+            : sha256(`revoked:${key}`),
+          ...(typeof record.accessFingerprint === "string"
+            ? { accessFingerprint: record.accessFingerprint }
+            : {}),
+          state: "revoked",
+        };
+        revokeIdempotency.run(canonicalJson(revoked), actor, now, key);
+      }
       this.#database.prepare(`
         UPDATE memory_nodes SET
           title = '[Forgotten memory]', summary = '', body = '', lifecycle_status = 'forgotten',
@@ -804,12 +992,46 @@ export class MemoryRepository {
         nodeId: id,
         suppressionId: storedSuppression.id,
         vaultProjections: projections.map((item) => ({
-          connectionId: item.connection_id,
-          relativePath: item.relative_path,
+          connectionId: item.connectionId,
+          // The original path can contain user-supplied forgotten text and is
+          // deliberately excluded from the response/idempotency cache.
+          relativePath: "[erased]",
         })),
         removed,
         auditRecordId,
       };
+    });
+  }
+
+  /** Records a content-free, tamper-evident export event for one memory node. */
+  recordNodeExportAudit(input: {
+    nodeId: string;
+    actor: string;
+    connectionId: string;
+    status: string;
+  }): string {
+    assertIdentifier(input.nodeId, "memory node ID");
+    assertIdentifier(input.connectionId, "vault connection ID");
+    assertNonEmpty(input.actor, "memory export actor", 256);
+    assertNonEmpty(input.status, "memory export status", 128);
+    return inImmediateTransaction(this.#database, () => {
+      const node = this.requireNode(input.nodeId);
+      const now = this.now();
+      return this.#appendContentFreeAudit({
+        actor: input.actor,
+        action: "memory.exported",
+        resourceId: node.id,
+        reason: "Operator exported a human-readable memory projection",
+        details: {
+          nodeType: node.nodeType,
+          scope: node.scope.kind,
+          destination: "obsidian_vault",
+          connectionId: input.connectionId,
+          status: input.status.slice(0, 128),
+        },
+        ...this.#resolveMemoryAuditScope(node),
+        occurredAt: now,
+      });
     });
   }
 
@@ -884,6 +1106,98 @@ export class MemoryRepository {
     return { missionId: node.scope.missionId, runId: null, journey: mission.journey };
   }
 
+  #assertContextPackLinkage(input: {
+    readonly missionId?: string;
+    readonly runId?: string;
+    readonly stepId?: string;
+    readonly actionId?: string;
+    readonly messageId?: string;
+    readonly journey: ContextPack["journey"];
+    readonly scopePolicy: RetrievalPolicy;
+  }): void {
+    const missionIds = new Set<string>();
+    const engagementIds = new Set<string | null>();
+    const runIds = new Set<string>();
+    const stepIds = new Set<string>();
+    const journeys = new Set<Journey>([input.journey, input.scopePolicy.journey]);
+
+    const addMission = (missionId: string, source: string): void => {
+      const mission = this.#database.prepare(
+        "SELECT journey, engagement_id FROM missions WHERE id = ?",
+      ).get(missionId) as { journey: Journey; engagement_id: string | null } | undefined;
+      if (!mission) throw new Error(`Context pack ${source} mission link is missing`);
+      missionIds.add(missionId);
+      engagementIds.add(mission.engagement_id);
+      journeys.add(mission.journey);
+    };
+    const addRun = (runId: string, source: string): void => {
+      const run = this.#database.prepare(
+        "SELECT mission_id, journey FROM runs WHERE id = ?",
+      ).get(runId) as { mission_id: string; journey: Journey } | undefined;
+      if (!run) throw new Error(`Context pack ${source} run link is missing`);
+      runIds.add(runId);
+      journeys.add(run.journey);
+      addMission(run.mission_id, `${source} run`);
+    };
+    const addStep = (stepId: string, source: string): void => {
+      const step = this.#database.prepare(`
+        SELECT ps.run_id, p.run_id AS plan_run_id
+        FROM plan_steps ps
+        JOIN plans p ON p.id = ps.plan_id
+        WHERE ps.id = ?
+      `).get(stepId) as { run_id: string; plan_run_id: string } | undefined;
+      if (!step) throw new Error(`Context pack ${source} step link is missing`);
+      if (step.run_id !== step.plan_run_id) {
+        throw new Error("Context pack step run does not match its canonical plan");
+      }
+      stepIds.add(stepId);
+      // plan_steps.run_id is the canonical direct step linkage. The plan's
+      // run_id is checked above as an independent consistency constraint.
+      addRun(step.run_id, `${source} step`);
+    };
+
+    if (input.missionId) addMission(input.missionId, "explicit");
+    if (input.scopePolicy.missionId) addMission(input.scopePolicy.missionId, "scope-policy");
+    if (input.scopePolicy.engagementId) engagementIds.add(input.scopePolicy.engagementId);
+    if (input.runId) addRun(input.runId, "explicit");
+    if (input.stepId) addStep(input.stepId, "explicit");
+    if (input.actionId) {
+      const action = this.#database.prepare(`
+        SELECT mission_id, run_id, step_id FROM actions WHERE id = ?
+      `).get(input.actionId) as {
+        mission_id: string;
+        run_id: string;
+        step_id: string | null;
+      } | undefined;
+      if (!action) throw new Error("Context pack action link is missing");
+      addMission(action.mission_id, "action");
+      addRun(action.run_id, "action");
+      if (action.step_id) addStep(action.step_id, "action");
+    }
+    if (input.messageId) {
+      const message = this.#database.prepare(`
+        SELECT c.mission_id, c.run_id, c.step_id
+        FROM messages msg
+        JOIN conversations c ON c.id = msg.conversation_id
+        WHERE msg.id = ?
+      `).get(input.messageId) as {
+        mission_id: string | null;
+        run_id: string | null;
+        step_id: string | null;
+      } | undefined;
+      if (!message) throw new Error("Context pack message link is missing");
+      if (message.mission_id) addMission(message.mission_id, "message");
+      if (message.run_id) addRun(message.run_id, "message");
+      if (message.step_id) addStep(message.step_id, "message");
+    }
+
+    if (missionIds.size > 1) throw new Error("Context pack mission links cross canonical scopes");
+    if (engagementIds.size > 1) throw new Error("Context pack engagement does not match its canonical mission");
+    if (runIds.size > 1) throw new Error("Context pack run links cross canonical scopes");
+    if (stepIds.size > 1) throw new Error("Context pack step links cross canonical scopes");
+    if (journeys.size > 1) throw new Error("Context pack journey does not match its canonical scope");
+  }
+
   persistContextPack(input: {
     readonly id?: string;
     readonly missionId?: string;
@@ -923,9 +1237,41 @@ export class MemoryRepository {
     if (!Number.isSafeInteger(input.contextBudget) || input.contextBudget < 0) {
       throw new TypeError("context budget must be a non-negative integer");
     }
+    validateJourney(input.journey);
+    validateJourney(input.scopePolicy.journey);
+    validateSensitivity(input.scopePolicy.maximumSensitivity);
+    if (input.scopePolicy.allowedStatuses?.some((status) => status !== "confirmed" && status !== "verified")) {
+      throw new TypeError("context packs may retain only confirmed or verified memory");
+    }
+    input.scopePolicy.allowedNodeTypes?.forEach(validateNodeType);
+    input.scopePolicy.exactNodeIds?.forEach((nodeId) => assertIdentifier(nodeId, "context pack exact memory ID"));
+    if (input.contextBudget !== input.scopePolicy.contextBudget) {
+      throw new TypeError("context pack budget must match its retrieval policy");
+    }
+    for (const [value, label] of [
+      [input.missionId, "context pack mission ID"],
+      [input.scopePolicy.missionId, "context pack scope-policy mission ID"],
+      [input.runId, "context pack run ID"],
+      [input.stepId, "context pack step ID"],
+      [input.actionId, "context pack action ID"],
+      [input.messageId, "context pack message ID"],
+    ] as const) {
+      if (value !== undefined) assertIdentifier(value, label);
+    }
     const id = input.id ?? this.createId("ctx");
     const now = this.now();
     return inImmediateTransaction(this.#database, () => {
+      this.#assertContextPackLinkage(input);
+      const canonicalItems = input.items.map((item) => {
+        const node = this.requireNode(item.node.id);
+        if (node.version !== item.node.version) {
+          throw new Error("Context pack memory changed after retrieval");
+        }
+        if (!memoryNodeMatchesPolicy(this.#database, node, input.scopePolicy, now)) {
+          throw new Error("Context pack item is outside its canonical retrieval scope");
+        }
+        return { ...item, node };
+      });
       this.#database.prepare(`
         INSERT INTO memory_context_packs (
           id, mission_id, run_id, step_id, action_id, message_id, journey, purpose,
@@ -944,7 +1290,7 @@ export class MemoryRepository {
           influence_summary, ignored_reason, corrected
         ) VALUES (?, ?, ?, ?, 0, ?, NULL, 'Not yet evaluated', 0)
       `);
-      input.items.forEach((item, rank) => {
+      canonicalItems.forEach((item, rank) => {
         insert.run(id, item.node.id, rank, item.score, item.relevanceReason);
       });
       return this.requireContextPack(id);

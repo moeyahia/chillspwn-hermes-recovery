@@ -90,6 +90,8 @@ interface AggregateRow {
   readonly corrected?: number | null;
   readonly tokens?: number | null;
   readonly cost?: number | null;
+  readonly first_meaningful_at?: string | null;
+  readonly with_progress?: number | null;
 }
 
 interface ServiceOptions {
@@ -331,7 +333,8 @@ export class RunLearningService {
         SUM(status = 'denied') AS denied,
         SUM(status = 'cancelled') AS cancelled,
         COUNT(DISTINCT fingerprint) AS unique_count,
-        SUM(retry_count) AS retries
+        SUM(retry_count) AS retries,
+        SUM(progress_signature IS NOT NULL AND length(trim(progress_signature)) > 0) AS with_progress
       FROM actions WHERE run_id = ?
     `).get(run.id) as AggregateRow;
     const actionCount = count(actions.count);
@@ -341,9 +344,12 @@ export class RunLearningService {
     const cancelledActions = count(actions.cancelled);
     const uniqueActions = count(actions.unique_count);
     const actionRetries = count(actions.retries);
+    const actionsWithProgress = count(actions.with_progress);
+    const noProgressActionCount = Math.max(0, actionCount - actionsWithProgress);
 
     const evidence = this.database.prepare(`
-      SELECT COUNT(*) AS count, SUM(verification_state = 'verified') AS verified
+      SELECT COUNT(*) AS count, SUM(verification_state = 'verified') AS verified,
+        MIN(CASE WHEN verification_state = 'verified' THEN acquired_at END) AS first_meaningful_at
       FROM evidence WHERE run_id = ?
     `).get(run.id) as AggregateRow;
     const evidenceCount = count(evidence.count);
@@ -450,6 +456,13 @@ export class RunLearningService {
     const startedAt = run.started_at ?? run.created_at;
     const endedAt = run.ended_at ?? this.#clock().toISOString();
     const durationMs = Math.max(0, Date.parse(endedAt) - Date.parse(startedAt));
+    const firstMeaningfulEvidenceAt = evidence.first_meaningful_at ?? null;
+    const firstMeaningfulEvidenceTimestamp = firstMeaningfulEvidenceAt === null
+      ? Number.NaN
+      : Date.parse(firstMeaningfulEvidenceAt);
+    const timeToFirstMeaningfulEvidenceMs = Number.isFinite(firstMeaningfulEvidenceTimestamp)
+      ? Math.max(0, firstMeaningfulEvidenceTimestamp - Date.parse(startedAt))
+      : null;
     const wallClockLimit = numberValue(budget.wallClockMs)
       ?? (numberValue(budget.timeBudgetMinutes) !== null
         ? numberValue(budget.timeBudgetMinutes)! * 60_000
@@ -475,6 +488,18 @@ export class RunLearningService {
       : ratio(actionCount - unboundGuidedActions, actionCount, 1);
     const policyCompliance = ratio(Math.max(0, actionCount - policyViolationCount), actionCount, policyViolationCount === 0 ? 1 : 0);
     const recoveryQuality = recoveryCount === 0 ? 1 : terminalStatus === "completed" ? 1 : 0;
+    const memoryContextPrecision = memoriesRetrieved > 0
+      ? ratio(memoriesUsed, memoriesRetrieved)
+      : null;
+    const preferenceCorrectionRate = memoriesRetrieved > 0
+      ? ratio(memoriesCorrected, memoriesRetrieved)
+      : null;
+    const operatorInterventionCount = run.journey === "guided"
+      ? guidedDecisionCount
+      : autonomousUserWaitCount;
+    const toolCallSuccessRate = toolCallCount > 0
+      ? ratio(succeededToolCalls, toolCallCount)
+      : null;
 
     const scores: Record<string, number | null> = {
       objectiveCompletion: terminalStatus === "completed" && outcome?.success !== false ? 1 : 0,
@@ -498,12 +523,15 @@ export class RunLearningService {
     const metrics: Record<string, number | string | null> = {
       terminalStatus,
       durationMs,
+      timeToFirstMeaningfulEvidenceMs,
       actionCount,
       succeededActions,
       failedActions,
       deniedActions,
       cancelledActions,
       uniqueActionFingerprints: uniqueActions,
+      actionsWithMeaningfulProgress: actionsWithProgress,
+      noProgressActionCount,
       repeatedActionRate,
       retryCount: run.retry_count + actionRetries,
       retryRate,
@@ -516,6 +544,7 @@ export class RunLearningService {
       completedAssignments,
       toolCallCount,
       succeededToolCalls,
+      toolCallSuccessRate,
       providerTurnCount,
       completedProviderTurns,
       providerTokens: numberValue(usage.providerTokens) ?? providerTokens,
@@ -523,14 +552,18 @@ export class RunLearningService {
       guidedDecisionCount,
       exactGuidedDecisionCount,
       operatorCorrectionCount,
+      operatorInterventionCount,
       autonomousUserWaitCount,
       policyViolationCount,
       recoveryCount,
+      recoverySuccessRate: recoveryCount > 0 ? recoveryQuality : null,
       artifactCount,
       reportCount,
       memoriesRetrieved,
       memoriesUsed,
       memoriesCorrected,
+      memoryContextPrecision,
+      preferenceCorrectionRate,
       successCriteriaCount: criteria.length,
       satisfiedCriteriaCount: satisfiedCriteria,
       evidenceBackedCriteriaCount: evidenceBackedCriteria,
