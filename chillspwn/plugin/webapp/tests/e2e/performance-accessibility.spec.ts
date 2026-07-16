@@ -256,6 +256,55 @@ test.describe("Command OS performance and accessibility evidence", () => {
     expect(focusStyle.outlineWidth).toBeGreaterThanOrEqual(2);
   });
 
+  test("long pages retain document scrolling with sticky operational chrome", async ({ page }, testInfo) => {
+    const measurements: Record<string, unknown> = {};
+    const viewports = [
+      { name: "desktop", width: 1_440, height: 700 },
+      { name: "mobile", width: 390, height: 667 },
+    ] as const;
+
+    for (const viewport of viewports) {
+      await page.setViewportSize({ width: viewport.width, height: viewport.height });
+      await gotoShell(page);
+
+      const before = await page.evaluate(() => ({
+        viewportHeight: innerHeight,
+        documentHeight: Math.max(document.body.scrollHeight, document.documentElement.scrollHeight),
+        bodyOverflowX: getComputedStyle(document.body).overflowX,
+        bodyOverflowY: getComputedStyle(document.body).overflowY,
+      }));
+      expect(before.documentHeight).toBeGreaterThan(before.viewportHeight);
+      expect(before.bodyOverflowX).toBe("hidden");
+      expect(before.bodyOverflowY).toBe("auto");
+
+      await page.getByRole("heading", { level: 1, name: "Command Center" }).hover();
+      await page.mouse.wheel(0, viewport.height);
+      await expect.poll(() => page.evaluate(() => window.scrollY)).toBeGreaterThan(0);
+
+      const wheel = await page.evaluate(() => ({
+        scrollY: window.scrollY,
+        topbarTop: document.querySelector<HTMLElement>(".os-topbar")!.getBoundingClientRect().top,
+        sidebarTop: document.querySelector<HTMLElement>(".os-sidebar")!.getBoundingClientRect().top,
+      }));
+      expect(Math.abs(wheel.topbarTop)).toBeLessThanOrEqual(1);
+      if (viewport.name === "desktop") expect(Math.abs(wheel.sidebarTop - 64)).toBeLessThanOrEqual(1);
+
+      await page.evaluate(() => window.scrollTo({ top: 0, behavior: "instant" }));
+      await page.locator("#command-os-content").focus();
+      await page.keyboard.press("End");
+      await expect.poll(() => page.evaluate(() => window.scrollY)).toBeGreaterThan(0);
+
+      measurements[viewport.name] = {
+        viewport: { width: viewport.width, height: viewport.height },
+        before,
+        wheel,
+        keyboardScrollY: await page.evaluate(() => window.scrollY),
+      };
+    }
+
+    await attachJson(testInfo, "document-scroll-regression.json", measurements);
+  });
+
   test("reduced-motion preference collapses running animation and transition durations", async ({ page }, testInfo) => {
     await page.emulateMedia({ reducedMotion: "reduce" });
     await gotoShell(page);

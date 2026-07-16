@@ -227,7 +227,8 @@ body {
   background-attachment: fixed;
   color: var(--desktop-text, oklch(0.96 0.01 280));
   font-family: "JetBrains Mono", "Fira Code", "Cascadia Code", monospace;
-  overflow: hidden;
+  overflow-x: hidden;
+  overflow-y: auto;
   position: relative;
 }
 
