@@ -14,6 +14,7 @@ const paths: Record<NavIconName, string[]> = {
   observability: ["M3 12s3-6 9-6 9 6 9 6-3 6-9 6-9-6-9-6z", "M12 9a3 3 0 1 0 0 6 3 3 0 0 0 0-6"],
   reports: ["M6 3h9l4 4v14H6z", "M15 3v5h4", "M9 12h6", "M9 16h6"],
   system: ["M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8", "M12 2v3", "M12 19v3", "M2 12h3", "M19 12h3", "M5 5l2 2", "M17 17l2 2", "M19 5l-2 2", "M7 17l-2 2"],
+  manual: ["M5 4h5a3 3 0 0 1 3 3v13H8a3 3 0 0 0-3 1z", "M19 4h-5a3 3 0 0 0-3 3v13h5a3 3 0 0 1 3 1z", "M8 8h2", "M14 8h2"],
 };
 
 export function Icon({ name, ...props }: SVGProps<SVGSVGElement> & { name: NavIconName }) {

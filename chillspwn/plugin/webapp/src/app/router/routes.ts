@@ -1,6 +1,6 @@
 export type NavIconName =
   | "overview" | "missions" | "live" | "guided" | "decisions" | "intelligence"
-  | "agents" | "brain" | "learning" | "observability" | "reports" | "system";
+  | "agents" | "brain" | "learning" | "observability" | "reports" | "system" | "manual";
 
 export interface NavigationItem {
   label: string;
@@ -23,6 +23,13 @@ export const PRIMARY_NAVIGATION: NavigationItem[] = [
   { label: "Reports", path: "/reports", icon: "reports", matchPrefix: "/reports" },
   { label: "System", path: "/system/connections", icon: "system", matchPrefix: "/system" },
 ];
+
+export const USER_MANUAL_NAVIGATION: NavigationItem = {
+  label: "User Manual",
+  path: "/manual",
+  icon: "manual",
+  matchPrefix: "/manual",
+};
 
 export function isNavigationItemActive(item: NavigationItem, pathname: string): boolean {
   if (item.path === "/") return pathname === "/";

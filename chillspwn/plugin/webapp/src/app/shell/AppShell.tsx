@@ -2,7 +2,7 @@ import { type ReactNode, useEffect, useState } from "react";
 import { useEventStream } from "../../data/events/EventStreamProvider";
 import { Icon } from "../../design-system/components/Icon";
 import { AppLink, useNavigation } from "../router/navigation";
-import { isNavigationItemActive, PRIMARY_NAVIGATION } from "../router/routes";
+import { isNavigationItemActive, PRIMARY_NAVIGATION, USER_MANUAL_NAVIGATION } from "../router/routes";
 import { CommandPalette } from "../command-palette/CommandPalette";
 import { NotificationCenter } from "../../features/notifications/NotificationCenter";
 
@@ -90,6 +90,10 @@ export function AppShell({ children }: { children: ReactNode }) {
             })}
           </nav>
           <div className="os-sidebar-footer">
+            <AppLink href={USER_MANUAL_NAVIGATION.path} className={`os-legacy-link ${isNavigationItemActive(USER_MANUAL_NAVIGATION, pathname) ? "is-active" : ""}`} aria-label={USER_MANUAL_NAVIGATION.label}>
+              <span>{USER_MANUAL_NAVIGATION.label}</span>
+              <Icon name={USER_MANUAL_NAVIGATION.icon} />
+            </AppLink>
             <p>Authorized operations only</p>
           </div>
         </aside>

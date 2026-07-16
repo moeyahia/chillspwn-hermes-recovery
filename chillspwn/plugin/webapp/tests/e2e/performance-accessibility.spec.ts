@@ -215,6 +215,7 @@ test.describe("Command OS performance and accessibility evidence", () => {
       ["/brain", "Second Brain"],
       ["/brain/graph", "Memory Graph"],
       ["/missions/new/guided", "Start with the authorized objective"],
+      ["/manual", "ChillsPwn User Manual"],
     ];
     for (const [path, heading] of pages) {
       await test.step(path, async () => {
@@ -228,6 +229,7 @@ test.describe("Command OS performance and accessibility evidence", () => {
       "/brain": [],
       "/brain/graph": [],
       "/missions/new/guided": [],
+      "/manual": [],
     });
   });
 

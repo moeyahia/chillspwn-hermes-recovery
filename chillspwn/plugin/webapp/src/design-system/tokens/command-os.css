@@ -255,6 +255,8 @@
 .os-sidebar-footer { margin-top: auto; padding: var(--os-space-8) var(--os-space-3) 0; }
 .os-legacy-link { min-height: 44px; display: flex; align-items: center; justify-content: space-between; color: var(--os-text-secondary) !important; font-size: 0.73rem; text-decoration: none; }
 .os-legacy-link:hover { color: var(--os-text) !important; }
+.os-legacy-link svg { width: 18px; height: 18px; flex: 0 0 auto; }
+.os-legacy-link.is-active { color: var(--os-accent) !important; }
 .os-sidebar-footer p { color: var(--os-text-muted); font-size: 0.62rem; letter-spacing: 0.05em; text-transform: uppercase; }
 
 .os-content { min-width: 0; outline: none; }

@@ -17,7 +17,7 @@ import type { GuidedCommanderMessage, GuidedCommanderStep, GuidedRememberInput }
 import type { RuntimeRun } from "../../domain/types/runtimeV2";
 import { suggestedMemorySummary, suggestedMemoryTitle } from "../../features/guided/guidedCommanderUi";
 import { useNavigation } from "../router/navigation";
-import { PRIMARY_NAVIGATION } from "../router/routes";
+import { PRIMARY_NAVIGATION, USER_MANUAL_NAVIGATION } from "../router/routes";
 import {
   agentCommand,
   contextualRunCommands,
@@ -32,12 +32,13 @@ import {
   runCommand,
 } from "./commandPaletteModel";
 
-const NAVIGATION_COMMANDS: readonly PaletteCommand[] = PRIMARY_NAVIGATION.map((item) => ({
+const NAVIGATION_COMMANDS: readonly PaletteCommand[] = [...PRIMARY_NAVIGATION, USER_MANUAL_NAVIGATION].map((item) => ({
   id: `navigate-${item.label.toLocaleLowerCase("en-US").replace(/\s+/gu, "-")}`,
   kind: "navigation",
   group: "Commands",
   label: item.label,
   description: `Navigate to ${item.label}`,
+  keywords: item.path === "/manual" ? ["help", "how to", "documentation", "new engagement", "start mission"] : undefined,
   path: item.path,
 }));
 

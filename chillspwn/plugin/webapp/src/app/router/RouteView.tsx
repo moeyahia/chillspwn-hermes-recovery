@@ -23,6 +23,7 @@ const DecisionsPage = lazy(() => import("../../features/decisions/DecisionsPage"
 const LiveOperationsPage = lazy(() => import("../../features/live-operations/LiveOperationsPage"));
 const GuidedWorkspacePage = lazy(() => import("../../features/guided/GuidedWorkspacePage"));
 const RunWorkspacePage = lazy(() => import("../../features/runs/RunWorkspacePage"));
+const UserManualPage = lazy(() => import("../../features/manual/UserManualPage"));
 
 function Redirect({ to }: { to: string }) {
   const { navigate } = useNavigation();
@@ -74,6 +75,7 @@ export function RouteView() {
   else if (pathname === "/system" || pathname === "/system/connections") route = <SystemPage view="connections" />;
   else if (pathname === "/system/policies") route = <SystemPage view="policies" />;
   else if (pathname === "/system/settings") route = <SystemPage view="settings" />;
+  else if (pathname === "/manual") route = <UserManualPage />;
   else route = <div className="os-page os-narrow-page"><PageHeader eyebrow="404" title="Command surface not found" description="The requested route does not exist in Command OS." actions={<ButtonLink href="/">Return to Overview</ButtonLink>} /></div>;
   return <Suspense fallback={<LoadingRoute />}>{route}</Suspense>;
 }
