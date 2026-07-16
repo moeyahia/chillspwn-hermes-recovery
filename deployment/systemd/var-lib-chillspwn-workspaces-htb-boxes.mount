@@ -1,0 +1,12 @@
+[Unit]
+Description=ChillsPwn HTB workspace bind mount
+Before=chillspwn.service hermes-gateway.service
+
+[Mount]
+What=/root/htb/boxes
+Where=/var/lib/chillspwn/workspaces/htb/boxes
+Type=none
+Options=bind
+
+[Install]
+WantedBy=local-fs.target

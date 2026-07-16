@@ -12,7 +12,10 @@ The server loads live personas from `CHILLSPWN_PERSONAS_DIR`, defaulting below t
 <CHILLSPWN_PERSONAS_DIR>/<persona-name>/persona.json
 ```
 
-The integrated recovery units set `/root/.hermes/chillspwn/personas` explicitly. Historical phase documentation may refer to `${HOME}/.claude/chillspwn/personas`; that is not the maintained recovery layout.
+The integrated units use the root-controlled release path
+`/opt/chillspwn/plugin/webapp/server/agents/personas`. Historical phase
+documentation may refer to `${HOME}/.claude/chillspwn/personas`; that is a
+migration source, not the maintained deployment layout.
 
 Persona Markdown under `server/agents/personas/` is tracked source material, not an automatic deployment mechanism. A fresh checkout without live persona JSON can start, but chat cannot select a persona.
 
@@ -20,7 +23,9 @@ Never publish live persona directories without reviewing them for provider setti
 
 ## Hermes
 
-OpenRouter, Codex, Gemini, Mission Board, conversation recall, reports, and other paths rely on components installed under `${HOME}/.hermes` or other host paths. Current examples include:
+OpenRouter, Codex, Gemini, Mission Board compatibility, conversation recall,
+reports, and other paths rely on the pinned Hermes environment and explicit
+state below `/var/lib/chillspwn/hermes`. Current examples include:
 
 - the OpenRouter orchestration Python entry point;
 - Mission Board and conversation MCP servers;
@@ -44,7 +49,7 @@ The optional runtime gate is disabled by default. Roll it out in `dry-run` mode 
 
 ## Codex and Gemini
 
-Current Codex and Gemini flows are mediated by the external Hermes orchestration path rather than a self-contained SDK in this repository. The integrated units isolate Codex state through `CODEX_HOME=/root/.hermes/auth/codex`. Gemini's current direct Google API path expects `GEMINI_API_KEY` in the inherited ChillsPwn service environment; the external Python orchestrator consumes it. The value must remain server-side and outside Git and Hermes YAML.
+Current Codex and Gemini flows are mediated by the external Hermes orchestration path rather than a self-contained SDK in this repository. The integrated units isolate Codex state through `CODEX_HOME=/var/lib/chillspwn/codex`. Gemini's current direct Google API path expects `GEMINI_API_KEY` in the inherited ChillsPwn service environment; the external Python orchestrator consumes it. The value must remain server-side and outside Git and Hermes YAML.
 
 ## Grok ACP
 
@@ -56,17 +61,31 @@ The Grok path uses the reviewed absolute `grok` CLI as an ACP process over stand
 - The credential file is not read into application configuration or copied into the ACP workspace.
 - API-key variables are deliberately removed from the commander child environment.
 
-Commander sessions use an isolated HOME/configuration root, a controlled profile, explicitly supplied Mission Board and conversation MCP servers, tool-surface attestation, and a pre-tool guard. The commander is coordination-only; execution must be assigned to named specialist personas through the Mission Board. The application launches with `--reasoning-effort high`, which is the maintained Expert thinking setting.
+Commander sessions use an isolated HOME/configuration root, a controlled profile, explicitly supplied Mission Board and conversation MCP servers, tool-surface attestation, and a pre-tool guard. Command OS planning sessions use the same canonical no-hands SOUL through a narrower Autonomous/Guided planning projection, run with zero MCP servers, and can only select bindings from the reviewed specialist inventory; the runtime performs the binding and contract checks after the provider returns. The commander is coordination-only, and specialists own execution. The application launches with `--reasoning-effort high`, which is the maintained Expert thinking setting.
 
-The integrated recovery contract supplies the pinned Hermes Python and MCP scripts at the documented `/root/hermes-venv` and `/root/.hermes/skills` locations. A standalone webapp deployment must provide equivalent files and configure its paths before Grok commander readiness can pass.
+The integrated contract supplies root-controlled Bun and Hermes Python under
+`/opt/chillspwn-runtime` and configured MCP assets under reviewed absolute
+paths. A standalone webapp deployment must provide equivalent immutable files
+before Grok commander readiness can pass.
+
+If a planning response is valid JSON but omits a required schema field, the
+runtime may request exactly one schema-repair turn. It reports only the safe
+field path, never replays or persists the rejected raw response, and accounts
+both OAuth provider turns. Secret-like material, policy/scope denial,
+unavailable specialist bindings, and Autonomous manual actions fail closed
+without a repair turn.
 
 ## Provider child-environment boundary
 
 Direct provider processes receive explicit allowlisted environment subsets, so a Claude, Grok, Codex, Gemini, or OpenRouter child does not automatically inherit every other provider's API variables. Individual Council lanes use provider-aware construction, while their multi-provider launcher necessarily holds the inputs needed to create its configured lanes. This is defense in depth only: the dashboard and provider children still share the `chillspwn` UID, so host `/proc` policy and service-readable OAuth stores can permit same-UID access. Strong mutual isolation requires separate service identities and a credential broker.
 
-## Reusable memory broker
+## Second Brain
 
-In the integrated recovery deployment, `/root/.hermes/memories` is root-only and model-facing processes have no direct filesystem access. `chillspwn-memory.service` accepts a narrow Unix-socket protocol at `/run/chillspwn-memory/broker.sock` for validated additions and policy-filtered `safe-read`. The legacy dashboard Memory page is read-only; whole-file `PUT /api/memory/:file` returns `403 MEMORY_MUTATION_MEDIATED`. Broker failure produces a fail-closed empty provider context and a `503 MEMORY_BROKER_UNAVAILABLE` response for the operator-facing read endpoint.
+Command OS V2 memory is canonical in
+`/var/lib/chillspwn/command-os-v2.sqlite` and projected under
+`/var/lib/chillspwn/brain-vaults`. Retrieval, context-pack use, lifecycle,
+engagement isolation, correction, and forgetting are database-mediated. The
+hardened deployment does not require the legacy root memory broker.
 
 ## MCP Arsenal
 
@@ -78,11 +97,14 @@ The MCP bridge is off by default. Its safe activation sequence is:
 4. Review health, proposed calls, output limits, and approval behavior.
 5. Set `MCP_ARSENAL_MODE=enabled` only after validation.
 
-Docker-based and auto-started servers have separate opt-in flags. Vendor API-key names are listed in `.env.mcp.example`; values belong only in the service secret store.
+Auto-started servers have separate opt-in flags. Docker-backed MCP is disabled
+for the hardened host because Docker socket access is root-equivalent. Vendor
+API-key names are listed in `.env.mcp.example`; values belong only in the
+service secret store.
 
 ## Reports and assets
 
-Report generation depends on templates, Python scripts, WeasyPrint, and engagement files. The outer recovery repository retains sanitized report templates, while engagement inputs remain external. Optional wordlists, binaries, and MCP assets may be installed under `/opt/chillspwn-*`; the setup scripts inventory or describe some resources but are not complete idempotent installers.
+Report generation depends on templates, Python scripts, WeasyPrint, and engagement files. The outer recovery repository retains sanitized report templates, while engagement inputs remain external. The reviewed template tree is selected through `CHILLSPWN_REPORT_TEMPLATE_DIR` and defaults to the root-controlled `/opt/chillspwn/report-template`; it is intentionally separate from mutable engagement roots. Optional wordlists, binaries, and MCP assets may be installed under `/opt/chillspwn-*`; the setup scripts inventory or describe some resources but are not complete idempotent installers.
 
 ## Readiness checklist
 

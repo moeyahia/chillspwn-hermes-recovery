@@ -1,0 +1,32 @@
+{
+  "schemaVersion": 1,
+  "reviewedAsset": {
+    "path": "/opt/chillspwn-mcp-arsenal/local-selftest-mcp.mjs",
+    "sha256": "ecc77ab562c9cabf5f68297ede9df563935d1720ead341dff4c307363da8a215",
+    "networkBehavior": "none",
+    "purpose": "process restart and specialist dispatch validation"
+  },
+  "mcpServers": {
+    "sechub-reconnaissance": {
+      "enabled": true,
+      "runtime": "stdio",
+      "command": "/usr/bin/node",
+      "args": [
+        "/opt/chillspwn-mcp-arsenal/local-selftest-mcp.mjs"
+      ],
+      "assignedAgents": [
+        "ReconScout"
+      ],
+      "toolNames": [
+        "quick_scan"
+      ],
+      "requiredBinaries": [
+        "/usr/bin/node"
+      ],
+      "requiredDockerImages": [],
+      "envTemplate": {},
+      "apiKeysRequired": [],
+      "installMethod": "reviewed no-network deployment validation selftest"
+    }
+  }
+}

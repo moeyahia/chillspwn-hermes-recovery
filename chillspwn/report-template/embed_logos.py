@@ -5,7 +5,10 @@
 # with an inline base64 data URI. Portable: logos render anywhere the HTML opens.
 import sys, base64, re, os
 
-ASSETS = "/root/report-template/assets"
+TEMPLATE_DIR = os.environ.get("CHILLSPWN_REPORT_TEMPLATE_DIR", "/opt/chillspwn/report-template")
+if not os.path.isabs(TEMPLATE_DIR):
+    raise SystemExit("CHILLSPWN_REPORT_TEMPLATE_DIR must be an absolute path")
+ASSETS = os.path.join(os.path.realpath(TEMPLATE_DIR), "assets")
 def data_uri(fn, mime):
     with open(os.path.join(ASSETS, fn), "rb") as f:
         return "data:%s;base64,%s" % (mime, base64.b64encode(f.read()).decode())
@@ -16,9 +19,9 @@ PNG = data_uri("smallLogo.png", "image/png")
 # match any src that ends in the asset filename, with optional path/scheme prefix
 pat_svg = re.compile(r'src="(?:[^"]*?/)?(?:file:///[^"]*?)?assets/Logo\.svg"')
 pat_png = re.compile(r'src="(?:[^"]*?/)?(?:file:///[^"]*?)?assets/smallLogo\.png"')
-# also catch the already-rewritten file:// absolute form
-pat_svg2 = re.compile(r'src="file:///root/report-template/assets/Logo\.svg"')
-pat_png2 = re.compile(r'src="file:///root/report-template/assets/smallLogo\.png"')
+# also catch an already-rewritten file:// absolute form for the configured root
+pat_svg2 = re.compile(r'src="' + re.escape("file://" + os.path.join(ASSETS, "Logo.svg")) + r'"')
+pat_png2 = re.compile(r'src="' + re.escape("file://" + os.path.join(ASSETS, "smallLogo.png")) + r'"')
 
 for path in sys.argv[1:]:
     h = open(path, encoding="utf-8").read()

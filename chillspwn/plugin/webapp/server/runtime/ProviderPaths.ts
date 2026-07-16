@@ -1,7 +1,7 @@
 import { resolve } from "path";
 
 export function claudeStateDir(env: NodeJS.ProcessEnv = process.env): string {
-  const hermesHome = resolve(env.HERMES_HOME || resolve(env.HOME || "/root", ".hermes"));
+  const hermesHome = resolve(env.HERMES_HOME || resolve(env.HOME || "/var/lib/chillspwn", ".hermes"));
   return resolve(env.CLAUDE_CONFIG_DIR || resolve(hermesHome, "auth/claude"));
 }
 

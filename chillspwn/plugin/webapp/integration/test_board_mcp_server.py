@@ -1,6 +1,6 @@
 """Regression tests for the recovery snapshot's ChillsPwn board MCP server.
 
-Run: /root/hermes-venv/bin/python integration/test_board_mcp_server.py
+Run: python3 integration/test_board_mcp_server.py
 """
 import importlib.util
 import json
@@ -39,8 +39,8 @@ except ImportError:
 BOARD_MCP_SERVER = os.environ.get(
     "CHILLSPWN_BOARD_MCP_SERVER",
     str(
-        Path(__file__).resolve().parents[4]
-        / "hermes/runtime/skills/red-teaming/council-of-ais/scripts/board_mcp_server.py"
+        Path(__file__).resolve().parents[1]
+        / "server/providers/grok-commander-mcp/board_mcp_server.py"
     ),
 )
 

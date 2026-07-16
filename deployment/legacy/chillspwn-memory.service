@@ -1,0 +1,49 @@
+# LEGACY ONLY. Do not install on a Command OS V2.1 host.
+[Unit]
+Description=ChillsPwn validated memory broker (legacy)
+After=local-fs.target
+Before=chillspwn.service hermes-gateway.service
+
+[Service]
+Type=simple
+User=root
+Group=chillspwn
+RuntimeDirectory=chillspwn-memory
+RuntimeDirectoryMode=0750
+Environment=HOME=/root
+Environment=HERMES_HOME=/root/.hermes
+Environment=HERMES_PYTHON=/root/hermes-venv/bin/python
+Environment=CHILLSPWN_HERMES_SRC=/opt/chillspwn/hermes-agent
+Environment=CHILLSPWN_MEM_CLI=/root/.hermes/skills/red-teaming/council-of-ais/scripts/chillspwn_mem.py
+Environment=CHILLSPWN_MEMORY_GUARD=required
+Environment=CHILLSPWN_MEMORY_SOCKET=/run/chillspwn-memory/broker.sock
+Environment=CHILLSPWN_SERVICE_GROUP=chillspwn
+ExecStart=/opt/chillspwn/libexec/chillspwn-memory-broker
+Restart=on-failure
+RestartSec=2
+UMask=0077
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateNetwork=true
+PrivateTmp=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHome=read-only
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectSystem=strict
+ReadWritePaths=/root/.hermes/memories /run/chillspwn-memory
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RemoveIPC=true
+SystemCallArchitectures=native
+CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target

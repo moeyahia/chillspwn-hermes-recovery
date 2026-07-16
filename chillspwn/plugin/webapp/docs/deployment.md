@@ -1,12 +1,36 @@
 # Deployment and rollback
 
-## Supported shape
+The supported production shape is a private Linux host with systemd, a
+root-controlled immutable release under `/opt`, and service-owned runtime state
+under `/var/lib/chillspwn`. The dashboard binds to loopback and is exposed only
+through an authenticated private proxy or SSH tunnel. This repository does not
+define a public-cloud or container deployment contract.
 
-The detected production shape is a Linux systemd service running Bun, serving a prebuilt `dist/`, with external environment/state directories and private network exposure. This repository does not include a public-cloud or container deployment contract.
+Follow the detailed [Command OS V2.1 deployment gate](command-os-v2/deployment.md)
+and [rollback runbook](command-os-v2/rollback.md). The sanitized units are under
+the repository-level [`deployment/systemd`](../../../../deployment/systemd)
+directory; the local [`deploy/systemd/chillspwn.service.example`](../deploy/systemd/chillspwn.service.example)
+is a dashboard-only reference.
 
-The example unit at `deploy/systemd/chillspwn.service.example` is sanitized and uses conventional paths. It is a core-dashboard starting point, not a drop-in full Hermes/Grok deployment: several current integrations still expect host-specific paths documented in [Integrations](integrations.md). Review every path, user, capability, HOME, and environment value for the target host before installing it.
+## Supported host contract
 
-## Build a candidate
+- Both `chillspwn.service` and `hermes-gateway.service` run as the unprivileged
+  `chillspwn` identity with an empty supplementary-group set.
+- Application releases, Bun, the Hermes virtual environment, Grok executable,
+  and report templates are root-owned and non-service-writable below `/opt`.
+- Mutable application, provider, OAuth, SQLite, and vault state is narrowly
+  service-owned below `/var/lib/chillspwn`.
+- Existing `/root/htb/boxes` and `/root/engagements` data is exposed only at the
+  configured `/var/lib/chillspwn/workspaces/...` paths through the tracked bind
+  mounts.
+- Command OS SQLite and the Obsidian-compatible vault replace the legacy root
+  memory-broker dependency.
+- Docker MCP execution is disabled. Do not grant the service Docker socket or
+  Docker-group access.
+- Secrets are injected from root-owned mode-`0600` environment files; they are
+  never stored in release files or units.
+
+## Build and validate a candidate
 
 From a reviewed checkout:
 
@@ -16,78 +40,55 @@ bun run check
 bun audit
 ```
 
-`bun run check` parses and bundles the production server entry, runs modular server and client typechecking, the Bun tests, both portable Python regressions, and the production frontend build.
+`bun run check` validates the server entry, strict server/client types, unit
+tests, portable Python regressions, and production frontend build. The V2 gate
+adds browser, migration, provider, restart/resume, performance, secret-scan,
+and deployed smoke requirements. Never promote an uncommitted worktree.
 
-For the combined recovery repository, do not install the standalone example below in place of the reviewed integrated units. Use the root [Recovery runbook](../../../../RECOVERY.md), which restores and coordinates `chillspwn-memory.service`, `chillspwn.service`, and `hermes-gateway.service`, the root-only environment/config validator, the pinned Hermes interpreter, Grok OAuth paths, and the memory broker.
+## Release promotion
 
-## Host preparation
+Stage each reviewed candidate at a unique
+`/opt/chillspwn/releases/<release-id>` path, install dependencies with the pinned
+root-controlled Bun, build it, remove group/other write permission, then update
+`/opt/chillspwn/plugin` atomically. Never overwrite the prior release.
 
-At minimum:
-
-1. Create a dedicated unprivileged service account.
-2. Install the pinned Bun runtime and required system tools.
-3. Place reviewed application source under a stable path such as `/opt/chillspwn`.
-4. Define an explicit secret-injection design. The integrated recovery units use root-owned mode-`0600` systemd environment files that the service cannot reopen; a standalone unit may use another audited secret manager.
-5. Provision external Hermes/persona/provider contracts described in [Integrations](integrations.md).
-6. Keep runtime logs, state, engagements, and credential files outside `/opt/chillspwn`.
-7. Bind to loopback and expose through an authenticated private proxy or SSH tunnel where possible.
-
-Do not copy the live host's HOME symlink arrangement or root-owned state blindly. Make ownership and access explicit for the service account.
-
-## Install the example service
-
-Review and adapt the example before running these host-level commands:
+Before starting services, create and permission the documented state/log roots,
+install the two `.mount` units and two `.service` units, and run:
 
 ```bash
-sudo install -m 0644 deploy/systemd/chillspwn.service.example /etc/systemd/system/chillspwn.service
-sudo systemctl daemon-reload
-sudo systemctl enable --now chillspwn.service
-sudo systemctl status chillspwn.service
+systemd-analyze verify \
+  /etc/systemd/system/var-lib-chillspwn-workspaces-htb-boxes.mount \
+  /etc/systemd/system/var-lib-chillspwn-workspaces-engagements.mount \
+  /etc/systemd/system/hermes-gateway.service \
+  /etc/systemd/system/chillspwn.service
+systemctl daemon-reload
 ```
 
-The example assumes `/opt/chillspwn`, service user/group and HOME for `chillspwn`, and an optional `/etc/chillspwn/chillspwn.env`. If those assumptions are wrong, edit the installed unit before enabling it. Full integrated operation also requires making the documented Hermes, report, and Grok paths available or making those application paths configurable.
+Do not start the candidate until the migration backup, verification,
+reconciliation, and non-production restore rehearsal pass.
 
-The example is intentionally not equivalent to the combined recovery deployment. It does not install the memory broker or Hermes gateway, does not validate `/root/.hermes/config.yaml`, and does not provision isolated Claude/Codex/Grok state. Do not claim full integrated readiness from this one unit.
-
-## Verify
-
-From the host:
+## Verification
 
 ```bash
 curl --fail --silent --show-error http://127.0.0.1:3131/api/health
-journalctl -u chillspwn.service -n 100 --no-pager
+curl --fail --silent --show-error http://127.0.0.1:3131/api/v2/health
+systemctl status hermes-gateway.service chillspwn.service --no-pager
 ```
 
-Then verify, without executing an engagement:
-
-- authentication from the intended client path;
-- persona readiness;
-- Mission Board read/write behavior;
-- provider readiness for each enabled persona;
-- WebSocket connection;
-- approval and feature-gate settings;
-- log/state locations and permissions.
+Also verify database integrity, event streaming, exactly two journey entries,
+provider/MCP readiness, a harmless Guided exact-step run, a harmless Autonomous
+delegated run, cancellation cleanup, restart/resume, memory scope/forgetting,
+and Obsidian projection/conflict handling. Record identifiers and status only;
+do not copy raw credentials, prompts, or engagement evidence into deployment
+reports.
 
 ## Network exposure
 
-Do not bind directly to a public interface. If a non-loopback bind is required, configure a strong `DASHBOARD_TOKEN`, TLS at the private ingress, firewall rules, and access logging. Keep the unsafe no-auth escape hatch disabled.
-
-## Rollback
-
-Before deployment, retain:
-
-- the previous reviewed commit/build;
-- a compatible encrypted state/database backup;
-- the previous environment/service configuration;
-- the exact runtime version.
-
-To roll back code:
-
-1. Stop the service.
-2. Restore the prior reviewed checkout/build without using destructive Git commands on an unreviewed worktree.
-3. Restore state only if the data format is incompatible and the backup matches that code.
-4. Start the service and repeat the verification checklist.
+Do not bind directly to a public interface. For any non-loopback bind, require a
+strong `DASHBOARD_TOKEN`, TLS at private ingress, firewall restrictions, and
+access logging. Keep the unsafe no-auth escape hatch disabled.
 
 ## Automation boundary
 
-GitHub Actions validates source only. Deployment automation should not be added until the target environment, artifact promotion, approvals, secret manager, state migration, and rollback policy are all defined.
+GitHub Actions validates source only. Host promotion, migration, OAuth setup,
+secret injection, and rollback remain explicit operator-controlled operations.

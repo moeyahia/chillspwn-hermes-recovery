@@ -7,6 +7,7 @@ import { AgentRunStore } from "../AgentRunStore";
 import { EventLog } from "../EventLog";
 import { MemoryBoardSink } from "../BoardSink";
 import { DEFAULT_POLICY_CONFIG, type PolicyConfig } from "../ToolPolicy";
+import { createMcpExecutionBinding } from "../../mcp/McpApprovalAttestation";
 
 let dir: string;
 let store: AgentRunStore;
@@ -120,6 +121,127 @@ describe("approval workflow", () => {
     const { rt, run, toolCall } = pendingApproval();
     // still awaiting approval → result must be refused
     expect(() => rt.recordToolResult(run.id, toolCall.id, { success: true })).toThrow(/not approved/);
+  });
+});
+
+describe("durable exact MCP approval claims", () => {
+  function approvedMcpTool() {
+    const { rt, run, steps } = executing(APPROVAL_POLICY);
+    rt.startStep(run.id, steps[1].id);
+    const args = { path: "/tmp/evidence.txt" };
+    const requested = rt.requestTool({
+      runId: run.id,
+      stepId: steps[1].id,
+      toolName: "write_file",
+      arguments: {
+        ...args,
+        __mcpServer: "mock-files",
+        __specialist: "ReconScout",
+      },
+    });
+    rt.resolveApproval(run.id, requested.toolCall.approvalId!, "approve", { resolvedBy: "operator:local" });
+    return { rt, run, stepId: steps[1].id, toolCallId: requested.toolCall.id, args };
+  }
+
+  test("claims, verifies, and durably consumes one exact approved binding", () => {
+    const state = approvedMcpTool();
+    const attestation = state.rt.claimApprovedMcpToolCall({
+      runId: state.run.id,
+      stepId: state.stepId,
+      toolCallId: state.toolCallId,
+      specialistAgentId: "ReconScout",
+      mcpServer: "mock-files",
+      toolName: "write_file",
+      arguments: state.args,
+    });
+    expect(state.rt.getToolCall(state.run.id, state.toolCallId)).toMatchObject({
+      status: "executing",
+      mcpApprovalClaim: {
+        claimId: attestation.claimId,
+        argumentsHash: attestation.argumentsHash,
+        actorId: "operator:local",
+      },
+    });
+    const binding = createMcpExecutionBinding({
+      runId: state.run.id,
+      stepId: state.stepId,
+      specialistAgentId: "ReconScout",
+      mcpServer: "mock-files",
+      toolName: "write_file",
+      arguments: state.args,
+    });
+    expect(state.rt.verifyAndConsumeMcpApprovalAttestation({
+      attestation,
+      binding,
+      verifiedAt: new Date().toISOString(),
+    })).toEqual({ approved: true });
+    expect(state.rt.verifyAndConsumeMcpApprovalAttestation({
+      attestation,
+      binding,
+      verifiedAt: new Date().toISOString(),
+    })).toMatchObject({ approved: false });
+    expect(state.rt.getToolCall(state.run.id, state.toolCallId)?.mcpApprovalClaim?.consumedAt).toBeTruthy();
+  });
+
+  test("changed arguments, server, tool, expired approval, and a second claim fail closed", () => {
+    const changedArgs = approvedMcpTool();
+    expect(() => changedArgs.rt.claimApprovedMcpToolCall({
+      runId: changedArgs.run.id,
+      stepId: changedArgs.stepId,
+      toolCallId: changedArgs.toolCallId,
+      specialistAgentId: "ReconScout",
+      mcpServer: "mock-files",
+      toolName: "write_file",
+      arguments: { path: "/tmp/changed.txt" },
+    })).toThrow("arguments changed");
+
+    const changedServer = approvedMcpTool();
+    expect(() => changedServer.rt.claimApprovedMcpToolCall({
+      runId: changedServer.run.id,
+      stepId: changedServer.stepId,
+      toolCallId: changedServer.toolCallId,
+      specialistAgentId: "ReconScout",
+      mcpServer: "another-server",
+      toolName: "write_file",
+      arguments: changedServer.args,
+    })).toThrow("specialist MCP binding");
+
+    const changedTool = approvedMcpTool();
+    expect(() => changedTool.rt.claimApprovedMcpToolCall({
+      runId: changedTool.run.id,
+      stepId: changedTool.stepId,
+      toolCallId: changedTool.toolCallId,
+      specialistAgentId: "ReconScout",
+      mcpServer: "mock-files",
+      toolName: "read_file",
+      arguments: changedTool.args,
+    })).toThrow("approval-gated tool binding");
+
+    const expired = approvedMcpTool();
+    const approvalId = expired.rt.getToolCall(expired.run.id, expired.toolCallId)!.approvalId!;
+    store.updateApproval(expired.run.id, approvalId, { resolvedAt: "2020-01-01T00:00:00.000Z" });
+    expect(() => expired.rt.claimApprovedMcpToolCall({
+      runId: expired.run.id,
+      stepId: expired.stepId,
+      toolCallId: expired.toolCallId,
+      specialistAgentId: "ReconScout",
+      mcpServer: "mock-files",
+      toolName: "write_file",
+      arguments: expired.args,
+    })).toThrow("expired");
+
+    const replay = approvedMcpTool();
+    const input = {
+      runId: replay.run.id,
+      stepId: replay.stepId,
+      toolCallId: replay.toolCallId,
+      specialistAgentId: "ReconScout",
+      mcpServer: "mock-files",
+      toolName: "write_file",
+      arguments: replay.args,
+    } as const;
+    replay.rt.claimApprovedMcpToolCall(input);
+    expect(() => replay.rt.claimApprovedMcpToolCall(input)).toThrow("not available for an approval claim");
   });
 });
 

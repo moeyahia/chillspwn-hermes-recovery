@@ -2,15 +2,17 @@
 
 ## Sources and precedence
 
-ChillsPwn reads server configuration from inherited environment variables. For local Bun runs, copy `.env.example` to `.env`; Bun loads that development file. The integrated recovery deployment lets systemd read two optional root-only files before dropping to `User=chillspwn`: legacy `/opt/chillspwn/plugin/webapp/.env` first and canonical `/root/.hermes/.env` second, so canonical values take precedence. The server does not reopen either file at runtime.
+ChillsPwn reads server configuration from inherited environment variables. For local Bun runs, copy `.env.example` to `.env`; Bun loads that development file. The hardened deployment lets systemd read root-owned `/etc/chillspwn/chillspwn.env` and, for the gateway, `/etc/hermes-gateway.env` before dropping to `User=chillspwn`. The processes do not reopen those files at runtime.
 
 Never place production values in the repository. Keep environment files, provider auth files, MCP credentials, certificates, and engagement configuration outside the checkout. API-secret environment files must be `root:root` mode `0600`, have no extended ACL, and be unreadable and unwritable by `chillspwn`. Refreshable CLI OAuth stores are a different class: they must be narrowly service-owned when the provider must replace tokens atomically.
 
-Both integrated application services run the root-owned structural validator before startup:
+When a Hermes YAML configuration is installed, run the root-controlled
+structural validator as a pre-deployment gate:
 
 ```bash
-/root/hermes-venv/bin/python /opt/chillspwn/libexec/validate-hermes-config.py \
-  --allow-missing /root/.hermes/config.yaml
+/opt/chillspwn-runtime/hermes-venv/bin/python \
+  /opt/chillspwn/libexec/validate-hermes-config.py \
+  --allow-missing /var/lib/chillspwn/hermes/config.yaml
 ```
 
 It rejects duplicate YAML keys, literal values under credential fields, URL-embedded credentials, and selected high-confidence credential patterns without printing the values. Environment references such as `${OPENROUTER_API_KEY}` are permitted. This is a structural guard, not proof that arbitrary free-form text contains no disguised secret.
@@ -37,8 +39,18 @@ The following default to `false`:
 - `ENABLE_MCP_ARSENAL`
 - `ENABLE_OPENROUTER_RUNTIME_GATING`
 - `ENABLE_RUNTIME_MANAGED_CHAT`
+- `ENABLE_LEGACY_EXECUTION_API`
 
 Enable one capability at a time and verify audit events, approvals, workspace roots, and provider behavior.
+
+`ENABLE_LEGACY_EXECUTION_API` is a rollback-only compatibility switch. When it
+is `false` (the default), historical unversioned `GET`/`HEAD` APIs remain
+readable for migration and reconciliation, while unversioned REST mutations,
+`/proxy`, legacy chat/terminal WebSocket commands, queued-board dispatch,
+detached OSINT rehydration, and legacy startup writers are disabled. Canonical
+`/api/v2` Autonomous and Guided mutations are unaffected. Setting the switch to
+`true` makes readiness visibly degraded and emits a startup warning; remove the
+opt-in immediately after the reviewed rollback task.
 
 ## Filesystem scope
 
@@ -49,19 +61,40 @@ Enable one capability at a time and verify audit events, approvals, workspace ro
 - the workspace roots passed to interactive Claude as `--add-dir`; and
 - the parent roots under which detached OSINT output directories may be created.
 
-The default is exactly `/root/htb/boxes` and `/root/engagements`. The combined recovery helper creates both as root-owned operational-data directories and grants `chillspwn` narrow access through directory/default ACLs. It does not infer or provision custom entries from the private environment file. Before configuring a custom root, create it as a real non-symlink directory, make it readable/writable/traversable by `chillspwn`, and verify that new children inherit usable access. The runtime selects the first configured root that exists and is writable for new engagement/OSINT output.
+The production value is exactly
+`/var/lib/chillspwn/workspaces/htb/boxes,/var/lib/chillspwn/workspaces/engagements`.
+Tracked systemd mount units bind existing `/root/htb/boxes` and
+`/root/engagements` data to those service paths. Install and verify the mounts
+before either service starts. Before configuring any additional root, create a
+real non-symlink directory, make it readable/writable/traversable by
+`chillspwn`, and repeat the path-boundary review.
 
 Do not add `/root`, the repository checkout, protected reusable memory, provider-auth directories, or reviewed code/template trees. Real-path containment and no-follow writes reject traversal and symlink escapes, but a needlessly broad configured root still grants a needlessly broad capability.
+
+`CHILLSPWN_REPORT_TEMPLATE_DIR` is a separate reviewed-code boundary for the
+canonical report generator, templates, and logo assets. It must be an absolute,
+non-root path and defaults to `/opt/chillspwn/report-template`. Production must
+install that tree as root-owned and non-writable by the service identity; never
+place it inside an engagement root or mutable provider state.
 
 ## Provider configuration
 
 - `OPENROUTER_API_KEY`: server-side only; leave blank when unused.
 - `GEMINI_API_KEY`: consumed by the external Hermes Python orchestrator for the current direct Gemini API path.
 - `GROK_BIN`: reviewed absolute Grok executable; the integrated deployment uses root-owned `/opt/chillspwn/bin/grok`.
-- `GROK_HOME`: mutable Grok CLI state directory; the integrated deployment uses `/root/.hermes/chillspwn/grok`.
-- `GROK_AUTH_PATH`: refreshable OAuth auth-file path; the integrated deployment uses `/root/.hermes/auth/grok/auth.json`.
+- `GROK_HOME`: mutable Grok CLI state directory; production uses `/var/lib/chillspwn/grok-home`.
+- `GROK_AUTH_PATH`: refreshable OAuth auth-file path; production uses `/var/lib/chillspwn/grok-auth/auth.json`.
+- `GROK_COMMANDER_BUN`: root-controlled Bun used by the Grok commander hook; production uses `/opt/chillspwn-runtime/bin/bun`.
+- `GROK_COMMANDER_PYTHON`: root-controlled Python interpreter for the two reviewed local commander MCP processes; defaults to `/usr/bin/python3`.
+- `GROK_COMMANDER_MCP_SCRIPT_DIR`: absolute reviewed directory containing the packaged board and conversation MCP entry points. Production normally uses the immutable release copy.
 
-Claude and Codex authentication is owned by their installed CLI/Hermes execution path. The integrated units isolate their state under `/root/.hermes/auth/claude` and `/root/.hermes/auth/codex`. Keep every provider credential out of the client bundle.
+`CHILLSPWN_GROK_ROLE` is an internal per-child marker set by the runtime after
+policy selection. Operators must not configure or persist it. `CHILLSPWN_MEM_CLI`
+selects only the legacy compatibility helper used by old chat surfaces; it is
+not the Command OS memory store and must point to reviewed local code when that
+compatibility surface is enabled.
+
+Claude and Codex authentication is owned by their installed CLI/Hermes execution path. The integrated units isolate their service-owned state under `/var/lib/chillspwn/claude` and `/var/lib/chillspwn/codex`. Keep every provider credential out of the client bundle.
 
 Direct provider subprocess environments and individual Council lanes are built from provider-aware allowlists. The Council launcher itself still receives the inputs required for its configured multi-provider lanes. These controls reduce accidental cross-provider secret inheritance, but all provider children currently share the `chillspwn` UID with the dashboard. A compromised child may still inspect same-UID process state where host `/proc` policy permits it or access OAuth stores readable by that UID. Separate provider identities and a credential broker are required for strong provider-to-provider isolation.
 
@@ -69,13 +102,17 @@ Direct provider subprocess environments and individual Council lanes are built f
 
 The integrated units set:
 
-- `CHILLSPWN_STATE_DIR=/root/.hermes/chillspwn`
-- `CHILLSPWN_SESSIONS_DIR=/root/.hermes/chillspwn/sessions`
-- `CHILLSPWN_PERSONAS_DIR=/root/.hermes/chillspwn/personas`
-- `CHILLSPWN_MEMORY_GUARD=required`
-- `CHILLSPWN_MEMORY_SOCKET=/run/chillspwn-memory/broker.sock`
+- `CHILLSPWN_STATE_DIR=/var/lib/chillspwn/state`
+- `CHILLSPWN_SESSIONS_DIR=/var/lib/chillspwn/state/sessions`
+- `CHILLSPWN_PERSONAS_DIR=/opt/chillspwn/plugin/webapp/server/agents/personas`
+- `COMMAND_OS_DB_PATH=/var/lib/chillspwn/command-os-v2.sqlite`
+- `CHILLSPWN_VAULT_ROOT=/var/lib/chillspwn/brain-vaults`
+- `HERMES_HOME=/var/lib/chillspwn/hermes`
 
-Reusable memory under `/root/.hermes/memories` is `root:root` and not directly accessible to the dashboard or provider children. The root-owned `chillspwn-memory.service` exposes only validated additive writes and policy-filtered `safe-read` over its group-restricted Unix socket. Whole-file replacement, deletion, restoration, and arbitrary paths are not available to the service account.
+Command OS V2 memory is canonical in SQLite and projected to the configured
+Obsidian-compatible vault under explicit memory scope, lifecycle, consent, and
+forgetting rules. The hardened units have no root memory-broker dependency.
+Do not set the legacy `CHILLSPWN_MEMORY_*` variables in production.
 
 ## Runtime and delegation
 
@@ -88,6 +125,8 @@ Important enforcement distinctions:
 - `APPROVAL_MODE=human` is the safest initial setting.
 - OpenRouter gating should move from `off` to `dry-run` before `enforce`.
 - MCP should move from `disabled` to `dry-run` before `enabled`.
+- `MCP_ARSENAL_ALLOW_DOCKER=false` is mandatory for this host contract; Docker
+  socket access is root-equivalent.
 
 ## Capacitor
 
@@ -104,9 +143,12 @@ The native Android project source is retained for recovery. Generated Gradle out
 Before restarting a service:
 
 1. Validate that no environment file is tracked: `git check-ignore -v .env`.
-2. Confirm the environment file is a single-link regular file owned by `root:root`, mode `0600`, with no extended ACL.
+2. Confirm each environment file is a single-link regular file owned by `root:root`, mode `0600`, with no extended ACL.
 3. Confirm `sudo -u chillspwn test ! -r <environment-file>` and `test ! -w <environment-file>` both succeed.
 4. Run the Hermes configuration validator without printing the configuration.
 5. Review non-loopback exposure and dashboard authentication.
 6. Review every enabled risky feature and approval mode.
-7. Restart all affected units and inspect `/api/health`, `chillspwn-memory.service`, dashboard logs, and gateway logs.
+7. Verify the workspace mounts, restart the two application units, and inspect
+   `/api/health`, `/api/v2/health`, dashboard logs, and gateway logs.
+8. Confirm `chillspwn` has no supplementary groups, sudo permission, or Docker
+   socket access.

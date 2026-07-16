@@ -5,7 +5,9 @@ import {
   existsSync,
   lstatSync,
   mkdirSync,
+  readFileSync,
   readdirSync,
+  realpathSync,
   renameSync,
   statSync,
   writeFileSync,
@@ -14,6 +16,17 @@ import { randomUUID } from "crypto";
 import { dirname, join, resolve } from "path";
 
 export type GrokCommanderRole = "commander" | "planner";
+
+const COMMAND_OS_PLANNING_RULES = [
+  "# COMMAND OS PLANNING-ONLY PROJECTION",
+  "You are a planning-only Grok ACP caller inside ChillsPwn Command OS.",
+  "Return analysis or the exact structured plan requested by the supplied prompt.",
+  "Do not execute commands, edit/read files, call native subagents, or invoke specialist MCP tools.",
+  "Specialists execute every consequential action; the planner only selects a reviewed inventory binding.",
+  "Autonomous work derives authority only from the signed mission contract and must recover in contract or safe-stop instead of asking for routine approval.",
+  "Guided work represents one exact explained step and waits for its durable operator decision before execution.",
+  "Use only the scoped Context Pack supplied by Command OS; do not claim or retrieve ambient memory.",
+].join("\n");
 
 export interface GrokAcpMcpServer {
   name: string;
@@ -32,8 +45,15 @@ export interface GrokCommanderRuntimePaths {
   xdgStateHome: string;
 }
 
-export const GROK_COMMANDER_PYTHON = "/root/hermes-venv/bin/python";
-export const GROK_COMMANDER_MCP_SCRIPT_DIR = "/root/.hermes/skills/red-teaming/council-of-ais/scripts";
+export const GROK_COMMANDER_PYTHON = resolve(
+  process.env.GROK_COMMANDER_PYTHON || "/usr/bin/python3",
+);
+export const GROK_COMMANDER_BUN = resolve(
+  process.env.CHILLSPWN_BUN_BIN || "/opt/chillspwn-runtime/bin/bun",
+);
+export const GROK_COMMANDER_MCP_SCRIPT_DIR = resolve(
+  process.env.GROK_COMMANDER_MCP_SCRIPT_DIR || join(import.meta.dir, "grok-commander-mcp"),
+);
 
 const CONTROLLED_GROK_CONFIG = `[compat.claude]
 mcps = false
@@ -61,12 +81,26 @@ official_marketplace_auto_installed = false
 `;
 
 /**
+ * Load the canonical commander SOUL into planning ACP sessions, then append a
+ * narrower Command OS projection. The projection resolves legacy board wording
+ * in favor of the signed Autonomous/Guided journey contract while retaining the
+ * canonical no-hands and specialist-routing identity.
+ */
+export function buildGrokPlanningOnlyRules(soulPath: string): string {
+  const soul = readFileSync(resolve(soulPath), "utf-8").trim();
+  if (!soul || !/NO HANDS/iu.test(soul) || !/MANDATORY ROUTING RULE/iu.test(soul)) {
+    throw new Error("Grok planning SOUL is missing the enforced commander boundary");
+  }
+  return `${soul}\n\n${COMMAND_OS_PLANNING_RULES}`;
+}
+
+/**
  * Resolve the existing Grok OAuth credential file without reading it. The ACP
  * child receives only the path through GROK_AUTH_PATH; API-key auth is removed.
  */
 export function resolveGrokOAuthAuthPath(env: NodeJS.ProcessEnv = process.env): string {
   if (env.GROK_AUTH_PATH) return resolve(env.GROK_AUTH_PATH);
-  const hermesHome = resolve(env.HERMES_HOME || resolve(env.HOME || "/root", ".hermes"));
+  const hermesHome = resolve(env.HERMES_HOME || resolve(env.HOME || "/var/lib/chillspwn", ".hermes"));
   return join(hermesHome, "auth", "grok", "auth.json");
 }
 
@@ -146,7 +180,7 @@ export function ensureGrokCommanderRuntime(paths: GrokCommanderRuntimePaths, gua
         PreToolUse: [{
           hooks: [{
             type: "command",
-            command: `/root/.bun/bin/bun ${JSON.stringify(resolve(guardPath))}`,
+            command: `${JSON.stringify(GROK_COMMANDER_BUN)} ${JSON.stringify(resolve(guardPath))}`,
             timeout: 5,
           }],
         }],
@@ -165,16 +199,42 @@ export function validateGrokCommanderAssets(options: {
   pluginDir: string;
   soul: string;
   authPath: string;
+  /** Planning-only ACP launches expose no MCP servers and must not depend on
+   * the legacy commander board/conversation bridge or its Python runtime. */
+  requireMcpScripts?: boolean;
 }): void {
-  const files = [
+  if (!existsSync(GROK_COMMANDER_BUN)) {
+    throw new Error(`Missing root-controlled Grok commander Bun runtime: ${GROK_COMMANDER_BUN}`);
+  }
+  const bunState = lstatSync(GROK_COMMANDER_BUN);
+  if (!bunState.isFile() || bunState.isSymbolicLink() || bunState.uid !== 0 || (bunState.mode & 0o022) !== 0
+      || realpathSync(GROK_COMMANDER_BUN) !== GROK_COMMANDER_BUN) {
+    throw new Error(`Grok commander Bun runtime must be a root-owned, non-writable regular file: ${GROK_COMMANDER_BUN}`);
+  }
+  let bunParent = dirname(GROK_COMMANDER_BUN);
+  while (true) {
+    const parentState = lstatSync(bunParent);
+    if (!parentState.isDirectory() || parentState.isSymbolicLink()
+        || parentState.uid !== 0 || (parentState.mode & 0o022) !== 0) {
+      throw new Error(`Grok commander Bun runtime parent chain must be root-controlled: ${bunParent}`);
+    }
+    const next = dirname(bunParent);
+    if (next === bunParent) break;
+    bunParent = next;
+  }
+  const files: Array<readonly [string, string]> = [
     [options.profile, "agent profile"],
     [join(options.pluginDir, "hooks", "hooks.json"), "PreToolUse hook manifest"],
     [join(options.pluginDir, "plugin.json"), "commander boundary plugin manifest"],
     [join(options.pluginDir, "bin", "commander-tool-guard.ts"), "PreToolUse guard"],
     [options.soul, "commander SOUL"],
-    [join(GROK_COMMANDER_MCP_SCRIPT_DIR, "board_mcp_server.py"), "board MCP server"],
-    [join(GROK_COMMANDER_MCP_SCRIPT_DIR, "conversation_mcp_server.py"), "conversation MCP server"],
-  ] as const;
+  ];
+  if (options.requireMcpScripts !== false) {
+    files.push(
+      [join(GROK_COMMANDER_MCP_SCRIPT_DIR, "board_mcp_server.py"), "board MCP server"],
+      [join(GROK_COMMANDER_MCP_SCRIPT_DIR, "conversation_mcp_server.py"), "conversation MCP server"],
+    );
+  }
   for (const [path, label] of files) {
     if (!existsSync(path)) throw new Error(`Missing Grok commander ${label}: ${path}`);
     const state = lstatSync(path);
@@ -197,19 +257,21 @@ export function validateGrokCommanderAssets(options: {
     throw new Error(`Grok commander plugin directory must be root-owned and not group/other-writable: ${options.pluginDir}`);
   }
 
-  // A venv's python entry point is normally a symlink. The symlink and its
-  // parent must be root-controlled, and its resolved executable must also be
-  // a root-owned, non-writable regular file.
-  if (!existsSync(GROK_COMMANDER_PYTHON)) {
-    throw new Error(`Missing Grok commander MCP Python runtime: ${GROK_COMMANDER_PYTHON}`);
-  }
-  const pythonLink = lstatSync(GROK_COMMANDER_PYTHON);
-  const pythonParent = lstatSync(dirname(GROK_COMMANDER_PYTHON));
-  const pythonTarget = statSync(GROK_COMMANDER_PYTHON);
-  if (pythonLink.uid !== 0
-      || !pythonParent.isDirectory() || pythonParent.uid !== 0 || (pythonParent.mode & 0o022) !== 0
-      || !pythonTarget.isFile() || pythonTarget.uid !== 0 || (pythonTarget.mode & 0o022) !== 0) {
-    throw new Error(`Grok commander MCP Python runtime must resolve through a root-controlled venv: ${GROK_COMMANDER_PYTHON}`);
+  if (options.requireMcpScripts !== false) {
+    // A venv's python entry point is normally a symlink. The symlink and its
+    // parent must be root-controlled, and its resolved executable must also be
+    // a root-owned, non-writable regular file.
+    if (!existsSync(GROK_COMMANDER_PYTHON)) {
+      throw new Error(`Missing Grok commander MCP Python runtime: ${GROK_COMMANDER_PYTHON}`);
+    }
+    const pythonLink = lstatSync(GROK_COMMANDER_PYTHON);
+    const pythonParent = lstatSync(dirname(GROK_COMMANDER_PYTHON));
+    const pythonTarget = statSync(GROK_COMMANDER_PYTHON);
+    if (pythonLink.uid !== 0
+        || !pythonParent.isDirectory() || pythonParent.uid !== 0 || (pythonParent.mode & 0o022) !== 0
+        || !pythonTarget.isFile() || pythonTarget.uid !== 0 || (pythonTarget.mode & 0o022) !== 0) {
+      throw new Error(`Grok commander MCP Python runtime must resolve through a root-controlled venv: ${GROK_COMMANDER_PYTHON}`);
+    }
   }
   validateGrokOAuthAuthFile(options.authPath);
 }

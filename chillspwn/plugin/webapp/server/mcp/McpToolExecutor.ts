@@ -9,7 +9,12 @@ import { spawn } from "child_process";
 import type { McpServerSpec, JsonRpcResponse } from "./McpTypes";
 import { MCP_PROTOCOL_VERSION } from "./McpTypes";
 
-export interface ExecOptions { timeoutMs: number; allowDocker: boolean; env?: NodeJS.ProcessEnv }
+export interface ExecOptions {
+  timeoutMs: number;
+  allowDocker: boolean;
+  env?: NodeJS.ProcessEnv;
+  signal?: AbortSignal;
+}
 
 const MCP_CHILD_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 const SAFE_STATIC_ENV = new Set(["MCP_TRANSPORT", "NODE_ENV", "PYTHONUNBUFFERED"]);
@@ -64,15 +69,40 @@ async function rpcSession(cmd: { command: string; args: string[]; cwd?: string; 
   return await new Promise<RawResult>((resolve) => {
     let child: ReturnType<typeof spawn>;
     try {
-      child = spawn(cmd.command, cmd.args, { cwd: cmd.cwd, env: opts.env ?? {}, stdio: ["pipe", "pipe", "pipe"] });
+      child = spawn(cmd.command, cmd.args, {
+        cwd: cmd.cwd,
+        env: opts.env ?? {},
+        stdio: ["pipe", "pipe", "pipe"],
+        // A separate process group lets cancellation clean up helpers spawned
+        // by an MCP server instead of orphaning them after the stdio client exits.
+        detached: process.platform !== "win32",
+      });
     } catch (e) { return resolve({ ok: false, error: `spawn failed: ${(e as Error).message}` }); }
 
     let buf = "";
     let nextId = 1;
     let settled = false;
     const pending = new Map<number, (r: JsonRpcResponse) => void>();
-    const done = (r: RawResult) => { if (settled) return; settled = true; clearTimeout(timer); try { child.kill("SIGKILL"); } catch {} resolve(r); };
+    const terminate = () => {
+      try {
+        if (process.platform !== "win32" && child.pid) process.kill(-child.pid, "SIGKILL");
+        else child.kill("SIGKILL");
+      } catch {
+        try { child.kill("SIGKILL"); } catch {}
+      }
+    };
+    const onAbort = () => done({ ok: false, error: "MCP call cancelled" });
+    const done = (r: RawResult) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      opts.signal?.removeEventListener("abort", onAbort);
+      terminate();
+      resolve(r);
+    };
     const timer = setTimeout(() => done({ ok: false, error: `MCP call timed out after ${opts.timeoutMs}ms` }), opts.timeoutMs);
+    if (opts.signal?.aborted) return done({ ok: false, error: "MCP call cancelled" });
+    opts.signal?.addEventListener("abort", onAbort, { once: true });
 
     const send = (msg: object) => { try { child.stdin!.write(JSON.stringify(msg) + "\n"); } catch {} };
     const request = (m: string, p?: unknown) => new Promise<JsonRpcResponse>((res) => { const id = nextId++; pending.set(id, res); send({ jsonrpc: "2.0", id, method: m, params: p }); });

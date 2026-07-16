@@ -25,10 +25,15 @@ import pino from 'pino';
 import path from 'path';
 import { mkdirSync, readFileSync, writeFileSync, existsSync, readdirSync, unlinkSync } from 'fs';
 import { randomBytes } from 'crypto';
-import { execSync } from 'child_process';
+import { execFileSync } from 'child_process';
 import { tmpdir } from 'os';
 import qrcode from 'qrcode-terminal';
 import { matchesAllowedUser, parseAllowedUsers } from './allowlist.js';
+import {
+  ffmpegAudioArgs,
+  MediaPathError,
+  resolveAllowedMediaFile,
+} from './media-path.js';
 
 // Parse CLI args
 const args = process.argv.slice(2);
@@ -57,6 +62,7 @@ const REPLY_PREFIX = process.env.WHATSAPP_REPLY_PREFIX === undefined
   : process.env.WHATSAPP_REPLY_PREFIX.replace(/\\n/g, '\n');
 const MAX_MESSAGE_LENGTH = parseInt(process.env.WHATSAPP_MAX_MESSAGE_LENGTH || '4096', 10);
 const CHUNK_DELAY_MS = parseInt(process.env.WHATSAPP_CHUNK_DELAY_MS || '300', 10);
+const WHATSAPP_ALLOWED_MEDIA_ROOT = (process.env.WHATSAPP_ALLOWED_MEDIA_ROOT || '').trim();
 // Per-call timeout for sock.sendMessage(). Baileys occasionally hangs forever
 // when uploading media to WhatsApp servers (and, less often, on text sends),
 // which pins the bridge's HTTP handler until the upstream aiohttp timeout
@@ -581,18 +587,29 @@ app.post('/send-media', async (req, res) => {
     return res.status(503).json({ error: 'Not connected to WhatsApp' });
   }
 
-  const { chatId, filePath, mediaType, caption, fileName } = req.body;
-  if (!chatId || !filePath) {
+  const body = req.body && typeof req.body === 'object' ? req.body : {};
+  const { chatId, filePath, mediaType, caption, fileName } = body;
+  if (typeof chatId !== 'string' || !chatId || typeof filePath !== 'string' || !filePath) {
     return res.status(400).json({ error: 'chatId and filePath are required' });
   }
 
   try {
-    if (!existsSync(filePath)) {
-      return res.status(404).json({ error: `File not found: ${filePath}` });
+    let validatedPath;
+    try {
+      validatedPath = resolveAllowedMediaFile(filePath, WHATSAPP_ALLOWED_MEDIA_ROOT);
+    } catch (error) {
+      const code = error instanceof MediaPathError ? error.code : 'MEDIA_PATH_INVALID';
+      const rootConfigurationError = code.startsWith('MEDIA_ROOT_');
+      return res.status(rootConfigurationError ? 503 : 403).json({
+        code,
+        error: rootConfigurationError
+          ? 'WhatsApp outbound media root is not configured correctly'
+          : 'The requested media file is outside the allowed outbound media boundary',
+      });
     }
 
-    const buffer = readFileSync(filePath);
-    const ext = filePath.toLowerCase().split('.').pop();
+    const buffer = readFileSync(validatedPath);
+    const ext = validatedPath.toLowerCase().split('.').pop();
     const type = mediaType || inferMediaType(ext);
     let msgPayload;
 
@@ -614,10 +631,10 @@ app.post('/send-media', async (req, res) => {
         if (needsConversion) {
           tmpPath = path.join(tmpdir(), `hermes_voice_${randomBytes(6).toString('hex')}.ogg`);
           try {
-            execSync(
-              `ffmpeg -y -i ${JSON.stringify(filePath)} -ar 48000 -ac 1 -c:a libopus ${JSON.stringify(tmpPath)}`,
-              { timeout: 30000, stdio: 'pipe' }
-            );
+            execFileSync('ffmpeg', ffmpegAudioArgs(validatedPath, tmpPath), {
+              timeout: 30000,
+              stdio: 'pipe',
+            });
             audioBuffer = readFileSync(tmpPath);
             audioExt = 'ogg';
           } catch (convErr) {
@@ -635,7 +652,7 @@ app.post('/send-media', async (req, res) => {
       default:
         msgPayload = {
           document: buffer,
-          fileName: fileName || path.basename(filePath),
+          fileName: fileName || path.basename(validatedPath),
           caption: caption || undefined,
           mimetype: MIME_MAP[ext] || 'application/octet-stream',
         };

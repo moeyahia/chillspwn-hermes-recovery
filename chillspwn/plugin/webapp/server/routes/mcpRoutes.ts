@@ -15,8 +15,10 @@ import type { Express, Request, Response } from "express";
 import type { AgentRuntime } from "../runtime/AgentRuntime";
 import type { McpArsenalBridge } from "../mcp/McpArsenalBridge";
 import { AgentRoutingPolicy, type RoutingPolicyConfig } from "../agents/AgentRoutingPolicy";
+import { specialistToolDecision } from "../agents/agentMcpMap";
 import { getAgent } from "../agents/agentRoster";
 import { COMMANDER_ID } from "../agents/types";
+import type { LegacyToolApprovalAttestation } from "../mcp/McpApprovalAttestation";
 
 export interface McpRouteDeps {
   bridge: () => McpArsenalBridge | null;
@@ -75,7 +77,9 @@ export function registerMcpRoutes(app: Express, deps: McpRouteDeps): void {
     const b = gate(res); if (!b) return;
     const body = req.body ?? {};
     const { runId, stepId, actorAgentId, specialistAgentId, mcpServer, toolName } = body;
-    const args = body.arguments && typeof body.arguments === "object" ? body.arguments : {};
+    const args = body.arguments && typeof body.arguments === "object" && !Array.isArray(body.arguments)
+      ? body.arguments as Record<string, unknown>
+      : {};
     if (!runId || !specialistAgentId || !mcpServer || !toolName) return res.status(400).json({ error: "runId, specialistAgentId, mcpServer, toolName are required" });
 
     const run = deps.agentRuntime.getRun(runId);
@@ -95,6 +99,11 @@ export function registerMcpRoutes(app: Express, deps: McpRouteDeps): void {
     const policy = new AgentRoutingPolicy(deps.routingConfig());
     const rd = policy.specialistTool(specialistAgentId, toolName);
     if (rd.action === "deny") { deps.log("warn", "16.3 MCP routing deny", { specialistAgentId, toolName, reason: rd.reason }); return res.status(403).json({ success: false, error: rd.reason, routingBlocked: true }); }
+    const bridgeDecision = specialistToolDecision(specialistAgentId, toolName);
+    if (bridgeDecision === "deny" || bridgeDecision === "unknown_agent") {
+      return res.status(403).json({ success: false, error: "specialist MCP binding is not permitted", routingBlocked: true });
+    }
+    let approvalRequired = bridgeDecision === "require_approval";
 
     // Post-approval dispatch: a toolCallId that is already approved → execute it now.
     const providedTcId = typeof body.toolCallId === "string" ? body.toolCallId : null;
@@ -106,6 +115,7 @@ export function registerMcpRoutes(app: Express, deps: McpRouteDeps): void {
         const rr = deps.agentRuntime.requestTool({ runId, stepId: stepId ?? null, toolName, arguments: { ...args, __mcpServer: mcpServer, __specialist: specialistAgentId }, enforceAllowedTools: false });
         toolCallId = rr.toolCall.id;
         if (rr.decision.action === "deny") return res.json({ success: false, decision: "deny", error: rr.decision.reason ?? "denied by tool policy", toolCallId, mcpServer, toolName });
+        if (rr.decision.action === "require_approval") approvalRequired = true;
         // Phase 16.2 — if runtime approval policy auto-approved, the toolCall is already approved →
         // fall through to execute. Otherwise it stays pending for a human.
         if (rr.decision.action === "require_approval" && !rr.autoApproved) {
@@ -115,19 +125,59 @@ export function registerMcpRoutes(app: Express, deps: McpRouteDeps): void {
         }
       } catch (e) { return res.status(400).json({ success: false, error: (e as Error).message }); }
     } else {
-      const tc = deps.agentRuntime.getRun(runId) && (deps.agentRuntime as any).store?.getToolCall?.(runId, toolCallId);
-      if (tc && tc.status !== "approved" && tc.status !== "executing") return res.status(409).json({ success: false, error: `toolCall ${toolCallId} is '${tc.status}', not approved` });
+      const toolCall = deps.agentRuntime.getToolCall(runId, toolCallId);
+      if (!toolCall) return res.status(409).json({ success: false, error: "approved tool call was not found in this run" });
+      if (toolCall.status !== "approved") {
+        return res.status(409).json({ success: false, error: `toolCall ${toolCallId} is '${toolCall.status}', not available for dispatch` });
+      }
+      if (toolCall.approvalId) approvalRequired = true;
     }
 
     // DRY-RUN: record-only, no execution.
     if (b.isDryRun()) {
-      const dr = await b.execute({ specialistAgentId, mcpServer, toolName, arguments: args, startedAtMs: deps.nowMs() });
+      const dr = await b.execute({ runId, stepId, specialistAgentId, mcpServer, toolName, arguments: args, startedAtMs: deps.nowMs() });
       return res.json({ success: true, dryRun: true, decision: "dry-run", outputPreview: dr.outputPreview, toolCallId, mcpServer, toolName, evidenceIds: [], artifacts: [] });
+    }
+
+    // Approval-required tools must claim the exact durable approval before the
+    // bridge sees an attestation. The claim binds every dispatch parameter and
+    // moves the ToolCall to `executing`, so changed-input and replay attempts
+    // fail before server execution.
+    let approvalAttestation: LegacyToolApprovalAttestation | undefined;
+    if (approvalRequired) {
+      if (!toolCallId || typeof stepId !== "string" || !stepId) {
+        return res.status(409).json({ success: false, error: "approval-required execution needs its exact run step and approved toolCallId" });
+      }
+      try {
+        approvalAttestation = deps.agentRuntime.claimApprovedMcpToolCall({
+          runId,
+          stepId,
+          toolCallId,
+          specialistAgentId,
+          mcpServer,
+          toolName,
+          arguments: args,
+        });
+      } catch (error) {
+        return res.status(409).json({
+          success: false,
+          error: error instanceof Error ? error.message : "durable MCP approval claim failed",
+        });
+      }
     }
 
     // ENABLED: execute the MCP tool.
     const t0 = deps.nowMs();
-    const result = await b.execute({ specialistAgentId, mcpServer, toolName, arguments: args, startedAtMs: t0 });
+    const result = await b.execute({
+      runId,
+      stepId,
+      specialistAgentId,
+      mcpServer,
+      toolName,
+      arguments: args,
+      startedAtMs: t0,
+      approvalAttestation,
+    });
     result.durationMs = Math.max(0, deps.nowMs() - t0);
 
     // Record ToolResult + Evidence (large output → artifact via recordEvidence).

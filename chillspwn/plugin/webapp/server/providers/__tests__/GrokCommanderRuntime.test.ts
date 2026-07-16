@@ -1,12 +1,14 @@
 import { describe, expect, test } from "bun:test";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from "fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import {
   buildGrokCommanderEnv,
   buildGrokCommanderMcpServers,
+  buildGrokPlanningOnlyRules,
   createGrokCommanderLaunchRuntime,
   ensureGrokCommanderRuntime,
+  GROK_COMMANDER_BUN,
   grokCommanderRuntimePaths,
   resolveGrokOAuthAuthPath,
   validateGrokOAuthAuthFile,
@@ -57,6 +59,26 @@ describe("Grok ACP commander isolated runtime", () => {
     });
   });
 
+  test("injects the canonical no-hands SOUL into the two-journey planning projection", () => {
+    const root = mkdtempSync(join(tmpdir(), "chillspwn-grok-planning-soul-"));
+    const soul = join(root, "SOUL.md");
+    try {
+      writeFileSync(soul, "# Commander\n\nNO HANDS\n\n## MANDATORY ROUTING RULE\nDelegate.\n", { mode: 0o600 });
+      const rules = buildGrokPlanningOnlyRules(soul);
+      expect(rules).toStartWith("# Commander");
+      expect(rules).toContain("NO HANDS");
+      expect(rules).toContain("Autonomous");
+      expect(rules).toContain("Guided");
+      expect(rules).toContain("signed mission contract");
+      expect(rules).toContain("scoped Context Pack");
+
+      writeFileSync(soul, "# Unbounded planner\n", { mode: 0o600 });
+      expect(() => buildGrokPlanningOnlyRules(soul)).toThrow(/missing the enforced commander boundary/);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("isolates concurrent ACP launches and prepares each root independently", () => {
     const root = mkdtempSync(join(tmpdir(), "chillspwn-grok-launches-"));
     try {
@@ -68,6 +90,22 @@ describe("Grok ACP commander isolated runtime", () => {
         expect(existsSync(join(paths.grokHome, "config.toml"))).toBeTrue();
         expect(statSync(join(paths.grokHome, "config.toml")).mode & 0o777).toBe(0o600);
       }
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("writes the commander hook against the attested root-controlled Bun runtime", () => {
+    const root = mkdtempSync(join(tmpdir(), "chillspwn-grok-hook-runtime-"));
+    const guard = join(root, "guard.ts");
+    try {
+      writeFileSync(guard, "process.exit(0);\n", { mode: 0o600 });
+      const paths = grokCommanderRuntimePaths(join(root, "runtime"));
+      ensureGrokCommanderRuntime(paths, guard);
+      const hook = JSON.parse(readFileSync(join(paths.grokHome, "hooks", "chillspwn-commander.json"), "utf8"));
+      expect(hook.hooks.PreToolUse[0].hooks[0].command)
+        .toBe(`${JSON.stringify(GROK_COMMANDER_BUN)} ${JSON.stringify(guard)}`);
+      expect(hook.hooks.PreToolUse[0].hooks[0].command).not.toContain("/root/.bun");
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

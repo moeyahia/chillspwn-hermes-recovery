@@ -1,1 +1,1 @@
-/root/.hermes/SOUL.md
+../../../hermes/runtime/SOUL.md

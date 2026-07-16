@@ -10,6 +10,7 @@ describe("security config — secure defaults", () => {
     expect(cfg.enableProxy).toBe(false);
     expect(cfg.enableFileWrite).toBe(false);
     expect(cfg.enableSecurityTools).toBe(false);
+    expect(cfg.enableLegacyExecutionApi).toBe(false);
     expect(cfg.enablePromptObfuscation).toBe(false);
     expect(cfg.requireApprovalForTerminal).toBe(true);
     expect(cfg.requireApprovalForFileWrite).toBe(true);
@@ -35,10 +36,15 @@ describe("security config — secure defaults", () => {
     expect(loadSecurityConfig({ ENABLE_TERMINAL: "on" }).enableTerminal).toBe(true);
     expect(loadSecurityConfig({ ENABLE_TERMINAL: "false" }).enableTerminal).toBe(false);
     expect(loadSecurityConfig({ ENABLE_TERMINAL: "garbage" }).enableTerminal).toBe(false);
+    expect(loadSecurityConfig({ ENABLE_LEGACY_EXECUTION_API: "true" }).enableLegacyExecutionApi).toBe(true);
+    expect(loadSecurityConfig({ ENABLE_LEGACY_EXECUTION_API: "garbage" }).enableLegacyExecutionApi).toBe(false);
   });
 
   test("ALLOWED_WORKSPACE_ROOTS parses colon/comma lists, defaults otherwise", () => {
-    expect(loadSecurityConfig({}).allowedWorkspaceRoots).toEqual(["/root/htb/boxes", "/root/engagements"]);
+    expect(loadSecurityConfig({}).allowedWorkspaceRoots).toEqual([
+      "/var/lib/chillspwn/workspaces/htb/boxes",
+      "/var/lib/chillspwn/workspaces/engagements",
+    ]);
     const cfg = loadSecurityConfig({ ALLOWED_WORKSPACE_ROOTS: "/a:/b,/c" });
     expect(cfg.allowedWorkspaceRoots).toEqual(["/a", "/b", "/c"]);
   });
@@ -77,6 +83,13 @@ describe("security config — startup validation (fail closed)", () => {
     const cfg = loadSecurityConfig({ ENABLE_PROMPT_OBFUSCATION: "true" });
     const chk = validateStartup(cfg);
     expect(chk.warnings.join(" ")).toMatch(/obfuscation/i);
+  });
+
+  test("enabling legacy execution produces a loud compatibility warning", () => {
+    const cfg = loadSecurityConfig({ ENABLE_LEGACY_EXECUTION_API: "true" });
+    const chk = validateStartup(cfg);
+    expect(chk.ok).toBe(true);
+    expect(chk.warnings.join(" ")).toMatch(/two-journey Command OS boundary/i);
   });
 
   test("toPolicyConfig mirrors the security flags", () => {
