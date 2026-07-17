@@ -7,7 +7,7 @@ The executable manifest is `chillspwn/plugin/command-os-v2/tests/interaction-man
 
 ## Current audited inventory
 
-The manifest contains **479** unique control groups:
+The manifest contains **489** unique control groups:
 
 | Surface | Groups | Fixture ownership |
 |---|---:|---|
@@ -22,8 +22,8 @@ The manifest contains **479** unique control groups:
 | Global command palette search, records, run controls, and memory candidate flow | 22 | Dedicated fixture IDs |
 | Vault repair and reindex recovery | 2 | Dedicated fixture IDs |
 
-Of the 479 groups, **371** have a canonical parameterized route and a
-`requiredState` beginning with `Fixture required:`. All 371 name dedicated test
+Of the 489 groups, **381** have a canonical parameterized route and a
+`requiredState` beginning with `Fixture required:`. All 381 name dedicated test
 IDs in source; the validator has exact family assertions for the run-control and
 Brain-node, Vault-lifecycle, journey-row, agent-row, trace-row, and report-row
 additions. This closes generic source ownership, not execution or
@@ -85,18 +85,18 @@ The generic crawler matches by route pattern, accessible role, and accessible
 name. It does not bind a rendered element to the manifest's `controlId`.
 Likewise, the unit ownership check currently proves that each declared test ID
 appears somewhere in E2E source; it does not prove assertion-level ownership of
-every option. The 371 dedicated assignments therefore remain an inventory
+every option. The 381 dedicated assignments therefore remain an inventory
 checkpoint, not a mathematical proof that every option and state was exercised.
 
-A checked-in visual registry now maps **15/479** manifest groups to **11**
+A checked-in visual registry now maps **15/489** manifest groups to **11**
 deterministic Chromium 1440/Linux baselines. Six cover the connected-Vault
 lifecycle; five new material screenshots cover minimal Autonomous intake,
 structured blocked recovery, Guided waiting decision, and Second Brain
-canvas/table modes. The remaining **464** groups are unmapped, cross-browser
+canvas/table modes. The remaining **474** groups are unmapped, cross-browser
 baselines are not complete, and `humanReleaseApproval` remains `false`.
 
 The focused visual replay passed **3/3** in 27,940.205 ms, and registry reverse
-mapping plus file-integrity tests passed **21/21 with 3,404 assertions**. JSON:
+mapping plus file-integrity tests passed **21/21 with 3,452 assertions**. JSON:
 `test-results/results/59786-1784264454738.json` (SHA-256
 `fc72e41f27b524cb3591825ccc29339bc3f9e95bd394ed764f40fc9a8371ef6c`).
 These are automated drift receipts, not cross-browser or human visual approval.
@@ -158,7 +158,7 @@ Source assignment is no longer the primary gap. Release evidence still needs:
    mutations, finding/admin/lesson
    review, live in-flight plan amendment, plan comparison/rollback, provider
    recovery, and Research Lab promotion;
-5. the remaining 464 screenshot mappings, cross-browser and human visual
+5. the remaining 474 screenshot mappings, cross-browser and human visual
    approval, accessibility coverage beyond the bounded 81/81 three-engine axe
    matrix, and a retry-free full 13-project complete-product release matrix
    beyond the bounded manifest crawl.

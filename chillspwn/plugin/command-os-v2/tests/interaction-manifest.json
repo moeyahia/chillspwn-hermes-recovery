@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "application": "CHILLSPWN // COMMAND OS",
   "namespace": "chillspwn.command-os-v2",
-  "scope": "Local authentication, shell navigation, two journey-entry surfaces, both registry-driven four-step mission-intake journeys, the complete currently rendered initial static-route inventory, and the currently mounted fixture-backed operational controls. All 371 fixture-required groups map to dedicated canonical fixture source coverage; the additional 108 shell, intake, and static-route groups map to bounded source tests. Current-run assertion receipts, remaining hidden and material state traversal, visual approval, and the full browser matrix remain release work.",
+  "scope": "Local authentication, shell navigation, two journey-entry surfaces, both registry-driven four-step mission-intake journeys, the complete currently rendered initial static-route inventory, and the currently mounted fixture-backed operational controls. All 381 fixture-required groups map to dedicated canonical fixture source coverage; the additional 108 shell, intake, and static-route groups map to bounded source tests. Current-run assertion receipts, remaining hidden and material state traversal, visual approval, and the full browser matrix remain release work.",
   "entries": [
     {
       "id": "shell.home",

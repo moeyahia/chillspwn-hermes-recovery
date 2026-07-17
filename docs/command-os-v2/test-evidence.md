@@ -144,7 +144,7 @@ Artifacts:
 This closes the stale absence of a current route/href crawl for the
 representative initial/static state. It does not exercise dynamic imported,
 archived, blocked, or evidence-reconciliation states and does not execute all
-479 material interactions. It is therefore not full route-state, interaction,
+489 material interactions. It is therefore not full route-state, interaction,
 or cutover proof.
 
 ### Exact browser-lifecycle and request audit
@@ -390,8 +390,8 @@ directory is never rebuilt in place.
 
 ## Interaction-manifest accounting
 
-The executable manifest currently contains **479** unique control groups. All
-**371** fixture-required groups are assigned to dedicated E2E test IDs in
+The executable manifest currently contains **489** unique control groups. All
+**381** fixture-required groups are assigned to dedicated E2E test IDs in
 source; none remains owned only by the generic audit. Of the **108**
 non-fixture groups, 83 name a dedicated E2E ID and 26 are intentionally owned by
 the bounded initial-state audit; one shell group is intentionally in both sets.
@@ -400,15 +400,15 @@ every browser.
 
 | Measure | Current value | Release requirement |
 |---|---:|---:|
-| Manifest groups | 479 | Complete audited inventory |
-| Fixture-required groups | 371 | Informational |
-| Groups assigned to dedicated fixture IDs | 371 | Every material option/state |
+| Manifest groups | 489 | Complete audited inventory |
+| Fixture-required groups | 381 | Informational |
+| Groups assigned to dedicated fixture IDs | 381 | Every material option/state |
 | Fixture-required groups still owned only by generic audit | 0 | 0 |
 | Static/non-fixture groups | 108 | Complete executable traversal still required |
 | Persistent-navigation projects | Current crawl: 8 projects; 478 applicable groups; 868/868 controls matched per project | Extend proof to material states and every option |
 | Compact/reflow projects | Current crawl: 5 projects; 479 applicable groups; 582/582 controls matched per project | Extend proof to material states and every option |
 | Cross-project initial-state result | Current 479-group crawl: 13/13; 0 missing, 0 unresolved, 0 stale, 0 unexpected/skipped/flaky | Same result across all material states and options |
-| Nonempty `screenshotsRequired` arrays | 15/479 | Approved mapping for every required visual |
+| Nonempty `screenshotsRequired` arrays | 15/489 | Approved mapping for every required visual |
 
 The latest complete initial-state artifact covers the current 479-group inventory:
 `test-results/results/manifest-current-479-all13-enforced-20260717-r2.json`
@@ -425,13 +425,13 @@ each applied 479 groups and matched 582/582.
 This is a bounded initial-state manifest crawl only. It does not render every
 material hidden, degraded, error, connected-Vault, dialog, or drawer state and
 does not activate every grouped option. A checked-in visual registry now maps
-**15/479** manifest groups to **11** deterministic Chromium 1440/Linux
-baselines; **464** groups remain unmapped and `humanReleaseApproval` remains
+**15/489** manifest groups to **11** deterministic Chromium 1440/Linux
+baselines; **474** groups remain unmapped and `humanReleaseApproval` remains
 `false`. Six baselines cover the connected-Vault lifecycle. Five new material
 screenshots cover minimal Autonomous intake review, structured blocked
 recovery, Guided waiting decision, and Second Brain canvas/table modes. The
 focused replay passed **3/3** in 27,940.205 ms; registry reverse mapping and
-file-integrity tests passed **21/21 with 3,404 assertions**. JSON:
+file-integrity tests passed **21/21 with 3,452 assertions**. JSON:
 `test-results/results/59786-1784264454738.json` (SHA-256
 `fc72e41f27b524cb3591825ccc29339bc3f9e95bd394ed764f40fc9a8371ef6c`).
 This is partial visual evidence, not cross-browser or human visual approval.
@@ -622,14 +622,14 @@ Cutover remains blocked by all of the following:
 - the 390/390 route/href crawl is green across all 13 configured projects for
   29 static routes plus the generated internal href contract per project, but
   dynamic imported, archived, blocked, and evidence-reconciliation states and
-  all 479 material interactions remain outside that representative crawl;
+  all 489 material interactions remain outside that representative crawl;
 - the exact final source has completed the strict retry-free Chromium 1440
   project, but has not completed the corresponding full 13-project matrix;
 - required-API enforcement is not yet enabled uniformly for every release
   journey, so focused zero-failure evidence is not a global network claim;
 - enterprise Chromium emulation is not actual Microsoft Edge proof;
 - the 200% project proves reflow geometry, not native browser-chrome zoom;
-- only 15/479 manifest groups map to 11 Chromium baselines; 464 remain
+- only 15/489 manifest groups map to 11 Chromium baselines; 474 remain
   unmapped, and cross-browser baselines and human visual approval remain absent;
 - the expanded axe matrix passed 81/81 across Chromium, Firefox, and WebKit for
   12 primary and 16 material states with zero A/AA violations, but retained

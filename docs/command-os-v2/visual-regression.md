@@ -31,9 +31,9 @@ column drift, graph-control occlusion, safe-area errors, and layout shift.
 
 ## Current deterministic baseline registry
 
-`tests/interaction-manifest/visual-baselines.json` currently maps **15 of 479
+`tests/interaction-manifest/visual-baselines.json` currently maps **15 of 489
 manifest groups** to **11 checked-in Chromium-1440/Linux baselines**. The other
-**464 groups remain explicitly unmapped**, cross-browser baseline coverage is
+**474 groups remain explicitly unmapped**, cross-browser baseline coverage is
 incomplete, and the registry retains `humanReleaseApproval: false`.
 
 The six original connected-Vault baselines cover:
@@ -64,7 +64,7 @@ The baseline PNGs live beside their owning specs under:
 The registry records each baseline's interaction IDs, owning test ID, project,
 viewport, platform, pixel dimensions, byte size, normalization fields, and
 SHA-256 hash. Reverse mapping, file integrity, dimensions, hashes, and explicit
-unmapped accounting passed **21/21 tests with 3,404 assertions**.
+unmapped accounting passed **21/21 tests with 3,452 assertions**.
 
 The final focused Chromium replay passed **3/3 tests** in **27,940.205 ms** with
 zero failures or skips and exercised all five newly added material screenshots.
@@ -84,7 +84,7 @@ remaining routes, states, browsers, viewports, or copy/alignment review.
 
 ## Current gaps
 
-- **464 of 479** manifest groups have no checked-in visual mapping;
+- **474 of 489** manifest groups have no checked-in visual mapping;
 - all 11 baselines are Chromium-1440/Linux only;
 - screenshot, trace, and video capture outside these assertions remains
   failure-oriented, so diagnostic images are not success-path approvals;
