@@ -138,6 +138,7 @@ const MAX_RECOVERY_NOTE_BYTES = 2 * 1024 * 1024;
 const MAX_BULK_EXPORT_NOTES = 100_000;
 const MAX_BULK_EXPORT_CONCURRENCY = 32;
 const MAX_BULK_EXPORT_ISSUES = 100;
+const MAX_ARTIFACT_BACKLINKS = 8;
 const ATTACHMENT_EXTENSIONS = new Map<string, string>([
   [".avif", "image/avif"],
   [".csv", "text/csv"],
@@ -817,11 +818,33 @@ export class ObsidianVaultBridge {
       target_node_id: string;
       target_relative_path: string | null;
     }>;
+    const incomingRows = node.nodeType === "artifact"
+      ? this.#database.prepare(`
+        SELECT edge.source_node_id, source_state.relative_path AS source_relative_path
+        FROM memory_edges edge
+        JOIN memory_nodes source ON source.id = edge.source_node_id
+        LEFT JOIN vault_sync_state source_state
+          ON source_state.connection_id = ? AND source_state.node_id = edge.source_node_id
+        WHERE edge.target_node_id = ?
+          AND edge.edge_type = 'produced'
+          AND edge.lifecycle_status IN ('confirmed', 'verified')
+          AND (edge.expires_at IS NULL OR edge.expires_at > ?)
+          AND source.lifecycle_status IN ('confirmed', 'verified')
+          AND (source.expires_at IS NULL OR source.expires_at > ?)
+        ORDER BY edge.created_at
+        LIMIT ${MAX_ARTIFACT_BACKLINKS}
+      `).all(connection?.id ?? "", nodeId, now, now) as Array<{
+        source_node_id: string;
+        source_relative_path: string | null;
+      }>
+      : [];
     const permittedTargets = new Map(rows.map((row) => [row.target_node_id, row.target_relative_path]));
+    const permittedSources = new Map(incomingRows.map((row) => [row.source_node_id, row.source_relative_path]));
     const permittedLifecycleStatuses = new Set(this.projectionLifecycleStatuses());
+    const relatedEdges = rows.length + incomingRows.length === 0 ? [] : this.#memory.listEdges(nodeId);
     const outgoing = rows.length === 0
       ? []
-      : this.#memory.listEdges(nodeId)
+      : relatedEdges
         .filter((edge) => (
           edge.sourceNodeId === nodeId
           && permittedTargets.has(edge.targetNodeId)
@@ -836,10 +859,35 @@ export class ObsidianVaultBridge {
           // that is intentionally absent from the same vault.
           if (!permittedLifecycleStatuses.has(target.lifecycleStatus)) return [];
           if (connection && !this.#connectionProjectionMatches(connection, target)) return [];
+          // Artifact leaves carry a safe native backlink to their producing
+          // node. Omitting the mirrored high-fanout line here keeps run hubs
+          // below the reusable-note size boundary without losing graph links.
+          if (edge.edgeType === "produced" && target.nodeType === "artifact") return [];
           const relativePath = permittedTargets.get(target.id);
           return [{
             edge,
             target,
+            ...(relativePath ? { relativePath } : {}),
+          }];
+        });
+    const backlinks = incomingRows.length === 0
+      ? []
+      : relatedEdges
+        .filter((edge) => (
+          edge.targetNodeId === nodeId
+          && edge.edgeType === "produced"
+          && permittedSources.has(edge.sourceNodeId)
+          && permittedLifecycleStatuses.has(edge.lifecycleStatus)
+        ))
+        .flatMap((edge) => {
+          const source = this.#memory.getNode(edge.sourceNodeId);
+          if (!source || (allowedTargetIds && !allowedTargetIds.has(source.id))) return [];
+          if (!permittedLifecycleStatuses.has(source.lifecycleStatus)) return [];
+          if (connection && !this.#connectionProjectionMatches(connection, source)) return [];
+          const relativePath = permittedSources.get(source.id);
+          return [{
+            edge,
+            source,
             ...(relativePath ? { relativePath } : {}),
           }];
         });
@@ -852,6 +900,7 @@ export class ObsidianVaultBridge {
       sources.map((source) => ({ sourceId: source.sourceId })),
       outgoing,
       attachments,
+      backlinks,
     );
     assertReusableMemoryText([{
       field: "vaultProjection.note",

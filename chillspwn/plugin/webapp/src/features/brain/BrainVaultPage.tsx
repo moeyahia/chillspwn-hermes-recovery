@@ -195,11 +195,14 @@ export default function BrainVaultPage() {
           <p className="os-muted">These are real configured Vault connections. SQLite remains transactional truth; each card shows filesystem health and explicit synchronization controls.</p>
           <div className="brain-vault-connections">{snapshot.connections.map((connection) => {
             const states = snapshot.syncStates.filter((item) => item.connectionId === connection.id);
+            const trackedNoteCount = connection.trackedNoteCount ?? states.length;
+            const needsReviewCount = connection.needsReviewCount
+              ?? states.filter((item) => ["conflict", "quarantined", "error"].includes(item.status)).length;
             const healthVerified = Boolean(connection.lastHealthCheckAt && connection.healthChecks);
             return <Card key={connection.id}>
               <header><div><p className="os-eyebrow">{connection.displayName}</p><h2>{connection.vaultPath}</h2></div><StatusPill status={connection.status} /></header>
               {connection.pathAvailable === false && <div className="os-state-panel os-state-panel--error" role="status"><div><strong>Configured Vault path is offline</strong><p>Command OS did not recreate the missing directory. Restore this exact path and permission, then run Repair vault or Test connection.</p></div></div>}
-              <dl><div><dt>Permission granted</dt><dd>{formatBrainDate(connection.permissionGrantedAt)}</dd></div><div><dt>Last round-trip health check</dt><dd>{formatBrainDate(connection.lastHealthCheckAt)}</dd></div><div><dt>Last synchronized</dt><dd>{formatBrainDate(connection.lastSyncAt)}</dd></div><div><dt>Tracked notes</dt><dd>{states.length}</dd></div><div><dt>Needs review</dt><dd>{states.filter((item) => ["conflict", "quarantined", "error"].includes(item.status)).length}</dd></div></dl>
+              <dl><div><dt>Permission granted</dt><dd>{formatBrainDate(connection.permissionGrantedAt)}</dd></div><div><dt>Last round-trip health check</dt><dd>{formatBrainDate(connection.lastHealthCheckAt)}</dd></div><div><dt>Last synchronized</dt><dd>{formatBrainDate(connection.lastSyncAt)}</dd></div><div><dt>Tracked notes</dt><dd>{trackedNoteCount.toLocaleString()}</dd></div><div><dt>Needs review</dt><dd>{needsReviewCount.toLocaleString()}</dd></div></dl>
               {!healthVerified && <p className="os-muted">This connection predates a recorded round-trip proof. Test it before synchronizing files.</p>}
               <p className="os-muted" id={`vault-recovery-help-${connection.id}`}>Repair validates the existing path, preserves conflicts, marks missing projections, and retains exact-byte guarded private quarantine copies without deleting operator files; only their recovery metadata is content-free. Reindex refreshes only represented canonical search rows and stops on index-integrity failure. Neither action imports operator text.</p>
               <div className="brain-vault-actions">
@@ -212,7 +215,7 @@ export default function BrainVaultPage() {
                 <Button variant="quiet" onClick={() => run(`portable:${connection.id}`, () => portableExportVault(connection.id))} disabled={!healthVerified || connection.pathAvailable === false || Boolean(state.busy)}>Create portable ZIP</Button>
                 {connection.obsidianUrl && <a className="os-button os-button--quiet" href={connection.obsidianUrl} rel="noopener noreferrer">Open vault in Obsidian</a>}
               </div>
-              {states.length > 0 && <details><summary>Note synchronization state</summary><ul className="brain-sync-list">{states.slice(0, 100).map((item) => <li key={item.id}><span><code>{item.relativePath}</code>{item.errorMessage && <small>{item.errorMessage}</small>}</span><span className="brain-sync-status">{item.obsidianUrl && <a href={item.obsidianUrl} rel="noopener noreferrer" aria-label={`Open ${item.relativePath} in Obsidian`}>Open</a>}<StatusPill status={item.status} /></span></li>)}</ul></details>}
+              {states.length > 0 && <details><summary>Note synchronization state</summary><p className="os-muted">{Math.min(states.length, 100).toLocaleString()} recent records shown of {trackedNoteCount.toLocaleString()} tracked notes.</p><ul className="brain-sync-list">{states.slice(0, 100).map((item) => <li key={item.id}><span><code>{item.relativePath}</code>{item.errorMessage && <small>{item.errorMessage}</small>}</span><span className="brain-sync-status">{item.obsidianUrl && <a href={item.obsidianUrl} rel="noopener noreferrer" aria-label={`Open ${item.relativePath} in Obsidian`}>Open</a>}<StatusPill status={item.status} /></span></li>)}</ul></details>}
             </Card>;
           })}</div>
         </div> : <Card><BrainEmpty kind="vault" title="No Obsidian vault connected" description="Connect a path inside the server-configured root to export confirmed memory as portable Markdown and wikilinks." /></Card>}

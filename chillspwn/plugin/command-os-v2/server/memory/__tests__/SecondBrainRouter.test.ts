@@ -754,9 +754,38 @@ describe("Second Brain HTTP boundary", () => {
       expect(snapshot.connections[0]).toMatchObject({
         status: "connected",
         healthChecks: { write: true, read: true, rename: true, delete: true },
+        trackedNoteCount: 3,
+        needsReviewCount: 0,
       });
       expect(typeof snapshot.connections[0].lastHealthCheckAt).toBe("string");
       expect(JSON.stringify(snapshot)).not.toContain(join(directory, "vaults"));
+
+      const insertAggregateFixture = database.prepare(`
+        INSERT INTO vault_sync_state (
+          id, connection_id, relative_path, status, last_scanned_at
+        ) VALUES (?, ?, ?, ?, ?)
+      `);
+      database.transaction(() => {
+        for (let index = 0; index < 260; index += 1) {
+          insertAggregateFixture.run(
+            `aggregate-fixture-${index}`,
+            connected.connection.id,
+            `.chillspwn/quarantine/aggregate-fixture-${index}.md`,
+            index === 0 ? "quarantined" : "synced",
+            "2026-07-16T22:00:00.000Z",
+          );
+        }
+      })();
+      const aggregateSnapshot = await json(await fetch(`${url}/api/v2/brain/vault`, {
+        headers: { "X-Test-Access": "all" },
+      }));
+      expect(aggregateSnapshot.syncStates).toHaveLength(250);
+      expect(aggregateSnapshot.connections[0]).toMatchObject({
+        trackedNoteCount: 263,
+        needsReviewCount: 1,
+      });
+      database.prepare("DELETE FROM vault_sync_state WHERE id LIKE 'aggregate-fixture-%'").run();
+
       const audits = database.prepare(`
         SELECT action, resource_type, details_json FROM audit_records
         WHERE action IN ('vault.health.verified', 'vault.connection.connected')

@@ -21,6 +21,7 @@ import {
 } from "../../memory";
 import {
   ObsidianVaultBridge,
+  parseObsidianNote,
   VaultBulkExportAbortError,
   VaultPathPolicy,
 } from "../index";
@@ -81,6 +82,78 @@ function addNode(memory: MemoryRepository, index: number, nodeType: MemoryNodeTy
 }
 
 describe("Obsidian vault bulk export", () => {
+  test("projects high-fanout produced edges as safe artifact backlinks", () => {
+    const { database, memory, bridge, connection } = setup();
+    try {
+      const run = addNode(memory, 90_000, "run");
+      const artifacts = Array.from({ length: 40 }, (_, offset) => {
+        const artifact = addNode(memory, 91_000 + offset, "artifact");
+        memory.createEdge({
+          sourceNodeId: run.id,
+          targetNodeId: artifact.id,
+          edgeType: "produced",
+          title: `Run produced ${artifact.id}`,
+          summary: "High-fanout Vault projection fixture",
+          scope: { kind: "global" },
+          sensitivity: "private",
+          confidence: 0.95,
+          lifecycleStatus: "verified",
+          provenance: run.provenance,
+          explanation: "High-fanout relationship ".padEnd(4_000, "x"),
+          authorType: "system",
+          authorId: "bulk-export-test",
+        });
+        return artifact;
+      });
+
+      const runText = bridge.renderNode(run.id, connection).text;
+      expect(Buffer.byteLength(runText)).toBeLessThan(128 * 1024);
+      expect(runText).not.toContain("chillspwn-edge:produced");
+
+      const artifactText = bridge.renderNode(artifacts[0]!.id, connection).text;
+      expect(artifactText).toContain(`chillspwn-backlink:produced:${run.id}`);
+      expect(artifactText).toContain("[[22 Runs/");
+      expect(parseObsidianNote(artifactText).edges).toHaveLength(0);
+
+      const portableText = bridge.renderNode(
+        artifacts[0]!.id,
+        connection,
+        new Set([artifacts[0]!.id]),
+      ).text;
+      expect(portableText).not.toContain(run.id);
+    } finally {
+      database.close();
+    }
+  });
+
+  test("does not backlink an artifact to a source excluded by the Vault scope", () => {
+    const { database, memory, bridge, connection } = setup({ nodeTypes: ["artifact"] });
+    try {
+      const run = addNode(memory, 92_000, "run");
+      const artifact = addNode(memory, 92_001, "artifact");
+      memory.createEdge({
+        sourceNodeId: run.id,
+        targetNodeId: artifact.id,
+        edgeType: "produced",
+        title: "Scoped production edge",
+        summary: "The source note is outside this connection's projection",
+        scope: { kind: "global" },
+        sensitivity: "private",
+        confidence: 0.95,
+        lifecycleStatus: "confirmed",
+        provenance: run.provenance,
+        explanation: "Scope filtering must prevent a dangling or disclosed backlink",
+        authorType: "system",
+        authorId: "bulk-export-test",
+      });
+      const text = bridge.renderNode(artifact.id, connection).text;
+      expect(text).not.toContain(run.id);
+      expect(text).not.toContain("chillspwn-backlink:");
+    } finally {
+      database.close();
+    }
+  });
+
   test("keeps the enlarged engagement projection bounded at 100,000 notes", async () => {
     const { database, bridge, connection } = setup();
     try {

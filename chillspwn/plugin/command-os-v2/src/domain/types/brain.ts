@@ -252,6 +252,8 @@ export interface VaultConnection {
   lastSyncAt?: string;
   lastHealthCheckAt?: string;
   healthChecks?: VaultHealthChecks;
+  trackedNoteCount?: number;
+  needsReviewCount?: number;
   createdAt: string;
   updatedAt: string;
   obsidianUrl?: string;

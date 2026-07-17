@@ -261,6 +261,12 @@ export function renderObsidianNote(
     readonly contentHash: string;
     readonly relativePath: string;
   }[] = [],
+  backlinks: readonly {
+    readonly edge: MemoryEdge;
+    readonly source: MemoryNode;
+    /** Preserve a connection's already-synchronized legacy projection path. */
+    readonly relativePath?: string;
+  }[] = [],
 ): string {
   const edgeLines = edges.flatMap(({ edge, target, relativePath }) => {
     const targetPath = normalizeObsidianWikilinkTarget(relativePath ?? notePath(target));
@@ -268,6 +274,16 @@ export function renderObsidianNote(
     const alias = escapeObsidianSingleLineText(target.title);
     const explanation = escapeObsidianSingleLineText(edge.explanation);
     return [`- [[${targetPath}|${alias}]] — ${edge.edgeType}: ${explanation} <!-- chillspwn-edge:${edge.edgeType}:${target.id} -->`];
+  });
+  const backlinkLines = backlinks.flatMap(({ edge, source, relativePath }) => {
+    const sourcePath = normalizeObsidianWikilinkTarget(relativePath ?? notePath(source));
+    if (!sourcePath) return [];
+    const alias = escapeObsidianSingleLineText(source.title);
+    const explanation = escapeObsidianSingleLineText(edge.explanation);
+    // This is a native graph backlink, not a canonical edge declaration. The
+    // distinct marker lets Obsidian connect high-fanout artifacts to their run
+    // without a later Vault import creating a reversed memory edge.
+    return [`- [[${sourcePath}|${alias}]] — incoming ${edge.edgeType}: ${explanation} <!-- chillspwn-backlink:${edge.edgeType}:${source.id} -->`];
   });
   const lines = [
     "---",
@@ -304,7 +320,9 @@ export function renderObsidianNote(
         `![[${attachment.relativePath}]] <!-- chillspwn-attachment:${attachment.artifactId}:${attachment.contentHash} -->`
       )),
     ] : []),
-    ...(edgeLines.length > 0 ? ["", "## Relationships", "", ...edgeLines] : []),
+    ...(edgeLines.length + backlinkLines.length > 0
+      ? ["", "## Relationships", "", ...edgeLines, ...backlinkLines]
+      : []),
     "",
   ];
   return lines.join("\n");

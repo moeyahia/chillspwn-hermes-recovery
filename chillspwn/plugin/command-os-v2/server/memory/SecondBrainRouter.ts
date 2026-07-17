@@ -2010,6 +2010,29 @@ export function createSecondBrainRouter(dependencies: SecondBrainRouterDependenc
         FROM vault_connections ORDER BY updated_at DESC
       `).all() as Array<Record<string, unknown>>;
       const connectionById = new Map(connections.map((item) => [String(item.id), item]));
+      const syncAccess = accessSql("mn", access);
+      const stateCountRows = dependencies.database.prepare(`
+        SELECT vs.connection_id, vs.status, COUNT(*) AS count
+        FROM vault_sync_state vs
+        LEFT JOIN memory_nodes mn ON mn.id = vs.node_id
+        WHERE (vs.node_id IS NOT NULL AND ${syncAccess.sql})
+          OR (vs.node_id IS NULL AND ? = 1)
+        GROUP BY vs.connection_id, vs.status
+      `).all(...syncAccess.params, access.allEngagements ? 1 : 0) as Array<{
+        connection_id: string;
+        status: string;
+        count: number;
+      }>;
+      const stateCountsByConnection = new Map<string, { trackedNoteCount: number; needsReviewCount: number }>();
+      for (const row of stateCountRows) {
+        const counts = stateCountsByConnection.get(row.connection_id)
+          ?? { trackedNoteCount: 0, needsReviewCount: 0 };
+        counts.trackedNoteCount += Number(row.count);
+        if (["conflict", "quarantined", "error"].includes(row.status)) {
+          counts.needsReviewCount += Number(row.count);
+        }
+        stateCountsByConnection.set(row.connection_id, counts);
+      }
       const states = dependencies.database.prepare(`
         SELECT id, connection_id, node_id, relative_path, database_version, status,
           last_scanned_at, last_synced_at, error_message
@@ -2030,6 +2053,7 @@ export function createSecondBrainRouter(dependencies: SecondBrainRouterDependenc
         projectionLifecycleStatuses: vault.projectionLifecycleStatuses(),
         allowedRootLabel: basename(pathPolicy.allowedRoot),
         connections: connections.map((item) => {
+          const aggregateCounts = stateCountsByConnection.get(String(item.id));
           let obsidianUrl: string | undefined;
           let pathAvailable = true;
           try {
@@ -2055,6 +2079,7 @@ export function createSecondBrainRouter(dependencies: SecondBrainRouterDependenc
               : undefined,
             createdAt: item.created_at,
             updatedAt: item.updated_at,
+            ...(aggregateCounts ?? {}),
             ...(obsidianUrl ? { obsidianUrl } : {}),
           };
         }),

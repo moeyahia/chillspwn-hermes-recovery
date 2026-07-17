@@ -74,6 +74,8 @@ describe("Brain Vault presentation contract", () => {
         permissionGrantedAt: "2026-07-16T21:00:00.000Z",
         lastHealthCheckAt: "2026-07-16T21:00:01.000Z",
         healthChecks: { write: true, read: true, rename: true, delete: true },
+        trackedNoteCount: 64_697,
+        needsReviewCount: 0,
         createdAt: "2026-07-16T21:00:00.000Z",
         updatedAt: "2026-07-16T21:00:01.000Z",
       }],
@@ -83,6 +85,8 @@ describe("Brain Vault presentation contract", () => {
     expect(connected.connections[0]).toMatchObject({
       status: "connected",
       healthChecks: { write: true, read: true, rename: true, delete: true },
+      trackedNoteCount: 64_697,
+      needsReviewCount: 0,
     });
   });
 

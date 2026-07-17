@@ -364,6 +364,8 @@ export function parseVaultConnection(value: unknown): VaultConnection {
     ...(optionalText(item.lastSyncAt) ? { lastSyncAt: optionalText(item.lastSyncAt) } : {}),
     ...(optionalText(item.lastHealthCheckAt) ? { lastHealthCheckAt: optionalText(item.lastHealthCheckAt) } : {}),
     ...(item.healthChecks === undefined ? {} : { healthChecks: parseVaultHealthChecks(item.healthChecks) }),
+    ...(typeof item.trackedNoteCount === "number" ? { trackedNoteCount: count(item.trackedNoteCount, "tracked note count") } : {}),
+    ...(typeof item.needsReviewCount === "number" ? { needsReviewCount: count(item.needsReviewCount, "notes needing review count") } : {}),
     createdAt: text(item.createdAt, "vault createdAt"), updatedAt: text(item.updatedAt, "vault updatedAt"),
     ...(optionalText(item.obsidianUrl) ? { obsidianUrl: optionalText(item.obsidianUrl) } : {}),
   };
