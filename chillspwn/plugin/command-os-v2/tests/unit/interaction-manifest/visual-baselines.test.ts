@@ -15,14 +15,14 @@ describe("Command OS V2 approved visual baseline registry", () => {
     expect(baselineRegistry.approvalScope).toBe("automated-drift-baseline");
     expect(baselineRegistry.humanReleaseApproval).toBe(false);
     expect(baselineRegistry.scope).toContain("do not imply cross-browser visual approval or release sign-off");
-    expect(baselineRegistry.baselines).toHaveLength(11);
+    expect(baselineRegistry.baselines).toHaveLength(12);
 
     const registryIds = baselineRegistry.baselines.map((baseline) => baseline.id);
     const mappedIds = manifest.entries.flatMap((entry) => entry.screenshotsRequired);
     expect(new Set(registryIds).size).toBe(registryIds.length);
     expect([...new Set(mappedIds)].sort()).toEqual([...registryIds].sort());
-    expect(manifest.entries.filter((entry) => entry.screenshotsRequired.length > 0)).toHaveLength(15);
-    expect(manifest.entries.filter((entry) => entry.screenshotsRequired.length === 0)).toHaveLength(474);
+    expect(manifest.entries.filter((entry) => entry.screenshotsRequired.length > 0)).toHaveLength(18);
+    expect(manifest.entries.filter((entry) => entry.screenshotsRequired.length === 0)).toHaveLength(471);
 
     for (const baseline of baselineRegistry.baselines) {
       expect(baseline.id).toMatch(/^visual\.[a-z0-9][a-z0-9.-]+$/u);

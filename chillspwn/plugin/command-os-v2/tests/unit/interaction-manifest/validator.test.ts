@@ -428,6 +428,15 @@ describe("Command OS V2 interaction manifest", () => {
       expect(entry.testIds.every((testId) => allowedTestIds.has(testId)), entry.id).toBe(true);
     }
     expect(new Set(entries.flatMap((entry) => entry.testIds))).toEqual(allowedTestIds);
+    const targetedVaultVisual = entries.filter((entry) => entry.screenshotsRequired.length > 0);
+    expect(targetedVaultVisual.map((entry) => entry.id)).toEqual([
+      "brain.node.vault-selection",
+      "brain.node.vault-export",
+      "brain.node.vault-open",
+    ]);
+    expect(new Set(targetedVaultVisual.flatMap((entry) => entry.screenshotsRequired))).toEqual(new Set([
+      "visual.brain-node.vault-exported.chromium-1440",
+    ]));
   });
 
   test("inventories every Memory Control Center control against only its three dedicated fixture sources", () => {
@@ -537,8 +546,8 @@ describe("Command OS V2 interaction manifest", () => {
       "brain.vault.conflict-keep-vault",
     ]);
     expect(new Set(visualEntries.flatMap((entry) => entry.screenshotsRequired)).size).toBe(6);
-    expect(manifest.entries.filter((entry) => entry.screenshotsRequired.length === 0)).toHaveLength(474);
-    expect(manifest.knownGaps.some((gap) => gap.includes("Eleven deterministic Chromium 1440") && gap.includes("remaining 474 entries"))).toBe(true);
+    expect(manifest.entries.filter((entry) => entry.screenshotsRequired.length === 0)).toHaveLength(471);
+    expect(manifest.knownGaps.some((gap) => gap.includes("Twelve deterministic Chromium 1440") && gap.includes("remaining 471 entries"))).toBe(true);
     expect(manifest.entries.filter((entry) => entry.requiredState.startsWith("Fixture required:"))).toHaveLength(381);
   });
 

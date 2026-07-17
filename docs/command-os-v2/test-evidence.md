@@ -408,7 +408,7 @@ every browser.
 | Persistent-navigation projects | Current crawl: 8 projects; 478 applicable groups; 868/868 controls matched per project | Extend proof to material states and every option |
 | Compact/reflow projects | Current crawl: 5 projects; 479 applicable groups; 582/582 controls matched per project | Extend proof to material states and every option |
 | Cross-project initial-state result | Current 479-group crawl: 13/13; 0 missing, 0 unresolved, 0 stale, 0 unexpected/skipped/flaky | Same result across all material states and options |
-| Nonempty `screenshotsRequired` arrays | 15/489 | Approved mapping for every required visual |
+| Nonempty `screenshotsRequired` arrays | 18/489 | Approved mapping for every required visual |
 
 The latest complete initial-state artifact covers the current 479-group inventory:
 `test-results/results/manifest-current-479-all13-enforced-20260717-r2.json`
@@ -425,15 +425,20 @@ each applied 479 groups and matched 582/582.
 This is a bounded initial-state manifest crawl only. It does not render every
 material hidden, degraded, error, connected-Vault, dialog, or drawer state and
 does not activate every grouped option. A checked-in visual registry now maps
-**15/489** manifest groups to **11** deterministic Chromium 1440/Linux
-baselines; **474** groups remain unmapped and `humanReleaseApproval` remains
-`false`. Six baselines cover the connected-Vault lifecycle. Five new material
-screenshots cover minimal Autonomous intake review, structured blocked
-recovery, Guided waiting decision, and Second Brain canvas/table modes. The
-focused replay passed **3/3** in 27,940.205 ms; registry reverse mapping and
-file-integrity tests passed **21/21 with 3,452 assertions**. JSON:
+**18/489** manifest groups to **12** deterministic Chromium 1440/Linux
+baselines; **471** groups remain unmapped and `humanReleaseApproval` remains
+`false`. Six baselines cover the connected-Vault lifecycle. Six additional
+material screenshots cover minimal Autonomous intake review, structured blocked
+recovery, Guided waiting decision, Second Brain canvas/table modes, and targeted
+node projection with a sanitized native Obsidian deep link after reload. The
+earlier five-screenshot focused replay passed **3/3** in 27,940.205 ms; registry reverse mapping and
+file-integrity tests passed **21/21 with 3,486 assertions**. JSON:
 `test-results/results/59786-1784264454738.json` (SHA-256
 `fc72e41f27b524cb3591825ccc29339bc3f9e95bd394ed764f40fc9a8371ef6c`).
+The targeted node projection baseline additionally passed a strict no-update
+Chromium-1440 replay **1/1** in
+`test-results/results/brain-node-vault-visual-verify-20260717.json` (SHA-256
+`e0ae9315f91d791da5b87dcdc0b95cb5cfd57b89a872e827112f96a7442dbcf7`).
 This is partial visual evidence, not cross-browser or human visual approval.
 
 Stable-ID journey, agent, trace, and report record families separately passed
@@ -629,7 +634,7 @@ Cutover remains blocked by all of the following:
   journey, so focused zero-failure evidence is not a global network claim;
 - enterprise Chromium emulation is not actual Microsoft Edge proof;
 - the 200% project proves reflow geometry, not native browser-chrome zoom;
-- only 15/489 manifest groups map to 11 Chromium baselines; 474 remain
+- only 18/489 manifest groups map to 12 Chromium baselines; 471 remain
   unmapped, and cross-browser baselines and human visual approval remain absent;
 - the expanded axe matrix passed 81/81 across Chromium, Firefox, and WebKit for
   12 primary and 16 material states with zero A/AA violations, but retained

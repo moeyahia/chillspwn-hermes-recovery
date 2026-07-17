@@ -1,7 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { parseObsidianNote } from "../../server/vault";
-import { expect, test, type Page } from "./support/playwright";
+import { expect, test, type Locator, type Page, type TestInfo } from "./support/playwright";
 import { BrowserAudit } from "./support/browserAudit";
 import {
   createBrainVaultOperationsFixture,
@@ -12,6 +12,29 @@ import {
 import { canonicalFixtureNamespace } from "./support/fixtureNamespace";
 
 const TEST_ID = "e2e.brain-node.vault-export-deep-link";
+const VISUAL_PROJECT = "chromium-1440";
+const VAULT_PROJECTION_VISUAL = {
+  id: "visual.brain-node.vault-exported.chromium-1440",
+  snapshot: "brain-node-vault-exported.png",
+} as const;
+
+async function expectApprovedVisual(locator: Locator, testInfo: TestInfo): Promise<void> {
+  if (testInfo.project.name !== VISUAL_PROJECT) return;
+  await locator.page().evaluate(async () => { await document.fonts.ready; });
+  await expect(locator).toHaveScreenshot(VAULT_PROJECTION_VISUAL.snapshot, {
+    animations: "disabled",
+    caret: "hide",
+    maxDiffPixels: 0,
+    threshold: 0.15,
+  });
+}
+
+async function normalizeVaultProjectionVisual(projectionPanel: Locator): Promise<void> {
+  await projectionPanel.getByRole("combobox", { name: "Vault", exact: true }).evaluate((node) => {
+    const selected = (node as HTMLSelectElement).selectedOptions[0];
+    if (selected) selected.textContent = "Verified Vault visual fixture";
+  });
+}
 
 async function connectVerifiedVault(page: Page, fixture: BrainVaultOperationsFixture): Promise<void> {
   await page.goto("/brain/vault", { waitUntil: "domcontentloaded" });
@@ -106,6 +129,14 @@ test(`${TEST_ID} projects one stable note and exposes only a sanitized native de
   await page.getByRole("combobox", { name: "Vault", exact: true }).selectOption(connectionId);
   const persistedLink = page.getByRole("link", { name: "Open this note in Obsidian", exact: true });
   await expect(persistedLink).toHaveAttribute("href", href!);
+
+  const projectionPanel = page.locator(".brain-control-card").filter({
+    has: page.getByRole("heading", { level: 2, name: "Obsidian note", exact: true }),
+  });
+  await expect(projectionPanel).toHaveCount(1);
+  await expect(projectionPanel).toBeVisible();
+  await normalizeVaultProjectionVisual(projectionPanel);
+  await expectApprovedVisual(projectionPanel, testInfo);
 
   const persisted = projectedNode(fixture);
   expect(persisted.node).toMatchObject({

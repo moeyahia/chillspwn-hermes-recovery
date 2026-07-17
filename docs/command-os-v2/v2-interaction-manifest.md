@@ -88,17 +88,22 @@ appears somewhere in E2E source; it does not prove assertion-level ownership of
 every option. The 381 dedicated assignments therefore remain an inventory
 checkpoint, not a mathematical proof that every option and state was exercised.
 
-A checked-in visual registry now maps **15/489** manifest groups to **11**
+A checked-in visual registry now maps **18/489** manifest groups to **12**
 deterministic Chromium 1440/Linux baselines. Six cover the connected-Vault
-lifecycle; five new material screenshots cover minimal Autonomous intake,
-structured blocked recovery, Guided waiting decision, and Second Brain
-canvas/table modes. The remaining **474** groups are unmapped, cross-browser
+lifecycle; six additional material screenshots cover minimal Autonomous
+intake, structured blocked recovery, Guided waiting decision, Second Brain
+canvas/table modes, and targeted node projection with a sanitized native
+Obsidian deep link after reload. The remaining **471** groups are unmapped, cross-browser
 baselines are not complete, and `humanReleaseApproval` remains `false`.
 
-The focused visual replay passed **3/3** in 27,940.205 ms, and registry reverse
-mapping plus file-integrity tests passed **21/21 with 3,452 assertions**. JSON:
+The earlier five-screenshot focused visual replay passed **3/3** in 27,940.205 ms, and registry reverse
+mapping plus file-integrity tests passed **21/21 with 3,486 assertions**. JSON:
 `test-results/results/59786-1784264454738.json` (SHA-256
 `fc72e41f27b524cb3591825ccc29339bc3f9e95bd394ed764f40fc9a8371ef6c`).
+The targeted node projection baseline separately passed a strict no-update
+Chromium-1440 replay **1/1** in
+`test-results/results/brain-node-vault-visual-verify-20260717.json` (SHA-256
+`e0ae9315f91d791da5b87dcdc0b95cb5cfd57b89a872e827112f96a7442dbcf7`).
 These are automated drift receipts, not cross-browser or human visual approval.
 
 ## Accessibility state inventory
@@ -154,11 +159,11 @@ Source assignment is no longer the primary gap. Release evidence still needs:
 2. assertion-level ownership of every option and material state;
 3. complete browser/viewport, keyboard, mobile, error, refresh/reconnect, and
    visual execution;
-4. remaining product controls for node-level Vault actions, provider-backed
-   mutations, finding/admin/lesson
+4. remaining product controls for provider-backed mutations,
+   finding/admin/lesson
    review, live in-flight plan amendment, plan comparison/rollback, provider
    recovery, and Research Lab promotion;
-5. the remaining 474 screenshot mappings, cross-browser and human visual
+5. the remaining 471 screenshot mappings, cross-browser and human visual
    approval, accessibility coverage beyond the bounded 81/81 three-engine axe
    matrix, and a retry-free full 13-project complete-product release matrix
    beyond the bounded manifest crawl.

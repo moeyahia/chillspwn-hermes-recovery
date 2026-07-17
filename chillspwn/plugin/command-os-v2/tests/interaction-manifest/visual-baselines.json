@@ -107,6 +107,23 @@
       "normalizedFields": ["fixture display name", "fixture relative path", "permission and health timestamps", "empty synchronization timestamp"]
     },
     {
+      "id": "visual.brain-node.vault-exported.chromium-1440",
+      "interactionIds": ["brain.node.vault-selection", "brain.node.vault-export", "brain.node.vault-open"],
+      "testId": "e2e.brain-node.vault-export-deep-link",
+      "sourceFile": "tests/e2e/brain-node-vault.spec.ts",
+      "project": "chromium-1440",
+      "viewport": "1440x900",
+      "platform": "linux",
+      "snapshotName": "brain-node-vault-exported.png",
+      "baselinePath": "tests/e2e/brain-node-vault.spec.ts-snapshots/brain-node-vault-exported-chromium-1440-linux.png",
+      "sha256": "467ca20199d1435546a84c00d268027866b3b00be6b5cb6e081a83c9c5c9e4bc",
+      "byteSize": 16385,
+      "pixelWidth": 321,
+      "pixelHeight": 360,
+      "state": "After a real targeted export and browser reload, the selected verified Vault, repeatable export control, and sanitized native Obsidian deep link remain visible together.",
+      "normalizedFields": ["fixture Vault display name"]
+    },
+    {
       "id": "visual.autonomous-intake.minimal-review.chromium-1440",
       "interactionIds": ["autonomous-intake.review.launch"],
       "testId": "e2e.mission-intake.autonomous-minimal",
