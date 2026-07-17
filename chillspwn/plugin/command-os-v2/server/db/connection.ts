@@ -3,7 +3,6 @@ import {
   existsSync,
   mkdirSync,
   statSync,
-  writeFileSync,
 } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname } from "node:path";
@@ -123,7 +122,10 @@ function createBunCompatibilityDatabase(
         page_count: number;
       }>;
       const pageCount = Number(pageRows[0]?.page_count ?? 0);
-      writeFileSync(destinationFile, inner.serialize(), { mode: 0o600, flag: "wx" });
+      // `serialize()` materializes the entire database in memory and can exhaust
+      // the runtime on real engagement stores. SQLite performs VACUUM INTO as a
+      // consistent file-backed snapshot without holding the database in RAM.
+      inner.prepare("VACUUM INTO ?").run(destinationFile);
       return { totalPages: pageCount, remainingPages: 0 };
     },
     serialize(): Buffer {
