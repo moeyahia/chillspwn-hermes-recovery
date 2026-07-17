@@ -151,7 +151,14 @@ def contained(path: Path) -> bool:
 
 for current, dirnames, filenames in os.walk(plugin, topdown=True, followlinks=False):
     current_path = Path(current)
-    dirnames[:] = [name for name in dirnames if current_path / name not in excluded]
+    # Dependency trees are excluded from the staged source and rebuilt from
+    # the lockfile. Apply that rule to every sibling application, not only the
+    # original webapp, so package-manager .bin links cannot enter the reviewed
+    # application-symlink inventory.
+    dirnames[:] = [
+        name for name in dirnames
+        if name != "node_modules" and current_path / name not in excluded
+    ]
     for name in [*dirnames, *filenames]:
         path = current_path / name
         try:
@@ -182,7 +189,8 @@ PY
     seen_links["$rel"]=1
   done < <(
     find "$PLUGIN_SOURCE" \
-      \( -path "$PLUGIN_SOURCE/webapp/node_modules" \
+      \( -type d -name node_modules \
+         -o -path "$PLUGIN_SOURCE/webapp/node_modules" \
          -o -path "$PLUGIN_SOURCE/webapp/dist" \
          -o -path "$PLUGIN_SOURCE/webapp/dist-revamp" \
          -o -path "$PLUGIN_SOURCE/webapp/playwright-report" \
