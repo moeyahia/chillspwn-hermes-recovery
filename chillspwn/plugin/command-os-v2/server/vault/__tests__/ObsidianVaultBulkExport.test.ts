@@ -81,6 +81,24 @@ function addNode(memory: MemoryRepository, index: number, nodeType: MemoryNodeTy
 }
 
 describe("Obsidian vault bulk export", () => {
+  test("keeps the enlarged engagement projection bounded at 100,000 notes", async () => {
+    const { database, bridge, connection } = setup();
+    try {
+      const admitted = Array.from({ length: 50_001 }, (_, index) => `admitted-node-${index}`);
+      const controller = new AbortController();
+      controller.abort();
+      await expect(bridge.exportNodes(connection.id, admitted, { signal: controller.signal })).rejects
+        .toBeInstanceOf(VaultBulkExportAbortError);
+
+      const oversized = Array.from({ length: 100_001 }, (_, index) => `oversized-node-${index}`);
+      await expect(bridge.exportNodes(connection.id, oversized)).rejects.toThrow(
+        "limited to 100000 canonical notes",
+      );
+    } finally {
+      database.close();
+    }
+  });
+
   test("exports atomically with bounded progress then skips current versions", async () => {
     const { database, memory, bridge, connection } = setup();
     try {

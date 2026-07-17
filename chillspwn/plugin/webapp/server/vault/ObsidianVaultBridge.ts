@@ -132,7 +132,10 @@ interface ArtifactRow {
 const MAX_ATTACHMENT_BYTES = 32 * 1024 * 1024;
 const MAX_ATTACHMENTS_PER_NOTE = 32;
 const MAX_RECOVERY_NOTE_BYTES = 2 * 1024 * 1024;
-const MAX_BULK_EXPORT_NOTES = 50_000;
+// Keep a hard per-operation ceiling while allowing a fully imported, verified
+// engagement corpus to be projected in one resumable pass. The eligible
+// imported corpus is already above the previous 50,000-note ceiling.
+const MAX_BULK_EXPORT_NOTES = 100_000;
 const MAX_BULK_EXPORT_CONCURRENCY = 32;
 const MAX_BULK_EXPORT_ISSUES = 100;
 const ATTACHMENT_EXTENSIONS = new Map<string, string>([
