@@ -139,6 +139,17 @@ jobs:
         working-directory: chillspwn/plugin/webapp
         run: bun run test:e2e:run
 
+      - name: Retain browser failure evidence
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: command-os-browser-failure-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            chillspwn/plugin/webapp/test-results/
+            chillspwn/plugin/webapp/playwright-report/
+          if-no-files-found: ignore
+          retention-days: 14
+
       - name: Audit web dependencies
         working-directory: chillspwn/plugin/webapp
         run: bun audit
