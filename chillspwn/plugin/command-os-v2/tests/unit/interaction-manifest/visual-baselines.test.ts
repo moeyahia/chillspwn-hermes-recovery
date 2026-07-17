@@ -22,7 +22,7 @@ describe("Command OS V2 approved visual baseline registry", () => {
     expect(new Set(registryIds).size).toBe(registryIds.length);
     expect([...new Set(mappedIds)].sort()).toEqual([...registryIds].sort());
     expect(manifest.entries.filter((entry) => entry.screenshotsRequired.length > 0)).toHaveLength(15);
-    expect(manifest.entries.filter((entry) => entry.screenshotsRequired.length === 0)).toHaveLength(471);
+    expect(manifest.entries.filter((entry) => entry.screenshotsRequired.length === 0)).toHaveLength(474);
 
     for (const baseline of baselineRegistry.baselines) {
       expect(baseline.id).toMatch(/^visual\.[a-z0-9][a-z0-9.-]+$/u);

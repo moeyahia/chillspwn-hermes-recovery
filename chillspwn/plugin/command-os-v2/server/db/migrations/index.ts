@@ -11,6 +11,7 @@ import { guidedDecisionBoundaryMigration } from "./009_guided_decision_boundary"
 import { v24OperationalTruthMigration } from "./010_v24_operational_truth";
 import { memoryEdgeScopeMigration } from "./011_memory_edge_scope";
 import { planningRetryContinuationMigration } from "./012_planning_retry_continuation";
+import { importedLegacyControlPlaneMigration } from "./013_imported_legacy_control_plane";
 
 export const DATABASE_MIGRATIONS: readonly Migration[] = Object.freeze([
   coreMigration,
@@ -25,4 +26,5 @@ export const DATABASE_MIGRATIONS: readonly Migration[] = Object.freeze([
   v24OperationalTruthMigration,
   memoryEdgeScopeMigration,
   planningRetryContinuationMigration,
+  importedLegacyControlPlaneMigration,
 ]);

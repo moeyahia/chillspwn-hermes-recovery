@@ -26,15 +26,13 @@ function resolveChromiumExecutable(): string | undefined {
     }
     return configured;
   }
-
-  for (const candidate of [
-    "/usr/bin/chromium",
-    "/usr/bin/chromium-browser",
-    "/usr/bin/google-chrome",
-    "/usr/bin/google-chrome-stable",
-  ]) {
-    if (existsSync(candidate)) return candidate;
-  }
+  // Use the browser revision pinned by @playwright/test unless an operator
+  // deliberately supplies an executable. Auto-selecting whatever Chromium or
+  // Chrome happened to be installed on the host made visual evidence depend
+  // on the runner image rather than the repository lockfile. CI installs the
+  // pinned Playwright browser before this suite; local operators can retain an
+  // explicit system-browser compatibility run through the environment
+  // variable above without changing the canonical regression baseline.
   return undefined;
 }
 
@@ -46,7 +44,10 @@ export default defineConfig({
   fullyParallel: false,
   workers: 1,
   forbidOnly: Boolean(process.env.CI),
-  retries: process.env.CI ? 1 : 0,
+  // A retry can collect useful diagnostics, but it cannot turn an
+  // intermittent product or visual state into release evidence. Keep the
+  // protected compatibility gate retry-free in CI and locally.
+  retries: 0,
   reporter: process.env.CI
     ? [["line"], ["html", { outputFolder: "playwright-report", open: "never" }]]
     : [["list"], ["html", { outputFolder: "playwright-report", open: "never" }]],

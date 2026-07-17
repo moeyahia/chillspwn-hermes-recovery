@@ -259,8 +259,8 @@ export class LegacyImporter {
       INSERT OR IGNORE INTO missions (
         id, name, objective, journey, status, authorization_status, engagement_id,
         scope_json, success_criteria_json, retention_policy_json, memory_policy_json,
-        created_by, version, created_at, updated_at
-      ) VALUES (?, ?, ?, 'guided', ?, 'unverified', ?, ?, '[]', ?, ?, 'import:legacy', 1, ?, ?)
+        created_by, version, created_at, updated_at, control_plane
+      ) VALUES (?, ?, ?, 'guided', ?, 'unverified', ?, ?, '[]', ?, ?, 'import:legacy', 1, ?, ?, 'legacy')
     `).run(
       missionId,
       redactLegacyText(input.title || "Legacy mission", 240),
@@ -295,8 +295,8 @@ export class LegacyImporter {
       INSERT OR IGNORE INTO runs (
         id, mission_id, journey, status, progress, status_reason, next_action_summary,
         budget_json, budget_usage_json, retry_count, replan_count,
-        started_at, ended_at, created_at, updated_at, version
-      ) VALUES (?, ?, 'guided', ?, ?, ?, NULL, '{}', '{}', 0, 0, ?, ?, ?, ?, 1)
+        started_at, ended_at, created_at, updated_at, version, control_plane
+      ) VALUES (?, ?, 'guided', ?, ?, ?, NULL, '{}', '{}', 0, 0, ?, ?, ?, ?, 1, 'legacy')
     `).run(
       runId,
       input.missionId,

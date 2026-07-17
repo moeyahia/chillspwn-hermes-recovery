@@ -186,7 +186,7 @@ export class LegacyEngagementImporter {
           scope_json, success_criteria_json, retention_policy_json, memory_policy_json,
           created_by, version, created_at, updated_at, control_plane
         ) VALUES (?, ?, ?, 'guided', 'paused', 'unverified', ?, ?, '[]', ?, ?,
-          'import:legacy-engagement', 1, ?, ?, 'command_os_v2')
+          'import:legacy-engagement', 1, ?, ?, 'legacy')
       `).run(
         missionId,
         redactLegacyText(manifest.engagementName, 240),
@@ -203,7 +203,7 @@ export class LegacyEngagementImporter {
           id, mission_id, journey, status, progress, status_reason, next_action_summary,
           budget_json, budget_usage_json, retry_count, replan_count,
           started_at, ended_at, created_at, updated_at, version, control_plane
-        ) VALUES (?, ?, 'guided', 'blocked', 0, ?, ?, '{}', '{}', 0, 0, ?, NULL, ?, ?, 1, 'command_os_v2')
+        ) VALUES (?, ?, 'guided', 'blocked', 0, ?, ?, '{}', '{}', 0, 0, ?, NULL, ?, ?, 1, 'legacy')
       `).run(
         runId,
         missionId,

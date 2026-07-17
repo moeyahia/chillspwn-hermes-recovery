@@ -116,11 +116,11 @@
       "platform": "linux",
       "snapshotName": "autonomous-intake-minimal-review.png",
       "baselinePath": "tests/e2e/mission-intake.spec.ts-snapshots/autonomous-intake-minimal-review-chromium-1440-linux.png",
-      "sha256": "00201e799f4cab91564aa674acf3bc312a70c1e7b54ea11363ba0d33f1b94822",
-      "byteSize": 324583,
+      "sha256": "cd4027ca54a69e74572c0b7ce88e6800921e0e1db2260eac13beb0f7cd497ff6",
+      "byteSize": 324780,
       "pixelWidth": 626,
       "pixelHeight": 3271,
-      "state": "The minimal Autonomous intake resolves recommended defaults into a reviewable contract and keeps launch visibly blocked when enforcing runtime capability is unavailable.",
+      "state": "The minimal Autonomous intake resolves recommended defaults into a reviewable contract, reports canonical database schema 13, and keeps launch visibly blocked when enforcing runtime capability is unavailable.",
       "normalizedFields": ["generated mission title", "generated objective", "contract hash", "fixed command-palette chrome"]
     },
     {

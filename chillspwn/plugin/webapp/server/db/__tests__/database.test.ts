@@ -10,6 +10,7 @@ import {
   listAppliedMigrations,
   migrateDatabase,
 } from "../index";
+import { ControlPlaneLeaseError, RunMutationAuthorityGuard } from "../../control-plane";
 
 const temporaryDirectories: string[] = [];
 
@@ -49,15 +50,113 @@ describe("Command OS database foundation", () => {
       const second = migrateDatabase(database);
       const health = getDatabaseHealth(database);
 
-      expect(first.applied.map((migration) => migration.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+      expect(first.applied.map((migration) => migration.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]);
       expect(second.applied).toEqual([]);
-      expect(listAppliedMigrations(database)).toHaveLength(12);
+      expect(listAppliedMigrations(database)).toHaveLength(13);
       expect(health.healthy).toBe(true);
       expect(health.journalMode).toBe("wal");
       expect(health.foreignKeys).toBe(true);
       expect(health.busyTimeoutMs).toBe(5_000);
-      expect(health.currentMigration).toBe(12);
+      expect(health.currentMigration).toBe(13);
       expect(existsSync(databasePath)).toBe(true);
+    } finally {
+      database.close();
+    }
+  });
+
+  test("repairs only unambiguously imported ownership and rejects V2 mutation until explicit transfer", () => {
+    const database = createDatabaseConnection({ filename: ":memory:" });
+    const importedMissionId = `mission_legacy_${"a".repeat(40)}`;
+    const importedRunId = `run_legacy_${"b".repeat(40)}`;
+    const engagementMissionId = `mission_engagement_legacy_${"c".repeat(40)}`;
+    const engagementRunId = `run_engagement_legacy_${"d".repeat(40)}`;
+    const nativeMissionId = "mission-v2-native-control-plane";
+    const nativeRunId = "run-v2-native-control-plane";
+    const provenanceSpoofMissionId = "mission-operator-owned-legacy-shaped-run";
+    const provenanceSpoofRunId = `run_legacy_${"e".repeat(40)}`;
+    const now = "2026-07-17T09:00:00.000Z";
+    try {
+      migrateDatabase(database, DATABASE_MIGRATIONS.slice(0, 12));
+      for (const [missionId, createdBy] of [
+        [importedMissionId, "import:legacy"],
+        [engagementMissionId, "import:legacy-engagement"],
+        [nativeMissionId, "operator:local"],
+        [provenanceSpoofMissionId, "operator:local"],
+      ] as const) {
+        insertMission(database, missionId, "guided");
+        database.prepare("UPDATE missions SET created_by = ? WHERE id = ?").run(createdBy, missionId);
+      }
+      const insertRun = database.prepare(`
+        INSERT INTO runs (
+          id, mission_id, journey, status, lease_owner, lease_acquired_at,
+          last_heartbeat_at, lease_expires_at, created_at, updated_at,
+          version, control_plane
+        ) VALUES (?, ?, 'guided', 'completed', ?, ?, ?, ?, ?, ?, 1, 'command_os_v2')
+      `);
+      insertRun.run(importedRunId, importedMissionId, "worker-imported", now, now, "2026-07-17T10:00:00.000Z", now, now);
+      insertRun.run(engagementRunId, engagementMissionId, null, null, null, null, now, now);
+      insertRun.run(nativeRunId, nativeMissionId, null, null, null, null, now, now);
+      insertRun.run(provenanceSpoofRunId, provenanceSpoofMissionId, null, null, null, null, now, now);
+      database.prepare(`
+        INSERT INTO control_plane_leases (
+          run_id, control_plane, lease_owner, lease_token_hash, acquired_at,
+          heartbeat_at, expires_at, released_at, version
+        ) VALUES (?, 'command_os_v2', 'worker-imported', ?, ?, ?, ?, NULL, 1)
+      `).run(importedRunId, "f".repeat(64), now, now, "2026-07-17T10:00:00.000Z");
+
+      expect(migrateDatabase(database)).toMatchObject({
+        applied: [{ version: 13, name: "imported_legacy_control_plane" }],
+        currentVersion: 13,
+      });
+      expect(database.prepare(`
+        SELECT id, control_plane FROM missions ORDER BY id
+      `).all()).toEqual([
+        { id: engagementMissionId, control_plane: "legacy" },
+        { id: importedMissionId, control_plane: "legacy" },
+        { id: provenanceSpoofMissionId, control_plane: "command_os_v2" },
+        { id: nativeMissionId, control_plane: "command_os_v2" },
+      ].sort((left, right) => left.id < right.id ? -1 : left.id > right.id ? 1 : 0));
+      expect(database.prepare(`
+        SELECT id, control_plane, lease_owner, lease_acquired_at,
+          last_heartbeat_at, lease_expires_at
+        FROM runs ORDER BY id
+      `).all()).toEqual([
+        { id: engagementRunId, control_plane: "legacy", lease_owner: null, lease_acquired_at: null, last_heartbeat_at: null, lease_expires_at: null },
+        { id: importedRunId, control_plane: "legacy", lease_owner: null, lease_acquired_at: null, last_heartbeat_at: null, lease_expires_at: null },
+        { id: provenanceSpoofRunId, control_plane: "command_os_v2", lease_owner: null, lease_acquired_at: null, last_heartbeat_at: null, lease_expires_at: null },
+        { id: nativeRunId, control_plane: "command_os_v2", lease_owner: null, lease_acquired_at: null, last_heartbeat_at: null, lease_expires_at: null },
+      ].sort((left, right) => left.id < right.id ? -1 : left.id > right.id ? 1 : 0));
+      expect(database.prepare(`
+        SELECT control_plane, released_at IS NOT NULL AS released, version
+        FROM control_plane_leases WHERE run_id = ?
+      `).get(importedRunId)).toEqual({ control_plane: "legacy", released: 1, version: 2 });
+
+      const authority = new RunMutationAuthorityGuard(database);
+      try {
+        authority.authorize({ runId: importedRunId, actorId: "operator-test", mode: "ownership" });
+        throw new Error("Expected imported run ownership to fail closed");
+      } catch (error) {
+        expect(error).toBeInstanceOf(ControlPlaneLeaseError);
+        expect((error as ControlPlaneLeaseError).code).toBe("control_plane_mismatch");
+      }
+      expect(authority.authorize({
+        runId: nativeRunId,
+        actorId: "operator-test",
+        mode: "ownership",
+      }).scope).toEqual({ missionId: nativeMissionId, runId: nativeRunId });
+
+      // Represents the separately authorized transfer transaction. Once the
+      // one-time migration is recorded, restarts do not infer or undo it.
+      database.prepare("UPDATE missions SET control_plane = 'command_os_v2', version = version + 1 WHERE id = ?")
+        .run(importedMissionId);
+      database.prepare("UPDATE runs SET control_plane = 'command_os_v2', version = version + 1 WHERE id = ?")
+        .run(importedRunId);
+      expect(migrateDatabase(database).applied).toEqual([]);
+      expect(authority.authorize({
+        runId: importedRunId,
+        actorId: "operator-test",
+        mode: "ownership",
+      }).scope).toEqual({ missionId: importedMissionId, runId: importedRunId });
     } finally {
       database.close();
     }
@@ -102,12 +201,13 @@ describe("Command OS database foundation", () => {
           { version: 10, name: "v24_operational_truth" },
           { version: 11, name: "memory_edge_scope_identity" },
           { version: 12, name: "planning_retry_continuation" },
+          { version: 13, name: "imported_legacy_control_plane" },
         ],
-        currentVersion: 12,
+        currentVersion: 13,
       });
       expect(getDatabaseHealth(database)).toMatchObject({
         healthy: true,
-        currentMigration: 12,
+        currentMigration: 13,
       });
     } finally {
       database.close();
@@ -143,8 +243,11 @@ describe("Command OS database foundation", () => {
       `).run(now, "2026-07-17T08:01:00.000Z", now, now);
 
       expect(migrateDatabase(database)).toMatchObject({
-        applied: [{ version: 12, name: "planning_retry_continuation" }],
-        currentVersion: 12,
+        applied: [
+          { version: 12, name: "planning_retry_continuation" },
+          { version: 13, name: "imported_legacy_control_plane" },
+        ],
+        currentVersion: 13,
       });
       expect(database.prepare(`
         SELECT kind, source_id, payload_json, status, attempt_count,
@@ -255,8 +358,9 @@ describe("Command OS database foundation", () => {
           { version: 10, name: "v24_operational_truth" },
           { version: 11, name: "memory_edge_scope_identity" },
           { version: 12, name: "planning_retry_continuation" },
+          { version: 13, name: "imported_legacy_control_plane" },
         ],
-        currentVersion: 12,
+        currentVersion: 13,
       });
       expect(database.prepare(`
         SELECT DISTINCT status, decision_actor, decision_reason
@@ -535,7 +639,7 @@ describe("Command OS database foundation", () => {
       `).run(now);
 
       const result = migrateDatabase(database);
-      expect(result.applied.map((migration) => migration.version)).toEqual([6, 7, 8, 9, 10, 11, 12]);
+      expect(result.applied.map((migration) => migration.version)).toEqual([6, 7, 8, 9, 10, 11, 12, 13]);
       expect(database.prepare(`
         SELECT comparison_status, reason, prior_run_id, metrics_json
         FROM run_evaluation_comparisons WHERE evaluation_id = 'evaluation-legacy'
@@ -589,7 +693,7 @@ describe("Command OS database foundation", () => {
       `).run("b".repeat(64), now);
 
       const result = migrateDatabase(database);
-      expect(result.applied.map((migration) => migration.version)).toEqual([7, 8, 9, 10, 11, 12]);
+      expect(result.applied.map((migration) => migration.version)).toEqual([7, 8, 9, 10, 11, 12, 13]);
       expect(database.prepare(
         "SELECT journey, record_hash FROM audit_records WHERE id = 'audit-legacy'",
       ).get()).toEqual({ journey: "guided", record_hash: "legacy-record-hash" });

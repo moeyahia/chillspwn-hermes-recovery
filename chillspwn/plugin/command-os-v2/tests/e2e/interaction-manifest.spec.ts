@@ -44,13 +44,16 @@ test.describe("manifested shell interactions", () => {
     });
   }
 
-  test(`${NAVIGATION_TEST_ID} product mark returns home`, async ({ page }) => {
+  test(`${NAVIGATION_TEST_ID} product mark returns home`, async ({ page, browserAudit }) => {
     const entry = manifest.entries.find((item) => item.id === "shell.home")!;
     await page.goto(entry.route);
+    await browserAudit.waitForPageApiSettlement(page);
     const link = page.getByRole("link", { name: entry.accessible.name, exact: true });
     await link.focus();
     await page.keyboard.press("Enter");
     await expectPath(page, entry.expectedStateTransition);
+    await expect(page.getByRole("heading", { level: 1 }).first()).toBeVisible();
+    await browserAudit.waitForPageApiSettlement(page);
   });
 
   test(`${PALETTE_TEST_ID} pointer and keyboard open, focus, and close`, async ({ page, browserAudit }) => {

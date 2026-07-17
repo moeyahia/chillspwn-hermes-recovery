@@ -15,6 +15,7 @@ const EXPECTED_BROWSER_SPECIFICATIONS = [
   "brain-graph.spec.ts",
   "brain-home-inbox.spec.ts",
   "brain-node-lifecycle.spec.ts",
+  "brain-node-vault.spec.ts",
   "brain-vault.spec.ts",
   "browser-audit-canary.spec.ts",
   "command-palette.spec.ts",

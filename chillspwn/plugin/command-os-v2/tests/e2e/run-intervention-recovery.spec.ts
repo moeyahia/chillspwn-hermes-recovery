@@ -346,6 +346,11 @@ test(`${TEST_PAUSE_RESUME} pauses and resumes from the exact durable checkpoint 
   });
   const resumedReplay = await replayCapturedMutation(page, resumedResponse.request());
   expect(resumedReplay).toEqual({ status: 200, body: resumedBody });
+  // Resume invalidates the mounted run, plan, observability, and notification
+  // projections. Prove those authoritative reads finish before deliberately
+  // replacing the document so the refresh cannot mask a failed reconciliation
+  // as an expected navigation cancellation.
+  await audit.waitForPageApiSettlement(page);
   await audit.withExpectedDocumentNavigationTeardown(page, () => page.reload({ waitUntil: "domcontentloaded" }));
   const waitingBand = page.getByLabel("Selected run status");
   await expect(waitingBand).toContainText("waiting guided decision");

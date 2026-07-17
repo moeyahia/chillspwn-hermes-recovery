@@ -162,7 +162,9 @@ describe("historical engagement import and approved Vault projection", () => {
       expect(count(database, "legacy_engagement_manifests")).toBe(1);
       expect(count(database, "legacy_migration_quarantine")).toBe(3);
       expect((database.prepare("SELECT authorization_status FROM missions").get() as { authorization_status: string }).authorization_status).toBe("unverified");
+      expect((database.prepare("SELECT control_plane FROM missions").get() as { control_plane: string }).control_plane).toBe("legacy");
       expect((database.prepare("SELECT status FROM runs").get() as { status: string }).status).toBe("blocked");
+      expect((database.prepare("SELECT control_plane FROM runs").get() as { control_plane: string }).control_plane).toBe("legacy");
       expect((database.prepare("SELECT technical_payload_json FROM engagement_log_records").get() as { technical_payload_json: string }).technical_payload_json)
         .toContain('"rawOutputIsEvidence":false');
       expect((database.prepare("SELECT COUNT(*) AS count FROM memory_edges WHERE lifecycle_status='verified'").get() as { count: number }).count).toBe(11);
@@ -250,7 +252,14 @@ describe("historical engagement import and approved Vault projection", () => {
       expect(parsed.every((item) => item.note.aliases.includes(item.note.id))).toBe(true);
       const run = parsed.find((item) => item.note.nodeType === "run");
       expect(run).toBeDefined();
-      expect(run!.note.edges.length).toBe(10);
+      expect(run!.note.edges).toHaveLength(1);
+      expect(run!.note.edges[0]).toMatchObject({ edgeType: "belongs_to" });
+      const artifacts = parsed.filter((item) => item.note.nodeType === "artifact");
+      expect(artifacts).toHaveLength(9);
+      for (const artifact of artifacts) {
+        expect(readFileSync(artifact.path, "utf8"))
+          .toContain(`<!-- chillspwn-backlink:produced:${run!.note.id} -->`);
+      }
       expect(readFileSync(run!.path, "utf8")).toContain("[[");
       expect(notes.map((path) => readFileSync(path, "utf8")).join("\n")).not.toContain(fixture.secret);
       expect(count(writable, "legacy_vault_projection_approvals")).toBe(1);

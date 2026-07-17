@@ -337,6 +337,10 @@ describe("LegacyMigrationService", () => {
     try {
       expect((database.prepare("SELECT COUNT(*) AS count FROM missions").get() as { count: number }).count).toBeGreaterThanOrEqual(2);
       expect((database.prepare("SELECT COUNT(*) AS count FROM runs").get() as { count: number }).count).toBe(2);
+      expect(database.prepare("SELECT DISTINCT control_plane FROM missions").all())
+        .toEqual([{ control_plane: "legacy" }]);
+      expect(database.prepare("SELECT DISTINCT control_plane FROM runs").all())
+        .toEqual([{ control_plane: "legacy" }]);
       expect((database.prepare("SELECT COUNT(*) AS count FROM plan_steps").get() as { count: number }).count).toBe(1);
       expect((database.prepare("SELECT COUNT(*) AS count FROM evidence").get() as { count: number }).count).toBe(1);
       expect((database.prepare("SELECT COUNT(*) AS count FROM evidence_chain_events").get() as { count: number }).count).toBe(1);
