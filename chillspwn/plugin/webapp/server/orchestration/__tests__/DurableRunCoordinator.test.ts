@@ -1,5 +1,4 @@
 import { describe, expect, test } from "bun:test";
-import { mappingFor, specialistToolDecision } from "../../agents/agentMcpMap";
 import { createDatabaseConnection, migrateDatabase } from "../../db";
 import { fingerprintAction } from "../../supervisor";
 import {
@@ -124,9 +123,30 @@ function seedRun(database: Database, input: {
   `).run(planId, input.runId, `hash_${input.runId}`, now, now);
   database.prepare(`
     INSERT OR IGNORE INTO agents (
-      id, role, display_name, status, version, created_at, updated_at
-    ) VALUES ('ReconScout', 'reconnaissance', 'ReconScout', 'available', '1', ?, ?)
+      id, role, display_name, status, tool_policy_json,
+      version, created_at, updated_at
+    ) VALUES (
+      'ReconScout', 'reconnaissance', 'ReconScout', 'available',
+      '{"allowedTools":["quick_scan"],"deniedTools":[],"approvalRequiredTools":[]}',
+      '1', ?, ?
+    )
   `).run(now, now);
+  database.prepare(`
+    INSERT OR IGNORE INTO agent_capabilities (
+      agent_id, capability, source, enabled, metadata_json
+    ) VALUES ('ReconScout', 'quick_scan', 'durable-coordinator-test', 1, '{}')
+  `).run();
+  database.prepare(`
+    INSERT OR IGNORE INTO mcp_servers (
+      id, name, transport, endpoint_redacted, status, capabilities_json,
+      policy_json, last_checked_at, created_at, updated_at
+    ) VALUES (
+      'sechub-reconnaissance', 'sechub-reconnaissance', 'fixture', 'test-only',
+      'healthy', '["quick_scan"]',
+      '{"enabled":true,"assignedAgents":["ReconScout"],"startPermitted":true}',
+      ?, ?, ?
+    )
+  `).run(now, now, now);
   database.prepare(`
     INSERT INTO plan_steps (
       id, plan_id, run_id, ordinal, phase, title, objective,
@@ -735,20 +755,29 @@ describe("DurableRunCoordinator", () => {
   test("Autonomous transient failures do not retry after specialist tool policy drifts", async () => {
     for (const drift of ["require_approval", "deny"] as const) {
       const { database, coordinator } = setup();
-      const mapping = mappingFor("ReconScout");
-      if (!mapping) throw new Error("ReconScout mapping fixture is missing");
-      const originalApproval = [...mapping.approvalRequiredTools];
-      const originalDenied = [...mapping.deniedTools];
       try {
         const runId = `run-tool-policy-drift-${drift}`;
         const fixture = seedRun(database, { runId, journey: "autonomous" });
-        expect(specialistToolDecision("ReconScout", "quick_scan")).toBe("allow");
+        expect(database.prepare(`
+          SELECT tool_policy_json FROM agents WHERE id = 'ReconScout'
+        `).get()).toEqual({
+          tool_policy_json: '{"allowedTools":["quick_scan"],"deniedTools":[],"approvalRequiredTools":[]}',
+        });
         const lease = coordinator.acquireRunLease(runId, "worker-1");
         const started = await coordinator.startAction({ lease, intent: intent(fixture, runId) });
 
-        if (drift === "require_approval") mapping.approvalRequiredTools.push("quick_scan");
-        else mapping.deniedTools.push("quick_scan");
-        expect(specialistToolDecision("ReconScout", "quick_scan")).toBe(drift);
+        const policyKey = drift === "require_approval"
+          ? "approvalRequiredTools"
+          : "deniedTools";
+        database.prepare(`
+          UPDATE agents
+          SET tool_policy_json = json_set(tool_policy_json, ?, json('["quick_scan"]'))
+          WHERE id = 'ReconScout'
+        `).run(`$.${policyKey}`);
+        expect(database.prepare(`
+          SELECT json_extract(tool_policy_json, ?) AS policy_value
+          FROM agents WHERE id = 'ReconScout'
+        `).get(`$.${policyKey}`)).toEqual({ policy_value: '["quick_scan"]' });
 
         const failed = await coordinator.completeAction({
           lease: started.lease,
@@ -775,8 +804,6 @@ describe("DurableRunCoordinator", () => {
           ORDER BY sequence DESC LIMIT 1
         `).get(runId)).toEqual({ directive: "blocked" });
       } finally {
-        mapping.approvalRequiredTools.splice(0, mapping.approvalRequiredTools.length, ...originalApproval);
-        mapping.deniedTools.splice(0, mapping.deniedTools.length, ...originalDenied);
         database.close();
       }
     }
@@ -858,16 +885,20 @@ describe("DurableRunCoordinator", () => {
 
   test("startup recovery does not resume an idempotent tool after it becomes approval-gated", async () => {
     const { database, coordinator, clock, port } = setup();
-    const mapping = mappingFor("ReconScout");
-    if (!mapping) throw new Error("ReconScout mapping fixture is missing");
-    const originalApproval = [...mapping.approvalRequiredTools];
     try {
       const runId = "run-startup-policy-drift";
       const fixture = seedRun(database, { runId, journey: "autonomous" });
       const lease = coordinator.acquireRunLease(runId, "dead-worker");
       await coordinator.startAction({ lease, intent: intent(fixture, runId) });
-      expect(specialistToolDecision("ReconScout", "quick_scan")).toBe("allow");
-      mapping.approvalRequiredTools.push("quick_scan");
+      database.prepare(`
+        UPDATE agents
+        SET tool_policy_json = json_set(
+          tool_policy_json,
+          '$.approvalRequiredTools',
+          json('["quick_scan"]')
+        )
+        WHERE id = 'ReconScout'
+      `).run();
       clock.advance(2_000);
 
       const restarted = new DurableRunCoordinator(database, port, { now: clock.now, leaseTtlMs: 1_000 });
@@ -879,7 +910,6 @@ describe("DurableRunCoordinator", () => {
       expect(port.resumed).toHaveLength(0);
       expect(restarted.getRun(runId)).toMatchObject({ run: { state: "blocked" }, lease: null });
     } finally {
-      mapping.approvalRequiredTools.splice(0, mapping.approvalRequiredTools.length, ...originalApproval);
       database.close();
     }
   });

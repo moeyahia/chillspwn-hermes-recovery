@@ -211,9 +211,9 @@ export function parseOverview(payload: unknown): OverviewSnapshot {
   const summary = record(value.summary, "overview summary");
   const brain = record(value.brain, "overview brain");
   const system = record(value.system, "overview system");
-  if (value.schemaVersion !== "2.1") throw new Error("unsupported overview schema version");
+  if (value.schemaVersion !== "2.4") throw new Error("unsupported overview schema version");
   return {
-    schemaVersion: "2.1",
+    schemaVersion: "2.4",
     readiness: parseReadiness(value.readiness),
     summary: {
       activeMissions: finiteNumber(summary.activeMissions, "active mission count"),
@@ -340,7 +340,7 @@ function parseAutonomousPreflight(
   const execution = record(value.execution, "Autonomous execution preview");
   const team = record(execution.team, "Autonomous specialist team preview");
   const summary = record(value.policySummary, "Autonomous policy summary");
-  if (value.schemaVersion !== "2.1") throw new Error("unsupported Autonomous preflight schema version");
+  if (value.schemaVersion !== "2.4") throw new Error("unsupported Autonomous preflight schema version");
   const version = finiteNumber(contract.version, "Autonomous contract version");
   if (!Number.isSafeInteger(version) || version < 1 || (requireInitialVersion && version !== 1)) {
     throw new Error("Autonomous contract version is invalid");
@@ -348,7 +348,7 @@ function parseAutonomousPreflight(
   const hash = text(contract.hash, "Autonomous contract hash");
   if (!/^[a-f0-9]{64}$/u.test(hash)) throw new Error("Autonomous contract hash is invalid");
   return {
-    schemaVersion: "2.1",
+    schemaVersion: "2.4",
     contract: { version, hash },
     readiness: parseReadiness(value.readiness),
     context: {
@@ -401,7 +401,12 @@ function parseAutonomousRequest(value: unknown): AutonomousMissionRequest {
     return expected;
   };
   const destructivePolicy = contract.destructivePolicy;
-  if (destructivePolicy !== "prohibited" && destructivePolicy !== "contract_only") {
+  if (
+    destructivePolicy !== "prohibited" &&
+    destructivePolicy !== "validate_without_executing" &&
+    destructivePolicy !== "bounded_lab_only" &&
+    destructivePolicy !== "contract_only"
+  ) {
     throw new Error("branch destructive policy is invalid");
   }
   const optionalNumber = (candidate: unknown, label: string): number | undefined => (
@@ -425,6 +430,9 @@ function parseAutonomousRequest(value: unknown): AutonomousMissionRequest {
       allowedActionClasses: stringList(contract.allowedActionClasses, "branch allowed action class"),
       prohibitedActionClasses: stringList(contract.prohibitedActionClasses, "branch prohibited action class"),
       destructivePolicy,
+      boundedDestructiveTargets: contract.boundedDestructiveTargets === undefined
+        ? []
+        : stringList(contract.boundedDestructiveTargets, "branch bounded destructive target"),
       evidenceRequirements: stringList(contract.evidenceRequirements, "branch evidence requirement"),
       timeBudgetMinutes: finiteNumber(contract.timeBudgetMinutes, "branch time budget"),
       ...(optionalNumber(contract.tokenBudget, "branch token budget") === undefined ? {} : { tokenBudget: optionalNumber(contract.tokenBudget, "branch token budget") }),
@@ -463,11 +471,11 @@ export function parseAutonomousBranchContext(payload: unknown): AutonomousBranch
   const mission = record(root.mission, "branch mission");
   const sourceRun = record(root.sourceRun, "branch source run");
   const contract = record(root.contract, "branch contract");
-  if (root.schemaVersion !== "2.1") throw new Error("unsupported branch context schema version");
+  if (root.schemaVersion !== "2.4") throw new Error("unsupported branch context schema version");
   const hash = text(contract.hash, "branch contract hash");
   if (!/^[a-f0-9]{64}$/u.test(hash)) throw new Error("branch contract hash is invalid");
   return {
-    schemaVersion: "2.1",
+    schemaVersion: "2.4",
     mission: {
       id: text(mission.id, "branch mission ID"),
       name: text(mission.name, "branch mission name"),
@@ -509,14 +517,14 @@ export function parseAutonomousBranchContext(payload: unknown): AutonomousBranch
 export function parseAutonomousBranchPreflight(payload: unknown): AutonomousBranchPreflight {
   const root = record(unwrap(payload), "Autonomous branch preflight");
   const contract = record(root.contract, "branch preflight contract");
-  if (root.schemaVersion !== "2.1") throw new Error("unsupported branch preflight schema version");
+  if (root.schemaVersion !== "2.4") throw new Error("unsupported branch preflight schema version");
   if (contract.state !== "confirmed" && contract.state !== "draft" && contract.state !== "unpersisted") {
     throw new Error("branch preflight contract state is invalid");
   }
   const hash = text(contract.hash, "branch preflight contract hash");
   if (!/^[a-f0-9]{64}$/u.test(hash)) throw new Error("branch preflight contract hash is invalid");
   return {
-    schemaVersion: "2.1",
+    schemaVersion: "2.4",
     mode: parseBranchMode(root.mode),
     sourceRunId: text(root.sourceRunId, "branch preflight source run ID"),
     sourceRunVersion: finiteNumber(root.sourceRunVersion, "branch preflight source version"),
@@ -538,7 +546,7 @@ export function parseAutonomousBranchResult(payload: unknown): AutonomousBranchR
   const root = record(unwrap(payload), "Autonomous branch result");
   const run = record(root.run, "Autonomous branch run");
   const contract = record(root.contract, "Autonomous branch confirmed contract");
-  if (root.schemaVersion !== "2.1" || run.journey !== "autonomous" || run.status !== "planning" || contract.state !== "confirmed") {
+  if (root.schemaVersion !== "2.4" || run.journey !== "autonomous" || run.status !== "planning" || contract.state !== "confirmed") {
     throw new Error("Autonomous branch result is invalid");
   }
   const hash = text(contract.hash, "confirmed branch contract hash");
@@ -548,7 +556,7 @@ export function parseAutonomousBranchResult(payload: unknown): AutonomousBranchR
     throw new Error("Autonomous branch next URL is invalid");
   }
   return {
-    schemaVersion: "2.1",
+    schemaVersion: "2.4",
     sourceRunId: text(root.sourceRunId, "Autonomous branch source run ID"),
     branchMode: parseBranchMode(root.branchMode),
     run: {
@@ -571,9 +579,9 @@ export function parseAutonomousBranchResult(payload: unknown): AutonomousBranchR
 
 export function parseMissionPage(payload: unknown): MissionPage {
   const value = record(unwrap(payload), "mission page");
-  if (value.schemaVersion !== "2.1") throw new Error("unsupported mission page schema version");
+  if (value.schemaVersion !== "2.4") throw new Error("unsupported mission page schema version");
   return {
-    schemaVersion: "2.1",
+    schemaVersion: "2.4",
     items: list(value.items).map(parseMission),
     nextCursor: value.nextCursor === null ? null : text(value.nextCursor, "mission page cursor"),
   };
@@ -603,11 +611,11 @@ function parsePortfolioState(value: unknown): MissionPortfolioFilterState {
 
 export function parseSavedMissionViewCollection(payload: unknown): SavedMissionViewCollection {
   const value = record(unwrap(payload), "saved mission views");
-  if (value.schemaVersion !== "2.1") throw new Error("unsupported saved mission view schema version");
+  if (value.schemaVersion !== "2.4") throw new Error("unsupported saved mission view schema version");
   const version = finiteNumber(value.version, "saved mission view version");
   if (!Number.isSafeInteger(version) || version < 0) throw new Error("saved mission view version is invalid");
   return {
-    schemaVersion: "2.1",
+    schemaVersion: "2.4",
     version,
     items: list(value.items).map((candidate) => {
       const item = record(candidate, "saved mission view");
@@ -636,9 +644,9 @@ function parseBulkOutcome(value: unknown): MissionBulkArchiveResult["outcomes"][
 
 export function parseMissionBulkArchive(payload: unknown): MissionBulkArchiveResult {
   const value = record(unwrap(payload), "mission archive result");
-  if (value.schemaVersion !== "2.1") throw new Error("unsupported mission archive schema version");
+  if (value.schemaVersion !== "2.4") throw new Error("unsupported mission archive schema version");
   return {
-    schemaVersion: "2.1",
+    schemaVersion: "2.4",
     selectionHash: sha256Text(value.selectionHash, "mission archive selection hash"),
     outcomes: list(value.outcomes).map(parseBulkOutcome),
     archivedCount: nonNegativeInteger(value.archivedCount, "archived mission count"),
@@ -648,12 +656,12 @@ export function parseMissionBulkArchive(payload: unknown): MissionBulkArchiveRes
 export function parseMissionBulkExport(payload: unknown): MissionBulkExportResult {
   const value = record(unwrap(payload), "mission export result");
   const policy = record(value.policy, "mission export policy");
-  if (value.schemaVersion !== "2.1") throw new Error("unsupported mission export schema version");
+  if (value.schemaVersion !== "2.4") throw new Error("unsupported mission export schema version");
   if (policy.evidenceBlobsIncluded !== false || policy.confidentialPayloadsIncluded !== false) {
     throw new Error("mission export policy must exclude evidence and confidential payloads");
   }
   return {
-    schemaVersion: "2.1",
+    schemaVersion: "2.4",
     generatedAt: text(value.generatedAt, "mission export generatedAt"),
     selectionHash: sha256Text(value.selectionHash, "mission export selection hash"),
     exportSha256: sha256Text(value.exportSha256, "mission export hash"),
@@ -746,14 +754,57 @@ export function parseCreatedMission(payload: unknown): CreatedMission {
 
 export function parseOperationalEvent(payload: unknown): OperationalEvent {
   const value = record(payload, "operational event");
+  const allowedKeys = new Set([
+    "id", "sequence", "type", "timestamp", "missionId", "runId", "journey", "summary",
+    "actor", "payload", "schemaVersion", "traceId", "spanId", "sensitivity", "redaction",
+    "contextPackId",
+  ]);
+  const unexpected = Object.keys(value).filter((key) => !allowedKeys.has(key));
+  if (unexpected.length > 0) throw new Error(`operational event contains unsupported fields: ${unexpected.join(", ")}`);
+  for (const key of ["payload", "redaction"]) {
+    if (!(key in value)) throw new Error(`operational event ${key} is required`);
+  }
+  const sequence = nonNegativeInteger(value.sequence, "event sequence");
+  if (sequence < 1) throw new Error("event sequence must be a positive integer");
+  const schemaVersion = nonNegativeInteger(value.schemaVersion, "event schema version");
+  if (schemaVersion < 1) throw new Error("event schema version must be a positive integer");
+  const actor = record(value.actor, "event actor");
+  const unexpectedActorKeys = Object.keys(actor).filter((key) => key !== "type" && key !== "id");
+  if (unexpectedActorKeys.length > 0) throw new Error(`event actor contains unsupported fields: ${unexpectedActorKeys.join(", ")}`);
+  if (![
+    "operator", "agent", "worker", "provider", "tool", "system",
+  ].includes(String(actor.type))) throw new Error("event actor type is invalid");
+  if (actor.id !== null && (typeof actor.id !== "string" || !actor.id.trim())) {
+    throw new Error("event actor id must be a non-empty string or null");
+  }
+  if (![
+    "public", "internal", "private", "restricted",
+  ].includes(String(value.sensitivity))) throw new Error("event sensitivity is invalid");
+  const nullableCorrelation = (item: unknown, label: string): string | null => {
+    if (item === null) return null;
+    return text(item, label);
+  };
+  const timestamp = text(value.timestamp, "event timestamp");
+  if (Number.isNaN(Date.parse(timestamp))) throw new Error("event timestamp must be an ISO-compatible date-time");
   return {
     id: text(value.id, "event id"),
-    sequence: typeof value.sequence === "number" ? value.sequence : undefined,
+    sequence,
     type: text(value.type, "event type"),
-    timestamp: text(value.timestamp, "event timestamp"),
-    missionId: optionalText(value.missionId),
-    runId: optionalText(value.runId),
-    journey: value.journey === undefined ? undefined : journey(value.journey, "event journey"),
+    timestamp,
+    missionId: text(value.missionId, "event mission id"),
+    runId: text(value.runId, "event run id"),
+    journey: journey(value.journey, "event journey"),
     summary: text(value.summary, "event summary"),
+    actor: {
+      type: actor.type as OperationalEvent["actor"]["type"],
+      id: actor.id as string | null,
+    },
+    payload: value.payload,
+    schemaVersion,
+    traceId: nullableCorrelation(value.traceId, "event trace id"),
+    spanId: nullableCorrelation(value.spanId, "event span id"),
+    sensitivity: value.sensitivity as OperationalEvent["sensitivity"],
+    redaction: value.redaction,
+    contextPackId: nullableCorrelation(value.contextPackId, "event context pack id"),
   };
 }

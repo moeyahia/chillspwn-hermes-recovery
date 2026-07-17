@@ -115,9 +115,26 @@ function seedAgent(database: SqliteDatabase): void {
   const now = "2026-07-15T00:00:00.000Z";
   database.prepare(`
     INSERT INTO agents (
-      id, role, display_name, status, version, created_at, updated_at
-    ) VALUES ('ReconScout', 'reconnaissance', 'Recon specialist', 'available', '1', ?, ?)
+      id, role, display_name, status, tool_policy_json, version, created_at, updated_at
+    ) VALUES ('ReconScout', 'reconnaissance', 'Recon specialist', 'available',
+      '{"allowedTools":["quick_scan"],"deniedTools":[],"approvalRequiredTools":[]}',
+      '1', ?, ?)
   `).run(now, now);
+  database.prepare(`
+    INSERT INTO agent_capabilities (agent_id, capability, source, enabled, metadata_json)
+    VALUES ('ReconScout', 'quick_scan', 'runtime-test-attestation', 1, '{}')
+  `).run();
+  database.prepare(`
+    INSERT INTO mcp_servers (
+      id, name, transport, endpoint_redacted, status, capabilities_json,
+      policy_json, last_checked_at, created_at, updated_at
+    ) VALUES (
+      'sechub-reconnaissance', 'sechub-reconnaissance', 'fixture', 'test-only',
+      'healthy', '["quick_scan"]',
+      '{"enabled":true,"assignedAgents":["ReconScout"],"startPermitted":true}',
+      ?, ?, ?
+    )
+  `).run(now, now, now);
 }
 
 function seedRun(database: SqliteDatabase, journey: "autonomous" | "guided"): { missionId: string; runId: string } {
@@ -639,6 +656,7 @@ describe("MissionRuntimeEngine", () => {
       database,
       port: interpreter,
       resolveActor: () => "operator-test",
+      assertRunMutationLease: runtime.assertRunMutationLease,
     }));
     app.use(createMissionRuntimeV2Router({ runtime, resolveActor: () => "operator-test" }));
     const server = app.listen(0, "127.0.0.1");
@@ -1491,7 +1509,14 @@ describe("MissionRuntimeEngine", () => {
         };
       },
     };
-    for (const destructivePolicy of [undefined, "prohibited", "operator_approval"] as const) {
+    for (const destructivePolicy of [
+      undefined,
+      "prohibited",
+      "validate_without_executing",
+      "contract_only",
+      "bounded_lab_only",
+      "operator_approval",
+    ] as const) {
       const { database, runtime, port, runId } = setup("autonomous", destructivePlanner);
       if (destructivePolicy === undefined) {
         database.prepare(`
@@ -1538,7 +1563,7 @@ describe("MissionRuntimeEngine", () => {
     }
   }, 120_000);
 
-  test("Autonomous permits a destructive action only for the explicit contract_only policy", async () => {
+  test("Autonomous permits a destructive action only for the exact bounded disposable-lab target", async () => {
     const destructivePlanner: MissionPlannerPort = {
       async plan(input, signal) {
         const valid = await planner.plan(input, signal);
@@ -1554,13 +1579,20 @@ describe("MissionRuntimeEngine", () => {
     };
     const { database, runtime, port, runId } = setup("autonomous", destructivePlanner);
     database.prepare(`
+      UPDATE mission_targets
+      SET target = 'lab:reapertwo', normalized_target = 'lab:reapertwo'
+      WHERE mission_id = 'mission-autonomous'
+    `).run();
+    database.prepare(`
       UPDATE mission_contracts
       SET action_policy_json = json_set(
         action_policy_json,
         '$.allowedActionClasses',
         json('["  ReConNaIsSaNcE  "]'),
         '$.destructivePolicy',
-        '  CONTRACT_ONLY  '
+        '  BOUNDED_LAB_ONLY  ',
+        '$.boundedDestructiveTargets',
+        json('["lab:reapertwo"]')
       )
       WHERE id = 'contract-autonomous'
     `).run();

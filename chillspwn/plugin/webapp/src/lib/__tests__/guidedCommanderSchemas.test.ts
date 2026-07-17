@@ -43,7 +43,7 @@ describe("Guided Commander client schemas", () => {
       guidedDecisionStatus: "pending",
     };
     const transcript = parseGuidedTranscript({
-      schemaVersion: "2.1",
+      schemaVersion: "2.4",
       mission: {
         id: "mission-test",
         name: "Mission",
@@ -80,7 +80,7 @@ describe("Guided Commander client schemas", () => {
     expect(transcript.items).toHaveLength(2);
 
     const reply = parseGuidedCommanderReply({
-      schemaVersion: "2.1",
+      schemaVersion: "2.4",
       result: {
         action: "explain_more",
         operatorMessage: message("message-operator", "operator"),
@@ -94,7 +94,7 @@ describe("Guided Commander client schemas", () => {
 
   test("rejects unknown actions and any memory response that skips pending review", () => {
     expect(() => parseGuidedCommanderReply({
-      schemaVersion: "2.1",
+      schemaVersion: "2.4",
       result: {
         action: "execute_everything",
         operatorMessage: message("message-operator", "operator"),
@@ -104,7 +104,7 @@ describe("Guided Commander client schemas", () => {
       },
     })).toThrow();
     expect(() => parseGuidedMemoryCandidate({
-      schemaVersion: "2.1",
+      schemaVersion: "2.4",
       result: {
         candidateId: "candidate-test",
         status: "confirmed",

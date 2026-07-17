@@ -21,7 +21,8 @@ interface FormState {
   authorizationConfirmed: boolean;
   allowedActionClasses: string;
   prohibitedActionClasses: string;
-  destructivePolicy: "prohibited" | "contract_only";
+  destructivePolicy: Exclude<AutonomousMissionRequest["contract"]["destructivePolicy"], "contract_only">;
+  boundedDestructiveTargets: string;
   evidenceRequirements: string;
   safeStopConditions: string;
   timeBudgetMinutes: number;
@@ -49,6 +50,7 @@ const INITIAL_STATE: FormState = {
   allowedActionClasses: "",
   prohibitedActionClasses: "",
   destructivePolicy: "prohibited",
+  boundedDestructiveTargets: "",
   evidenceRequirements: "",
   safeStopConditions: "",
   timeBudgetMinutes: 60,
@@ -83,6 +85,9 @@ function validateStep(step: number, form: FormState): string[] {
     if (form.concurrencyLimit < 1) errors.push("Concurrency limit must be at least one.");
     if (!Number.isSafeInteger(form.evidenceStorageBudgetMb) || form.evidenceStorageBudgetMb < 1) errors.push("Evidence storage budget must be at least 1 MiB.");
     if (!Number.isSafeInteger(form.artifactStorageBudgetMb) || form.artifactStorageBudgetMb < 1) errors.push("Artifact storage budget must be at least 1 MiB.");
+    if (form.destructivePolicy === "bounded_lab_only" && lines(form.boundedDestructiveTargets).length === 0) {
+      errors.push("Name at least one authorized disposable lab target for bounded lab-only actions.");
+    }
   }
   if (step === 3 && form.specialistAgentIds.length === 0) {
     errors.push("Select at least one compatible specialist for the signed assignment pool.");
@@ -139,6 +144,7 @@ export default function AutonomousContractPage() {
       allowedActionClasses: lines(form.allowedActionClasses),
       prohibitedActionClasses: lines(form.prohibitedActionClasses),
       destructivePolicy: form.destructivePolicy,
+      boundedDestructiveTargets: lines(form.boundedDestructiveTargets),
       evidenceRequirements: lines(form.evidenceRequirements),
       timeBudgetMinutes: form.timeBudgetMinutes,
       tokenBudget: optionalPositive(form.tokenBudget),
@@ -270,7 +276,8 @@ export default function AutonomousContractPage() {
             {step === 2 && <fieldset><legend>Autonomous operating contract</legend><p className="os-field-intro">The runtime may adapt its plan, but cannot expand these permissions or budgets.</p>
               <label>Pre-authorized action classes <span>One per line</span><textarea value={form.allowedActionClasses} onChange={(event) => set("allowedActionClasses", event.target.value)} rows={4} required /></label>
               <label>Prohibited action classes <span>One per line</span><textarea value={form.prohibitedActionClasses} onChange={(event) => set("prohibitedActionClasses", event.target.value)} rows={3} /></label>
-              <label>Destructive-action policy<select value={form.destructivePolicy} onChange={(event) => set("destructivePolicy", event.target.value as FormState["destructivePolicy"])}><option value="prohibited">Prohibited</option><option value="contract_only">Allowed only where explicitly described in this contract</option></select></label>
+              <label>Destructive-action policy<select value={form.destructivePolicy} onChange={(event) => set("destructivePolicy", event.target.value as FormState["destructivePolicy"])}><option value="prohibited">Prohibited</option><option value="validate_without_executing">Validate the path without executing it</option><option value="bounded_lab_only">Bounded disposable lab targets only</option></select></label>
+              {form.destructivePolicy === "bounded_lab_only" ? <label>Named disposable lab targets<textarea value={form.boundedDestructiveTargets} onChange={(event) => set("boundedDestructiveTargets", event.target.value)} placeholder="lab:reapertwo" /></label> : null}
               <label>Evidence requirements <span>One per line</span><textarea value={form.evidenceRequirements} onChange={(event) => set("evidenceRequirements", event.target.value)} rows={3} /></label>
               <label>Safe-stop conditions <span>One per line</span><textarea value={form.safeStopConditions} onChange={(event) => set("safeStopConditions", event.target.value)} rows={4} required /></label>
               <div className="os-field-grid os-field-grid--three">

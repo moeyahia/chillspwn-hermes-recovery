@@ -266,6 +266,9 @@ function exact(recovery: any) {
     expectedPlanVersion: recovery.boundary.planVersion,
     expectedStepId: recovery.boundary.stepId,
     expectedAssignmentId: recovery.boundary.assignmentId,
+    expectedCheckpointId: recovery.checkpoint.id,
+    expectedCheckpointStateHash: recovery.checkpoint.stateHash,
+    expectedCheckpointEventSequence: recovery.checkpoint.eventSequence,
   };
 }
 

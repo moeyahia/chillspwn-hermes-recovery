@@ -1,0 +1,182 @@
+import { defineConfig } from "@playwright/test";
+import { existsSync } from "node:fs";
+import { resolve } from "node:path";
+import { E2E_AUTH_STATE, E2E_DATABASE_PATH, E2E_OPERATOR_TOKEN, E2E_RUN_ID, E2E_VAULT_ROOT } from "./tests/e2e/support/environment";
+import { parseE2EProfile } from "./tests/e2e/support/e2eProfile";
+
+const root = import.meta.dirname;
+const apiEntryExists = existsSync(resolve(root, "server/index.ts"));
+const e2eProfile = parseE2EProfile();
+const baseURL = e2eProfile.baseURL;
+const apiURL = e2eProfile.apiURL;
+const externalServers = e2eProfile.externalServers;
+const releaseProfile = e2eProfile.profile === "release";
+const releaseServerUrl = new URL(baseURL);
+const releaseBind = releaseServerUrl.hostname.replace(/^\[|\]$/gu, "") === "localhost"
+  ? "127.0.0.1"
+  : releaseServerUrl.hostname.replace(/^\[|\]$/gu, "");
+const releasePort = releaseServerUrl.port || (releaseServerUrl.protocol === "http:" ? "80" : "443");
+const evidenceRunId = E2E_RUN_ID.replace(/[^A-Za-z0-9._-]+/gu, "-").slice(0, 120) || "unnamed-run";
+// A release-profile server must never serve the shared mutable `dist` tree.
+// Focused release gates can overlap while the full suite is still running;
+// Vite clears its output directory at the start of each build, which used to
+// make an already-running server return a transient document 500. Build into
+// a process-owned directory, then use the same verified immutable handoff as
+// preview/release deployments before the server starts.
+const releaseStaticId = `e2e-${evidenceRunId.slice(0, 108)}-${process.pid}`;
+const releaseStaticRoot = resolve(
+  "/tmp/chillspwn-command-os-v2-e2e-data",
+  `static-releases-${evidenceRunId}`,
+);
+const releaseBuildRoot = resolve(
+  "/tmp/chillspwn-command-os-v2-e2e-data",
+  `static-build-${releaseStaticId}`,
+);
+const profileMetadata = {
+  e2eProfile: e2eProfile.profile,
+  requireApi: e2eProfile.requireApi,
+  enforceManifest: e2eProfile.enforceManifest,
+  serverMode: e2eProfile.serverMode,
+  ...(e2eProfile.releaseAttestation ? { releaseAttestation: e2eProfile.releaseAttestation } : {}),
+};
+
+const viewports = {
+  phone360: { width: 360, height: 800 },
+  phone390: { width: 390, height: 844 },
+  tablet: { width: 768, height: 1024 },
+  compactDesktop: { width: 1024, height: 768 },
+  laptop: { width: 1280, height: 800 },
+  desktop: { width: 1440, height: 900 },
+  fullHd: { width: 1920, height: 1080 },
+  wide: { width: 2560, height: 1440 },
+  // A 1440×900 desktop at 200% browser zoom exposes a 720×450 CSS
+  // viewport while rasterizing each CSS pixel at 2×2 device pixels. Chromium
+  // headless does not honor Ctrl/Cmd-Plus as browser chrome does, so this
+  // project emulates the resulting rendering geometry explicitly instead of
+  // mislabeling a small 1x viewport as a native browser-zoom operation.
+  zoom200CssViewport: { width: 720, height: 450 },
+} as const;
+
+export default defineConfig({
+  testDir: "./tests/e2e",
+  globalSetup: "./tests/e2e/globalSetup.ts",
+  outputDir: `./test-results/playwright/${evidenceRunId}`,
+  fullyParallel: !releaseProfile,
+  forbidOnly: true,
+  retries: 0,
+  workers: releaseProfile ? 1 : process.env.CI ? 2 : undefined,
+  timeout: 30_000,
+  expect: { timeout: 7_500 },
+  reporter: [
+    ["line"],
+    ["html", { outputFolder: `test-results/html/${evidenceRunId}`, open: "never" }],
+    ["json", { outputFile: `test-results/results/${evidenceRunId}.json` }],
+  ],
+  use: {
+    baseURL,
+    storageState: E2E_AUTH_STATE,
+    locale: "en-US",
+    timezoneId: "UTC",
+    colorScheme: "dark",
+    contextOptions: { reducedMotion: "no-preference" },
+    screenshot: "only-on-failure",
+    trace: "retain-on-failure",
+    video: "retain-on-failure",
+    serviceWorkers: "allow",
+  },
+  metadata: profileMetadata,
+  webServer: externalServers ? undefined : releaseProfile ? {
+    command: [
+      "bun run logo:sync",
+      "bunx vite build --outDir \"$COMMAND_OS_V2_DIST_ROOT\" --emptyOutDir",
+      "bun run release:static:stage",
+      "bun run release:static:activate",
+      "bun run server/index.ts",
+    ].join(" && "),
+    url: new URL("/api/v2/health", baseURL).toString(),
+    timeout: 120_000,
+    reuseExistingServer: false,
+    env: {
+      ...process.env,
+      COMMAND_OS_V2_BIND: releaseBind,
+      COMMAND_OS_V2_PORT: releasePort,
+      COMMAND_OS_V2_SERVE_STATIC: "true",
+      COMMAND_OS_V2_PREVIEW: "true",
+      COMMAND_OS_V2_UI_ORIGIN: releaseServerUrl.origin,
+      COMMAND_OS_V2_DATABASE_PATH: E2E_DATABASE_PATH,
+      COMMAND_OS_V2_DIST_ROOT: releaseBuildRoot,
+      COMMAND_OS_V2_STATIC_RELEASE_ID: releaseStaticId,
+      COMMAND_OS_V2_STATIC_RELEASE_ROOT: releaseStaticRoot,
+      COMMAND_OS_V2_OPERATOR_TOKEN: E2E_OPERATOR_TOKEN,
+      COMMAND_OS_V2_OPERATOR_ID: "e2e-local-operator",
+      COMMAND_OS_V2_OBSIDIAN_VAULT_ROOT: E2E_VAULT_ROOT,
+      COMMAND_OS_V2_E2E_RUN_ID: E2E_RUN_ID,
+      COMMAND_OS_V2_TEST_RUN_CONTROL_RUNTIME: "true",
+      COMMAND_OS_V2_TEST_RUN_CONTROL_SCHEDULER: "false",
+      COMMAND_OS_V2_PROJECTION_INTERVAL_MS: "300000",
+    },
+  } : [
+    ...(apiEntryExists ? [{
+      command: "bun run server/index.ts",
+      url: `${apiURL}/api/v2/health`,
+      timeout: 120_000,
+      reuseExistingServer: !process.env.CI,
+      env: {
+        ...process.env,
+        COMMAND_OS_V2_PORT: "43141",
+        COMMAND_OS_V2_SERVE_STATIC: "false",
+        COMMAND_OS_V2_DATABASE_PATH: E2E_DATABASE_PATH,
+        COMMAND_OS_V2_OPERATOR_TOKEN: E2E_OPERATOR_TOKEN,
+        COMMAND_OS_V2_OPERATOR_ID: "e2e-local-operator",
+        COMMAND_OS_V2_OBSIDIAN_VAULT_ROOT: E2E_VAULT_ROOT,
+        COMMAND_OS_V2_E2E_RUN_ID: E2E_RUN_ID,
+        // Exposes only pause/resume/cancel against disposable Playwright
+        // state. Planning, tool execution, and provider/MCP paths remain
+        // fail-closed and are not mounted by this test-only boundary.
+        COMMAND_OS_V2_TEST_RUN_CONTROL_RUNTIME: "true",
+        // Browser suites exercise the HTTP adapter, not background execution.
+        // Restart/recovery integration tests opt into the scheduler separately.
+        COMMAND_OS_V2_TEST_RUN_CONTROL_SCHEDULER: "false",
+        // Database-only fixture specialists are intentionally absent from the
+        // standalone runtime manifest. Keep the real projector enabled while
+        // preventing its normal 15-second reconciliation from racing an
+        // isolated browser fixture during one bounded test invocation.
+        COMMAND_OS_V2_PROJECTION_INTERVAL_MS: "300000",
+      },
+    }] : []),
+    {
+      command: "CHOKIDAR_USEPOLLING=true CHOKIDAR_INTERVAL=1000 bun run client:dev",
+      url: baseURL,
+      timeout: 120_000,
+      reuseExistingServer: !process.env.CI,
+    },
+  ],
+  projects: [
+    { name: "chromium-1440", use: { browserName: "chromium", viewport: viewports.desktop } },
+    { name: "firefox-1440", use: { browserName: "firefox", viewport: viewports.desktop } },
+    { name: "webkit-1440", use: { browserName: "webkit", viewport: viewports.desktop } },
+    { name: "chromium-enterprise-1440", use: { browserName: "chromium", viewport: viewports.desktop, userAgent: "ChillsPwn-Enterprise-Compatibility/2.4 Chromium" } },
+    { name: "android-chromium-390", use: { browserName: "chromium", viewport: viewports.phone390, isMobile: true, hasTouch: true, deviceScaleFactor: 2.75 } },
+    { name: "iphone-webkit-390", use: { browserName: "webkit", viewport: viewports.phone390, isMobile: true, hasTouch: true, deviceScaleFactor: 3 } },
+    { name: "tablet-chromium-768", use: { browserName: "chromium", viewport: viewports.tablet, isMobile: true, hasTouch: true, deviceScaleFactor: 2 } },
+    { name: "chromium-360", use: { browserName: "chromium", viewport: viewports.phone360, isMobile: true, hasTouch: true, deviceScaleFactor: 2 } },
+    { name: "chromium-1024", use: { browserName: "chromium", viewport: viewports.compactDesktop } },
+    { name: "chromium-1280", use: { browserName: "chromium", viewport: viewports.laptop } },
+    { name: "chromium-1920", use: { browserName: "chromium", viewport: viewports.fullHd } },
+    { name: "chromium-2560", use: { browserName: "chromium", viewport: viewports.wide } },
+    {
+      name: "chromium-200-percent-zoom",
+      metadata: {
+        ...profileMetadata,
+        zoomContract: "1440x900 desktop rendered as a 720x450 CSS viewport at DPR 2",
+        nativeBrowserChromeZoom: false,
+      },
+      use: {
+        browserName: "chromium",
+        viewport: viewports.zoom200CssViewport,
+        deviceScaleFactor: 2,
+        contextOptions: { reducedMotion: "no-preference", screen: viewports.desktop },
+      },
+    },
+  ],
+});

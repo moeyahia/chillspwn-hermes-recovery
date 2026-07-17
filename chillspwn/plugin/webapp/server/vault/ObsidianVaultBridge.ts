@@ -1,8 +1,14 @@
 import { createHash, randomUUID } from "node:crypto";
 import {
+  chmodSync,
+  closeSync,
+  constants as fsConstants,
   existsSync,
+  fstatSync,
+  fsyncSync,
   lstatSync,
   mkdirSync,
+  openSync,
   readFileSync,
   readdirSync,
   renameSync,
@@ -33,6 +39,7 @@ import {
   type ProvenanceSource,
 } from "../memory/index";
 import {
+  OBSIDIAN_V2_4_VAULT_FOLDERS,
   parseObsidianNote,
   renderObsidianNote,
   vaultRelativePath,
@@ -85,9 +92,15 @@ interface SyncStateRow {
   error_message: string | null;
 }
 
-interface BridgeOptions {
+export interface BridgeOptions {
   readonly clock?: () => Date;
   readonly createId?: (prefix: string) => string;
+  /** Test seam immediately before a managed file is opened with O_NOFOLLOW. */
+  readonly beforeManagedRead?: (absolutePath: string) => void;
+  /** Test seam after a durable quarantine intent and before the guarded copy. */
+  readonly beforeQuarantineCopy?: (absolutePath: string) => void;
+  /** Test seam after the copy is durable but before its marker/state commit. */
+  readonly afterQuarantineCopy?: (intentId: string) => void;
 }
 
 type Mutable<T> = { -readonly [Key in keyof T]: T[Key] };
@@ -118,6 +131,7 @@ interface ArtifactRow {
 
 const MAX_ATTACHMENT_BYTES = 32 * 1024 * 1024;
 const MAX_ATTACHMENTS_PER_NOTE = 32;
+const MAX_RECOVERY_NOTE_BYTES = 2 * 1024 * 1024;
 const MAX_BULK_EXPORT_NOTES = 50_000;
 const MAX_BULK_EXPORT_CONCURRENCY = 32;
 const MAX_BULK_EXPORT_ISSUES = 100;
@@ -137,6 +151,17 @@ const ATTACHMENT_EXTENSIONS = new Map<string, string>([
 
 function hashText(value: string): string {
   return createHash("sha256").update(value.replaceAll("\r\n", "\n"), "utf8").digest("hex");
+}
+
+function hashBytes(value: Uint8Array): string {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+function sameFileIdentity(
+  left: { readonly dev: number; readonly ino: number },
+  right: { readonly dev: number; readonly ino: number },
+): boolean {
+  return left.dev === right.dev && left.ino === right.ino;
 }
 
 function attachmentExtension(relativePath: string): { extension: string; mediaType: string } {
@@ -234,6 +259,42 @@ class VaultSyncPolicyRevokedError extends Error {
   }
 }
 
+export class VaultManagedNoteInspectionError extends Error {
+  readonly contentHash: string;
+
+  constructor(message: string, contentHash: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = "VaultManagedNoteInspectionError";
+    this.contentHash = contentHash;
+  }
+}
+
+interface ManagedNoteSnapshot {
+  readonly bytes: Buffer;
+  readonly source: string;
+  /** Hash of exact bytes, used only as the quarantine compare-and-copy guard. */
+  readonly exactHash: string;
+}
+
+interface VaultQuarantineIntent {
+  readonly id: string;
+  readonly connectionId: string;
+  readonly sourcePathHash: string;
+  readonly sourceContentHash: string;
+  readonly quarantineRelative: string;
+  readonly markerRelative: string;
+  readonly syncStateId: string;
+  readonly reason: string;
+  readonly status: "planned" | "recovery_required" | "committed";
+  readonly createdAt: string;
+  readonly updatedAt: string;
+}
+
+export interface VaultQuarantineRecovery {
+  readonly recovered: number;
+  readonly unresolved: number;
+}
+
 export class VaultBulkExportAbortError extends Error {
   readonly result: VaultBulkExportResult;
 
@@ -264,6 +325,9 @@ export class ObsidianVaultBridge {
   readonly #paths: VaultPathPolicy;
   readonly #clock: () => Date;
   readonly #createId: (prefix: string) => string;
+  readonly #beforeManagedRead?: (absolutePath: string) => void;
+  readonly #beforeQuarantineCopy?: (absolutePath: string) => void;
+  readonly #afterQuarantineCopy?: (intentId: string) => void;
 
   constructor(
     database: SqliteDatabase,
@@ -276,6 +340,9 @@ export class ObsidianVaultBridge {
     this.#paths = pathPolicy;
     this.#clock = options.clock ?? (() => new Date());
     this.#createId = options.createId ?? ((prefix) => `${prefix}_${randomUUID()}`);
+    this.#beforeManagedRead = options.beforeManagedRead;
+    this.#beforeQuarantineCopy = options.beforeQuarantineCopy;
+    this.#afterQuarantineCopy = options.afterQuarantineCopy;
   }
 
   #now(): string {
@@ -320,6 +387,28 @@ export class ObsidianVaultBridge {
     }
   }
 
+  verifyVaultPath(vaultPath: string): {
+    readonly vaultRoot: string;
+    readonly checkedAt: string;
+    readonly checks: { readonly write: true; readonly read: true; readonly rename: true; readonly delete: true };
+  } {
+    this.assertVaultSyncAllowed();
+    const result = this.#paths.verifyRoundTrip(vaultPath);
+    return { ...result, checkedAt: this.#now() };
+  }
+
+  /** Recovery-only health proof. Unlike candidate verification, this refuses
+   * to recreate a configured Vault that disappeared or went offline. */
+  verifyExistingVaultPath(vaultPath: string): {
+    readonly vaultRoot: string;
+    readonly checkedAt: string;
+    readonly checks: { readonly write: true; readonly read: true; readonly rename: true; readonly delete: true };
+  } {
+    this.assertVaultSyncAllowed();
+    const result = this.#paths.verifyExistingRoundTrip(vaultPath);
+    return { ...result, checkedAt: this.#now() };
+  }
+
   connect(input: {
     readonly id?: string;
     readonly vaultPath: string;
@@ -330,7 +419,10 @@ export class ObsidianVaultBridge {
     this.assertVaultSyncAllowed();
     if (!input.permissionGranted) throw new Error("Explicit filesystem permission is required");
     if (!input.displayName.trim()) throw new TypeError("Vault display name is required");
-    const vaultPath = this.#paths.resolveVault(input.vaultPath);
+    // A connection is never reported healthy from mkdir alone. Re-run the
+    // complete write/read/rename/delete proof at the point of connection so a
+    // stale UI preflight cannot bypass the filesystem boundary.
+    const vaultPath = this.verifyVaultPath(input.vaultPath).vaultRoot;
     this.#createVaultFolders(vaultPath);
     const id = input.id ?? this.#createId("vault");
     const now = this.#now();
@@ -345,17 +437,7 @@ export class ObsidianVaultBridge {
 
   #createVaultFolders(vaultRoot: string): void {
     for (const folder of [
-      "00 Inbox",
-      "10 Operator",
-      "20 Missions",
-      "30 Attack Patterns",
-      "40 Tools and Capabilities",
-      "50 Evidence and Findings",
-      "60 Failures and Recoveries",
-      "70 Lessons",
-      "80 Agents",
-      "90 Reports",
-      "Attachments",
+      ...OBSIDIAN_V2_4_VAULT_FOLDERS,
       ".chillspwn/attachments",
       ".chillspwn/quarantine",
       ".chillspwn/forget-staging",
@@ -369,8 +451,323 @@ export class ObsidianVaultBridge {
     const row = this.#database.prepare("SELECT * FROM vault_connections WHERE id = ?").get(id) as ConnectionRow | undefined;
     if (!row) throw new Error(`Vault connection not found: ${id}`);
     const connection = connectionFromRow(row);
-    this.#paths.resolveVault(connection.vaultPath);
+    this.#paths.resolveExistingVault(connection.vaultPath);
     return connection;
+  }
+
+  requireExistingConnection(id: string): VaultConnection {
+    const row = this.#database.prepare("SELECT * FROM vault_connections WHERE id = ?").get(id) as ConnectionRow | undefined;
+    if (!row) throw new Error(`Vault connection not found: ${id}`);
+    const connection = connectionFromRow(row);
+    this.#paths.resolveExistingVault(connection.vaultPath);
+    return connection;
+  }
+
+  inspectManagedNote(connectionId: string, relativePath: string): {
+    readonly note: VaultNote;
+    readonly contentHash: string;
+    readonly sourceHash: string;
+  } {
+    this.assertVaultSyncAllowed();
+    const connection = this.requireExistingConnection(connectionId);
+    const path = this.#paths.resolveRelative(connection.vaultPath, relativePath);
+    const snapshot = this.#readManagedNoteSnapshot(path);
+    try {
+      this.#assertVaultSourceSafe(snapshot.source);
+      const note = parseObsidianNote(snapshot.source);
+      this.#assertVaultNoteSafe(note);
+      this.#assertConnectionProjectionAllowed(connection, note);
+      return { note, contentHash: hashText(snapshot.source), sourceHash: snapshot.exactHash };
+    } catch (error) {
+      throw new VaultManagedNoteInspectionError(
+        error instanceof Error ? error.message : "Managed Vault note failed validation",
+        snapshot.exactHash,
+        { cause: error },
+      );
+    }
+  }
+
+  /**
+   * Preserve an invalid operator note through a guarded, content-free copy.
+   * The source is intentionally never renamed or deleted by recovery. A
+   * durable intent written before the copy allows the next run to reconcile a
+   * crash after fsync without guessing which file won.
+   */
+  quarantineManagedNote(
+    connectionId: string,
+    relativePath: string,
+    reason: string,
+    expectedContentHash: string,
+  ): string {
+    this.assertVaultSyncAllowed();
+    const connection = this.requireExistingConnection(connectionId);
+    const path = this.#paths.resolveRelative(connection.vaultPath, relativePath);
+    const snapshot = this.#readManagedNoteSnapshot(path);
+    if (snapshot.exactHash !== expectedContentHash) throw new VaultDestinationChangedError();
+
+    const sourcePathHash = hashText(relativePath);
+    const prior = this.#matchingQuarantineIntent(connection.id, sourcePathHash, expectedContentHash);
+    if (prior?.status === "committed") return prior.quarantineRelative;
+    const intent = prior ?? this.#createQuarantineIntent(
+      connection,
+      relativePath,
+      sourcePathHash,
+      expectedContentHash,
+      reason,
+    );
+
+    try {
+      this.#beforeQuarantineCopy?.(path);
+      const publishSnapshot = this.#readManagedNoteSnapshot(path, false);
+      if (publishSnapshot.exactHash !== expectedContentHash) throw new VaultDestinationChangedError();
+      const copyPath = this.#paths.resolveRelative(connection.vaultPath, intent.quarantineRelative);
+      if (!existsSync(copyPath)) {
+        this.#paths.atomicWriteBytes(connection.vaultPath, intent.quarantineRelative, publishSnapshot.bytes, {
+          exists: false,
+        });
+      }
+      const copied = this.#readManagedNoteSnapshot(copyPath, false);
+      if (copied.exactHash !== expectedContentHash) {
+        throw new Error("Quarantine copy failed content verification");
+      }
+      this.#fsyncDirectory(dirname(copyPath));
+      this.#afterQuarantineCopy?.(intent.id);
+      this.#commitQuarantineIntent(connection, intent);
+      return intent.quarantineRelative;
+    } catch (error) {
+      this.#markQuarantineIntent(intent, "recovery_required");
+      throw error;
+    }
+  }
+
+  /** Finish verified quarantine copies left between fsync and SQLite commit. */
+  recoverQuarantineIntents(connectionId: string): VaultQuarantineRecovery {
+    const connection = this.requireExistingConnection(connectionId);
+    let recovered = 0;
+    let unresolved = 0;
+    for (const intent of this.#quarantineIntents(connectionId).filter((item) => item.status !== "committed")) {
+      try {
+        const copyPath = this.#paths.resolveRelative(connection.vaultPath, intent.quarantineRelative);
+        if (!existsSync(copyPath)) {
+          this.#markQuarantineIntent(intent, "recovery_required");
+          unresolved += 1;
+          continue;
+        }
+        const copied = this.#readManagedNoteSnapshot(copyPath, false);
+        if (copied.exactHash !== intent.sourceContentHash) {
+          this.#markQuarantineIntent(intent, "recovery_required");
+          unresolved += 1;
+          continue;
+        }
+        this.#commitQuarantineIntent(connection, intent);
+        recovered += 1;
+      } catch {
+        this.#markQuarantineIntent(intent, "recovery_required");
+        unresolved += 1;
+      }
+    }
+    return { recovered, unresolved };
+  }
+
+  #readManagedNoteSnapshot(path: string, invokeHook = true): ManagedNoteSnapshot {
+    if (!existsSync(path)) throw new Error("Vault note does not exist");
+    const before = lstatSync(path);
+    if (before.isSymbolicLink() || !before.isFile()) {
+      throw new Error("Symbolic links are not permitted in managed vault paths");
+    }
+    if (before.size > MAX_RECOVERY_NOTE_BYTES) throw new Error("Managed vault note exceeds the recovery size limit");
+    if (invokeHook) this.#beforeManagedRead?.(path);
+    const noFollow = (fsConstants as { O_NOFOLLOW?: number }).O_NOFOLLOW ?? 0;
+    const descriptor = openSync(path, fsConstants.O_RDONLY | noFollow);
+    try {
+      const opened = fstatSync(descriptor);
+      if (!opened.isFile() || !sameFileIdentity(before, opened)) {
+        throw new VaultDestinationChangedError();
+      }
+      const bytes = readFileSync(descriptor);
+      const afterDescriptor = fstatSync(descriptor);
+      const afterPath = lstatSync(path);
+      if (
+        bytes.byteLength > MAX_RECOVERY_NOTE_BYTES
+        || !sameFileIdentity(opened, afterDescriptor)
+        || !sameFileIdentity(afterDescriptor, afterPath)
+        || opened.size !== afterDescriptor.size
+        || opened.mtimeMs !== afterDescriptor.mtimeMs
+        || afterDescriptor.size !== bytes.byteLength
+      ) {
+        throw new VaultDestinationChangedError();
+      }
+      return { bytes, source: bytes.toString("utf8"), exactHash: hashBytes(bytes) };
+    } finally {
+      closeSync(descriptor);
+    }
+  }
+
+  #quarantineIntentKey(id: string): string {
+    return `brain.vault.quarantine_intent.${id}`;
+  }
+
+  #quarantineIntents(connectionId: string): VaultQuarantineIntent[] {
+    const rows = this.#database.prepare(`
+      SELECT value_json FROM settings
+      WHERE key LIKE 'brain.vault.quarantine_intent.%'
+      ORDER BY updated_at, key
+    `).all() as Array<{ value_json: string }>;
+    return rows.flatMap((row) => {
+      const value = JSON.parse(row.value_json) as Partial<VaultQuarantineIntent>;
+      if (
+        typeof value.id !== "string"
+        || typeof value.connectionId !== "string"
+        || typeof value.sourcePathHash !== "string"
+        || typeof value.sourceContentHash !== "string"
+        || typeof value.quarantineRelative !== "string"
+        || typeof value.markerRelative !== "string"
+        || typeof value.syncStateId !== "string"
+        || typeof value.reason !== "string"
+        || !["planned", "recovery_required", "committed"].includes(String(value.status))
+        || typeof value.createdAt !== "string"
+        || typeof value.updatedAt !== "string"
+      ) {
+        throw new Error("Stored Vault quarantine recovery intent is malformed");
+      }
+      return value.connectionId === connectionId ? [value as VaultQuarantineIntent] : [];
+    });
+  }
+
+  #matchingQuarantineIntent(
+    connectionId: string,
+    sourcePathHash: string,
+    sourceContentHash: string,
+  ): VaultQuarantineIntent | undefined {
+    return this.#quarantineIntents(connectionId)
+      .filter((intent) => (
+        intent.sourcePathHash === sourcePathHash
+        && intent.sourceContentHash === sourceContentHash
+      ))
+      .at(-1);
+  }
+
+  #createQuarantineIntent(
+    connection: VaultConnection,
+    relativePath: string,
+    sourcePathHash: string,
+    sourceContentHash: string,
+    reason: string,
+  ): VaultQuarantineIntent {
+    const id = this.#createId("vquarantine");
+    const now = this.#now();
+    const quarantineRelative = `.chillspwn/quarantine/note-${id}.md`;
+    const markerRelative = `.chillspwn/quarantine/note-${id}.receipt.json`;
+    const existing = this.#database.prepare(`
+      SELECT id FROM vault_sync_state WHERE connection_id = ? AND relative_path = ?
+    `).get(connection.id, relativePath) as { id: string } | undefined;
+    const syncStateId = existing?.id ?? this.#createId("vsync");
+    const intent: VaultQuarantineIntent = {
+      id,
+      connectionId: connection.id,
+      sourcePathHash,
+      sourceContentHash,
+      quarantineRelative,
+      markerRelative,
+      syncStateId,
+      reason: reason.slice(0, 1_000),
+      status: "planned",
+      createdAt: now,
+      updatedAt: now,
+    };
+    inImmediateTransaction(this.#database, () => {
+      if (!existing) {
+        // A new malformed filename can itself contain confidential text. Keep
+        // only the generated content-free quarantine path in new metadata.
+        this.#database.prepare(`
+          INSERT INTO vault_sync_state (
+            id, connection_id, relative_path, vault_content_hash,
+            status, last_scanned_at, error_message
+          ) VALUES (?, ?, ?, ?, 'pending', ?, ?)
+        `).run(
+          syncStateId,
+          connection.id,
+          quarantineRelative,
+          sourceContentHash,
+          now,
+          "Quarantine copy is pending durable verification",
+        );
+      }
+      this.#database.prepare(`
+        INSERT INTO settings (
+          key, value_json, sensitivity, version, updated_by, updated_at
+        ) VALUES (?, ?, 'private', 1, 'vault-recovery', ?)
+      `).run(this.#quarantineIntentKey(id), JSON.stringify(intent), now);
+    });
+    return intent;
+  }
+
+  #markQuarantineIntent(
+    intent: VaultQuarantineIntent,
+    status: VaultQuarantineIntent["status"],
+  ): void {
+    const updated: VaultQuarantineIntent = { ...intent, status, updatedAt: this.#now() };
+    this.#database.prepare(`
+      UPDATE settings SET value_json = ?, version = version + 1,
+        updated_by = 'vault-recovery', updated_at = ? WHERE key = ?
+    `).run(JSON.stringify(updated), updated.updatedAt, this.#quarantineIntentKey(intent.id));
+  }
+
+  #commitQuarantineIntent(connection: VaultConnection, intent: VaultQuarantineIntent): void {
+    const markerPath = this.#paths.resolveRelative(connection.vaultPath, intent.markerRelative);
+    const marker = JSON.stringify({
+      schemaVersion: "2.4",
+      intentId: intent.id,
+      connectionId: intent.connectionId,
+      sourcePathHash: intent.sourcePathHash,
+      sourceContentHash: intent.sourceContentHash,
+      quarantineRelative: intent.quarantineRelative,
+    });
+    if (existsSync(markerPath)) {
+      const existing = readFileSync(markerPath, "utf8");
+      if (existing !== marker) throw new Error("Quarantine recovery marker does not match its durable intent");
+    } else {
+      this.#paths.atomicWrite(connection.vaultPath, intent.markerRelative, marker, { exists: false });
+    }
+    const markerDescriptor = openSync(markerPath, fsConstants.O_RDONLY);
+    try {
+      fsyncSync(markerDescriptor);
+    } finally {
+      closeSync(markerDescriptor);
+    }
+    chmodSync(markerPath, 0o600);
+    this.#fsyncDirectory(dirname(markerPath));
+
+    const now = this.#now();
+    const committed: VaultQuarantineIntent = { ...intent, status: "committed", updatedAt: now };
+    inImmediateTransaction(this.#database, () => {
+      const updatedState = this.#database.prepare(`
+        UPDATE vault_sync_state SET node_id = NULL, status = 'quarantined',
+          vault_content_hash = ?, error_message = ?, last_scanned_at = ?
+        WHERE id = ? AND connection_id = ?
+      `).run(
+        intent.sourceContentHash,
+        intent.reason,
+        now,
+        intent.syncStateId,
+        connection.id,
+      );
+      if (updatedState.changes !== 1) throw new Error("Quarantine recovery state no longer exists");
+      const updatedIntent = this.#database.prepare(`
+        UPDATE settings SET value_json = ?, version = version + 1,
+          updated_by = 'vault-recovery', updated_at = ? WHERE key = ?
+      `).run(JSON.stringify(committed), now, this.#quarantineIntentKey(intent.id));
+      if (updatedIntent.changes !== 1) throw new Error("Quarantine recovery intent no longer exists");
+    });
+  }
+
+  #fsyncDirectory(path: string): void {
+    const descriptor = openSync(path, fsConstants.O_RDONLY);
+    try {
+      fsyncSync(descriptor);
+    } finally {
+      closeSync(descriptor);
+    }
   }
 
   markConnectionHealth(connectionId: string, status: "connected" | "degraded" | "error"): void {
@@ -402,26 +799,46 @@ export class ObsidianVaultBridge {
     `).all(nodeId) as Array<{ sourceId: string }>;
     const now = this.#now();
     const rows = this.#database.prepare(`
-      SELECT edge.target_node_id
+      SELECT edge.target_node_id, target_state.relative_path AS target_relative_path
       FROM memory_edges edge
       JOIN memory_nodes target ON target.id = edge.target_node_id
+      LEFT JOIN vault_sync_state target_state
+        ON target_state.connection_id = ? AND target_state.node_id = edge.target_node_id
       WHERE edge.source_node_id = ?
         AND edge.lifecycle_status IN ('confirmed', 'verified')
         AND (edge.expires_at IS NULL OR edge.expires_at > ?)
         AND target.lifecycle_status IN ('confirmed', 'verified')
         AND (target.expires_at IS NULL OR target.expires_at > ?)
       ORDER BY edge.created_at
-    `).all(nodeId, now, now) as Array<{ target_node_id: string }>;
-    const permittedTargetIds = new Set(rows.map((row) => row.target_node_id));
+    `).all(connection?.id ?? "", nodeId, now, now) as Array<{
+      target_node_id: string;
+      target_relative_path: string | null;
+    }>;
+    const permittedTargets = new Map(rows.map((row) => [row.target_node_id, row.target_relative_path]));
+    const permittedLifecycleStatuses = new Set(this.projectionLifecycleStatuses());
     const outgoing = rows.length === 0
       ? []
       : this.#memory.listEdges(nodeId)
-        .filter((edge) => edge.sourceNodeId === nodeId && permittedTargetIds.has(edge.targetNodeId))
+        .filter((edge) => (
+          edge.sourceNodeId === nodeId
+          && permittedTargets.has(edge.targetNodeId)
+          && permittedLifecycleStatuses.has(edge.lifecycleStatus)
+        ))
         .flatMap((edge) => {
           const target = this.#memory.getNode(edge.targetNodeId);
           if (!target || (allowedTargetIds && !allowedTargetIds.has(target.id))) return [];
+          // A canonical edge must never project a wikilink to a note that the
+          // live memory-control lifecycle policy excludes. Without this check,
+          // a confirmed-only connection can emit a link to a verified note
+          // that is intentionally absent from the same vault.
+          if (!permittedLifecycleStatuses.has(target.lifecycleStatus)) return [];
           if (connection && !this.#connectionProjectionMatches(connection, target)) return [];
-          return [{ edge, target }];
+          const relativePath = permittedTargets.get(target.id);
+          return [{
+            edge,
+            target,
+            ...(relativePath ? { relativePath } : {}),
+          }];
         });
     // `rows` intentionally causes SQLite to use the directed adjacency index;
     // the repository mapping above supplies validated domain records.
@@ -541,6 +958,21 @@ export class ObsidianVaultBridge {
     const connection = this.requireConnection(connectionId);
     this.assertVaultSyncAllowed();
     this.#purgeRevokedConnectionProjections(connection);
+    return this.#selectExportableNodeIds(connection);
+  }
+
+  /**
+   * Read-only export selection for operator previews. Unlike
+   * `exportableNodeIds`, this never removes revoked projections or portable
+   * archives and never updates synchronization state.
+   */
+  previewExportableNodeIds(connectionId: string): readonly string[] {
+    const connection = this.requireConnection(connectionId);
+    this.assertVaultSyncAllowed();
+    return this.#selectExportableNodeIds(connection);
+  }
+
+  #selectExportableNodeIds(connection: VaultConnection): readonly string[] {
     const lifecycleStatuses = this.#connectionScopeValues(
       connection,
       "lifecycleStatuses",
@@ -1432,7 +1864,7 @@ export class ObsidianVaultBridge {
     }
     entries.push(...portableAttachments.values());
     const manifest = {
-      schemaVersion: "2.1",
+      schemaVersion: "2.4",
       product: "ChillsPwn Command OS",
       sourceOfTruth: "canonical-sqlite",
       vault: connection.displayName,

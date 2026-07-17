@@ -5,7 +5,7 @@ import type { TraceDetailRecord } from "../../domain/types/operations";
 import { TraceWaterfall } from "../../features/observability/TraceWaterfall";
 
 const payload = {
-  schemaVersion: "2.1",
+  schemaVersion: "2.4",
   trace: {
     id: "trace-1", traceId: "trace-1", status: "completed", summary: "Evidence retained",
     mission: { id: "mission-1", name: "Authorized mission" }, missionCount: 1,
@@ -14,7 +14,7 @@ const payload = {
     counts: { events: 1, logs: 0, actions: 1, toolCalls: 0, errors: 0 },
   },
   records: {
-    schemaVersion: "2.1", nextCursor: "next-page", items: [{
+    schemaVersion: "2.4", nextCursor: "next-page", items: [{
       id: "action:action-1", sourceId: "action-1", kind: "action", title: "scan",
       summary: "One unique service retained", status: "succeeded",
       mission: { id: "mission-1", name: "Authorized mission" }, runId: "run-1",
@@ -32,7 +32,7 @@ describe("observability trace client contract", () => {
     expect(detail.trace).toMatchObject({ traceId: "trace-1", counts: { events: 1, actions: 1 } });
     expect(detail.records.items[0]).toMatchObject({ kind: "action", correlation: { spanId: "span-1" } });
     expect(detail.records.nextCursor).toBe("next-page");
-    expect(parseTracePage({ schemaVersion: "2.1", nextCursor: null, items: [payload.trace] }).items[0].status).toBe("completed");
+    expect(parseTracePage({ schemaVersion: "2.4", nextCursor: null, items: [payload.trace] }).items[0].status).toBe("completed");
     expect(() => parseTraceDetail({ ...payload, trace: { ...payload.trace, status: "invented" } })).toThrow("trace status");
     expect(() => parseTraceDetail({ ...payload, records: { ...payload.records, items: [{ ...payload.records.items[0], kind: "provider_magic" }] } })).toThrow("trace record kind");
   });

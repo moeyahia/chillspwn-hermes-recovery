@@ -1,4 +1,10 @@
 import { randomUUID } from "node:crypto";
+import {
+  ControlPlaneLeaseError,
+  ControlPlaneLeaseService,
+  type ControlPlaneLease,
+  type RunMutationLeaseRequest,
+} from "../control-plane";
 import type { SqliteDatabase } from "../db";
 import { inImmediateTransaction } from "../db";
 import {
@@ -14,8 +20,11 @@ import { canonicalJson } from "../orchestration/serialization";
 import { RunLearningService } from "../learning";
 import {
   classifyFailure,
+  FAILURE_CATEGORIES,
   fingerprintAction,
+  isRetryableCategory,
   isTerminalRunState,
+  RunSupervisor,
   transitionRun as transitionSupervisedRun,
   type FailureCategory,
   type ProgressSnapshot,
@@ -67,6 +76,66 @@ function completionResult(
   return "evaluation" in value ? value : { evaluation: value, usage: value.providerUsage };
 }
 
+function errorRecord(error: unknown): Readonly<Record<string, unknown>> {
+  return error && typeof error === "object" ? error as Readonly<Record<string, unknown>> : {};
+}
+
+function failureSignal(error: unknown): Parameters<typeof classifyFailure>[0] {
+  const item = errorRecord(error);
+  const status = typeof item.status === "number"
+    ? item.status
+    : typeof item.statusCode === "number"
+      ? item.statusCode
+      : error instanceof CommandRuntimeError
+        ? error.status
+        : undefined;
+  const message = error instanceof Error ? error.message : "";
+  return {
+    ...(typeof item.code === "string" ? { code: item.code } : error instanceof Error ? { code: error.name } : {}),
+    ...(message ? { message } : {}),
+    ...(status === undefined ? {} : { httpStatus: status }),
+    source: /grok|provider|acp|oauth|rate.?limit|too many requests/i.test(message)
+      || status === 429 || status === 502 || status === 503 || status === 504
+      ? "provider"
+      : "unknown",
+  };
+}
+
+function planningFailureCategory(error: unknown, runtimeError: CommandRuntimeError): FailureCategory {
+  const declared = runtimeError.options.category;
+  if (declared && FAILURE_CATEGORIES.includes(declared as FailureCategory)) {
+    return declared as FailureCategory;
+  }
+  return classifyFailure(failureSignal(error));
+}
+
+function numericRetryAfter(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
+}
+
+function planningRetryAfterMs(error: unknown, now: Date): number | undefined {
+  const item = errorRecord(error);
+  const direct = numericRetryAfter(item.retryAfterMs);
+  if (direct !== undefined) return direct;
+  if (error instanceof CommandRuntimeError) {
+    const details = error.options.details;
+    if (details && typeof details === "object" && !Array.isArray(details)) {
+      const fromDetails = numericRetryAfter(details.retryAfterMs);
+      if (fromDetails !== undefined) return fromDetails;
+    }
+  }
+  const headers = item.headers;
+  const raw = headers && typeof headers === "object" && "get" in headers
+    && typeof (headers as { get?: unknown }).get === "function"
+    ? (headers as { get(name: string): unknown }).get("retry-after")
+    : undefined;
+  if (typeof raw !== "string" || !raw.trim()) return undefined;
+  const seconds = Number(raw);
+  if (Number.isFinite(seconds) && seconds >= 0) return Math.round(seconds * 1_000);
+  const boundary = Date.parse(raw);
+  return Number.isFinite(boundary) ? Math.max(0, boundary - now.getTime()) : undefined;
+}
+
 function asRuntimeError(error: unknown): CommandRuntimeError {
   if (error instanceof CommandRuntimeError) return error;
   if (error instanceof DurableOrchestrationError) {
@@ -77,12 +146,7 @@ function asRuntimeError(error: unknown): CommandRuntimeError {
         : "runtime",
     });
   }
-  const message = error instanceof Error ? error.message : "";
-  const category = classifyFailure({
-    code: error instanceof Error ? error.name : undefined,
-    message,
-    source: /grok|provider|acp|oauth/i.test(message) ? "provider" : "unknown",
-  });
+  const category = classifyFailure(failureSignal(error));
   const explanations: Record<FailureCategory, { humanMessage: string; remediation: string }> = {
     transient_network: {
       humanMessage: "The planning provider lost its network connection before it could produce a durable result.",
@@ -173,6 +237,9 @@ export class MissionRuntimeEngine implements ExecutionResultSink {
   private readonly decisionTtlMs: number;
   private readonly maxPlanSteps: number;
   private readonly now: () => Date;
+  private readonly controlPlaneLeases: ControlPlaneLeaseService;
+  /** Raw lease tokens exist only inside this runtime process. */
+  private readonly controlPlaneTokens = new Map<string, string>();
   private readonly processing = new Map<string, Promise<void>>();
   private readonly continuationProcessing = new Map<string, Promise<void>>();
   private readonly actionContexts = new Map<string, RuntimeActionContext>();
@@ -185,6 +252,7 @@ export class MissionRuntimeEngine implements ExecutionResultSink {
     this.database = options.database;
     this.now = options.now ?? (() => new Date());
     this.repository = new RuntimeRepository(options.database);
+    this.controlPlaneLeases = new ControlPlaneLeaseService(options.database);
     this.continuations = new RuntimeContinuationRepository(options.database);
     this.learning = new RunLearningService(options.database, {
       clock: this.now,
@@ -201,6 +269,7 @@ export class MissionRuntimeEngine implements ExecutionResultSink {
     this.coordinator = new DurableRunCoordinator(options.database, options.execution, {
       now: this.now,
       leaseTtlMs: this.leaseTtlMs,
+      supervisor: new RunSupervisor({ retryPolicy: options.retryPolicy }),
       afterActionCommit: (action) => {
         this.crashAfterCommit("action_reserved_before_dispatch", action.runId, action.id);
       },
@@ -215,6 +284,154 @@ export class MissionRuntimeEngine implements ExecutionResultSink {
   private timestamp(): string {
     return this.now().toISOString();
   }
+
+  /**
+   * Trusted server-side bridge for V2 run mutations.
+   *
+   * A control-plane proof can be acquired or heartbeated only while this exact
+   * engine process owns an unexpired durable run lease. The raw control-plane
+   * token remains in memory and is never returned to an HTTP boundary.
+   */
+  readonly assertRunMutationLease = (request: RunMutationLeaseRequest): ControlPlaneLease => {
+    if (this.stopping) {
+      throw new ControlPlaneLeaseError(
+        "lease_missing",
+        `Run ${request.runId} runtime controller is stopping`,
+      );
+    }
+    const now = this.now();
+    const nowMs = now.getTime();
+    if (!Number.isFinite(nowMs)) throw new RangeError("Mutation lease assertion time is invalid");
+
+    let durable: ReturnType<DurableRunCoordinator["getRun"]>;
+    try {
+      durable = this.coordinator.getRun(request.runId);
+    } catch {
+      throw new ControlPlaneLeaseError("run_not_found", `Run ${request.runId} does not exist`);
+    }
+    if (durable.run.missionId !== request.missionId) {
+      throw new ControlPlaneLeaseError(
+        "control_plane_mismatch",
+        `Run ${request.runId} does not belong to mission ${request.missionId}`,
+      );
+    }
+    let durableLease = durable.lease;
+    const durableExpiryAtStart = durableLease ? Date.parse(durableLease.expiresAt) : Number.NaN;
+    const operatorWaitingState = durable.run.state === "waiting_guided_decision"
+      || durable.run.state === "blocked"
+      || durable.run.state === "recovering";
+    if ((!durableLease || durableExpiryAtStart <= nowMs) && operatorWaitingState) {
+      // Waiting and recovery states deliberately release/expire the worker
+      // lease while no provider or tool work is running. The trusted runtime
+      // may atomically reclaim that durable lease for one represented operator
+      // mutation; another live worker still wins the database fence.
+      try {
+        durableLease = this.coordinator.acquireRunLease(
+          request.runId,
+          this.workerId,
+          this.leaseTtlMs,
+        );
+        durable = this.coordinator.getRun(request.runId);
+      } catch {
+        throw new ControlPlaneLeaseError(
+          "lease_fence_invalid",
+          `Run ${request.runId} mutation authority is owned by another durable runtime worker`,
+          true,
+        );
+      }
+    }
+    if (!durableLease) {
+      throw new ControlPlaneLeaseError(
+        "lease_missing",
+        `Run ${request.runId} has no active durable runtime lease`,
+      );
+    }
+    if (durableLease.ownerId !== this.workerId) {
+      throw new ControlPlaneLeaseError(
+        "lease_fence_invalid",
+        `Run ${request.runId} is owned by another durable runtime worker`,
+        true,
+      );
+    }
+    const durableExpiry = Date.parse(durableLease.expiresAt);
+    if (!Number.isFinite(durableExpiry) || durableExpiry <= nowMs) {
+      throw new ControlPlaneLeaseError(
+        "lease_expired",
+        `Run ${request.runId} durable runtime lease expired`,
+        true,
+      );
+    }
+    const ttlMs = Math.min(this.leaseTtlMs, Math.floor(durableExpiry - nowMs));
+    if (ttlMs < 1_000) {
+      throw new ControlPlaneLeaseError(
+        "lease_expired",
+        `Run ${request.runId} durable runtime lease is too close to expiry`,
+        true,
+      );
+    }
+
+    let token = this.controlPlaneTokens.get(request.runId);
+    let proof: ControlPlaneLease;
+    if (token) {
+      proof = this.controlPlaneLeases.heartbeat({
+        runId: request.runId,
+        controlPlane: "command_os_v2",
+        leaseOwner: this.workerId,
+        leaseToken: token,
+        ttlMs,
+        now,
+      });
+    } else {
+      const acquired = this.controlPlaneLeases.acquire({
+        runId: request.runId,
+        controlPlane: "command_os_v2",
+        leaseOwner: this.workerId,
+        ttlMs,
+        now,
+      });
+      if (!acquired.leaseToken) {
+        throw new ControlPlaneLeaseError(
+          "lease_token_invalid",
+          `Run ${request.runId} did not return a private control-plane token`,
+        );
+      }
+      token = acquired.leaseToken;
+      this.controlPlaneTokens.set(request.runId, token);
+      proof = acquired.lease;
+    }
+
+    // Fence a cross-process durable-lease takeover that raced the
+    // control-plane acquisition. A stale proof is released before failing.
+    const after = this.coordinator.getRun(request.runId);
+    const currentLease = after.lease;
+    if (
+      after.run.missionId !== request.missionId
+      || !currentLease
+      || currentLease.ownerId !== this.workerId
+      || currentLease.fence !== durableLease.fence
+      || currentLease.expiresAt !== durableLease.expiresAt
+      || Date.parse(currentLease.expiresAt) <= nowMs
+    ) {
+      try {
+        this.controlPlaneLeases.release({
+          runId: request.runId,
+          controlPlane: "command_os_v2",
+          leaseOwner: this.workerId,
+          leaseToken: token,
+          now,
+        });
+      } catch {
+        // A newer controller already fenced this proof.
+      }
+      this.controlPlaneTokens.delete(request.runId);
+      throw new ControlPlaneLeaseError(
+        "lease_fence_invalid",
+        `Run ${request.runId} durable runtime lease changed during authority acquisition`,
+        true,
+      );
+    }
+    return proof;
+  };
 
   private crashAfterCommit(
     point: Parameters<NonNullable<MissionRuntimeOptions["crashAfterCommit"]>>[0],
@@ -352,6 +569,8 @@ export class MissionRuntimeEngine implements ExecutionResultSink {
       if (context.heartbeat) clearInterval(context.heartbeat);
     }
     this.actionContexts.clear();
+    // Tokens are process authority and must never survive runtime shutdown.
+    this.controlPlaneTokens.clear();
     this.unbindResultSink?.();
     this.unbindResultSink = undefined;
   }
@@ -405,10 +624,11 @@ export class MissionRuntimeEngine implements ExecutionResultSink {
     return scheduled;
   }
 
-  async processRunNow(runId: string): Promise<void> {
+  async processRunNow(runId: string, planningRetryContinuationId?: string): Promise<void> {
     const existing = this.processing.get(runId);
     if (existing) return existing;
-    const work = this.processRun(runId).finally(() => this.processing.delete(runId));
+    const work = this.processRun(runId, planningRetryContinuationId)
+      .finally(() => this.processing.delete(runId));
     this.processing.set(runId, work);
     return work;
   }
@@ -519,6 +739,11 @@ export class MissionRuntimeEngine implements ExecutionResultSink {
       return;
     }
     switch (continuation.kind) {
+      case "planning_retry_to_dispatch": {
+        await this.processRunNow(continuation.runId, continuation.id);
+        this.completeContinuation(continuation);
+        return;
+      }
       case "autonomous_retry_to_dispatch": {
         await this.dispatchAutonomousRetryContinuation(continuation);
         return;
@@ -970,7 +1195,7 @@ export class MissionRuntimeEngine implements ExecutionResultSink {
     }
   }
 
-  private async processRun(runId: string): Promise<void> {
+  private async processRun(runId: string, planningRetryContinuationId?: string): Promise<void> {
     let planningRun = this.repository.getPlanningRun(runId);
     if (planningRun.state !== "planning" && planningRun.state !== "recovering") return;
     const mission = this.repository.getMission(planningRun.missionId);
@@ -978,6 +1203,13 @@ export class MissionRuntimeEngine implements ExecutionResultSink {
       ? this.repository.latestGuidedRecovery(runId)
       : null;
     const durableAtStart = this.coordinator.getRun(runId);
+    const scheduledPlanningRetry = durableAtStart.control.planningRetry;
+    if (scheduledPlanningRetry) {
+      if (
+        planningRetryContinuationId !== scheduledPlanningRetry.continuationId ||
+        Date.parse(scheduledPlanningRetry.notBefore) > Date.parse(this.timestamp())
+      ) return;
+    }
     const recovery = durableAtStart.control.recovery;
     if (
       planningRun.journey === "autonomous" && planningRun.state === "recovering" &&
@@ -986,6 +1218,18 @@ export class MissionRuntimeEngine implements ExecutionResultSink {
     let lease = durableAtStart.lease?.ownerId === this.workerId
       ? durableAtStart.lease
       : this.coordinator.acquireRunLease(runId, this.workerId, this.leaseTtlMs);
+    if (scheduledPlanningRetry && planningRetryContinuationId) {
+      const begun = this.coordinator.beginScheduledPlanningRetry({
+        lease,
+        continuationId: planningRetryContinuationId,
+      });
+      if (!begun.run.lease) {
+        throw new CommandRuntimeError(500, "planning_retry_lease_lost", "Planning retry lost its run lease");
+      }
+      lease = begun.run.lease;
+      planningRun = this.repository.getPlanningRun(runId);
+      this.crashAfterCommit("planning_retry_started", runId, planningRetryContinuationId);
+    }
     if (planningRun.journey === "autonomous" && planningRun.state === "recovering" && recovery?.kind === "retry") {
       // The failed action committed a delayed, owner-fenced continuation in
       // the same transaction that requeued its exact assignment and step.
@@ -1036,6 +1280,7 @@ export class MissionRuntimeEngine implements ExecutionResultSink {
     }
     const heartbeat = this.heartbeat(lease);
     let heartbeatStopped = false;
+    let planningProviderFailed = false;
     const signal = this.controller(runId).signal;
     try {
       if (mission.authorizationStatus !== "verified") {
@@ -1044,19 +1289,25 @@ export class MissionRuntimeEngine implements ExecutionResultSink {
           category: "authorization_denied",
         });
       }
-      const planned = planResult(await this.options.planner.plan({
-          mission,
-          run: planningRun,
-          ...(guidedRecovery ? {
-            rejectionReason: `The represented action "${guidedRecovery.attemptedActionSummary}" failed with ${guidedRecovery.errorCategory}: ${guidedRecovery.failureSummary}. Propose one materially different in-scope action; do not repeat the failed parameters.`,
-          } : recovery?.kind === "replan" ? {
-            // beginReplan intentionally moves the run from recovering to
-            // planning before this provider turn. Preserve the durable,
-            // operator-supplied strategy across that transition so a replay
-            // cannot silently fall back to an equivalent plan.
-            rejectionReason: recovery.reason,
-          } : planningRun.state === "recovering" ? { rejectionReason: planningRun.stateReason } : {}),
-        }, signal));
+      let planned: MissionPlanPortResult;
+      try {
+        planned = planResult(await this.options.planner.plan({
+            mission,
+            run: planningRun,
+            ...(guidedRecovery ? {
+              rejectionReason: `The represented action "${guidedRecovery.attemptedActionSummary}" failed with ${guidedRecovery.errorCategory}: ${guidedRecovery.failureSummary}. Propose one materially different in-scope action; do not repeat the failed parameters.`,
+            } : recovery?.kind === "replan" ? {
+              // beginReplan intentionally moves the run from recovering to
+              // planning before this provider turn. Preserve the durable,
+              // operator-supplied strategy across that transition so a replay
+              // cannot silently fall back to an equivalent plan.
+              rejectionReason: recovery.reason,
+            } : planningRun.state === "recovering" ? { rejectionReason: planningRun.stateReason } : {}),
+          }, signal));
+      } catch (error) {
+        planningProviderFailed = true;
+        throw error;
+      }
       const draft = validateMissionPlanDraft(
         planned.plan,
         this.maxPlanSteps,
@@ -1134,7 +1385,52 @@ export class MissionRuntimeEngine implements ExecutionResultSink {
     } catch (error) {
       if (!heartbeatStopped) lease = await heartbeat.stop().catch(() => lease);
       if (error instanceof RuntimeCrashAfterCommit) throw error;
-      const runtimeError = asRuntimeError(error);
+      let runtimeError = asRuntimeError(error);
+      if (planningProviderFailed) {
+        const category = planningFailureCategory(error, runtimeError);
+        const canRetry = planningRun.journey === "autonomous"
+          && isRetryableCategory(category)
+          && runtimeError.options.retryable !== false;
+        if (canRetry) {
+          const retryAfterMs = planningRetryAfterMs(error, this.now());
+          const scheduled = this.coordinator.schedulePlanningRetry({
+            lease,
+            category,
+            errorCode: runtimeError.code,
+            ...(retryAfterMs === undefined ? {} : { retryAfterMs }),
+            ...(this.options.retryRandom ? { random: this.options.retryRandom } : {}),
+          });
+          if (scheduled.scheduled) {
+            this.crashAfterCommit("planning_retry_scheduled", runId, scheduled.continuationId);
+            return;
+          }
+          const exhausted = scheduled.reason === "signed_budget_exhausted"
+            ? ` The signed ${scheduled.exhausted.join(", ")} budget leaves no room for another provider turn.`
+            : " The default bounded retry allowance of two automatic retries is exhausted.";
+          runtimeError = new CommandRuntimeError(
+            429,
+            `mission_runtime_${category}_retry_exhausted`,
+            "Autonomous planning retry path exhausted",
+            {
+              humanMessage: `Safe-stopped: Autonomous planning remained unavailable after ${this.coordinator.getRun(runId).control.retryCount} bounded automatic retries.${exhausted}`,
+              retryable: false,
+              category,
+              details: {
+                retriesUsed: this.coordinator.getRun(runId).control.retryCount,
+                retryReason: scheduled.reason,
+                exhausted: [...scheduled.exhausted],
+              },
+              remediation: "Wait for the provider window to recover, then start a new run or explicitly resume from the preserved checkpoint.",
+            },
+          );
+        }
+        const accounted = this.coordinator.accountUsage({
+          lease,
+          delta: { providerTurns: 1 },
+          phase: "failed mission planning turn",
+        });
+        if (accounted.allowed && accounted.run.lease) lease = accounted.run.lease;
+      }
       await this.safeStopPlanning(runId, lease, runtimeError);
       throw runtimeError;
     }

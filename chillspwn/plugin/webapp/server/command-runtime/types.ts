@@ -11,6 +11,7 @@ import type {
   FailureSignal,
   Journey,
   ProgressSnapshot,
+  RetryPolicyConfig,
   RunState,
 } from "../supervisor";
 
@@ -203,11 +204,17 @@ export interface MissionRuntimeOptions {
   readonly leaseTtlMs?: number;
   readonly decisionTtlMs?: number;
   readonly maxPlanSteps?: number;
+  /** Shared bounded retry policy; defaults to two transient retries. */
+  readonly retryPolicy?: Partial<RetryPolicyConfig>;
+  /** Injectable entropy source for deterministic retry timing tests. */
+  readonly retryRandom?: () => number;
   readonly now?: () => Date;
   /** Test-only fault injection immediately after a durable predecessor commit. */
   readonly crashAfterCommit?: (
     point:
       | "plan_ready_to_dispatch"
+      | "planning_retry_scheduled"
+      | "planning_retry_started"
       | "action_reserved_before_dispatch"
       | "guided_approval_to_dispatch"
       | "action_result_to_advance"
@@ -231,6 +238,7 @@ export interface StoredPlanStep {
   readonly assignedAgentId: string;
   readonly riskClass: string;
   readonly successCriteria: readonly string[];
+  readonly dependencyStepIds: readonly string[];
   readonly action: PlannedAction;
   readonly explanation: string;
   readonly rationale: string;

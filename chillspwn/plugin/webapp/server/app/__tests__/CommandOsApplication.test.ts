@@ -67,14 +67,14 @@ describe("CommandOsApplication", () => {
     const response = await fetch(`http://127.0.0.1:${address.port}/api/v2/system/readiness`);
     expect(response.status).toBe(200);
     const health = await response.json() as any;
-    expect(health.status).toBe("healthy");
+    expect(health.status).toBe("degraded");
     expect(health.database.currentMigration).toBe(DATABASE_MIGRATIONS.at(-1)?.version);
     expect(health.eventStream.status).toBe("healthy");
 
     const overview = await fetch(`http://127.0.0.1:${address.port}/api/v2/overview`);
     expect(overview.status).toBe(200);
     const body = await overview.json() as any;
-    expect(body.schemaVersion).toBe("2.1");
+    expect(body.schemaVersion).toBe("2.4");
     expect(body.readiness.status).toBe("blocked");
 
     const openApiResponse = await fetch(`http://127.0.0.1:${address.port}/api/v2/openapi.json`);
@@ -86,7 +86,7 @@ describe("CommandOsApplication", () => {
     const eventContractResponse = await fetch(`http://127.0.0.1:${address.port}/api/v2/contracts/events`);
     expect(eventContractResponse.status).toBe(200);
     const eventContract = await eventContractResponse.json() as any;
-    expect(eventContract.schemaVersion).toBe("2.1");
+    expect(eventContract.schemaVersion).toBe("2.4");
     expect(eventContract.resume.replayEndpoint).toBe("/api/v2/events/replay");
   });
 });

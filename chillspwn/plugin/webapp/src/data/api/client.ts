@@ -83,6 +83,14 @@ export async function apiRequest<T>(
       ...(request.body ? { "Content-Type": "application/json" } : {}),
       ...request.headers,
     },
+  }).catch((error: unknown) => {
+    // Mobile WebKit can surface a lifecycle-cancelled same-origin request as a
+    // global access-control failure. Normalize only explicitly aborted work;
+    // every operational failure still reaches the caller unchanged.
+    if (request.signal?.aborted) {
+      throw new DOMException("Command OS request was cancelled", "AbortError");
+    }
+    throw error;
   });
   const payload = await responseBody(response);
   if (!response.ok) {

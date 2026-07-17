@@ -11,7 +11,7 @@ const node = {
 describe("Second Brain API schema validation", () => {
   test("validates a canonical summary and wrapped response", () => {
     const result = parseBrainSummary({ data: {
-      schemaVersion: "2.1",
+      schemaVersion: "2.4",
       counts: { confirmed: 4, candidates: 1, stale: 0, disputed: 0, forgotten: 0, edges: 3, contextPacks: 2 },
       health: { database: "healthy", fts: "ready" },
       vault: { status: "connected", connections: 1, conflicts: 0, lastSyncAt: null },
@@ -23,15 +23,15 @@ describe("Second Brain API schema validation", () => {
 
   test("validates graph relationships and rejects cross-version or invalid sensitivity data", () => {
     const graph = parseMemoryGraph({
-      schemaVersion: "2.1", view: "local", rootNodeId: "mem-technique", nodes: [node], edges: [], truncated: false,
+      schemaVersion: "2.4", view: "local", rootNodeId: "mem-technique", nodes: [node], edges: [], truncated: false,
     });
     expect(graph.rootNodeId).toBe("mem-technique");
     expect(() => parseMemoryGraph({ schemaVersion: "2.0", view: "global", nodes: [], edges: [], truncated: false })).toThrow("unsupported");
-    expect(() => parseMemoryGraph({ schemaVersion: "2.1", view: "global", nodes: [{ ...node, sensitivity: "secret" }], edges: [], truncated: false })).toThrow("sensitivity");
+    expect(() => parseMemoryGraph({ schemaVersion: "2.4", view: "global", nodes: [{ ...node, sensitivity: "secret" }], edges: [], truncated: false })).toThrow("sensitivity");
   });
 
   test("requires the locked safety invariants in memory-control responses", () => {
-    const policy = parseMemoryControlPolicy({ schemaVersion: "2.1", policy: {
+    const policy = parseMemoryControlPolicy({ schemaVersion: "2.4", policy: {
       enabled: true,
       personalPreferencePolicy: "candidate_only",
       operationalMemoryEnabled: true,

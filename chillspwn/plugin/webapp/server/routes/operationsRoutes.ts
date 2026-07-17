@@ -1,5 +1,12 @@
 import { Router, type Request, type Response } from "express";
 import { attachV2RequestId, sendV2Error } from "../contracts/ApiErrorContract";
+import {
+  BrainContextHookError,
+  BrainContextService,
+  parseMissionMemoryPolicy,
+  retrieveMissionBrainContext,
+} from "../brain-runtime";
+import { MemoryRepository, SecondBrainService } from "../memory";
 import { OperationsApiError } from "../operations/errors";
 import { OperationsRepository } from "../operations/OperationsRepository";
 import { RecoveryRepository } from "../operations/RecoveryRepository";
@@ -9,6 +16,11 @@ import { OperationsReviewRepository } from "../operations/OperationsReviewReposi
 import { DecisionInboxRepository } from "../operations/DecisionInboxRepository";
 import { SecureExportService } from "../operations/SecureExportService";
 import { TraceRepository } from "../observability/TraceRepository";
+import {
+  ControlPlaneLeaseError,
+  RunMutationAuthorityGuard,
+  describeRunMutationAuthorityError,
+} from "../control-plane";
 import { validateAccessPolicy } from "../operations/scope";
 import type {
   OperationsContext,
@@ -52,6 +64,37 @@ const DECISION_INBOX_KINDS = new Set([
 const ADMINISTRATIVE_REVIEW_STATUSES = new Set(["approved", "rejected"] as const);
 
 function sendError(response: Response, error: unknown, requestTraceId: string): void {
+  if (error instanceof ControlPlaneLeaseError) {
+    const descriptor = describeRunMutationAuthorityError(error);
+    sendV2Error(response, requestTraceId, {
+      status: descriptor.status,
+      code: descriptor.code,
+      message: error.message,
+      humanMessage: error.message,
+      retryable: descriptor.retryable,
+      category: descriptor.category,
+      remediation: descriptor.remediation,
+    });
+    return;
+  }
+  if (error instanceof BrainContextHookError) {
+    const unavailable = error.code === "brain_context_unavailable";
+    sendV2Error(response, requestTraceId, {
+      status: unavailable ? 503 : 500,
+      code: error.code,
+      message: "Required reporting context could not be established",
+      humanMessage: unavailable
+        ? "The completion report was not produced because this Autonomous contract requires Second Brain context that is currently unavailable."
+        : "The completion report was not produced because its required Context Pack or audit receipt could not be persisted safely.",
+      retryable: unavailable,
+      category: unavailable ? "dependency_unavailable" : "integrity_failure",
+      details: { hook: error.hook, auditRecordId: error.auditRecordId ?? null },
+      remediation: unavailable
+        ? "Restore the local Second Brain dependency, verify the signed memory selection, and retry the export."
+        : "Inspect the trace and local database health before retrying; do not bypass the reporting context gate.",
+    });
+    return;
+  }
   const known = error instanceof OperationsApiError;
   sendV2Error(response, requestTraceId, known
     ? {
@@ -177,12 +220,28 @@ function identifierArray(value: unknown, label: string, maximum = 20): string[] 
 }
 
 function exactRecoveryExpectation(body: Record<string, unknown>) {
+  const checkpointStateHash = requiredText(body.expectedCheckpointStateHash, "Expected checkpoint state hash", 64);
+  if (!/^[a-f0-9]{64}$/u.test(checkpointStateHash)) {
+    throw new OperationsApiError(400, "invalid_request", "Expected checkpoint state hash is invalid", {
+      humanMessage: "Expected checkpoint state hash must be a lowercase SHA-256 digest.",
+      category: "invalid_input",
+    });
+  }
+  if (!Number.isSafeInteger(body.expectedCheckpointEventSequence) || Number(body.expectedCheckpointEventSequence) < 0) {
+    throw new OperationsApiError(400, "invalid_request", "Expected checkpoint event sequence is invalid", {
+      humanMessage: "Expected checkpoint event sequence must be a non-negative integer.",
+      category: "invalid_input",
+    });
+  }
   return {
     expectedRunVersion: requiredPositiveInteger(body.expectedRunVersion, "Expected run version"),
     expectedPlanId: identifier(body.expectedPlanId, "Expected plan ID"),
     expectedPlanVersion: requiredPositiveInteger(body.expectedPlanVersion, "Expected plan version"),
     expectedStepId: identifier(body.expectedStepId, "Expected step ID"),
     expectedAssignmentId: identifier(body.expectedAssignmentId, "Expected assignment ID"),
+    expectedCheckpointId: identifier(body.expectedCheckpointId, "Expected checkpoint ID"),
+    expectedCheckpointStateHash: checkpointStateHash,
+    expectedCheckpointEventSequence: Number(body.expectedCheckpointEventSequence),
   };
 }
 
@@ -206,6 +265,10 @@ function handle(
  */
 export function createOperationsRouter(dependencies: OperationsRouterDependencies): Router {
   const repository = new OperationsRepository(dependencies.database, dependencies.clock);
+  const brainContext = dependencies.brainContext ?? new BrainContextService({
+    database: dependencies.database,
+    secondBrain: new SecondBrainService(new MemoryRepository(dependencies.database)),
+  });
   const recovery = new RecoveryRepository(dependencies.database, {
     providerRouteIds: dependencies.providerRouteIds,
     clock: dependencies.clock,
@@ -219,6 +282,7 @@ export function createOperationsRouter(dependencies: OperationsRouterDependencie
     agentHeartbeatMaxAgeMs: dependencies.agentHeartbeatMaxAgeMs,
   });
   const followUps = new FollowUpRunRepository(dependencies.database, dependencies.clock);
+  const mutationAuthority = new RunMutationAuthorityGuard(dependencies.database, dependencies.clock);
   const reviews = new OperationsReviewRepository(dependencies.database, dependencies.clock);
   const decisions = new DecisionInboxRepository(dependencies.database, dependencies.clock);
   const traces = new TraceRepository(dependencies.database);
@@ -343,7 +407,11 @@ export function createOperationsRouter(dependencies: OperationsRouterDependencie
     }));
   }));
   router.get("/api/v2/intelligence/artifacts/:artifactId", handle(dependencies, (request, response, { access }) => {
-    response.json(repository.getArtifact(identifier(request.params.artifactId, "Artifact ID"), access));
+    const artifactId = identifier(request.params.artifactId, "Artifact ID");
+    response.json({
+      ...repository.getArtifact(artifactId, access),
+      delivery: secureExports.describeArtifactDelivery(artifactId, access),
+    });
   }));
   router.get("/api/v2/intelligence/artifacts/:artifactId/download", handle(dependencies, (request, response, ctx) => {
     const download = secureExports.downloadArtifact(
@@ -440,9 +508,10 @@ export function createOperationsRouter(dependencies: OperationsRouterDependencie
     response.json(recovery.getRunRecovery(identifier(request.params.runId, "Run ID"), access));
   }));
   router.post("/api/v2/operations/runs/:runId/recovery/replan", handle(dependencies, (request, response, ctx) => {
+    const runId = identifier(request.params.runId, "Run ID");
     const body = object(request.body);
-    response.json(recoveryMutations.requestReplan(
-      identifier(request.params.runId, "Run ID"),
+    const projection = recoveryMutations.requestReplan(
+      runId,
       {
         ...exactRecoveryExpectation(body),
         strategyReason: requiredSafeReason(body.strategyReason, "Materially different strategy", 4_000),
@@ -450,7 +519,14 @@ export function createOperationsRouter(dependencies: OperationsRouterDependencie
       requiredIdempotencyKey(request.get("Idempotency-Key")),
       ctx.actor,
       ctx.access,
-    ));
+    );
+    response.json(projection);
+    if (projection.mutation.continuationId) {
+      dependencies.notifyRecoveryContinuation?.({
+        runId,
+        continuationId: projection.mutation.continuationId,
+      });
+    }
   }));
   router.post("/api/v2/operations/runs/:runId/recovery/reassign", handle(dependencies, (request, response, ctx) => {
     const body = object(request.body);
@@ -487,8 +563,19 @@ export function createOperationsRouter(dependencies: OperationsRouterDependencie
   }));
   router.post("/api/v2/operations/runs/:runId/follow-up", handle(dependencies, (request, response, ctx) => {
     const body = object(request.body);
+    const sourceRunId = identifier(request.params.runId, "Source run ID");
+    const authority = mutationAuthority.authorize({
+      runId: sourceRunId,
+      actorId: ctx.actor.id,
+      // A follow-up does not mutate or resume its terminal source attempt.
+      // Requiring a live worker lease here made the feature impossible after
+      // normal terminal cleanup. Exclusive V2 ownership is rechecked inside
+      // the atomic create transaction; the new run obtains its own fenced
+      // runtime lease before planning or execution.
+      mode: "ownership",
+    });
     const created = followUps.create(
-      identifier(request.params.runId, "Source run ID"),
+      sourceRunId,
       {
         reason: requiredSafeReason(body.reason, "Follow-up reason", 2_000),
         selectedLessonIds: identifierArray(body.selectedLessonIds, "selectedLessonIds"),
@@ -496,6 +583,7 @@ export function createOperationsRouter(dependencies: OperationsRouterDependencie
       requiredIdempotencyKey(request.get("Idempotency-Key")),
       ctx.actor,
       ctx.access,
+      authority.assertCurrent,
     );
     response.status(201).json(created);
   }));
@@ -553,7 +641,45 @@ export function createOperationsRouter(dependencies: OperationsRouterDependencie
   }));
   router.get("/api/v2/reports/runs/:runId/export", handle(dependencies, (request, response, ctx) => {
     const runId = identifier(request.params.runId, "Run ID");
-    const exported = repository.getRunCompletionExport(runId, ctx.access);
+    const reportingScope = repository.getRunCompletionReportingScope(runId, ctx.access);
+    const contextResult = retrieveMissionBrainContext({
+      brainContext,
+      hook: "reporting",
+      journey: reportingScope.journey,
+      missionId: reportingScope.missionId,
+      runId: reportingScope.runId,
+      actorId: ctx.actor.id,
+      actorType: ctx.actor.type === "agent" || ctx.actor.type === "system"
+        ? ctx.actor.type
+        : "operator",
+      query: "Prepare a traceable terminal completion report using confirmed reporting preferences and evidence-linked mission outcomes.",
+      queryRedacted: "Prepare a traceable terminal completion report using scoped confirmed preferences and evidence-linked outcomes.",
+      memoryPolicy: parseMissionMemoryPolicy(reportingScope.memoryPolicyJson),
+    });
+    if (contextResult.items.length > 0) {
+      brainContext.recordUnusedContext(
+        contextResult,
+        "The signed Command OS JSON format and local privacy boundary are fixed; retrieved memory was retained as report provenance but did not override canonical report contents.",
+      );
+    }
+    const influenceSummary = contextResult.status === "degraded"
+      ? "Second Brain context was unavailable; Guided policy used an audited empty Context Pack and fixed local report defaults."
+      : contextResult.status === "no_relevant_memory"
+        ? "No relevant confirmed memory was found; the fixed local report contract supplied the defaults."
+        : "Confirmed context was retrieved and retained as report provenance; fixed contract and privacy rules remained authoritative."
+    const exported = repository.getRunCompletionExport(runId, ctx.access, {
+      contextPackId: contextResult.contextPack.id,
+      status: contextResult.status,
+      retrievedItems: contextResult.items.length,
+      appliedItems: 0,
+      degradation: contextResult.degradation
+        ? {
+            code: contextResult.degradation.code,
+            explanation: "Second Brain context was unavailable; audited fixed report defaults were used.",
+          }
+        : null,
+      influenceSummary,
+    });
     repository.recordRunCompletionExport(exported, ctx.actor);
     const filename = completionExportFilename(runId);
     response.status(200);

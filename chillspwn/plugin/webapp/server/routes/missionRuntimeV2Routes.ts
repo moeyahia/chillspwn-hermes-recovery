@@ -172,7 +172,7 @@ export function createMissionRuntimeV2Router(
 
   router.get("/api/v2/missions/:missionId/runtime", route((request, response) => {
     const missionId = pathId(request.params.missionId, "missionId");
-    response.json({ schemaVersion: "2.1", ...dependencies.runtime.repository.getMissionRuntime(missionId) });
+    response.json({ schemaVersion: "2.4", ...dependencies.runtime.repository.getMissionRuntime(missionId) });
   }));
 
   router.get("/api/v2/runs", route((request, response) => {
@@ -197,7 +197,7 @@ export function createMissionRuntimeV2Router(
       throw new CommandRuntimeError(400, "invalid_pagination", "Run limit must be 1 through 100", { category: "invalid_input" });
     }
     response.json({
-      schemaVersion: "2.1",
+      schemaVersion: "2.4",
       items: dependencies.runtime.repository.listRunProjections({
         ...(query ? { query } : {}),
         ...(journey ? { journey: journey as "autonomous" | "guided" } : {}),
@@ -210,7 +210,7 @@ export function createMissionRuntimeV2Router(
   router.get("/api/v2/runs/:runId", route((request, response) => {
     const runId = pathId(request.params.runId, "runId");
     response.json({
-      schemaVersion: "2.1",
+      schemaVersion: "2.4",
       run: dependencies.runtime.repository.getRunProjection(runId),
       latestCheckpoint: dependencies.runtime.coordinator.getLatestCheckpoint(runId) ?? null,
     });
@@ -219,7 +219,7 @@ export function createMissionRuntimeV2Router(
   router.get("/api/v2/runs/:runId/plans", route((request, response) => {
     const runId = pathId(request.params.runId, "runId");
     dependencies.runtime.repository.getRunProjection(runId);
-    response.json({ schemaVersion: "2.1", items: dependencies.runtime.repository.listPlans(runId) });
+    response.json({ schemaVersion: "2.4", items: dependencies.runtime.repository.listPlans(runId) });
   }));
 
   router.get("/api/v2/decisions", route((request, response) => {
@@ -238,7 +238,7 @@ export function createMissionRuntimeV2Router(
       throw new CommandRuntimeError(400, "invalid_pagination", "Decision limit must be 1 through 100", { category: "invalid_input" });
     }
     response.json({
-      schemaVersion: "2.1",
+      schemaVersion: "2.4",
       items: dependencies.runtime.repository.listDecisions({ status, runId, query, limit }),
     });
   }));
@@ -280,7 +280,7 @@ export function createMissionRuntimeV2Router(
       operatorId,
       optionalReason(body.reason),
     );
-    return asJson({ schemaVersion: "2.1", decisionId, status: "approved", action });
+    return asJson({ schemaVersion: "2.4", decisionId, status: "approved", action });
   }));
 
   router.post("/api/v2/guided-decisions/:decisionId/reject", mutation("decision.reject", async (request, operatorId) => {
@@ -290,7 +290,7 @@ export function createMissionRuntimeV2Router(
     expectedFingerprint(body, decision.actionFingerprint);
     expectedParameters(body, decision.requestedParameters);
     await dependencies.runtime.rejectGuidedDecision(decisionId, operatorId, requiredReason(body.reason));
-    return { schemaVersion: "2.1", decisionId, status: "rejected" };
+    return { schemaVersion: "2.4", decisionId, status: "rejected" };
   }));
 
   router.post("/api/v2/guided-decisions/:decisionId/manual-result", mutation("decision.manual", async (request, operatorId) => {
@@ -332,7 +332,7 @@ export function createMissionRuntimeV2Router(
       evidence.summary,
       evidenceId,
     );
-    return asJson({ schemaVersion: "2.1", decisionId, status: "manual", receipt });
+    return asJson({ schemaVersion: "2.4", decisionId, status: "manual", receipt });
   }));
 
   router.post("/api/v2/guided-decisions/:decisionId/skip", mutation("decision.skip", async (request, operatorId) => {
@@ -346,7 +346,7 @@ export function createMissionRuntimeV2Router(
       operatorId,
       requiredReason(body.reason),
     );
-    return asJson({ schemaVersion: "2.1", decisionId, status: "skipped", receipt });
+    return asJson({ schemaVersion: "2.4", decisionId, status: "skipped", receipt });
   }));
 
   router.post("/api/v2/guided-decisions/:decisionId/stop", mutation("decision.stop", async (request, operatorId) => {
@@ -394,7 +394,7 @@ export function createMissionRuntimeV2Router(
       });
     });
     return asJson({
-      schemaVersion: "2.1",
+      schemaVersion: "2.4",
       decisionId,
       status: "cancelled",
       run: dependencies.runtime.repository.getRunProjection(decision.runId),
@@ -409,7 +409,7 @@ export function createMissionRuntimeV2Router(
       if (command === "pause") dependencies.runtime.pauseRun(runId, operatorId, reason);
       if (command === "resume") dependencies.runtime.resumeRun(runId, operatorId, reason);
       if (command === "cancel") await dependencies.runtime.cancelRun(runId, operatorId, reason);
-      return asJson({ schemaVersion: "2.1", run: dependencies.runtime.repository.getRunProjection(runId) });
+      return asJson({ schemaVersion: "2.4", run: dependencies.runtime.repository.getRunProjection(runId) });
     }));
   }
 

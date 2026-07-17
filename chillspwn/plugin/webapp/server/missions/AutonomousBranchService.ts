@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { SqliteDatabase } from "../db";
 import { inImmediateTransaction } from "../db";
 import { EventRepository } from "../events";
-import { redactSecrets } from "../runtime/RunReport";
+import { redactSecrets } from "../contracts/redaction";
 import { autonomousContractHash, canonicalJson, hashCanonical, sha256 } from "./canonical";
 import { AutonomousReadinessError, IdempotencyConflictError, MissionApiError } from "./errors";
 import type { MissionService } from "./MissionService";
@@ -54,7 +54,7 @@ interface ContractRow {
 }
 
 export interface AutonomousBranchContext {
-  readonly schemaVersion: "2.1";
+  readonly schemaVersion: "2.4";
   readonly mission: { readonly id: string; readonly name: string; readonly version: number };
   readonly sourceRun: {
     readonly id: string;
@@ -84,7 +84,7 @@ export interface AutonomousBranchContext {
 }
 
 export interface AutonomousBranchPreflight {
-  readonly schemaVersion: "2.1";
+  readonly schemaVersion: "2.4";
   readonly mode: BranchMode;
   readonly sourceRunId: string;
   readonly sourceRunVersion: number;
@@ -106,7 +106,7 @@ export type VersionedAutonomousPreflight = Omit<AutonomousMissionPreflight, "con
 };
 
 export interface AutonomousBranchResult {
-  readonly schemaVersion: "2.1";
+  readonly schemaVersion: "2.4";
   readonly sourceRunId: string;
   readonly branchMode: BranchMode;
   readonly run: {
@@ -231,7 +231,7 @@ export class AutonomousBranchService {
       confirmed_at: string | null; created_at: string;
     }>;
     return {
-      schemaVersion: "2.1",
+      schemaVersion: "2.4",
       mission: { id: source.mission_id, name: source.mission_name, version: source.mission_version },
       sourceRun: {
         id: source.run_id,
@@ -272,6 +272,7 @@ export class AutonomousBranchService {
     },
     idempotencyKey: string,
     actorId: string,
+    assertMutationAuthority: () => void,
   ): Promise<AutonomousBranchPreflight> {
     const reason = safeReason(input.reason);
     const requestHash = hashCanonical({
@@ -286,11 +287,13 @@ export class AutonomousBranchService {
       actorId,
     });
     const settingKey = branchSettingKey("draft", idempotencyKey);
-    // A completed mutation owns its idempotency key permanently. Replay it
-    // before consulting mutable source/contract state: confirming the draft
-    // intentionally supersedes the source contract, but must not make an
-    // identical client retry fail after a lost response or process restart.
-    const prior = this.stored<AutonomousBranchPreflight>(settingKey, requestHash);
+    // A replay is still a disclosure of mutation-owned mission state. Resolve
+    // it only while the current runtime authority is fenced in the same
+    // IMMEDIATE transaction used by the eventual write.
+    const prior = inImmediateTransaction(this.database, () => {
+      assertMutationAuthority();
+      return this.stored<AutonomousBranchPreflight>(settingKey, requestHash);
+    });
     if (prior) return prior;
     const source = this.source(missionId, input.sourceRunId);
     if (source.run_version !== input.sourceRunVersion) {
@@ -314,26 +317,34 @@ export class AutonomousBranchService {
       : this.nextContractVersion(missionId);
     const preflight = { ...checked, contract: { version: nextVersion, hash } };
     if (input.mode === "unchanged_contract" || checked.readiness.status === "blocked" || !safety.safe) {
-      return {
-        schemaVersion: "2.1",
-        mode: input.mode,
-        sourceRunId: source.run_id,
-        sourceRunVersion: source.run_version,
-        safeToBranch: safety.safe,
-        safeToBranchReason: safety.reason,
-        contract: {
-          id: input.mode === "unchanged_contract" ? source.contract_id : null,
-          version: nextVersion,
-          state: input.mode === "unchanged_contract" ? "confirmed" : "unpersisted",
-          hash,
-          sourceContractId: source.contract_id!,
-        },
-        request,
-        preflight,
-      };
+      return inImmediateTransaction(this.database, () => {
+        assertMutationAuthority();
+        const replay = this.stored<AutonomousBranchPreflight>(settingKey, requestHash);
+        if (replay) return replay;
+        const current = this.source(missionId, input.sourceRunId);
+        if (current.run_version !== input.sourceRunVersion) throw this.staleSource();
+        return {
+          schemaVersion: "2.4",
+          mode: input.mode,
+          sourceRunId: current.run_id,
+          sourceRunVersion: current.run_version,
+          safeToBranch: safety.safe,
+          safeToBranchReason: safety.reason,
+          contract: {
+            id: input.mode === "unchanged_contract" ? current.contract_id : null,
+            version: nextVersion,
+            state: input.mode === "unchanged_contract" ? "confirmed" : "unpersisted",
+            hash,
+            sourceContractId: current.contract_id!,
+          },
+          request,
+          preflight,
+        };
+      });
     }
 
     return inImmediateTransaction(this.database, () => {
+      assertMutationAuthority();
       const replay = this.stored<AutonomousBranchPreflight>(settingKey, requestHash);
       if (replay) return replay;
       const current = this.source(missionId, input.sourceRunId);
@@ -387,7 +398,7 @@ export class AutonomousBranchService {
         details: { sourceContractId: current.contract_id, version, contractHash: hash, eventId: event.id }, now,
       });
       const response: AutonomousBranchPreflight = {
-        schemaVersion: "2.1",
+        schemaVersion: "2.4",
         mode: "contract_amendment",
         sourceRunId: current.run_id,
         sourceRunVersion: current.run_version,
@@ -420,6 +431,7 @@ export class AutonomousBranchService {
     },
     idempotencyKey: string,
     actorId: string,
+    assertMutationAuthority: () => void,
   ): Promise<AutonomousBranchResult> {
     const reason = safeReason(input.reason);
     const requestHash = hashCanonical({
@@ -433,10 +445,13 @@ export class AutonomousBranchService {
       actorId,
     });
     const settingKey = branchSettingKey("create", idempotencyKey);
-    // Replay the committed response before checking mutable lineage. An
-    // amendment confirmation necessarily changes that lineage, so performing
-    // these checks first would violate HTTP idempotency after success.
-    const prior = this.stored<AutonomousBranchResult>(settingKey, requestHash);
+    // Idempotency never outlives mutation authority. Keep the replay read under
+    // an IMMEDIATE authority fence so a lost lease cannot disclose or recreate
+    // control-plane state after a successful response was lost.
+    const prior = inImmediateTransaction(this.database, () => {
+      assertMutationAuthority();
+      return this.stored<AutonomousBranchResult>(settingKey, requestHash);
+    });
     if (prior) return prior;
     const source = this.source(missionId, input.sourceRunId);
     if (source.run_version !== input.sourceRunVersion) throw this.staleSource();
@@ -472,6 +487,7 @@ export class AutonomousBranchService {
       });
     }
     return inImmediateTransaction(this.database, () => {
+      assertMutationAuthority();
       const replay = this.stored<AutonomousBranchResult>(settingKey, requestHash);
       if (replay) return replay;
       const current = this.source(missionId, input.sourceRunId);
@@ -515,10 +531,10 @@ export class AutonomousBranchService {
         : `New run created under unchanged confirmed Autonomous contract version ${currentTarget.version}.`;
       this.database.prepare(`
         INSERT INTO runs (
-          id, mission_id, journey, status, contract_id, progress,
+          id, mission_id, journey, status, control_plane, contract_id, progress,
           status_reason, next_action_summary, budget_json, budget_usage_json,
           retry_count, replan_count, started_at, created_at, updated_at, version
-        ) VALUES (?, ?, 'autonomous', 'planning', ?, 0, ?,
+        ) VALUES (?, ?, 'autonomous', 'planning', 'command_os_v2', ?, 0, ?,
           'Build and version a new plan inside the confirmed contract', ?, '{}',
           0, 0, ?, ?, ?, 1)
       `).run(
@@ -577,7 +593,7 @@ export class AutonomousBranchService {
         now,
       });
       const response: AutonomousBranchResult = {
-        schemaVersion: "2.1",
+        schemaVersion: "2.4",
         sourceRunId: current.run_id,
         branchMode: input.mode,
         run: {
@@ -660,6 +676,7 @@ export class AutonomousBranchService {
         allowedActionClasses: policy.allowedActionClasses,
         prohibitedActionClasses: policy.prohibitedActionClasses,
         destructivePolicy: policy.destructivePolicy,
+        boundedDestructiveTargets: policy.boundedDestructiveTargets ?? [],
         evidenceRequirements: policy.evidenceRequirements,
         timeBudgetMinutes: budgets.timeBudgetMinutes,
         tokenBudget: budgets.tokenBudget ?? undefined,
@@ -843,6 +860,7 @@ export class AutonomousBranchService {
         allowedActionClasses: request.contract.allowedActionClasses,
         prohibitedActionClasses: request.contract.prohibitedActionClasses,
         destructivePolicy: request.contract.destructivePolicy,
+        boundedDestructiveTargets: request.contract.boundedDestructiveTargets ?? [],
         evidenceRequirements: request.contract.evidenceRequirements,
         notificationPolicy: request.contract.notificationPolicy,
         reportingFormat: request.contract.reportingFormat,
@@ -925,6 +943,7 @@ export class AutonomousBranchService {
       allowedActionClasses: request.contract.allowedActionClasses,
       prohibitedActionClasses: request.contract.prohibitedActionClasses,
       destructivePolicy: request.contract.destructivePolicy,
+      boundedDestructiveTargets: request.contract.boundedDestructiveTargets ?? [],
       specialistAgentIds: request.contract.specialistAgentIds,
     }), now);
     upsert.run(id("constraint"), missionId, "evidence_requirements", canonicalJson(request.contract.evidenceRequirements), now);

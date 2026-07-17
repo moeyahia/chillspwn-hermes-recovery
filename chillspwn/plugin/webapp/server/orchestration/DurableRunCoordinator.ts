@@ -12,6 +12,7 @@ import {
   classifyInFlightAction,
   isTerminalRunState,
   type BudgetValues,
+  type FailureCategory,
   type RunState,
   type SupervisedRun,
 } from "../supervisor";
@@ -42,6 +43,23 @@ export interface DurableRunCoordinatorOptions {
   readonly afterActionCommit?: (action: DurableAction) => void;
   readonly afterCancellationCleanup?: (runId: string) => void;
 }
+
+export type PlanningRetryScheduleResult =
+  | {
+      readonly scheduled: true;
+      readonly run: DurableRun;
+      readonly continuationId: string;
+      readonly retryCount: number;
+      readonly notBefore: string;
+      readonly delayMs: number;
+      readonly eventSequence: number;
+      readonly checkpointId: string;
+    }
+  | {
+      readonly scheduled: false;
+      readonly reason: "non_retryable" | "retry_budget_exhausted" | "signed_budget_exhausted";
+      readonly exhausted: readonly string[];
+    };
 
 function bumpedRun(run: SupervisedRun, now: string, reason: string): SupervisedRun {
   return {
@@ -240,6 +258,192 @@ export class DurableRunCoordinator {
         eventSequence: event.sequence,
         checkpointId: checkpoint.id,
       };
+    });
+  }
+
+  /**
+   * Atomically account one failed planning turn and reserve one bounded retry.
+   * The retry is represented only by its exact delayed continuation; no timer
+   * or ambient runnable-run scan is allowed to recreate it.
+   */
+  schedulePlanningRetry(input: {
+    readonly lease: RunLeaseToken;
+    readonly category: FailureCategory;
+    readonly errorCode: string;
+    readonly retryAfterMs?: number;
+    readonly random?: () => number;
+  }): PlanningRetryScheduleResult {
+    const now = this.timestamp();
+    return inImmediateTransaction(this.database, () => {
+      const current = this.load(input.lease.runId);
+      this.runs.assertLease(current, input.lease, now);
+      if (current.run.journey !== "autonomous") {
+        return { scheduled: false, reason: "non_retryable", exhausted: [] };
+      }
+      const decision = this.supervisor.decideRecovery({
+        journey: "autonomous",
+        category: input.category,
+        retriesUsed: current.control.retryCount,
+        retrySafe: true,
+        inContract: true,
+        materiallyNewReplanAvailable: false,
+        replanBudgetAvailable: false,
+        ...(input.retryAfterMs === undefined ? {} : { retryAfterMs: input.retryAfterMs }),
+        ...(input.random ? { random: input.random } : {}),
+      }).retry;
+      if (!decision.retry) {
+        return {
+          scheduled: false,
+          reason: decision.reason === "retry_budget_exhausted"
+            ? "retry_budget_exhausted"
+            : "non_retryable",
+          exhausted: [],
+        };
+      }
+
+      const delayMs = decision.delayMs ?? 0;
+      const notBefore = new Date(Date.parse(now) + delayMs).toISOString();
+      const failureBudget = checkBudget({
+        limits: current.control.budget.limits,
+        usage: elapsedUsage(current, now),
+      }, { providerTurns: 1, retries: 1 });
+      const nextTurnBudget = failureBudget.allowed
+        ? checkBudget({
+            limits: current.control.budget.limits,
+            usage: failureBudget.projected,
+          }, { providerTurns: 1 })
+        : failureBudget;
+      const wallClockLimit = current.control.budget.limits.wallClockMs;
+      const retryExceedsWallClock = wallClockLimit !== undefined && current.run.startedAt !== undefined
+        && Date.parse(notBefore) - Date.parse(current.run.startedAt) > wallClockLimit;
+      if (!failureBudget.allowed || !nextTurnBudget.allowed || retryExceedsWallClock) {
+        const exhausted = new Set([
+          ...failureBudget.exhausted,
+          ...nextTurnBudget.exhausted,
+          ...(retryExceedsWallClock ? ["wallClockMs"] : []),
+        ]);
+        return {
+          scheduled: false,
+          reason: "signed_budget_exhausted",
+          exhausted: [...exhausted],
+        };
+      }
+
+      const retryCount = current.control.retryCount + 1;
+      const continuation = this.continuations.enqueue({
+        runId: current.run.id,
+        kind: "planning_retry_to_dispatch",
+        sourceId: `planning-retry-${retryCount}`,
+        payload: {
+          failureCategory: input.category,
+          retryCount: String(retryCount),
+          errorCode: input.errorCode,
+        },
+        now,
+        availableAt: notBefore,
+      });
+      const reason = `Autonomous planning retry ${retryCount} scheduled after transient ${input.category}; eligible at ${notBefore}`;
+      const nextRun = bumpedRun(current.run, now, reason);
+      const control: DurableControlState = {
+        ...current.control,
+        budget: {
+          limits: current.control.budget.limits,
+          usage: failureBudget.projected,
+        },
+        retryCount,
+        planningRetry: {
+          continuationId: continuation.id,
+          failureCategory: input.category,
+          retryCount,
+          notBefore,
+          errorCode: input.errorCode,
+        },
+      };
+      const persisted = this.runs.persistMutation({
+        current,
+        nextRun,
+        control,
+        now,
+        lease: "clear",
+      });
+      const event = this.events.append({
+        missionId: persisted.run.missionId,
+        runId: persisted.run.id,
+        journey: persisted.run.journey,
+        eventType: "run.planning_retry_scheduled",
+        actorType: "system",
+        summary: reason,
+        payload: {
+          continuationId: continuation.id,
+          failureCategory: input.category,
+          errorCode: input.errorCode,
+          retryCount,
+          nextEligibility: notBefore,
+          delayMs,
+          retryAfterMs: input.retryAfterMs ?? null,
+        },
+      });
+      const checkpoint = this.checkpoints.create({ run: persisted, eventSequence: event.sequence, now });
+      return {
+        scheduled: true,
+        run: persisted,
+        continuationId: continuation.id,
+        retryCount,
+        notBefore,
+        delayMs,
+        eventSequence: event.sequence,
+        checkpointId: checkpoint.id,
+      };
+    });
+  }
+
+  /** Consume only the exact eligible retry before opening its provider turn. */
+  beginScheduledPlanningRetry(input: {
+    readonly lease: RunLeaseToken;
+    readonly continuationId: string;
+  }): DurableTransitionResult {
+    const now = this.timestamp();
+    return inImmediateTransaction(this.database, () => {
+      const current = this.load(input.lease.runId);
+      this.runs.assertLease(current, input.lease, now);
+      const retry = current.control.planningRetry;
+      if (!retry || retry.continuationId !== input.continuationId) {
+        throw new DurableOrchestrationError(
+          "planning_retry_fence_mismatch",
+          "The planning retry continuation is no longer the exact durable retry",
+        );
+      }
+      if (Date.parse(retry.notBefore) > Date.parse(now)) {
+        throw new DurableOrchestrationError(
+          "planning_retry_not_eligible",
+          `Planning retry is not eligible before ${retry.notBefore}`,
+        );
+      }
+      const reason = `Autonomous planning retry ${retry.retryCount} started from its exact durable continuation`;
+      const persisted = this.runs.persistMutation({
+        current,
+        nextRun: bumpedRun(current.run, now, reason),
+        control: { ...current.control, planningRetry: undefined },
+        now,
+        lease: "keep",
+      });
+      const event = this.events.append({
+        missionId: persisted.run.missionId,
+        runId: persisted.run.id,
+        journey: persisted.run.journey,
+        eventType: "run.planning_retry_started",
+        actorType: "worker",
+        actorId: input.lease.ownerId,
+        summary: reason,
+        payload: {
+          continuationId: input.continuationId,
+          failureCategory: retry.failureCategory,
+          retryCount: retry.retryCount,
+          eligibleAt: retry.notBefore,
+        },
+      });
+      const checkpoint = this.checkpoints.create({ run: persisted, eventSequence: event.sequence, now });
+      return { run: persisted, eventSequence: event.sequence, checkpointId: checkpoint.id };
     });
   }
 

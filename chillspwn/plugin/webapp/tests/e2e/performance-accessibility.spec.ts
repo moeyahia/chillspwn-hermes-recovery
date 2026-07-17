@@ -214,7 +214,7 @@ test.describe("Command OS performance and accessibility evidence", () => {
       ["/", "Command Center"],
       ["/brain", "Second Brain"],
       ["/brain/graph", "Memory Graph"],
-      ["/missions/new/guided", "Start with the authorized objective"],
+      ["/missions/new/guided", "Begin with one authorized target"],
       ["/manual", "ChillsPwn User Manual"],
     ];
     for (const [path, heading] of pages) {
@@ -345,7 +345,7 @@ test.describe("Command OS performance and accessibility evidence", () => {
     await gotoShell(page);
     const pages: Array<[string, string]> = [
       ["/", "Command Center"],
-      ["/missions/new/guided", "Start with the authorized objective"],
+      ["/missions/new/guided", "Begin with one authorized target"],
       ["/brain", "Second Brain"],
       ["/brain/graph", "Memory Graph"],
       ["/observability", "Observability"],

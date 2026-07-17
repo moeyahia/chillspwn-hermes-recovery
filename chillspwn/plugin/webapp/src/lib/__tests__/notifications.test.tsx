@@ -11,7 +11,7 @@ import {
 import { NotificationPanel } from "../../features/notifications/NotificationCenter";
 
 const payload = {
-  schemaVersion: "2.1",
+  schemaVersion: "2.4",
   nextCursor: null,
   items: [{
     id: "notification:event-safe-stop",
@@ -55,9 +55,9 @@ describe("in-app notification client", () => {
       run: { journey: "autonomous" },
       deepLink: "/live/run-1",
     });
-    expect(parseNotificationUnreadCount({ schemaVersion: "2.1", unreadCount: 1 }).unreadCount).toBe(1);
+    expect(parseNotificationUnreadCount({ schemaVersion: "2.4", unreadCount: 1 }).unreadCount).toBe(1);
     expect(parseNotificationMutation({
-      schemaVersion: "2.1",
+      schemaVersion: "2.4",
       mutation: {
         kind: "mark_read", notificationId: "notification:event-safe-stop",
         changedCount: 1, readAt: "2026-07-15T19:01:00.000Z",
@@ -68,7 +68,7 @@ describe("in-app notification client", () => {
       items: [{ ...payload.items[0], deepLink: "//external.invalid" }],
     })).toThrow("deep link");
     expect(() => parseNotificationMutation({
-      schemaVersion: "2.1",
+      schemaVersion: "2.4",
       mutation: { kind: "mark_all_read", notificationId: "unexpected", changedCount: 1, readAt: "now" },
     })).toThrow("identity");
   });

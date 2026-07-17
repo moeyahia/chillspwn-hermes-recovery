@@ -91,7 +91,6 @@ async function application() {
   app.use(v2RequestContext);
   app.use(express.json({ limit: "256kb" }));
   app.use(v2JsonBodyError);
-  app.use(commandOs.router);
   app.use(createSecondBrainRouter({
     database: commandOs.database,
     resolveActor: () => "operator:error-contract",
@@ -131,6 +130,10 @@ async function application() {
       canReviewAdministrativeApprovals: true,
     }),
   }));
+  // Mount the focused domain fixtures first so their injected failures prove
+  // each error adapter. The composed application remains the fallback for all
+  // other V2 routes under the same request context.
+  app.use(commandOs.router);
   app.use(v2NotFound);
 
   const server = createServer(app);

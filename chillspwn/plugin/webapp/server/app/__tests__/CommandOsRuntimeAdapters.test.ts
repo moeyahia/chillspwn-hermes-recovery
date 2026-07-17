@@ -86,9 +86,29 @@ function seed(
     NOW,
   );
   db.prepare(`
-    INSERT INTO agents (id, role, display_name, status, version, created_at, updated_at)
-    VALUES ('ReconScout', 'reconnaissance', 'ReconScout', 'available', '2.1', ?, ?)
+    INSERT INTO agents (
+      id, role, display_name, status, tool_policy_json, version, created_at, updated_at
+    ) VALUES (
+      'ReconScout', 'reconnaissance', 'ReconScout', 'available',
+      '{"allowedTools":["quick_scan"],"deniedTools":[],"approvalRequiredTools":[]}',
+      '2.4', ?, ?
+    )
   `).run(NOW, NOW);
+  db.prepare(`
+    INSERT INTO agent_capabilities (agent_id, capability, source, enabled, metadata_json)
+    VALUES ('ReconScout', 'quick_scan', 'runtime-adapter-test-attestation', 1, '{}')
+  `).run();
+  db.prepare(`
+    INSERT INTO mcp_servers (
+      id, name, transport, endpoint_redacted, status, capabilities_json,
+      policy_json, last_checked_at, created_at, updated_at
+    ) VALUES (
+      'sechub-reconnaissance', 'sechub-reconnaissance', 'fixture', 'test-only',
+      'healthy', '["quick_scan"]',
+      '{"enabled":true,"assignedAgents":["ReconScout"],"startPermitted":true}',
+      ?, ?, ?
+    )
+  `).run(NOW, NOW, NOW);
   return {
     mission: {
       id: "mission-1",
@@ -385,7 +405,11 @@ describe("Command OS production runtime adapters", () => {
         provenance: { method: "operator_statement" as const, explanation: "Confirmed", sources: [{ sourceType: "message" as const, sourceId: "msg-1", acquiredAt: NOW }] },
         authorType: "operator" as const,
         authorId: "operator",
-        retentionPolicy: { journeys: ["autonomous" as const] },
+        retentionPolicy: {
+          journeys: ["autonomous" as const],
+          allowAutonomous: true,
+          publicProviderDisclosure: "sanitized",
+        },
       };
       memory.createNode({ ...base, id: "global-memory", scope: { kind: "global" } });
       memory.createNode({ ...base, id: "eng-memory", scope: { kind: "engagement", engagementId: "eng-1" } });
@@ -422,6 +446,15 @@ describe("Command OS production runtime adapters", () => {
         provider: "xai-grok-oauth",
         model: "grok-4.5",
         status: "completed",
+      });
+      expect(db.prepare(`
+        SELECT per.provider_turn_id, pt.id AS turn_id, per.selected_context_ids_json
+        FROM provider_exposure_receipts per
+        JOIN provider_turns pt ON pt.id = per.provider_turn_id
+      `).get()).toEqual({
+        provider_turn_id: expect.any(String),
+        turn_id: expect.any(String),
+        selected_context_ids_json: '["eng-memory"]',
       });
     } finally {
       db.close();
@@ -1230,7 +1263,8 @@ describe("Command OS production runtime adapters", () => {
       });
       expect(prompts).toHaveLength(2);
       expect(prompts[0]).toContain("DESTRUCTIVE_POLICY=\"prohibited\"");
-      expect(prompts[0]).toContain("action.destructive must be false unless DESTRUCTIVE_POLICY is exactly contract_only");
+      expect(prompts[0]).toContain("action.destructive must be false unless DESTRUCTIVE_POLICY is exactly bounded_lab_only");
+      expect(prompts[0]).toContain("BOUNDED_DESTRUCTIVE_TARGETS=[]");
       expect(prompts[1]).toContain("REJECTED_FIELD=steps[0].action.destructive");
       expect(prompts[1]).toContain("REJECTED_RULE=signed_destructive_policy");
       expect(prompts[1]).not.toContain("NEVER_REPLAY_DESTRUCTIVE_PLAN");
@@ -1982,6 +2016,28 @@ describe("Command OS production runtime adapters", () => {
           UPDATE runs SET status = 'running', current_plan_id = 'plan-provider-live',
             current_step_id = 'step-provider-live' WHERE id = 'run-1'
         `).run();
+        new MemoryRepository(db).createNode({
+          id: "eng-memory",
+          nodeType: "technique",
+          title: "NEVER_RAW_FALLBACK_NODE",
+          summary: "This eligible memory must not be selected without an action Context Pack.",
+          body: "NEVER_RAW_FALLBACK_BODY",
+          scope: { kind: "engagement", engagementId: "eng-1" },
+          sensitivity: "internal",
+          confidence: 1,
+          lifecycleStatus: "confirmed",
+          confirmationState: "confirmed",
+          provenance: {
+            method: "operator_statement",
+            explanation: "Explicit no-fallback test fixture",
+            sources: [{ sourceType: "message", sourceId: "no-fallback-source", acquiredAt: NOW }],
+          },
+          authorType: "operator",
+          retentionPolicy: {
+            allowAutonomous: true,
+            publicProviderDisclosure: "sanitized",
+          },
+        });
         if (testCase.attestedAt) seedLiveGrokHealth(db, testCase.attestedAt);
         const action = new ActionRepository(db).create({
           intent: {
@@ -1995,14 +2051,16 @@ describe("Command OS production runtime adapters", () => {
           now: NOW,
         });
         let providerCalls = 0;
+        let capturedPrompt = "";
         let resolveResult!: (value: unknown) => void;
         const received = new Promise((resolve) => { resolveResult = resolve; });
         const port = new CommandOsBoundedExecutionPort({
           database: db,
           inventory: () => inventory,
           now: () => new Date(NOW),
-          callGrok: async () => {
+          callGrok: async (prompt) => {
             providerCalls += 1;
+            capturedPrompt = prompt;
             return "Bounded provider analysis";
           },
           executeMcp: async () => { throw new Error("MCP must not be called"); },
@@ -2027,6 +2085,26 @@ describe("Command OS production runtime adapters", () => {
           providerCalls: testCase.expectedSuccess ? 1 : 0,
           code: testCase.expectedCode,
         });
+        if (testCase.expectedSuccess) {
+          expect(capturedPrompt).toContain("SANITIZED_CONTEXT_PACK=");
+          expect(capturedPrompt).toContain('"status":"no_relevant_memory"');
+          expect(capturedPrompt).toContain('"items":[]');
+          expect(capturedPrompt).not.toContain("NEVER_RAW_FALLBACK_NODE");
+          expect(capturedPrompt).not.toContain("NEVER_RAW_FALLBACK_BODY");
+          expect(db.prepare(`
+            SELECT per.provider_turn_id, pt.id AS turn_id,
+              per.selected_context_ids_json
+            FROM provider_exposure_receipts per
+            JOIN provider_turns pt ON pt.id = per.provider_turn_id
+          `).get()).toMatchObject({
+            provider_turn_id: expect.any(String),
+            turn_id: expect.any(String),
+            selected_context_ids_json: "[]",
+          });
+          expect(db.prepare(`
+            SELECT action_id FROM memory_context_packs WHERE action_id = ?
+          `).get(action.id)).toEqual({ action_id: action.id });
+        }
       } finally {
         db.close();
       }
@@ -2186,6 +2264,11 @@ describe("Command OS production runtime adapters", () => {
       });
       expect(providerCalls).toBe(1);
       expect(db.prepare("SELECT status FROM provider_turns").get()).toEqual({ status: "completed" });
+      expect(db.prepare(`
+        SELECT COUNT(*) AS count FROM provider_exposure_receipts per
+        JOIN provider_turns pt ON pt.id = per.provider_turn_id
+        WHERE pt.status = 'completed'
+      `).get()).toEqual({ count: 1 });
     } finally {
       db.close();
     }

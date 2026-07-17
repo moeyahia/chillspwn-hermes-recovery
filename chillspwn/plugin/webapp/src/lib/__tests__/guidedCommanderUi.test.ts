@@ -32,7 +32,7 @@ function message(overrides: Partial<GuidedCommanderMessage>): GuidedCommanderMes
 describe("Guided Commander response contracts", () => {
   test("parses a canonical transcript and rejects hidden journey schema drift", () => {
     const transcript = parseGuidedTranscript({
-      schemaVersion: "2.1",
+      schemaVersion: "2.4",
       mission: { id: "mission-1", name: "Local readiness", objective: "Validate health", engagementId: null, authorizationStatus: "verified", scope: { targets: ["127.0.0.1"] } },
       run: { id: "run-1", status: "waiting_guided_decision", currentStepId: "step-1", progress: 0.5 },
       currentStep: {
@@ -56,13 +56,13 @@ describe("Guided Commander response contracts", () => {
     const operator = message({ id: "operator-1", role: "operator", body: "Submitted result" });
     const assistant = message({ id: "assistant-1", contextPackId: "context-1", structuredContent: { executionPerformed: false } });
     const parsed = parseGuidedCommanderReply({
-      schemaVersion: "2.1",
+      schemaVersion: "2.4",
       result: { action: "interpret_result", operatorMessage: operator, assistantMessage: assistant, contextPackId: "context-1", evidenceId: "evidence-1", actionFingerprint: fingerprint },
       ingestion: { multipartSupported: false, rawContentRetained: false, acceptedSources: ["paste", "text_upload"] },
     });
     expect(parsed.result.evidenceId).toBe("evidence-1");
     expect(parsed.ingestion?.rawContentRetained).toBeFalse();
-    expect(() => parseGuidedCommanderReply({ schemaVersion: "2.1", result: { action: "execute", operatorMessage: operator, assistantMessage: assistant, contextPackId: "context-1", actionFingerprint: fingerprint } })).toThrow("action");
+    expect(() => parseGuidedCommanderReply({ schemaVersion: "2.4", result: { action: "execute", operatorMessage: operator, assistantMessage: assistant, contextPackId: "context-1", actionFingerprint: fingerprint } })).toThrow("action");
   });
 
   test("encodes mission identifiers in every Guided Commander route", () => {

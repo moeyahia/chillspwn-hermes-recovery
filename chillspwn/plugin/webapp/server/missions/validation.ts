@@ -186,6 +186,38 @@ function parseAutonomous(root: UnknownRecord, issues: string[]): AutonomousMissi
     issues.push("allowed and prohibited action classes must not overlap");
   }
 
+  const destructivePolicy = requiredChoice(
+    contract.destructivePolicy,
+    [
+      "prohibited",
+      "validate_without_executing",
+      "bounded_lab_only",
+      // Read compatibility only. Registry-backed V2.4 intake never emits this.
+      "contract_only",
+    ] as const,
+    "contract.destructivePolicy",
+    issues,
+  );
+  const boundedDestructiveTargets = uniqueTargets(stringList(
+    contract.boundedDestructiveTargets ?? [],
+    "contract.boundedDestructiveTargets",
+    issues,
+  ));
+  if (destructivePolicy === "bounded_lab_only") {
+    if (boundedDestructiveTargets.length === 0) {
+      issues.push("contract.boundedDestructiveTargets must name at least one disposable lab target for bounded_lab_only");
+    }
+    const allowedTargetKeys = new Set(allowedTargets.map(targetKey));
+    if (boundedDestructiveTargets.some((target) => !allowedTargetKeys.has(targetKey(target)))) {
+      issues.push("contract.boundedDestructiveTargets must be a subset of authorization.allowedTargets");
+    }
+    if (boundedDestructiveTargets.some((target) => !/^(?:lab|htb|thm|ctf):/iu.test(target))) {
+      issues.push("contract.boundedDestructiveTargets must use explicit disposable lab environment references");
+    }
+  } else if (boundedDestructiveTargets.length > 0) {
+    issues.push("contract.boundedDestructiveTargets is allowed only with bounded_lab_only");
+  }
+
   if (authorization.authorizationConfirmed !== true) {
     issues.push("authorization.authorizationConfirmed must be true");
   }
@@ -299,12 +331,8 @@ function parseAutonomous(root: UnknownRecord, issues: string[]): AutonomousMissi
     contract: {
       allowedActionClasses,
       prohibitedActionClasses,
-      destructivePolicy: requiredChoice(
-        contract.destructivePolicy,
-        ["prohibited", "contract_only"] as const,
-        "contract.destructivePolicy",
-        issues,
-      ),
+      destructivePolicy,
+      boundedDestructiveTargets,
       evidenceRequirements: stringList(
         contract.evidenceRequirements,
         "contract.evidenceRequirements",

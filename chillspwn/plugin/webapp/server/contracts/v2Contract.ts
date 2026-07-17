@@ -1,4 +1,6 @@
-export const COMMAND_OS_API_VERSION = "2.1" as const;
+import { FAILURE_OPERATOR_ACTION_KINDS } from "../intelligence-v24/types";
+
+export const COMMAND_OS_API_VERSION = "2.4" as const;
 
 export const COMMAND_OS_JOURNEYS = ["autonomous", "guided"] as const;
 
@@ -22,6 +24,12 @@ export interface V2EndpointContract {
   readonly path: string;
   readonly summary: string;
   readonly idempotencyRequired: boolean;
+  readonly requestBodyRequired: boolean;
+}
+
+export interface V2DeferredEndpointContract extends V2EndpointContract {
+  readonly reason: string;
+  readonly requiredAdapters: readonly string[];
 }
 
 const read = (path: string, summary: string): V2EndpointContract => ({
@@ -29,6 +37,7 @@ const read = (path: string, summary: string): V2EndpointContract => ({
   path,
   summary,
   idempotencyRequired: false,
+  requestBodyRequired: false,
 });
 
 const write = (
@@ -36,7 +45,13 @@ const write = (
   path: string,
   summary: string,
   idempotencyRequired = true,
-): V2EndpointContract => ({ method, path, summary, idempotencyRequired });
+): V2EndpointContract => ({
+  method,
+  path,
+  summary,
+  idempotencyRequired,
+  requestBodyRequired: method !== "delete",
+});
 
 /**
  * Checked catalog for the public Command OS V2 surface. Internal compatibility
@@ -48,6 +63,8 @@ export const COMMAND_OS_V2_ENDPOINTS: readonly V2EndpointContract[] = [
   read("/api/v2/health", "Read Command OS liveness and database health"),
   read("/api/v2/system/readiness", "Read Command OS process readiness"),
   read("/api/v2/overview", "Read the Command Center overview"),
+  read("/api/v2/registries/intake", "Read runtime-derived mission intake registries"),
+  write("post", "/api/v2/registries/intake/resolve", "Resolve minimal mission intake into a complete reviewable contract", false),
   read("/api/v2/missions", "Search and page through missions"),
   read("/api/v2/missions/saved-views", "Read synchronized operator mission views"),
   write("post", "/api/v2/missions/saved-views", "Save a versioned operator mission view"),
@@ -56,31 +73,25 @@ export const COMMAND_OS_V2_ENDPOINTS: readonly V2EndpointContract[] = [
   write("post", "/api/v2/missions/bulk/export", "Export exact bounded redacted mission metadata"),
   write("post", "/api/v2/missions/autonomous/preflight", "Validate an Autonomous Mission Contract", false),
   write("post", "/api/v2/missions", "Create a durable mission"),
+  read("/api/v2/missions/:missionId/runtime", "Read canonical mission runtime state"),
   read("/api/v2/missions/:missionId/autonomous-branches/context", "Read safe Autonomous branch context"),
   write("post", "/api/v2/missions/:missionId/autonomous-branches/preflight", "Preflight an Autonomous branch or contract amendment"),
   write("post", "/api/v2/missions/:missionId/autonomous-branches", "Create a versioned Autonomous branch"),
-  read("/api/v2/missions/:missionId/runtime", "Read a mission runtime projection"),
-  read("/api/v2/runs", "Search active and historical runs"),
-  read("/api/v2/runs/:runId", "Read a run and its latest checkpoint"),
+  read("/api/v2/runs", "Search canonical run projections"),
+  read("/api/v2/runs/:runId", "Read canonical run state and checkpoint"),
   read("/api/v2/runs/:runId/plans", "Read versioned plans for a run"),
-  write("post", "/api/v2/runs/:runId/pause", "Pause a run at a durable boundary"),
-  write("post", "/api/v2/runs/:runId/resume", "Resume a safely paused run"),
-  write("post", "/api/v2/runs/:runId/cancel", "Cancel a run and propagate cleanup"),
-  read("/api/v2/decisions", "Search Guided decisions"),
-  read("/api/v2/decision-inbox", "Read Guided decisions, Autonomous exceptions, and administrative approvals"),
-  write("post", "/api/v2/administrative-approvals/:approvalId/review", "Review an administrative approval"),
-  write("post", "/api/v2/guided-decisions/:decisionId/approve", "Approve the exact represented Guided step"),
-  write("post", "/api/v2/guided-decisions/:decisionId/manual-result", "Submit a manual Guided step result"),
-  write("post", "/api/v2/guided-decisions/:decisionId/reject", "Reject the exact represented Guided step"),
-  write("post", "/api/v2/guided-decisions/:decisionId/skip", "Skip the exact represented Guided step"),
-  write("post", "/api/v2/guided-decisions/:decisionId/stop", "Stop a Guided mission at its checkpoint"),
-  read("/api/v2/guided/:missionId/commander/transcript", "Read the contextual Guided transcript"),
-  write("post", "/api/v2/guided/:missionId/commander/explain-more", "Request a deeper bounded explanation"),
-  write("post", "/api/v2/guided/:missionId/commander/show-next-step", "Request the next Guided step"),
-  write("post", "/api/v2/guided/:missionId/commander/use-another-approach", "Request a different Guided approach"),
-  write("post", "/api/v2/guided/:missionId/commander/interpret-result", "Interpret and record Guided output"),
+  read("/api/v2/runs/:runId/plan-changes", "Read normalized versioned plan-change proposals for a run"),
+  write("post", "/api/v2/runs/:runId/plan-changes", "Create and validate one structured plan-change proposal"),
+  read("/api/v2/runs/:runId/plan-changes/:requestId", "Read one plan-change proposal, exact diff, and impact analysis"),
+  write("put", "/api/v2/runs/:runId/plan-changes/:requestId", "Edit and fully revalidate an unresolved plan-change proposal"),
+  write("post", "/api/v2/runs/:runId/plan-changes/:requestId/apply", "Activate one validated pre-execution plan version without executing actions"),
+  write("post", "/api/v2/runs/:runId/plan-changes/:requestId/reject", "Reject one unresolved plan-change proposal without changing execution state"),
+  read("/api/v2/decisions", "Search exact Guided decisions"),
+  read("/api/v2/guided/:missionId/commander/transcript", "Read a durable Guided Commander transcript"),
   write("post", "/api/v2/guided/:missionId/commander/remember", "Create a reviewable Guided memory candidate"),
   write("post", "/api/v2/guided/:missionId/commander/do-not-remember", "Suppress a Guided memory candidate"),
+  read("/api/v2/decision-inbox", "Read Guided decisions, Autonomous exceptions, and administrative approvals"),
+  write("post", "/api/v2/administrative-approvals/:approvalId/review", "Review an administrative approval"),
   read("/api/v2/events/stream", "Subscribe to the resumable semantic event stream"),
   read("/api/v2/events/replay", "Replay durable run events after a sequence"),
   read("/api/v2/events/gap", "Repair a detected run event gap"),
@@ -105,6 +116,56 @@ export const COMMAND_OS_V2_ENDPOINTS: readonly V2EndpointContract[] = [
   read("/api/v2/learning/lessons/:lessonId", "Read lesson provenance and usage"),
   write("post", "/api/v2/learning/lessons/:lessonId/review", "Review a proposed lesson"),
   read("/api/v2/learning/usage", "Read selective lesson usage"),
+  read("/api/v2/research", "Read bounded Research Lab campaigns, readiness, integrity, and promotion state"),
+  write("post", "/api/v2/research/campaigns", "Create a human-owned bounded draft research campaign"),
+  write("post", "/api/v2/research/campaigns/:campaignId/stop", "Stop a bounded research campaign without promoting a candidate"),
+  read("/api/v2/operational-truth/missions/:missionId/logs", "Read scoped engagement log records that are not automatically evidence"),
+  write("post", "/api/v2/operational-truth/missions/:missionId/logs", "Append one attributable engagement log record"),
+  read("/api/v2/operational-truth/missions/:missionId/logs/:logId", "Read one scoped engagement log record"),
+  read("/api/v2/operational-truth/missions/:missionId/observations", "Read parsed attributable observations"),
+  write("post", "/api/v2/operational-truth/missions/:missionId/observations", "Create one parsed observation from canonical logs"),
+  read("/api/v2/operational-truth/missions/:missionId/observations/:observationId", "Read one parsed observation and its sources"),
+  read("/api/v2/operational-truth/missions/:missionId/evidence-candidates", "Read evidence candidates separately from verified evidence"),
+  write("post", "/api/v2/operational-truth/missions/:missionId/evidence-candidates", "Propose one reviewable evidence candidate"),
+  read("/api/v2/operational-truth/missions/:missionId/evidence-candidates/:candidateId", "Read one evidence candidate and validation requirements"),
+  write("post", "/api/v2/operational-truth/missions/:missionId/evidence-candidates/:candidateId/promote", "Promote one candidate into provenance validation"),
+  write("post", "/api/v2/operational-truth/missions/:missionId/evidence-candidates/:candidateId/reject", "Reject one evidence candidate with an audited reason"),
+  write("post", "/api/v2/operational-truth/missions/:missionId/evidence-candidates/:candidateId/demote", "Demote one candidate from validation with an audited reason"),
+  write("post", "/api/v2/operational-truth/missions/:missionId/evidence-candidates/:candidateId/verify", "Create immutable verified evidence after provenance validation"),
+  read("/api/v2/operational-truth/missions/:missionId/verified-evidence", "Read immutable verified evidence records"),
+  read("/api/v2/operational-truth/missions/:missionId/verified-evidence/:evidenceId", "Read verified evidence and chain of custody"),
+  read("/api/v2/operational-truth/missions/:missionId/findings/:findingId/verification-readiness", "Read evidence-gate readiness for a finding"),
+  write("post", "/api/v2/operational-truth/missions/:missionId/findings/:findingId/verify", "Verify a finding only when immutable evidence is sufficient"),
+  read("/api/v2/operational-truth/missions/:missionId/runs/:runId/failure-diagnoses", "Read structured failure diagnoses and valid recovery actions"),
+  write("post", "/api/v2/operational-truth/missions/:missionId/runs/:runId/failure-diagnoses", "Persist one structured failure diagnosis"),
+  read("/api/v2/operational-truth/missions/:missionId/runs/:runId/failure-diagnoses/:diagnosisId", "Read one structured failure diagnosis"),
+  write("post", "/api/v2/operational-truth/missions/:missionId/runs/:runId/failure-diagnoses/:diagnosisId/resolve", "Resolve one active or terminal failure diagnosis through a declared action, verified outcome, explicit confirmation, and server-authored audit record"),
+  read("/api/v2/runs/:runId/intelligence/metrics/snapshots", "Read reproducible run-metric snapshots with canonical drill-downs"),
+  read("/api/v2/runs/:runId/intelligence/metrics/snapshots/:snapshotId", "Read one immutable run-metric snapshot"),
+  write("post", "/api/v2/runs/:runId/intelligence/metrics/recompute", "Recompute and persist run metrics from canonical records"),
+  read("/api/v2/runs/:runId/intelligence/attack-attempts", "Read intent-level attack attempts separately from tool processes"),
+  write("post", "/api/v2/runs/:runId/intelligence/attack-attempts", "Create one scoped intent-level attack attempt"),
+  read("/api/v2/runs/:runId/intelligence/attack-attempts/:attemptId", "Read one attack attempt, outcome, and evidence history"),
+  write("post", "/api/v2/runs/:runId/intelligence/attack-attempts/:attemptId/transition", "Apply one versioned attack-attempt state or outcome transition"),
+  read("/api/v2/missions/:missionId/intelligence/topology", "Read the evidence-backed recon digital twin"),
+  read("/api/v2/missions/:missionId/intelligence/topology/nodes", "Read evidence-backed topology nodes"),
+  write("post", "/api/v2/missions/:missionId/intelligence/topology/nodes", "Create one evidence-backed topology node"),
+  read("/api/v2/missions/:missionId/intelligence/topology/nodes/:nodeId", "Read one topology node and provenance"),
+  read("/api/v2/missions/:missionId/intelligence/topology/edges", "Read typed evidence-backed topology relationships"),
+  write("post", "/api/v2/missions/:missionId/intelligence/topology/edges", "Create one typed evidence-backed topology relationship"),
+  read("/api/v2/missions/:missionId/intelligence/topology/edges/:edgeId", "Read one topology edge and provenance"),
+  read("/api/v2/missions/:missionId/intelligence/topology/assets/:assetNodeId/osi", "Read a seven-layer evidence-backed asset stack"),
+  write("post", "/api/v2/missions/:missionId/intelligence/topology/assets/:assetNodeId/osi", "Record one attributable OSI or application-stack observation"),
+  read("/api/v2/missions/:missionId/intelligence/cves", "Read evidence-gated version-aware CVE applicability records"),
+  write("post", "/api/v2/missions/:missionId/intelligence/cves", "Create or optimistically update one evidence-gated CVE applicability record"),
+  read("/api/v2/missions/:missionId/intelligence/cves/:recordId", "Read one version-aware CVE applicability record and authoritative provenance"),
+  read("/api/v2/missions/:missionId/intelligence/page-captures", "Read scoped web-page capture metadata and gallery readiness"),
+  write("post", "/api/v2/missions/:missionId/intelligence/page-captures", "Record one supplied, attributable web-page capture result without initiating network activity"),
+  read("/api/v2/missions/:missionId/intelligence/page-captures/:captureId", "Read one web-page capture, provenance, sensitivity, and canonical artifact links"),
+  read("/api/v2/missions/:missionId/script-artifacts", "Read scoped generated-script artifacts and immutable version summaries"),
+  write("post", "/api/v2/missions/:missionId/script-artifacts", "Create one documented source artifact without executing it"),
+  read("/api/v2/missions/:missionId/script-artifacts/:scriptArtifactId", "Read one documented script artifact, immutable versions, and verified source"),
+  write("post", "/api/v2/missions/:missionId/script-artifacts/:scriptArtifactId/versions", "Create one immutable, documented script-source version without executing it"),
   read("/api/v2/observability/traces", "Search scoped correlated trace summaries"),
   read("/api/v2/observability/traces/:traceId", "Read a bounded correlated trace waterfall"),
   read("/api/v2/observability/events", "Search semantic operational events"),
@@ -135,24 +196,50 @@ export const COMMAND_OS_V2_ENDPOINTS: readonly V2EndpointContract[] = [
   read("/api/v2/brain/context-packs", "Search persisted memory influence packs"),
   read("/api/v2/brain/context-packs/:contextPackId", "Read persisted memory influence"),
   write("post", "/api/v2/brain/candidates/:candidateId/confirm", "Confirm a memory candidate"),
-  write("post", "/api/v2/brain/candidates/:candidateId/reject", "Reject a memory candidate"),
+  write("post", "/api/v2/brain/candidates/:candidateId/reject", "Reject a memory candidate, optionally adding a privacy-safe suppression against relearning"),
   write("post", "/api/v2/brain/nodes/:nodeId/correct", "Correct and version a memory node"),
   write("post", "/api/v2/brain/nodes/:nodeId/dispute", "Dispute a memory node"),
   write("post", "/api/v2/brain/nodes/:nodeId/pin", "Pin or unpin a memory node"),
   write("post", "/api/v2/brain/nodes/:nodeId/expire", "Set memory expiry"),
   write("post", "/api/v2/brain/nodes/:nodeId/forget", "Forget memory and remove derived retrieval state"),
   read("/api/v2/brain/vault", "Read Obsidian vault connections"),
+  write("post", "/api/v2/brain/vault/health-check", "Verify bounded Obsidian vault filesystem round-trip health"),
   write("post", "/api/v2/brain/vault/connect", "Connect an allowed Obsidian vault"),
   write("post", "/api/v2/brain/vault/export", "Project memory into an Obsidian vault"),
   write("post", "/api/v2/brain/vault/import", "Import reviewable Obsidian notes"),
   write("post", "/api/v2/brain/vault/sync", "Synchronize an Obsidian vault"),
+  write("post", "/api/v2/brain/vault/repair", "Repair and reconcile a connected Obsidian vault without overwriting operator edits"),
+  write("post", "/api/v2/brain/vault/reindex", "Incrementally refresh canonical search projection from managed Obsidian notes"),
   write("post", "/api/v2/brain/vault/portable-export", "Create a portable vault archive"),
   read("/api/v2/brain/vault/portable-exports/:connectionId/:archiveName", "Download a portable vault archive"),
   read("/api/v2/brain/vault/deep-link", "Create a safe Obsidian deep link"),
   read("/api/v2/brain/vault/conflicts", "Read vault sync conflicts"),
   read("/api/v2/brain/vault/conflicts/:conflictId", "Read a vault conflict"),
   write("post", "/api/v2/brain/vault/conflicts/:conflictId/resolve", "Resolve a versioned vault conflict"),
+  ...[
+    ["approve", "Approve one exact represented Guided action"],
+    ["reject", "Reject one exact represented Guided action"],
+    ["manual-result", "Attach one interpreted manual result to a Guided decision"],
+    ["skip", "Skip one exact represented Guided action"],
+    ["stop", "Stop a Guided mission at the represented action"],
+  ].map(([command, summary]) =>
+    write("post", `/api/v2/guided-decisions/:decisionId/${command}`, summary)),
+  ...["pause", "resume", "cancel"].map((command) =>
+    write("post", `/api/v2/runs/:runId/${command}`, `${command[0]!.toUpperCase()}${command.slice(1)} a canonical run`)),
+  ...[
+    ["explain-more", "Explain the represented Guided step in more depth"],
+    ["show-next-step", "Recommend one bounded next Guided step"],
+    ["use-another-approach", "Propose a materially different Guided approach"],
+    ["interpret-result", "Interpret operator-supplied Guided output"],
+  ].map(([command, summary]) =>
+    write("post", `/api/v2/guided/:missionId/commander/${command}`, summary)),
 ] as const;
+
+/**
+ * The accelerated live hybrid mounts the real runtime and Guided provider
+ * adapters, so no implemented V2 route remains advertised as deferred.
+ */
+export const COMMAND_OS_V2_DEFERRED_ENDPOINTS: readonly V2DeferredEndpointContract[] = [];
 
 const operationId = (endpoint: V2EndpointContract): string => {
   const resource = endpoint.path
@@ -197,6 +284,7 @@ export function createCommandOsOpenApiDocument(): Record<string, unknown> {
     }
     const isEventStream = endpoint.path === "/api/v2/events/stream";
     const isArtifactDownload = endpoint.path === "/api/v2/intelligence/artifacts/:artifactId/download";
+    const isFailureDiagnosisResolution = endpoint.path === "/api/v2/operational-truth/missions/:missionId/runs/:runId/failure-diagnoses/:diagnosisId/resolve";
     const successStatus = endpoint.path === "/api/v2/missions" && endpoint.method === "post"
       ? "201"
       : "200";
@@ -207,12 +295,14 @@ export function createCommandOsOpenApiDocument(): Record<string, unknown> {
       tags: [tagFor(endpoint.path)],
       security: [{ bearerToken: [] }, { dashboardHeader: [] }, { dashboardCookie: [] }],
       parameters,
-      ...(endpoint.method === "get" ? {} : {
+      ...(endpoint.requestBodyRequired ? {
         requestBody: {
           required: true,
-          content: { "application/json": { schema: { type: "object" } } },
+          content: { "application/json": { schema: isFailureDiagnosisResolution
+            ? { $ref: "#/components/schemas/FailureDiagnosisResolutionRequest" }
+            : { type: "object" } } },
         },
-      }),
+      } : {}),
       responses: {
         [successStatus]: isEventStream
           ? {
@@ -265,6 +355,13 @@ export function createCommandOsOpenApiDocument(): Record<string, unknown> {
       description: "Canonical mission, runtime, evidence, learning, observability, and user-owned Second Brain contract.",
     },
     servers: [{ url: "/", description: "Authenticated ChillsPwn host" }],
+    "x-command-os-deferred-operations": COMMAND_OS_V2_DEFERRED_ENDPOINTS.map((endpoint) => ({
+      method: endpoint.method,
+      path: openApiPath(endpoint.path),
+      summary: endpoint.summary,
+      reason: endpoint.reason,
+      requiredAdapters: endpoint.requiredAdapters,
+    })),
     paths,
     components: {
       headers: {
@@ -283,6 +380,7 @@ export function createCommandOsOpenApiDocument(): Record<string, unknown> {
           type: "apiKey",
           in: "header",
           name: "X-Dashboard-Token",
+          description: "DASHBOARD_TOKEN supplied through the host dashboard header boundary.",
         },
         dashboardCookie: {
           type: "apiKey",
@@ -303,6 +401,16 @@ export function createCommandOsOpenApiDocument(): Record<string, unknown> {
       schemas: {
         Journey: { type: "string", enum: [...COMMAND_OS_JOURNEYS] },
         RunState: { type: "string", enum: [...COMMAND_OS_RUN_STATES] },
+        FailureDiagnosisResolutionRequest: {
+          type: "object",
+          additionalProperties: false,
+          required: ["actionKind", "verifiedOutcome", "confirmed"],
+          properties: {
+            actionKind: { type: "string", enum: [...FAILURE_OPERATOR_ACTION_KINDS] },
+            verifiedOutcome: { type: "string", minLength: 16, maxLength: 4_000 },
+            confirmed: { type: "boolean", const: true },
+          },
+        },
         ErrorResponse: {
           type: "object",
           required: ["error"],
@@ -333,44 +441,43 @@ export function createCommandOsOpenApiDocument(): Record<string, unknown> {
 export function operationalEventJsonSchema(): Record<string, unknown> {
   return {
     $schema: "https://json-schema.org/draft/2020-12/schema",
-    $id: "https://chillspwn.local/contracts/v2.1/operational-event.schema.json",
+    $id: "https://chillspwn.local/contracts/v2.4/operational-event.schema.json",
     title: "Command OS Operational Event",
     type: "object",
     additionalProperties: false,
     required: [
-      "id", "sequence", "eventType", "timestamp", "actor", "summary",
-      "payload", "schemaVersion", "sensitivity", "redacted", "journey",
+      "id", "sequence", "type", "timestamp", "missionId", "runId", "journey",
+      "summary", "actor", "payload", "schemaVersion", "traceId", "spanId",
+      "sensitivity", "redaction", "contextPackId",
     ],
     properties: {
       id: { type: "string", minLength: 1 },
       sequence: { type: "integer", minimum: 1 },
-      eventType: { type: "string", minLength: 1 },
+      type: { type: "string", minLength: 1 },
       timestamp: { type: "string", format: "date-time" },
-      missionId: { type: "string" },
-      runId: { type: "string" },
-      planVersion: { type: "integer", minimum: 1 },
-      stepId: { type: "string" },
-      actionId: { type: "string" },
-      assignmentId: { type: "string" },
-      guidedDecisionId: { type: "string" },
-      approvalId: { type: "string" },
-      contextPackId: { type: "string" },
-      traceId: { type: "string" },
-      spanId: { type: "string" },
+      missionId: { type: "string", minLength: 1 },
+      runId: { type: "string", minLength: 1 },
+      contextPackId: { type: ["string", "null"] },
+      traceId: { type: ["string", "null"] },
+      spanId: { type: ["string", "null"] },
       actor: {
         type: "object",
         additionalProperties: false,
         required: ["type", "id"],
         properties: {
-          type: { type: "string", enum: ["operator", "agent", "system", "provider", "tool"] },
-          id: { type: "string" },
+          type: { type: "string", enum: ["operator", "agent", "worker", "system", "provider", "tool"] },
+          id: { type: ["string", "null"] },
         },
       },
       summary: { type: "string", minLength: 1 },
       payload: {},
-      schemaVersion: { const: COMMAND_OS_API_VERSION },
+      schemaVersion: {
+        type: "integer",
+        minimum: 1,
+        description: "Version of the durable event payload, independent of the HTTP API version.",
+      },
       sensitivity: { type: "string", enum: ["public", "internal", "private", "restricted"] },
-      redacted: { type: "boolean" },
+      redaction: {},
       journey: { type: "string", enum: [...COMMAND_OS_JOURNEYS] },
     },
   };

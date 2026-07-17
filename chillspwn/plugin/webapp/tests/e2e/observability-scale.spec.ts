@@ -8,7 +8,7 @@ import {
 } from "./support/seed-observability-scale";
 
 interface CursorPage<T> {
-  readonly schemaVersion: "2.1";
+  readonly schemaVersion: "2.4";
   readonly items: readonly T[];
   readonly nextCursor: string | null;
 }
@@ -47,7 +47,7 @@ interface TraceRecord {
 }
 
 interface TraceDetail {
-  readonly schemaVersion: "2.1";
+  readonly schemaVersion: "2.4";
   readonly trace: TraceSummary;
   readonly records: CursorPage<TraceRecord>;
 }

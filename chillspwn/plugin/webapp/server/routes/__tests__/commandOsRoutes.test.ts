@@ -2,11 +2,52 @@ import { afterEach, describe, expect, test } from "bun:test";
 import type { AddressInfo } from "node:net";
 import type { Server } from "node:http";
 import express from "express";
+import { AGENT_ROSTER } from "../../agents/agentRoster";
+import { buildHybridRuntimeSourceManifests } from "../../app/RuntimeCapabilityManifestAdapter";
+import { ControlPlaneLeaseError, ControlPlaneLeaseService } from "../../control-plane";
 import { createDatabaseConnection, migrateDatabase } from "../../db";
 import type { AutonomousMissionRequest, GuidedMissionRequest, ReadinessCheckProvider } from "../../missions";
+import { EVIDENCE_KINDS, RISK_LEVELS } from "../../runtime/types";
 import { createCommandOsRouter } from "../commandOsRoutes";
 
 const servers: Server[] = [];
+const ROUTE_LEASE_OWNER = "command-os-route-test-runtime";
+const ROUTE_LEASE_TOKEN = "command-os-route-test-runtime-token-0001";
+
+function testRunMutationLease(database: ReturnType<typeof createDatabaseConnection>) {
+  const leases = new ControlPlaneLeaseService(database);
+  return ({ runId }: { readonly runId: string }) => {
+    const now = new Date();
+    try {
+      return leases.assertMutationAuthority({
+        runId,
+        controlPlane: "command_os_v2",
+        leaseOwner: ROUTE_LEASE_OWNER,
+        leaseToken: ROUTE_LEASE_TOKEN,
+        now,
+      });
+    } catch (error) {
+      if (!(error instanceof ControlPlaneLeaseError) || !["lease_missing", "lease_expired"].includes(error.code)) {
+        throw error;
+      }
+      leases.acquire({
+        runId,
+        controlPlane: "command_os_v2",
+        leaseOwner: ROUTE_LEASE_OWNER,
+        leaseToken: ROUTE_LEASE_TOKEN,
+        ttlMs: 300_000,
+        now,
+      });
+      return leases.assertMutationAuthority({
+        runId,
+        controlPlane: "command_os_v2",
+        leaseOwner: ROUTE_LEASE_OWNER,
+        leaseToken: ROUTE_LEASE_TOKEN,
+        now,
+      });
+    }
+  };
+}
 
 afterEach(async () => {
   await Promise.all(
@@ -33,6 +74,86 @@ function provider(status: "pass" | "fail"): ReadinessCheckProvider {
       remediation: status === "fail" ? "Restore the enforcing runtime." : undefined,
     }),
   };
+}
+
+function runtimeManifests() {
+  const source = AGENT_ROSTER.find(({ agentId }) => agentId === "ReconScout");
+  if (!source) throw new Error("ReconScout fixture is unavailable");
+  const agent = {
+    ...source,
+    agentId: "agent-recon",
+    displayName: "Recon specialist",
+    allowedMcpServers: ["runtime-recon"],
+    allowedTools: ["nmap"],
+    approvalRequiredTools: [],
+  };
+  const observedAt = "2026-07-17T00:00:00.000Z";
+  const readiness = {
+    actionBoundaryActive: true,
+    delegationEnforced: true,
+    noHandsCommanderEnforced: true,
+    directCommanderToolsDenied: true,
+    specialistAssignmentRequired: true,
+    specialistsConfigured: 1,
+    providers: [{
+      id: "grok-acp",
+      health: "healthy" as const,
+      authenticated: true,
+      callable: true,
+      attestedAt: observedAt,
+      supportsGuided: true,
+      enforcesAutonomousBoundary: true,
+      reportsExactTokenUsage: true,
+      reportsExactCostUsage: true,
+    }],
+    mcp: {
+      enabled: true,
+      executionMode: "enabled" as const,
+      startPermitted: true,
+      configuredServers: 1,
+      runnableServers: 1,
+      missingDependencies: 0,
+      missingSecrets: 0,
+    },
+    eventStream: "healthy" as const,
+    secondBrain: "healthy" as const,
+    legacyExecutionEnabled: false,
+  };
+  return buildHybridRuntimeSourceManifests({
+    riskLevels: RISK_LEVELS,
+    evidenceKinds: EVIDENCE_KINDS,
+    agents: [agent],
+    projectedAgents: [{
+      id: agent.agentId,
+      role: agent.specialty,
+      displayName: agent.displayName,
+      status: "available",
+      providerPolicy: {},
+      toolPolicy: {},
+      configuration: {},
+      version: "test",
+      capabilities: [],
+    }],
+    toolInventory: [{
+      agentId: agent.agentId,
+      role: agent.specialty,
+      description: agent.description,
+      mcpServer: "runtime-recon",
+      toolNames: ["nmap"],
+      safetyBoundaries: agent.safetyBoundaries,
+    }],
+    mcpServers: [{
+      id: "mcp:runtime-recon",
+      name: "runtime-recon",
+      transport: "stdio",
+      status: "healthy",
+      capabilities: ["nmap"],
+      policy: {},
+    }],
+    providers: readiness.providers,
+    readiness,
+    observedAt,
+  });
 }
 
 async function application(status: "pass" | "fail" = "pass") {
@@ -83,6 +204,8 @@ async function application(status: "pass" | "fail" = "pass") {
       database,
       readinessProviders: [provider(status)],
       resolveActor: () => "operator-route-test",
+      readRuntimeManifests: runtimeManifests,
+      assertRunMutationLease: testRunMutationLease(database),
     }),
   );
   const server = app.listen(0, "127.0.0.1");
@@ -107,6 +230,7 @@ const autonomous: AutonomousMissionRequest = {
     allowedActionClasses: ["reconnaissance"],
     prohibitedActionClasses: [],
     destructivePolicy: "prohibited",
+    boundedDestructiveTargets: [],
     evidenceRequirements: [],
     timeBudgetMinutes: 30,
     retryBudget: 2,
@@ -141,6 +265,71 @@ const guided: GuidedMissionRequest = {
 };
 
 describe("Command OS V2 routes", () => {
+  test("derives checklist options from live manifests and launches the minimal recommended contract", async () => {
+    const { database, url } = await application("pass");
+    try {
+      const registryResponse = await fetch(`${url}/api/v2/registries/intake?journey=autonomous&templateId=safe_recon`);
+      expect(registryResponse.status).toBe(200);
+      const registry = await registryResponse.json() as any;
+      expect(registry).toMatchObject({
+        schemaVersion: "2.4",
+        source: { status: "live" },
+        actionClasses: { autonomousLaunchReady: true },
+      });
+      expect(registry.actionClasses.classes.port_service_enumeration).toMatchObject({
+        policyState: "pre_authorized",
+        capability: { availability: "supported", enforcementReady: true },
+      });
+      expect(registry.actionClasses.classes.passive_intelligence_osint.policyState).toBe("prohibited");
+      expect(registry.safeStops.mandatory.length).toBeGreaterThan(0);
+      expect(registry.safeStops.optional.length).toBeGreaterThan(0);
+
+      const resolvedResponse = await fetch(`${url}/api/v2/registries/intake/resolve`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          journey: "autonomous",
+          authorizationAcknowledged: true,
+          targets: [{ value: "lab:reapertwo" }],
+        }),
+      });
+      expect(resolvedResponse.status).toBe(200);
+      const resolved = await resolvedResponse.json() as any;
+      expect(resolved.request.contract.allowedActionClasses).toEqual([
+        "active_host_discovery",
+        "port_service_enumeration",
+      ]);
+      expect(resolved.request.contract.boundedDestructiveTargets).toEqual([]);
+      expect(resolved.inferredFields).toContain("deliverables");
+
+      const preflightResponse = await fetch(`${url}/api/v2/missions/autonomous/preflight`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(resolved.request),
+      });
+      expect(preflightResponse.status).toBe(200);
+      const preflight = await preflightResponse.json() as any;
+      expect(preflight.readiness.status).toBe("ready");
+
+      const launchResponse = await fetch(`${url}/api/v2/missions`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Idempotency-Key": "minimal-registry-mission-0001",
+        },
+        body: JSON.stringify({ ...resolved.request, contractReview: preflight.contract }),
+      });
+      expect(launchResponse.status).toBe(201);
+      expect(await launchResponse.json()).toMatchObject({
+        mission: { journey: "autonomous" },
+        run: { journey: "autonomous", status: "planning" },
+      });
+      expect(database.prepare("SELECT COUNT(*) AS count FROM missions").get()).toEqual({ count: 1 });
+    } finally {
+      database.close();
+    }
+  });
+
   test("rejects an open-ended destructive-action policy at the API boundary", async () => {
     const { database, url } = await application("pass");
     try {
@@ -158,7 +347,7 @@ describe("Command OS V2 routes", () => {
           code: "invalid_mission_request",
           traceId: "invalid-destructive-policy",
           details: {
-            issues: ["contract.destructivePolicy must be one of: prohibited, contract_only"],
+            issues: ["contract.destructivePolicy must be one of: prohibited, validate_without_executing, bounded_lab_only, contract_only"],
           },
         },
       });
@@ -289,7 +478,7 @@ describe("Command OS V2 routes", () => {
       const overview = await fetch(`${url}/api/v2/overview`);
       expect(overview.status).toBe(200);
       expect(await overview.json()).toMatchObject({
-        schemaVersion: "2.1",
+        schemaVersion: "2.4",
         readiness: { status: "ready", score: 100 },
         summary: { activeMissions: 1 },
         missions: [{ id: created.mission.id, journey: "guided", status: "planning" }],
@@ -297,7 +486,7 @@ describe("Command OS V2 routes", () => {
 
       const page = await fetch(`${url}/api/v2/missions?limit=1&journey=guided`);
       expect(await page.json()).toMatchObject({
-        schemaVersion: "2.1",
+        schemaVersion: "2.4",
         items: [{ id: created.mission.id, journey: "guided" }],
         nextCursor: null,
       });
@@ -549,6 +738,7 @@ describe("Command OS V2 routes", () => {
         database,
         readinessProviders: [provider("fail")],
         resolveActor: () => "operator-route-test",
+        assertRunMutationLease: testRunMutationLease(database),
       }));
       const restartedServer = restartedApp.listen(0, "127.0.0.1");
       servers.push(restartedServer);

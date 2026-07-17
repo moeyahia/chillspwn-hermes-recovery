@@ -3,6 +3,7 @@ import type { SqliteDatabase } from "../db";
 import { inImmediateTransaction } from "../db";
 import type { JsonValue } from "../events";
 import { EventRepository } from "../events";
+import { evaluateDestructiveAuthorization } from "../domain";
 import { redactSensitiveText } from "../guided-commander/validation";
 import type { DurableActionIntent, RunLeaseToken } from "../orchestration";
 import {
@@ -26,6 +27,17 @@ import type {
   StoredPlanStep,
 } from "./types";
 import { CommandRuntimeError } from "./types";
+
+function normalizeContractTarget(target: string): string {
+  const trimmed = target.trim().normalize("NFKC");
+  try {
+    const url = new URL(trimmed);
+    url.hostname = url.hostname.toLocaleLowerCase("en-US");
+    return url.toString();
+  } catch {
+    return trimmed.toLocaleLowerCase("en-US");
+  }
+}
 
 interface MissionRow {
   readonly id: string;
@@ -248,6 +260,7 @@ function mapPlan(row: PlanRow, steps: StepRow[]): StoredPlan {
         assignedAgentId: step.assigned_agent_id ?? "",
         riskClass: step.risk_class ?? "",
         successCriteria: jsonArray(step.success_criteria_json),
+        dependencyStepIds: [...represented.dependencies],
         action: represented.action,
         explanation: represented.explanation,
         rationale: represented.rationale,
@@ -310,6 +323,24 @@ export class RuntimeRepository {
     this.events = new EventRepository(database);
   }
 
+  /** Minimal ownership projection used by shared control-plane guards. */
+  getControlPlaneOwnership(runId: string): {
+    readonly runId: string;
+    readonly missionId: string;
+    readonly controlPlane: "legacy" | "command_os_v2";
+  } | undefined {
+    const row = this.database.prepare(
+      "SELECT id, mission_id, control_plane FROM runs WHERE id = ?",
+    ).get(runId) as {
+      readonly id: string;
+      readonly mission_id: string;
+      readonly control_plane: "legacy" | "command_os_v2";
+    } | undefined;
+    return row
+      ? { runId: row.id, missionId: row.mission_id, controlPlane: row.control_plane }
+      : undefined;
+  }
+
   /**
    * Close every nonterminal child record after the coordinator has propagated
    * cooperative cancellation to provider/MCP processes. This prevents queued
@@ -359,6 +390,12 @@ export class RuntimeRepository {
       SELECT id FROM runs
       WHERE status IN ('planning', 'recovering')
         AND (lease_expires_at IS NULL OR lease_expires_at <= ?)
+        AND NOT EXISTS (
+          SELECT 1 FROM runtime_continuations continuation
+          WHERE continuation.run_id = runs.id
+            AND continuation.kind = 'planning_retry_to_dispatch'
+            AND continuation.status IN ('pending', 'processing')
+        )
       ORDER BY updated_at ASC, id ASC LIMIT ?
     `).all(now, limit) as Array<{ id: string }>).map((row) => row.id);
   }
@@ -728,6 +765,12 @@ export class RuntimeRepository {
     const destructivePolicy = typeof policy.destructivePolicy === "string"
       ? normalizePolicyValue(policy.destructivePolicy)
       : "";
+    const boundedDestructiveTargets = new Set(
+      (Array.isArray(policy.boundedDestructiveTargets) ? policy.boundedDestructiveTargets : [])
+        .filter((item): item is string => typeof item === "string")
+        .map(normalizeContractTarget)
+        .filter(Boolean),
+    );
     const specialists = new Set(
       (Array.isArray(policy.specialistAgentIds) ? policy.specialistAgentIds : [])
         .filter((item): item is string => typeof item === "string")
@@ -743,15 +786,22 @@ export class RuntimeRepository {
     }
     const targets = new Set(
       (this.database.prepare(`
-        SELECT target FROM mission_targets WHERE mission_id = (
+        SELECT normalized_target FROM mission_targets WHERE mission_id = (
           SELECT mission_id FROM runs WHERE id = ?
         ) AND disposition = 'allowed'
-      `).all(runId) as Array<{ target: string }>).map((row) => row.target.trim()),
+      `).all(runId) as Array<{ normalized_target: string }>).map((row) => row.normalized_target),
     );
     for (const step of plan.steps) {
       const actionType = normalizePolicyValue(step.action.actionType);
       const actionClass = normalizePolicyValue(step.action.actionClass);
-      if (step.action.destructive && destructivePolicy !== "contract_only") {
+      const normalizedTarget = normalizeContractTarget(step.action.target);
+      const destructiveAuthorization = evaluateDestructiveAuthorization({
+        destructive: step.action.destructive,
+        policy: destructivePolicy,
+        target: normalizedTarget,
+        boundedTargets: [...boundedDestructiveTargets],
+      });
+      if (!destructiveAuthorization.allowed) {
         throw new CommandRuntimeError(
           409,
           "autonomous_destructive_action_not_authorized",
@@ -764,8 +814,10 @@ export class RuntimeRepository {
               actionType,
               actionClass,
               destructivePolicy: destructivePolicy || "missing",
+              destructiveAuthorization: destructiveAuthorization.reason,
+              boundedTargetCount: boundedDestructiveTargets.size,
             },
-            remediation: "Use a non-destructive in-contract alternative or create a versioned contract amendment before a new run.",
+            remediation: "Use a non-destructive alternative, validation-only handling, or create a versioned contract amendment naming the exact disposable lab target.",
           },
         );
       }
@@ -774,7 +826,7 @@ export class RuntimeRepository {
         !allowed.has(actionClass) ||
         prohibited.has(actionType) ||
         prohibited.has(actionClass) ||
-        !targets.has(step.action.target.trim()) ||
+        !targets.has(normalizedTarget) ||
         !specialists.has(step.assignedAgentId)
       ) {
         throw new CommandRuntimeError(409, "autonomous_plan_outside_contract", "Plan contains an out-of-contract action", {

@@ -4,6 +4,7 @@ import { NavigationProvider, useNavigation } from "./app/router/navigation";
 import { RouteView } from "./app/router/RouteView";
 import { AppShell } from "./app/shell/AppShell";
 import "./design-system/tokens/command-os.css";
+import "./design-system/tokens/feature-surfaces.css";
 
 function ApplicationRoute() {
   const { pathname } = useNavigation();

@@ -76,7 +76,7 @@ function seed(database: ReturnType<typeof createDatabaseConnection>, includeSele
       summary: statement,
       body: "Use the bounded read-only observation only when it remains in the signed scope.",
       scope: { kind: "engagement", engagementId: "eng-reuse" },
-      sensitivity: "private",
+      sensitivity: "internal",
       confidence: 0.9,
       lifecycleStatus: "verified",
       confirmationState: "not_required",
@@ -87,7 +87,11 @@ function seed(database: ReturnType<typeof createDatabaseConnection>, includeSele
       },
       authorType: "operator",
       authorId: "reviewer-independent",
-      retentionPolicy: { allowAutonomous: true, allowGuided: true },
+      retentionPolicy: {
+        allowAutonomous: true,
+        allowGuided: true,
+        publicProviderDisclosure: "sanitized",
+      },
     });
     return nodeId;
   };
@@ -249,7 +253,7 @@ describe("follow-up verified lesson planning attribution", () => {
         summary: "This body must never reach the planner.",
         body: "CANARY_NONCANONICAL_LESSON_BODY",
         scope: { kind: "engagement", engagementId: "eng-reuse" },
-        sensitivity: "private",
+        sensitivity: "internal",
         confidence: 0.99,
         lifecycleStatus: "verified",
         confirmationState: "not_required",
@@ -260,7 +264,11 @@ describe("follow-up verified lesson planning attribution", () => {
         },
         authorType: "agent",
         authorId: "poison-fixture",
-        retentionPolicy: { allowAutonomous: true, allowGuided: true },
+        retentionPolicy: {
+          allowAutonomous: true,
+          allowGuided: true,
+          publicProviderDisclosure: "sanitized",
+        },
       });
       database.prepare(`
         INSERT INTO run_context_selections (
@@ -331,7 +339,7 @@ describe("follow-up verified lesson planning attribution", () => {
         summary: "This cross-engagement content must never reach the planner.",
         body: "CANARY_CROSS_ENGAGEMENT_LESSON_BODY",
         scope: { kind: "engagement", engagementId: "eng-reuse" },
-        sensitivity: "private",
+        sensitivity: "internal",
         confidence: 0.95,
         lifecycleStatus: "verified",
         confirmationState: "not_required",
@@ -342,7 +350,11 @@ describe("follow-up verified lesson planning attribution", () => {
         },
         authorType: "agent",
         authorId: "poison-fixture",
-        retentionPolicy: { allowAutonomous: true, allowGuided: true },
+        retentionPolicy: {
+          allowAutonomous: true,
+          allowGuided: true,
+          publicProviderDisclosure: "sanitized",
+        },
       });
       database.prepare(`
         INSERT INTO run_context_selections (

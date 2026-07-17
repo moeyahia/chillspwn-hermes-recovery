@@ -88,7 +88,7 @@ export interface SavedMissionView {
 }
 
 export interface SavedMissionViewCollection {
-  schemaVersion: "2.1";
+  schemaVersion: "2.4";
   version: number;
   items: SavedMissionView[];
 }
@@ -100,7 +100,7 @@ export interface MissionBulkItemOutcome {
 }
 
 export interface MissionBulkArchiveResult {
-  schemaVersion: "2.1";
+  schemaVersion: "2.4";
   selectionHash: string;
   outcomes: MissionBulkItemOutcome[];
   archivedCount: number;
@@ -132,7 +132,7 @@ export interface MissionExportRecord {
 }
 
 export interface MissionBulkExportResult {
-  schemaVersion: "2.1";
+  schemaVersion: "2.4";
   generatedAt: string;
   selectionHash: string;
   exportSha256: string;
@@ -164,7 +164,7 @@ export interface AgentSummary {
 }
 
 export interface OverviewSnapshot {
-  schemaVersion: "2.1";
+  schemaVersion: "2.4";
   readiness: ReadinessSummary;
   summary: {
     activeMissions: number;
@@ -202,7 +202,7 @@ export interface MissionRecord {
 }
 
 export interface MissionPage {
-  schemaVersion: "2.1";
+  schemaVersion: "2.4";
   items: MissionSummary[];
   nextCursor: string | null;
 }
@@ -234,7 +234,12 @@ export interface AutonomousMissionRequest {
   contract: {
     allowedActionClasses: string[];
     prohibitedActionClasses: string[];
-    destructivePolicy: "prohibited" | "contract_only";
+    destructivePolicy:
+      | "prohibited"
+      | "validate_without_executing"
+      | "bounded_lab_only"
+      | "contract_only";
+    boundedDestructiveTargets: string[];
     evidenceRequirements: string[];
     timeBudgetMinutes: number;
     tokenBudget?: number;
@@ -316,7 +321,7 @@ export interface AutonomousSpecialistCandidate {
 }
 
 export interface AutonomousMissionPreflight {
-  schemaVersion: "2.1";
+  schemaVersion: "2.4";
   contract: { version: 1; hash: string };
   readiness: ReadinessSummary;
   context: {
@@ -352,7 +357,7 @@ export type VersionedAutonomousMissionPreflight = Omit<AutonomousMissionPrefligh
 export type AutonomousBranchMode = "unchanged_contract" | "contract_amendment";
 
 export interface AutonomousBranchContext {
-  schemaVersion: "2.1";
+  schemaVersion: "2.4";
   mission: { id: string; name: string; version: number };
   sourceRun: {
     id: string; status: string; statusReason: string | null; version: number;
@@ -367,7 +372,7 @@ export interface AutonomousBranchContext {
 }
 
 export interface AutonomousBranchPreflight {
-  schemaVersion: "2.1";
+  schemaVersion: "2.4";
   mode: AutonomousBranchMode;
   sourceRunId: string;
   sourceRunVersion: number;
@@ -382,7 +387,7 @@ export interface AutonomousBranchPreflight {
 }
 
 export interface AutonomousBranchResult {
-  schemaVersion: "2.1";
+  schemaVersion: "2.4";
   sourceRunId: string;
   branchMode: AutonomousBranchMode;
   run: {
@@ -421,12 +426,23 @@ export interface ApiErrorEnvelope {
 }
 
 export interface OperationalEvent {
-  id: string;
-  sequence?: number;
-  type: string;
-  timestamp: string;
-  missionId?: string;
-  runId?: string;
-  journey?: Journey;
-  summary: string;
+  readonly id: string;
+  readonly sequence: number;
+  readonly type: string;
+  readonly timestamp: string;
+  readonly missionId: string;
+  readonly runId: string;
+  readonly journey: Journey;
+  readonly summary: string;
+  readonly actor: {
+    readonly type: "operator" | "agent" | "worker" | "provider" | "tool" | "system";
+    readonly id: string | null;
+  };
+  readonly payload: unknown;
+  readonly schemaVersion: number;
+  readonly traceId: string | null;
+  readonly spanId: string | null;
+  readonly sensitivity: "public" | "internal" | "private" | "restricted";
+  readonly redaction: unknown;
+  readonly contextPackId: string | null;
 }

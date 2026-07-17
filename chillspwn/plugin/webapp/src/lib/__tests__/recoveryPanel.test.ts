@@ -3,7 +3,7 @@ import { parseRecoveryMutation, parseRunRecovery } from "../../domain/schemas/op
 
 function projection() {
   return {
-    schemaVersion: "2.1",
+    schemaVersion: "2.4",
     recoveryRequired: true,
     run: {
       id: "run-1", missionId: "mission-1", missionName: "Authorized lab", journey: "guided", status: "blocked",
@@ -57,7 +57,7 @@ describe("Recovery Panel boundary schema", () => {
 
   test("accepts the exact replacement assignment returned by an enforced mutation", () => {
     const parsed = parseRecoveryMutation({
-      schemaVersion: "2.1",
+      schemaVersion: "2.4",
       mutation: {
         kind: "reassign",
         eventId: "event-reassign",

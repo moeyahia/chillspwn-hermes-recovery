@@ -3,6 +3,7 @@ import { useNavigation } from "../../app/router/navigation";
 import {
   createAutonomousBranch,
   fetchAutonomousBranchContext,
+  fetchMissionIntakeRegistry,
   preflightAutonomousBranch,
 } from "../../data/api/commandOs";
 import { useQuery, useQueryCache } from "../../data/cache/QueryProvider";
@@ -12,9 +13,15 @@ import type {
   AutonomousBranchPreflight,
   AutonomousMissionRequest,
 } from "../../domain/types/commandOs";
+import type { ActionPolicyState, IntakeRegistrySnapshot } from "../../domain/types/intake";
 import type { RuntimeRun } from "../../domain/types/runtimeV2";
 import { Button, Card, ErrorPanel, LoadingPanel, StatusPill } from "../../design-system/components/Primitives";
 import { KeyValueGrid, useActionState } from "../runs/OperationalSurface";
+import {
+  projectAutonomousRegistryFields,
+  registryFieldsFromAutonomousRequest,
+  type AutonomousBranchRegistryFields,
+} from "./autonomousBranchContract";
 import { lines, requestKey, safeNextUrl } from "./formUtils";
 
 const TERMINAL = new Set(["completed", "failed", "cancelled"]);
@@ -28,10 +35,8 @@ interface AmendmentForm {
   prohibitedTargets: string;
   timeWindow: string;
   dataHandling: string;
-  allowedActionClasses: string;
-  prohibitedActionClasses: string;
-  destructivePolicy: "prohibited" | "contract_only";
-  evidenceRequirements: string;
+  destructivePolicy: AutonomousMissionRequest["contract"]["destructivePolicy"];
+  boundedDestructiveTargets: readonly string[];
   timeBudgetMinutes: string;
   tokenBudget: string;
   costBudget: string;
@@ -43,11 +48,10 @@ interface AmendmentForm {
   specialistAgentIds: string;
   memoryScopes: string;
   contextNodeIds: string;
-  safeStopConditions: string;
-  deliverables: string;
+  registryFields: AutonomousBranchRegistryFields;
 }
 
-function formFromRequest(request: AutonomousMissionRequest): AmendmentForm {
+function formFromRequest(request: AutonomousMissionRequest, registry: IntakeRegistrySnapshot): AmendmentForm {
   return {
     title: request.title,
     objective: request.objective,
@@ -57,10 +61,8 @@ function formFromRequest(request: AutonomousMissionRequest): AmendmentForm {
     prohibitedTargets: request.authorization.prohibitedTargets.join("\n"),
     timeWindow: request.authorization.timeWindow ?? "",
     dataHandling: request.authorization.dataHandling ?? "",
-    allowedActionClasses: request.contract.allowedActionClasses.join("\n"),
-    prohibitedActionClasses: request.contract.prohibitedActionClasses.join("\n"),
     destructivePolicy: request.contract.destructivePolicy,
-    evidenceRequirements: request.contract.evidenceRequirements.join("\n"),
+    boundedDestructiveTargets: request.contract.boundedDestructiveTargets ?? [],
     timeBudgetMinutes: String(request.contract.timeBudgetMinutes),
     tokenBudget: request.contract.tokenBudget === undefined ? "" : String(request.contract.tokenBudget),
     costBudget: request.contract.costBudget === undefined ? "" : String(request.contract.costBudget),
@@ -72,8 +74,7 @@ function formFromRequest(request: AutonomousMissionRequest): AmendmentForm {
     specialistAgentIds: request.contract.specialistAgentIds.join("\n"),
     memoryScopes: request.contract.memoryScopes.join("\n"),
     contextNodeIds: request.contract.contextNodeIds.join("\n"),
-    safeStopConditions: request.contract.safeStopConditions.join("\n"),
-    deliverables: request.contract.deliverables.join("\n"),
+    registryFields: registryFieldsFromAutonomousRequest(request, registry),
   };
 }
 
@@ -81,9 +82,14 @@ function numberValue(value: string): number {
   return Number(value.trim());
 }
 
-function requestFromForm(base: AutonomousMissionRequest, form: AmendmentForm): AutonomousMissionRequest {
+function requestFromForm(
+  base: AutonomousMissionRequest,
+  form: AmendmentForm,
+  registry: IntakeRegistrySnapshot,
+): AutonomousMissionRequest {
   const tokenBudget = form.tokenBudget.trim() ? numberValue(form.tokenBudget) : undefined;
   const costBudget = form.costBudget.trim() ? numberValue(form.costBudget) : undefined;
+  const registryContract = projectAutonomousRegistryFields(form.registryFields, registry);
   return {
     ...base,
     title: form.title.trim(),
@@ -99,10 +105,9 @@ function requestFromForm(base: AutonomousMissionRequest, form: AmendmentForm): A
     },
     contract: {
       ...base.contract,
-      allowedActionClasses: lines(form.allowedActionClasses),
-      prohibitedActionClasses: lines(form.prohibitedActionClasses),
+      ...registryContract,
       destructivePolicy: form.destructivePolicy,
-      evidenceRequirements: lines(form.evidenceRequirements),
+      boundedDestructiveTargets: [...form.boundedDestructiveTargets],
       timeBudgetMinutes: numberValue(form.timeBudgetMinutes),
       ...(tokenBudget === undefined ? {} : { tokenBudget }),
       ...(costBudget === undefined ? {} : { costBudget }),
@@ -114,10 +119,17 @@ function requestFromForm(base: AutonomousMissionRequest, form: AmendmentForm): A
       specialistAgentIds: lines(form.specialistAgentIds),
       memoryScopes: lines(form.memoryScopes),
       contextNodeIds: lines(form.contextNodeIds),
-      safeStopConditions: lines(form.safeStopConditions),
-      deliverables: lines(form.deliverables),
     },
   };
+}
+
+function listToggle(current: readonly string[], value: string, checked: boolean): string[] {
+  return checked ? [...new Set([...current, value])] : current.filter((item) => item !== value);
+}
+
+function UnmappedRegistryValues({ label, values }: { readonly label: string; readonly values: readonly string[] }) {
+  if (values.length === 0) return null;
+  return <div className="os-validation-summary" role="status"><strong>{label}</strong><p>These historical contract values are not present in the current runtime registry. They remain preserved for server readiness reconciliation and cannot be newly selected here.</p><ul>{values.map((value) => <li key={value} className="os-mono">{value}</li>)}</ul></div>;
 }
 
 function ReadinessReview({ review }: { review: AutonomousBranchPreflight }) {
@@ -142,6 +154,11 @@ export function AutonomousBranchPanel({ missionId, selectedRun }: { missionId: s
     (signal) => fetchAutonomousBranchContext(missionId, selectedRun.id, signal),
     { staleTime: 0 },
   );
+  const registry = useQuery(
+    "mission-intake:autonomous:custom",
+    (signal) => fetchMissionIntakeRegistry("autonomous", "custom", signal),
+    { staleTime: 30_000 },
+  );
   const control = useActionState();
   const [mode, setMode] = useState<AutonomousBranchMode>("unchanged_contract");
   const [reason, setReason] = useState("");
@@ -158,10 +175,10 @@ export function AutonomousBranchPanel({ missionId, selectedRun }: { missionId: s
   const createKey = useRef(requestKey());
 
   useEffect(() => {
-    if (!context.data || initializedRunId === context.data.sourceRun.id) return;
-    setForm(formFromRequest(context.data.request));
+    if (!context.data || !registry.data || initializedRunId === context.data.sourceRun.id) return;
+    setForm(formFromRequest(context.data.request, registry.data));
     setInitializedRunId(context.data.sourceRun.id);
-  }, [context.data, initializedRunId]);
+  }, [context.data, initializedRunId, registry.data]);
 
   const invalidateReview = () => {
     setReview(undefined);
@@ -175,6 +192,7 @@ export function AutonomousBranchPanel({ missionId, selectedRun }: { missionId: s
     invalidateReview();
     setForm((current) => current ? { ...current, [key]: value } : current);
   };
+  const updateRegistryFields = (fields: AutonomousBranchRegistryFields) => updateForm("registryFields", fields);
   const refreshRuntime = () => {
     cache.invalidatePrefix("mission-runtime:");
     cache.invalidatePrefix("run:");
@@ -185,8 +203,7 @@ export function AutonomousBranchPanel({ missionId, selectedRun }: { missionId: s
     void control.run(
       () => runtimeV2Api.controlRun(
         selectedRun.id,
-        command,
-        stopReason,
+        { command, reason: stopReason },
         requestKey(),
       ).then(() => { refreshRuntime(); }),
       command === "pause"
@@ -197,7 +214,15 @@ export function AutonomousBranchPanel({ missionId, selectedRun }: { missionId: s
 
   const runPreflight = async (event: FormEvent) => {
     event.preventDefault();
-    if (!context.data || !form) return;
+    if (!context.data) return;
+    if (mode === "contract_amendment" && (!form || !registry.data)) {
+      setReviewError(new Error("The live runtime registry must load before an amended contract can be reviewed."));
+      return;
+    }
+    if (mode === "contract_amendment" && form?.destructivePolicy === "contract_only") {
+      setReviewError(new Error("Legacy contract-only authority cannot be carried into a V2.4 amendment. Choose prohibited, validate without executing, or named bounded lab targets."));
+      return;
+    }
     setReviewPending(true);
     setReviewError(undefined);
     setCreateError(undefined);
@@ -208,7 +233,9 @@ export function AutonomousBranchPanel({ missionId, selectedRun }: { missionId: s
         sourceRunVersion: context.data.sourceRun.version,
         mode,
         reason,
-        ...(mode === "contract_amendment" ? { request: requestFromForm(context.data.request, form) } : {}),
+        ...(mode === "contract_amendment" && form && registry.data
+          ? { request: requestFromForm(context.data.request, form, registry.data) }
+          : {}),
       }, preflightKey.current);
       setReview(result);
     } catch (cause) {
@@ -249,7 +276,7 @@ export function AutonomousBranchPanel({ missionId, selectedRun }: { missionId: s
 
   if (context.isLoading) return <LoadingPanel label="Loading signed Autonomous contract history" />;
   if (context.error && !context.data) return <ErrorPanel title="Contract branch controls are unavailable" error={context.error} onRetry={context.refresh} />;
-  if (!context.data || !form) return null;
+  if (!context.data) return null;
   const source = context.data.sourceRun;
   const canPause = !TERMINAL.has(source.status) && source.status !== "blocked";
   const canCancel = !TERMINAL.has(source.status);
@@ -289,9 +316,12 @@ export function AutonomousBranchPanel({ missionId, selectedRun }: { missionId: s
         <label><span>Branch or amendment reason (audited)</span><textarea required minLength={3} rows={3} value={reason} onChange={(event) => { setReason(event.target.value); invalidateReview(); }} placeholder="Why is a new execution attempt necessary?" /></label>
       </Card>
 
-      {mode === "contract_amendment" && <Card className="os-branch-fields">
+      {mode === "contract_amendment" && registry.isLoading && <Card><LoadingPanel label="Loading live contract registries" /></Card>}
+      {mode === "contract_amendment" && registry.error && !registry.data && <Card><ErrorPanel title="Structured contract controls are unavailable" error={registry.error} onRetry={registry.refresh} /></Card>}
+      {mode === "contract_amendment" && registry.data && form && <Card className="os-branch-fields">
         <p className="os-eyebrow">Full successor contract</p><h3>Amend explicit authority</h3>
         <p className="os-muted">Unchanged fields remain copied from contract v{context.data.contract.version}; every submitted field is revalidated by the live readiness gate.</p>
+        <div className="os-registry-source" role="status"><StatusPill status={registry.data.source.status === "live" ? "ready" : "degraded"} /><span><strong>{registry.data.source.status === "live" ? "Live runtime registry" : "Runtime registry unavailable"}</strong><small>{registry.data.source.explanation}</small></span></div>
         <div className="os-branch-field-grid">
           <label><span>Mission title</span><input required value={form.title} onChange={(event) => updateForm("title", event.target.value)} /></label>
           <label className="is-wide"><span>Authorized objective</span><textarea required rows={3} value={form.objective} onChange={(event) => updateForm("objective", event.target.value)} /></label>
@@ -301,10 +331,9 @@ export function AutonomousBranchPanel({ missionId, selectedRun }: { missionId: s
           <label><span>Prohibited targets · one per line</span><textarea rows={4} value={form.prohibitedTargets} onChange={(event) => updateForm("prohibitedTargets", event.target.value)} /></label>
           <label><span>Authorization time window</span><input value={form.timeWindow} onChange={(event) => updateForm("timeWindow", event.target.value)} /></label>
           <label><span>Data-handling constraint</span><input value={form.dataHandling} onChange={(event) => updateForm("dataHandling", event.target.value)} /></label>
-          <label><span>Allowed action classes · one per line</span><textarea required rows={4} value={form.allowedActionClasses} onChange={(event) => updateForm("allowedActionClasses", event.target.value)} /></label>
-          <label><span>Prohibited action classes · one per line</span><textarea rows={4} value={form.prohibitedActionClasses} onChange={(event) => updateForm("prohibitedActionClasses", event.target.value)} /></label>
-          <label><span>Destructive-action policy</span><select value={form.destructivePolicy} onChange={(event) => updateForm("destructivePolicy", event.target.value as AmendmentForm["destructivePolicy"])}><option value="prohibited">Prohibited</option><option value="contract_only">Only when explicitly inside this contract</option></select></label>
-          <label><span>Evidence requirements · one per line</span><textarea rows={4} value={form.evidenceRequirements} onChange={(event) => updateForm("evidenceRequirements", event.target.value)} /></label>
+          <label><span>Destructive-action policy</span><select value={form.destructivePolicy} onChange={(event) => updateForm("destructivePolicy", event.target.value as AmendmentForm["destructivePolicy"])}><option value="prohibited">Prohibited</option><option value="validate_without_executing">Validate the path without executing</option><option value="bounded_lab_only">Named disposable lab targets only</option><option value="contract_only" disabled>Legacy contract-only policy — amend before reuse</option></select></label>
+          {form.destructivePolicy === "contract_only" && <p className="os-policy-note is-wide" role="alert">This immutable legacy value remains readable, but it cannot authorize a V2.4 amendment. Select a current fail-closed policy before review.</p>}
+          {form.destructivePolicy === "bounded_lab_only" && <fieldset className="os-registry-checklist is-wide"><legend>Named bounded destructive targets</legend><p className="os-policy-note">Only exact targets already present in this signed authorization boundary can be selected.</p>{lines(form.allowedTargets).map((target) => <label className="os-check-field" key={target}><input type="checkbox" aria-label={`Bound destructive activity to ${target}`} checked={form.boundedDestructiveTargets.includes(target)} onChange={(event) => updateForm("boundedDestructiveTargets", listToggle(form.boundedDestructiveTargets, target, event.target.checked))} /><span><strong>{target}</strong><small>Exact authorized target · bounded lab-only policy</small></span></label>)}</fieldset>}
           <label><span>Time budget · minutes</span><input type="number" min="1" required value={form.timeBudgetMinutes} onChange={(event) => updateForm("timeBudgetMinutes", event.target.value)} /></label>
           <label><span>Token budget · optional</span><input type="number" min="0" value={form.tokenBudget} onChange={(event) => updateForm("tokenBudget", event.target.value)} /></label>
           <label><span>Cost budget · optional</span><input type="number" min="0" step="0.01" value={form.costBudget} onChange={(event) => updateForm("costBudget", event.target.value)} /></label>
@@ -316,12 +345,17 @@ export function AutonomousBranchPanel({ missionId, selectedRun }: { missionId: s
           <label><span>Signed specialist IDs · one per line</span><textarea required rows={4} value={form.specialistAgentIds} onChange={(event) => updateForm("specialistAgentIds", event.target.value)} /></label>
           <label><span>Allowed memory scopes · one per line</span><textarea rows={4} value={form.memoryScopes} onChange={(event) => updateForm("memoryScopes", event.target.value)} /></label>
           <label><span>Exact context-node IDs · one per line</span><textarea rows={4} value={form.contextNodeIds} onChange={(event) => updateForm("contextNodeIds", event.target.value)} /></label>
-          <label><span>Safe-stop conditions · one per line</span><textarea required rows={4} value={form.safeStopConditions} onChange={(event) => updateForm("safeStopConditions", event.target.value)} /></label>
-          <label><span>Final deliverables · one per line</span><textarea required rows={4} value={form.deliverables} onChange={(event) => updateForm("deliverables", event.target.value)} /></label>
         </div>
+        <details className="os-advanced-section"><summary>Action-class policy matrix · {Object.keys(registry.data.actionClasses.classes).length} classes</summary><div className="os-policy-matrix">{Object.values(registry.data.actionClasses.classes).map((action) => {
+          const state = form.registryFields.actionPolicyStates[action.id] ?? "inherited_default";
+          return <article key={action.id} className="os-policy-row"><div><strong>{action.label}</strong><p>{action.plainLanguageDescription}</p><small>{action.capability.availableAgentIds.length} ready agents · {action.capability.availableToolIds.length} ready tools · {action.capability.enforcedProviderModelRefs.length} enforcing models</small></div><StatusPill status={action.capability.availability} /><label><span>Mission state</span><select aria-label={`${action.label} branch policy`} value={state} onChange={(event) => updateRegistryFields({ ...form.registryFields, actionPolicyStates: { ...form.registryFields.actionPolicyStates, [action.id]: event.target.value as ActionPolicyState } })}><option value="pre_authorized">Pre-authorized</option><option value="guided_only">Guided only / not autonomous</option><option value="prohibited">Prohibited</option><option value="inherited_default">Inherited default</option></select></label>{action.launchBlockingReasons.length > 0 && <ul>{action.launchBlockingReasons.map((reason) => <li key={reason}>{reason}</li>)}</ul>}</article>;
+        })}<UnmappedRegistryValues label="Unmapped allowed action classes" values={form.registryFields.unmatchedAllowedActionClasses} /><UnmappedRegistryValues label="Unmapped prohibited action classes" values={form.registryFields.unmatchedProhibitedActionClasses} /></div></details>
+        <details className="os-advanced-section"><summary>Final deliverables · {form.registryFields.deliverableIds.length} selected</summary><div className="os-registry-checklist">{Object.values(registry.data.deliverables.deliverables).map((item) => <label className="os-check-field" key={item.id}><input type="checkbox" aria-label={`Require ${item.label} deliverable`} checked={form.registryFields.deliverableIds.includes(item.id)} onChange={(event) => updateRegistryFields({ ...form.registryFields, deliverableIds: listToggle(form.registryFields.deliverableIds, item.id, event.target.checked) })} /><span><strong>{item.label}</strong><small>{item.purpose}</small><small>{item.capability.availability} · {item.formats.join(", ")}</small></span></label>)}<UnmappedRegistryValues label="Unmapped historical deliverables" values={form.registryFields.unmatchedDeliverables} /></div></details>
+        <details className="os-advanced-section"><summary>Evidence requirements · {form.registryFields.evidenceTypeIds.length} selected</summary><div className="os-registry-checklist">{Object.values(registry.data.evidenceTypes.types).map((item) => <label className="os-check-field" key={item.id}><input type="checkbox" aria-label={`Require ${item.label} evidence`} checked={form.registryFields.evidenceTypeIds.includes(item.id)} onChange={(event) => updateRegistryFields({ ...form.registryFields, evidenceTypeIds: listToggle(form.registryFields.evidenceTypeIds, item.id, event.target.checked) })} /><span><strong>{item.label}</strong><small>{item.proves}</small><small>{item.capability.availability} · hash {item.immutableHashRequired ? "required" : "optional"} · custody {item.chainOfCustodyRequired ? "required" : "optional"}</small></span></label>)}<UnmappedRegistryValues label="Unmapped historical evidence requirements" values={form.registryFields.unmatchedEvidenceRequirements} /></div></details>
+        <details className="os-advanced-section"><summary>Safe-stop behavior · {form.registryFields.optionalSafeStopIds.length} mission stops</summary><div className="os-registry-checklist"><p className="os-policy-note">A safe stop preserves the checkpoint and explains why the mission cannot continue safely. Mandatory platform stops are always enforced and cannot be removed.</p>{registry.data.safeStops.optional.map((item) => <label className="os-check-field" key={item.id}><input type="checkbox" aria-label={`Enable ${item.label} safe stop`} checked={form.registryFields.optionalSafeStopIds.includes(item.id)} onChange={(event) => updateRegistryFields({ ...form.registryFields, optionalSafeStopIds: listToggle(form.registryFields.optionalSafeStopIds, item.id, event.target.checked) })} /><span><strong>{item.label}</strong><small>{item.explanation}</small></span></label>)}<UnmappedRegistryValues label="Unmapped historical safe-stop conditions" values={form.registryFields.unmatchedSafeStopConditions} /><h3>Always enforced</h3>{registry.data.safeStops.mandatory.map((item) => <div className="os-mandatory-stop" key={item.id}><StatusPill status="enforced" /><span><strong>{item.label}</strong><small>{item.explanation}</small></span></div>)}</div></details>
       </Card>}
 
-      <div className="os-branch-actions"><Button disabled={!source.safeToBranch || reason.trim().length < 3 || reviewPending}>{reviewPending ? "Checking live readiness…" : mode === "contract_amendment" ? "Draft and review amended contract" : "Review unchanged signed contract"}</Button></div>
+      <div className="os-branch-actions"><Button disabled={!source.safeToBranch || reason.trim().length < 3 || reviewPending || (mode === "contract_amendment" && (!form || !registry.data || form.destructivePolicy === "contract_only"))}>{reviewPending ? "Checking live readiness…" : mode === "contract_amendment" ? "Draft and review amended contract" : "Review unchanged signed contract"}</Button></div>
     </form>
 
     {reviewError && <ErrorPanel title="Branch preflight did not pass" error={reviewError} />}

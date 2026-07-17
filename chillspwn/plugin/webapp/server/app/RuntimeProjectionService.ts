@@ -5,6 +5,7 @@ import type {
   ComponentHealth,
   RuntimeReadinessSnapshot,
 } from "./RuntimeReadiness";
+import type { RuntimeSourceManifests } from "../domain";
 
 export type FleetAgentStatus =
   | "available"
@@ -56,6 +57,8 @@ export interface RuntimeProjectionInput {
   readonly readiness: RuntimeReadinessSnapshot;
   readonly agents: readonly FleetAgentProjection[];
   readonly mcpServers: readonly McpServerProjection[];
+  /** Canonical live manifests consumed by the V2.4 mission-intake registries. */
+  readonly capabilityManifests?: RuntimeSourceManifests;
 }
 
 export interface RuntimeProjectionResult {

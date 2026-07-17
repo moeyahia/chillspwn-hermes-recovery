@@ -72,21 +72,21 @@ describe("mission portfolio state", () => {
   test("validates synchronized views and bounded bulk response policy", () => {
     const state = parseMissionPortfolioState({ journey: "guided", evidence: "present", view: "board" });
     expect(parseSavedMissionViewCollection({
-      schemaVersion: "2.1",
+      schemaVersion: "2.4",
       version: 1,
       items: [{ id: "view-1", name: "Evidence", state, createdAt: "2026-07-15T00:00:00Z", updatedAt: "2026-07-15T00:00:00Z" }],
     })).toMatchObject({ version: 1, items: [{ state: { journey: "guided", evidence: "present", view: "board" } }] });
     expect(parseMissionBulkArchive({
-      schemaVersion: "2.1", selectionHash: "a".repeat(64), archivedCount: 1,
+      schemaVersion: "2.4", selectionHash: "a".repeat(64), archivedCount: 1,
       outcomes: [{ missionId: "mission-1", status: "archived", reason: "terminal" }],
     }).archivedCount).toBe(1);
     expect(parseMissionBulkExport({
-      schemaVersion: "2.1", generatedAt: "2026-07-15T00:00:00Z",
+      schemaVersion: "2.4", generatedAt: "2026-07-15T00:00:00Z",
       selectionHash: "a".repeat(64), exportSha256: "b".repeat(64), records: [], outcomes: [],
       policy: { maxBatch: 50, evidenceBlobsIncluded: false, confidentialPayloadsIncluded: false, titlePreviewLimit: 120 },
     }).policy.evidenceBlobsIncluded).toBeFalse();
     expect(() => parseMissionBulkExport({
-      schemaVersion: "2.1", generatedAt: "2026-07-15T00:00:00Z",
+      schemaVersion: "2.4", generatedAt: "2026-07-15T00:00:00Z",
       selectionHash: "a".repeat(64), exportSha256: "b".repeat(64), records: [], outcomes: [],
       policy: { maxBatch: 50, evidenceBlobsIncluded: true, confidentialPayloadsIncluded: false, titlePreviewLimit: 120 },
     })).toThrow("must exclude evidence");

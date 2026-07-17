@@ -187,7 +187,7 @@ describe("exact-step Guided approve and reject controls", () => {
     const first = await fetch(endpoint, request);
     expect(first.status).toBe(200);
     expect(await first.json()).toMatchObject({
-      schemaVersion: "2.1",
+      schemaVersion: "2.4",
       decisionId: "decision-1",
       status: "approved",
       action: { id: "action-1", fingerprint },
@@ -254,7 +254,7 @@ describe("exact-step Guided mission stop control", () => {
     const first = await fetch(endpoint, stopRequest());
     expect(first.status).toBe(200);
     expect(await first.json()).toMatchObject({
-      schemaVersion: "2.1",
+      schemaVersion: "2.4",
       decisionId: "decision-1",
       status: "cancelled",
       run: { id: "run-1", status: "cancelled" },
@@ -344,7 +344,7 @@ describe("exact-step Guided skip route", () => {
     );
     expect(response.status).toBe(200);
     expect(await response.json()).toMatchObject({
-      schemaVersion: "2.1",
+      schemaVersion: "2.4",
       decisionId: "decision-1",
       status: "skipped",
       receipt: {

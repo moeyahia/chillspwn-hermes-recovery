@@ -81,11 +81,11 @@ describe("Command Palette model", () => {
 
   test("validates bounded mission and run search projections", () => {
     expect(parseMissionPage({
-      schemaVersion: "2.1",
+      schemaVersion: "2.4",
       items: [{ id: "mission-a", title: "Mission A", journey: "autonomous", status: "running", updatedAt: "2026-07-15T00:00:00Z" }],
       nextCursor: null,
     }).items[0]).toMatchObject({ id: "mission-a", journey: "autonomous" });
-    expect(parseRunPage({ schemaVersion: "2.1", items: [run("running")] }).items[0]).toMatchObject({ id: "run-credential-audit", status: "running" });
-    expect(() => parseRunPage({ schemaVersion: "2.1", items: [{ ...run("running"), journey: "direct" }] })).toThrow("journey is invalid");
+    expect(parseRunPage({ schemaVersion: "2.4", items: [run("running")] }).items[0]).toMatchObject({ id: "run-credential-audit", status: "running" });
+    expect(() => parseRunPage({ schemaVersion: "2.4", items: [{ ...run("running"), journey: "direct" }] })).toThrow("journey is invalid");
   });
 });

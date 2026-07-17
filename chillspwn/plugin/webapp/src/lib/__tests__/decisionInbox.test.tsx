@@ -18,7 +18,7 @@ const base = {
 
 function payload() {
   return {
-    schemaVersion: "2.1",
+    schemaVersion: "2.4",
     nextCursor: "next-page",
     items: [
       {
@@ -84,7 +84,7 @@ describe("canonical Decisions inbox client", () => {
 
   test("requires an administrative response to prove no runtime authority changed", () => {
     const parsed = parseAdministrativeApprovalReview({
-      schemaVersion: "2.1",
+      schemaVersion: "2.4",
       approval: {
         id: "approval-1", missionId: "mission-1", runId: "run-1",
         approvalType: "policy_change", status: "approved", decidedBy: "reviewer",

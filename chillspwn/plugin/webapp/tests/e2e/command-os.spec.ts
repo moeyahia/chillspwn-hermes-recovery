@@ -26,7 +26,7 @@ async function completeRequiredAutonomousFields(page: Page): Promise<void> {
   await page.getByRole("button", { name: "Continue" }).click();
 }
 
-test.describe("Command OS V2.1 real application journeys", () => {
+test.describe("Command OS V2.4 real application journeys", () => {
   test("Overview exposes exactly the Autonomous and Guided journey entry points", async ({ page, request }) => {
     await page.goto("/");
 
@@ -89,7 +89,7 @@ test.describe("Command OS V2.1 real application journeys", () => {
     const eventResponse = await request.get("/api/v2/contracts/events");
     expect(eventResponse.ok()).toBe(true);
     expect(await eventResponse.json()).toMatchObject({
-      schemaVersion: "2.1",
+      schemaVersion: "2.4",
       transport: "server-sent-events",
       delivery: "at-least-once; clients must deduplicate by stable event ID",
       resume: {

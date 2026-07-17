@@ -110,7 +110,7 @@ test.describe("E2E-only Second Brain 50,000-node profile", () => {
     );
     timings.globalGraphApiMs = globalGraph.elapsedMs;
     expect(globalGraph.body).toMatchObject({
-      schemaVersion: "2.1",
+      schemaVersion: "2.4",
       view: "global",
       truncated: true,
     });

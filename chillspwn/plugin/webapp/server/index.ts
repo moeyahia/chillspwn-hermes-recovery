@@ -76,7 +76,7 @@ import { AgentRuntime, RuntimeError } from "./runtime/AgentRuntime";
 import { AgentRunStore } from "./runtime/AgentRunStore";
 import { KanbanBoardSink } from "./runtime/BoardSink";
 import { buildPlanPrompt } from "./runtime/Planner";
-import { isEvidenceKind } from "./runtime/types";
+import { EVIDENCE_KINDS, RISK_LEVELS, isEvidenceKind } from "./runtime/types";
 import { MemoryService, MemoryError, buildVerifiedMemoryContext } from "./runtime/MemoryService";
 import { MemoryStore } from "./runtime/MemoryStore";
 import {
@@ -210,6 +210,9 @@ import {
   type CommandOsToolInventory,
   type GrokOAuthTurnResult,
 } from "./app/CommandOsRuntimeAdapters";
+import { buildHybridRuntimeSourceManifests } from "./app/RuntimeCapabilityManifestAdapter";
+import { resolveV2ScriptSourceRoot } from "./app/V2ArtifactPaths";
+import { FileScriptSourceStore } from "./script-artifacts";
 import {
   createMissionRuntime,
   type MissionRuntimeEngine,
@@ -5973,24 +5976,48 @@ function commandOsRuntimeProjection(): RuntimeProjectionInput {
   const readiness = commandOsRuntimeSnapshot();
   const routes = commandOsAttestedMcpRoutes();
   const mcp = commandOsMcpProjection(routes);
+  const projectedAgents = AGENT_ROSTER.map((agent) => deriveSpecialistCallability(agent, {
+    routingEnabled: SECURITY.enableSpecialistAgentRouting,
+    durableBoundaryActive: readiness.actionBoundaryActive,
+    providers: readiness.providers,
+    mcpRoutes: routes,
+  }));
+  const toolInventory = commandOsToolInventory(routes);
   return {
     readiness,
-    agents: AGENT_ROSTER.map((agent) => deriveSpecialistCallability(agent, {
-      routingEnabled: SECURITY.enableSpecialistAgentRouting,
-      durableBoundaryActive: readiness.actionBoundaryActive,
-      providers: readiness.providers,
-      mcpRoutes: routes,
-    })),
+    agents: projectedAgents,
     mcpServers: mcp.servers,
+    capabilityManifests: buildHybridRuntimeSourceManifests({
+      riskLevels: RISK_LEVELS,
+      evidenceKinds: EVIDENCE_KINDS,
+      agents: AGENT_ROSTER,
+      projectedAgents,
+      toolInventory,
+      mcpServers: mcp.servers,
+      providers: readiness.providers,
+      readiness,
+    }),
   };
 }
 
+const commandOsDatabasePath = resolve(
+  process.env.COMMAND_OS_DB_PATH || join(RUNTIME_DATA_DIR, "command-os-v2.sqlite"),
+);
 commandOsApplication = createCommandOsApplication({
-  databasePath: resolve(process.env.COMMAND_OS_DB_PATH || join(RUNTIME_DATA_DIR, "command-os-v2.sqlite")),
+  databasePath: commandOsDatabasePath,
   readinessProviders: () => createRuntimeReadinessProviders(commandOsRuntimeSnapshot),
   runtimeProjection: commandOsRuntimeProjection,
   resolveActor: () => "operator:local",
   resolveEventSensitivity: () => "restricted",
+  // This closure is registered before runtime construction but is only called
+  // by authenticated HTTP mutations after startup. It cannot mint authority:
+  // the runtime returns a proof only while it owns the current durable lease.
+  assertRunMutationLease: (request) => commandOsMissionRuntime
+    ?.assertRunMutationLease(request),
+  scriptSourceStore: new FileScriptSourceStore(resolveV2ScriptSourceRoot(
+    commandOsDatabasePath,
+    process.env.COMMAND_OS_V2_SCRIPT_SOURCE_ROOT,
+  )),
 });
 app.use(commandOsApplication.router);
 const commandOsVaultRoot = resolve(
@@ -6066,6 +6093,8 @@ app.use(createGuidedCommanderRouter({
   database: commandOsApplication.database,
   resolveActor: () => "operator:local",
   port: guidedCommanderPort,
+  assertRunMutationLease: (request) => commandOsMissionRuntime
+    ?.assertRunMutationLease(request),
   options: {
     maximumMemorySensitivity: "private",
     memoryContextBudget: 6_000,
@@ -6098,6 +6127,7 @@ app.use(createMissionRuntimeV2Router({
 app.use(createOperationsRouter({
   database: commandOsApplication.database,
   providerRouteIds: commandOsRuntimeAdapters.providerRouteIds,
+  assertRunMutationLease: commandOsMissionRuntime.assertRunMutationLease,
   vaultPathPolicy: commandOsVaultPathPolicy,
   resolveActor: () => ({ id: "operator:local", type: "admin" }),
   // The host auth middleware already gates this single-operator deployment.
@@ -10967,7 +10997,7 @@ try {
   commandOsApplication?.start();
   obsidianVaultWatcher?.start();
   const runtimeLifecycle = await commandOsMissionRuntime?.start();
-  log("info", "Command OS V2.1 canonical services started", {
+  log("info", "Command OS V2.4 canonical services started", {
     database: "command-os-v2.sqlite",
     eventStream: "ready",
     autonomousBoundary: currentCommandOsDurableBoundary(commandOsAttestedMcpRoutes())

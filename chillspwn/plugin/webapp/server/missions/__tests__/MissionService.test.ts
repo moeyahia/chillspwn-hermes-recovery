@@ -1,7 +1,12 @@
 import { describe, expect, test } from "bun:test";
 import { randomUUID } from "node:crypto";
 import { createDatabaseConnection, migrateDatabase } from "../../db";
-import { MemoryRepository, type MemoryNodeType, type MemoryScope } from "../../memory";
+import {
+  BrainContextHookError,
+  BrainContextService,
+  type BrainDependencyAvailability,
+} from "../../brain-runtime";
+import { MemoryRepository, SecondBrainService, type MemoryNodeType, type MemoryScope } from "../../memory";
 import {
   AutonomousReadinessError,
   IdempotencyConflictError,
@@ -98,6 +103,7 @@ function provider(
 function service(
   database: ReturnType<typeof createDatabaseConnection>,
   readinessProviders: readonly ReadinessCheckProvider[] = [provider()],
+  brainAvailability?: () => BrainDependencyAvailability,
 ): MissionService {
   const now = new Date().toISOString();
   const validUntil = new Date(Date.now() + 5 * 60_000).toISOString();
@@ -108,7 +114,7 @@ function service(
     ) VALUES ('agent-recon', 'reconnaissance', 'Recon specialist', 'available',
       '{"defaultProvider":"xai-grok-oauth"}',
       '{"allowedTools":["nmap"],"deniedTools":[],"approvalRequiredTools":[]}',
-      '{}', '2.1', ?, ?, ?)
+      '{}', '2.4', ?, ?, ?)
   `).run(now, now, now);
   database.prepare(`
     INSERT OR IGNORE INTO agent_capabilities (
@@ -142,6 +148,11 @@ function service(
     new MissionRepository(database),
     new OverviewRepository(database),
     new ReadinessService(readinessProviders),
+    new BrainContextService({
+      database,
+      secondBrain: new SecondBrainService(new MemoryRepository(database)),
+      ...(brainAvailability ? { availability: brainAvailability } : {}),
+    }),
   );
 }
 
@@ -220,9 +231,29 @@ describe("Command OS mission vertical slice", () => {
   });
 
   test("accepts only closed destructive-action policy values", () => {
-    expect(validateMissionCreateRequest(autonomousRequest({
-      contract: { ...autonomousRequest().contract, destructivePolicy: "contract_only" },
-    })).contract.destructivePolicy).toBe("contract_only");
+    const validated = validateMissionCreateRequest(autonomousRequest({
+      contract: { ...autonomousRequest().contract, destructivePolicy: "validate_without_executing" },
+    }));
+    expect(validated.journey).toBe("autonomous");
+    if (validated.journey !== "autonomous") throw new Error("Expected an Autonomous request");
+    expect(validated.contract.destructivePolicy).toBe("validate_without_executing");
+    const boundedTarget = "lab:10.10.10.0/24";
+    const bounded = validateMissionCreateRequest(autonomousRequest({
+      authorization: {
+        ...autonomousRequest().authorization,
+        allowedTargets: [boundedTarget],
+        prohibitedTargets: [],
+      },
+      contract: {
+        ...autonomousRequest().contract,
+        destructivePolicy: "bounded_lab_only",
+        boundedDestructiveTargets: [boundedTarget],
+      },
+    }));
+    expect(bounded.journey === "autonomous" && bounded.contract.boundedDestructiveTargets).toEqual([boundedTarget]);
+    expect(() => validateMissionCreateRequest(autonomousRequest({
+      contract: { ...autonomousRequest().contract, destructivePolicy: "bounded_lab_only" },
+    }))).toThrow(MissionValidationError);
     expect(() => validateMissionCreateRequest({
       ...autonomousRequest(),
       contract: { ...autonomousRequest().contract, destructivePolicy: "ask_operator" },
@@ -300,7 +331,7 @@ describe("Command OS mission vertical slice", () => {
       expect(persisted.contract_hash).toMatch(/^[a-f0-9]{64}$/u);
       expect(count(database, "events")).toBe(2);
       expect(count(database, "event_outbox")).toBe(2);
-      expect(count(database, "audit_records")).toBe(1);
+      expect(count(database, "audit_records")).toBe(2);
       expect(
         database.prepare("SELECT COUNT(*) AS count FROM runs WHERE status = 'waiting_guided_decision'").get(),
       ).toEqual({ count: 0 });
@@ -349,6 +380,12 @@ describe("Command OS mission vertical slice", () => {
         "exact-memory-contract-001",
         "operator-1",
       );
+      expect(created.intakeContext).toMatchObject({
+        hook: "intake",
+        status: "ready",
+        retrievedCount: 2,
+        memoryInfluencedDefaults: false,
+      });
       const policy = database.prepare(`
         SELECT mc.action_policy_json FROM runs r
         JOIN mission_contracts mc ON mc.id = r.contract_id WHERE r.id = ?
@@ -484,6 +521,170 @@ describe("Command OS mission vertical slice", () => {
     }
   });
 
+  test("retrieves and binds a scope-safe intake Context Pack without claiming it changed defaults", async () => {
+    const database = createDatabaseConnection({ filename: ":memory:" });
+    try {
+      migrateDatabase(database);
+      new MemoryRepository(database).createNode({
+        id: "mem-guided-intake-preference",
+        nodeType: "preference",
+        title: "Guided lab assessment explanation preference",
+        summary: "Use a concise explanation after the operator confirms the preference.",
+        scope: { kind: "global" },
+        sensitivity: "private",
+        confidence: 1,
+        lifecycleStatus: "confirmed",
+        confirmationState: "confirmed",
+        provenance: {
+          method: "operator_statement",
+          explanation: "Confirmed by the operator in the intake lifecycle fixture.",
+          sources: [{ sourceType: "test", sourceId: "guided-intake", acquiredAt: new Date().toISOString() }],
+        },
+        authorType: "operator",
+        authorId: "operator-1",
+        retentionPolicy: { allowGuided: true },
+      });
+      const created = await service(database).create(
+        guidedRequest(),
+        "guided-intake-context-0001",
+        "operator-1",
+      );
+      expect(created.intakeContext).toMatchObject({
+        hook: "intake",
+        status: "ready",
+        retrievedCount: 1,
+        memoryInfluencedDefaults: false,
+      });
+      if (!created.intakeContext) throw new Error("Expected a durable intake Context Pack binding");
+      const policy = database.prepare("SELECT memory_policy_json FROM missions WHERE id = ?")
+        .get(created.mission.id) as { memory_policy_json: string };
+      expect(JSON.parse(policy.memory_policy_json).intakeContext).toMatchObject({
+        contextPackId: created.intakeContext.contextPackId,
+        status: "ready",
+        memoryInfluencedDefaults: false,
+      });
+      const disposition = database.prepare(`
+        SELECT used, ignored_reason FROM memory_context_items
+        WHERE context_pack_id = ? AND node_id = 'mem-guided-intake-preference'
+      `).get(created.intakeContext.contextPackId) as { used: number; ignored_reason: string };
+      expect(disposition.used).toBe(0);
+      expect(disposition.ignored_reason).toContain("defaults remained deterministic");
+      const createdEvent = database.prepare(`
+        SELECT context_pack_id, payload_json FROM events
+        WHERE run_id = ? AND event_type = 'mission.created'
+      `).get(created.run.id) as { context_pack_id: string | null; payload_json: string };
+      expect(createdEvent.context_pack_id).toBe(created.intakeContext.contextPackId);
+      expect(JSON.parse(createdEvent.payload_json).intakeContext).toMatchObject({
+        status: "ready",
+        memoryInfluencedDefaults: false,
+      });
+      const missionAudit = database.prepare(`
+        SELECT details_json FROM audit_records
+        WHERE mission_id = ? AND action = 'mission.created'
+      `).get(created.mission.id) as { details_json: string };
+      expect(JSON.parse(missionAudit.details_json).intakeContext).toMatchObject({
+        contextPackId: created.intakeContext.contextPackId,
+        status: "ready",
+      });
+    } finally {
+      database.close();
+    }
+  });
+
+  test("continues Guided intake with an audited empty degraded Context Pack when the Brain is unavailable", async () => {
+    const database = createDatabaseConnection({ filename: ":memory:" });
+    try {
+      migrateDatabase(database);
+      const created = await service(database, [provider()], () => ({
+        available: false,
+        code: "brain_offline",
+        explanation: "The local Second Brain index is offline.",
+      })).create(guidedRequest(), "guided-intake-degraded-0001", "operator-1");
+      expect(created.intakeContext).toMatchObject({
+        status: "degraded",
+        retrievedCount: 0,
+        memoryInfluencedDefaults: false,
+        degradation: { code: "brain_offline" },
+      });
+      expect(database.prepare(`
+        SELECT COUNT(*) AS count FROM memory_context_items WHERE context_pack_id = ?
+      `).get(created.intakeContext?.contextPackId)).toEqual({ count: 0 });
+      const hookAudit = database.prepare(`
+        SELECT details_json FROM audit_records WHERE id = ?
+      `).get(created.intakeContext?.auditRecordId) as { details_json: string };
+      expect(JSON.parse(hookAudit.details_json)).toMatchObject({
+        hook: "intake",
+        status: "degraded",
+        contextPackId: created.intakeContext?.contextPackId,
+        dependencyCode: "brain_offline",
+      });
+    } finally {
+      database.close();
+    }
+  });
+
+  test("fails a signed-memory Autonomous launch before commit and retains a privacy-safe blocked receipt", async () => {
+    const database = createDatabaseConnection({ filename: ":memory:" });
+    try {
+      migrateDatabase(database);
+      const action = service(database, [provider()], () => ({
+        available: false,
+        code: "brain_offline",
+        explanation: "The local Second Brain index is offline.",
+      })).create(autonomousRequest(), "autonomous-intake-required-0001", "operator-1");
+      await expect(action).rejects.toBeInstanceOf(BrainContextHookError);
+      expect(count(database, "missions")).toBe(0);
+      expect(count(database, "runs")).toBe(0);
+      expect(count(database, "memory_context_packs")).toBe(0);
+      const receipt = database.prepare(`
+        SELECT mission_id, run_id, journey, action, resource_type, details_json
+        FROM audit_records WHERE action = 'mission.intake_context.blocked'
+      `).get() as Record<string, unknown>;
+      expect(receipt).toMatchObject({
+        mission_id: null,
+        run_id: null,
+        journey: "autonomous",
+        action: "mission.intake_context.blocked",
+        resource_type: "mission_intake_request",
+      });
+      expect(JSON.parse(receipt.details_json as string)).toMatchObject({
+        hook: "intake",
+        status: "blocked",
+        contextPackId: null,
+        memoryInfluencedDefaults: false,
+      });
+    } finally {
+      database.close();
+    }
+  });
+
+  test("persists truthful degraded Autonomous intake when the signed contract selected no memory", async () => {
+    const database = createDatabaseConnection({ filename: ":memory:" });
+    try {
+      migrateDatabase(database);
+      const request = autonomousRequest({
+        contract: {
+          ...autonomousRequest().contract,
+          memoryScopes: [],
+          contextNodeIds: [],
+        },
+      });
+      const created = await service(database, [provider()], () => ({
+        available: false,
+        code: "brain_offline",
+        explanation: "The local Second Brain index is offline.",
+      })).create(request, "autonomous-intake-empty-0001", "operator-1");
+      expect(created.intakeContext).toMatchObject({
+        status: "degraded",
+        retrievedCount: 0,
+        memoryInfluencedDefaults: false,
+      });
+      expect(created.run.status).toBe("planning");
+    } finally {
+      database.close();
+    }
+  });
+
   test("blocks Autonomous launch on a real failed readiness check without partial writes", async () => {
     const database = createDatabaseConnection({ filename: ":memory:" });
     try {
@@ -589,7 +790,7 @@ describe("Command OS mission vertical slice", () => {
       expect(new Set([...first.items, ...second.items].map((mission) => mission.id)).size).toBe(3);
 
       const overview = await missionService.getOverview();
-      expect(overview.schemaVersion).toBe("2.1");
+      expect(overview.schemaVersion).toBe("2.4");
       expect(overview.readiness).toMatchObject({ status: "degraded", score: 65 });
       expect(overview.summary.activeMissions).toBe(3);
       expect(overview.missions).toHaveLength(3);

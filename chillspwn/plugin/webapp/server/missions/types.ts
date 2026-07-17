@@ -2,6 +2,17 @@ import type { JsonValue, Journey } from "../events";
 
 export type { Journey };
 
+/**
+ * `contract_only` is retained solely so immutable V2.1 contract snapshots stay
+ * readable during the compatibility window. V2.4 intake never emits it and
+ * the runtime cannot use it to authorize destructive execution.
+ */
+export type MissionDestructivePolicy =
+  | "prohibited"
+  | "validate_without_executing"
+  | "bounded_lab_only"
+  | "contract_only";
+
 export type RunStatus =
   | "queued"
   | "planning"
@@ -31,7 +42,9 @@ export interface AutonomousMissionRequest {
   readonly contract: {
     readonly allowedActionClasses: readonly string[];
     readonly prohibitedActionClasses: readonly string[];
-    readonly destructivePolicy: "prohibited" | "contract_only";
+    readonly destructivePolicy: MissionDestructivePolicy;
+    /** Exact authorized target values where destructive execution is bounded. */
+    readonly boundedDestructiveTargets?: readonly string[];
     readonly evidenceRequirements: readonly string[];
     readonly timeBudgetMinutes: number;
     readonly tokenBudget?: number;
@@ -144,7 +157,7 @@ export interface AutonomousExecutionPreview {
 }
 
 export interface AutonomousMissionPreflight {
-  readonly schemaVersion: "2.1";
+  readonly schemaVersion: "2.4";
   readonly contract: {
     readonly version: 1;
     readonly hash: string;
@@ -200,7 +213,26 @@ export interface CreatedMission {
     readonly status: RunStatus;
     readonly journey: Journey;
   };
+  /**
+   * The persisted, scope-checked Second Brain intake result. A ready pack is
+   * not proof that memory changed mission defaults; that attribution remains
+   * false until a later consumer records an explicit item disposition.
+   */
+  readonly intakeContext?: MissionIntakeContextBinding;
   readonly nextUrl: string;
+}
+
+export interface MissionIntakeContextBinding {
+  readonly hook: "intake";
+  readonly contextPackId: string;
+  readonly auditRecordId: string;
+  readonly status: "ready" | "no_relevant_memory" | "degraded";
+  readonly retrievedCount: number;
+  readonly memoryInfluencedDefaults: false;
+  readonly degradation?: {
+    readonly code: string;
+    readonly explanation: string;
+  };
 }
 
 export type ReadinessCheckStatus = "pass" | "warn" | "fail";
@@ -311,7 +343,7 @@ export interface SavedMissionView {
 }
 
 export interface SavedMissionViewCollection {
-  readonly schemaVersion: "2.1";
+  readonly schemaVersion: "2.4";
   readonly version: number;
   readonly items: readonly SavedMissionView[];
 }
@@ -323,7 +355,7 @@ export interface MissionBulkItemOutcome {
 }
 
 export interface MissionBulkArchiveResult {
-  readonly schemaVersion: "2.1";
+  readonly schemaVersion: "2.4";
   readonly selectionHash: string;
   readonly outcomes: readonly MissionBulkItemOutcome[];
   readonly archivedCount: number;
@@ -359,7 +391,7 @@ export interface MissionExportRecord {
 }
 
 export interface MissionBulkExportResult {
-  readonly schemaVersion: "2.1";
+  readonly schemaVersion: "2.4";
   readonly generatedAt: string;
   readonly selectionHash: string;
   readonly exportSha256: string;
@@ -391,7 +423,7 @@ export interface AgentSummary {
 }
 
 export interface OverviewSnapshot {
-  readonly schemaVersion: "2.1";
+  readonly schemaVersion: "2.4";
   readonly readiness: ReadinessSummary;
   readonly summary: {
     readonly activeMissions: number;
@@ -419,7 +451,7 @@ export interface OverviewSnapshot {
 }
 
 export interface MissionListPage {
-  readonly schemaVersion: "2.1";
+  readonly schemaVersion: "2.4";
   readonly items: readonly MissionSummary[];
   readonly nextCursor: string | null;
 }

@@ -49,21 +49,21 @@ describe("Command OS database foundation", () => {
       const second = migrateDatabase(database);
       const health = getDatabaseHealth(database);
 
-      expect(first.applied.map((migration) => migration.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9]);
+      expect(first.applied.map((migration) => migration.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
       expect(second.applied).toEqual([]);
-      expect(listAppliedMigrations(database)).toHaveLength(9);
+      expect(listAppliedMigrations(database)).toHaveLength(12);
       expect(health.healthy).toBe(true);
       expect(health.journalMode).toBe("wal");
       expect(health.foreignKeys).toBe(true);
       expect(health.busyTimeoutMs).toBe(5_000);
-      expect(health.currentMigration).toBe(9);
+      expect(health.currentMigration).toBe(12);
       expect(existsSync(databasePath)).toBe(true);
     } finally {
       database.close();
     }
   });
 
-  test("rehearses the schema-eight bridge, then applies the Guided boundary migration", () => {
+  test("rehearses the schema-eight bridge, then applies the current additive migrations", () => {
     const database = createDatabaseConnection({ filename: ":memory:" });
     try {
       const schemaSeven = DATABASE_MIGRATIONS.slice(0, 7);
@@ -97,13 +97,79 @@ describe("Command OS database foundation", () => {
         "Database contains unknown migration version 8",
       );
       expect(migrateDatabase(database, DATABASE_MIGRATIONS)).toMatchObject({
-        applied: [{ version: 9, name: "guided_decision_single_pending_boundary" }],
-        currentVersion: 9,
+        applied: [
+          { version: 9, name: "guided_decision_single_pending_boundary" },
+          { version: 10, name: "v24_operational_truth" },
+          { version: 11, name: "memory_edge_scope_identity" },
+          { version: 12, name: "planning_retry_continuation" },
+        ],
+        currentVersion: 12,
       });
       expect(getDatabaseHealth(database)).toMatchObject({
         healthy: true,
-        currentMigration: 9,
+        currentMigration: 12,
       });
+    } finally {
+      database.close();
+    }
+  });
+
+  test("widens the continuation kind boundary without losing a schema-eleven owner fence", () => {
+    const database = createDatabaseConnection({ filename: ":memory:" });
+    try {
+      expect(migrateDatabase(database, DATABASE_MIGRATIONS.slice(0, 11))).toMatchObject({
+        currentVersion: 11,
+      });
+      insertMission(database, "mission-continuation-v12");
+      const now = "2026-07-17T08:00:00.000Z";
+      database.prepare(`
+        INSERT INTO runs (
+          id, mission_id, journey, status, budget_json, budget_usage_json,
+          created_at, updated_at, version
+        ) VALUES ('run-continuation-v12', 'mission-continuation-v12', 'autonomous',
+          'planning', '{}', '{}', ?, ?, 1)
+      `).run(now, now);
+      database.prepare(`
+        INSERT INTO runtime_continuations (
+          id, run_id, kind, source_id, payload_json, status, attempt_count,
+          available_at, lease_owner, lease_expires_at, last_error,
+          created_at, updated_at
+        ) VALUES (
+          'continuation-v11-owned', 'run-continuation-v12',
+          'resume_recovery_pending', 'legacy-source', '{"actionId":"action-v11"}',
+          'processing', 2, ?, 'worker-v11:continuation-v11-owned:2', ?,
+          'redacted prior failure', ?, ?
+        )
+      `).run(now, "2026-07-17T08:01:00.000Z", now, now);
+
+      expect(migrateDatabase(database)).toMatchObject({
+        applied: [{ version: 12, name: "planning_retry_continuation" }],
+        currentVersion: 12,
+      });
+      expect(database.prepare(`
+        SELECT kind, source_id, payload_json, status, attempt_count,
+          available_at, lease_owner, lease_expires_at, last_error
+        FROM runtime_continuations WHERE id = 'continuation-v11-owned'
+      `).get()).toEqual({
+        kind: "resume_recovery_pending",
+        source_id: "legacy-source",
+        payload_json: '{"actionId":"action-v11"}',
+        status: "processing",
+        attempt_count: 2,
+        available_at: now,
+        lease_owner: "worker-v11:continuation-v11-owned:2",
+        lease_expires_at: "2026-07-17T08:01:00.000Z",
+        last_error: "redacted prior failure",
+      });
+      expect(() => database.prepare(`
+        INSERT INTO runtime_continuations (
+          id, run_id, kind, source_id, payload_json, available_at, created_at, updated_at
+        ) VALUES (
+          'continuation-planning-v12', 'run-continuation-v12',
+          'planning_retry_to_dispatch', 'planning-retry-1',
+          '{"failureCategory":"rate_limit","retryCount":"1"}', ?, ?, ?
+        )
+      `).run(now, now, now)).not.toThrow();
     } finally {
       database.close();
     }
@@ -184,8 +250,13 @@ describe("Command OS database foundation", () => {
       insertDecision.run("decision-guided-stale", "step-guided-stale", "c".repeat(64), "2026-07-16T12:00:00.000Z", now);
 
       expect(migrateDatabase(database)).toMatchObject({
-        applied: [{ version: 9, name: "guided_decision_single_pending_boundary" }],
-        currentVersion: 9,
+        applied: [
+          { version: 9, name: "guided_decision_single_pending_boundary" },
+          { version: 10, name: "v24_operational_truth" },
+          { version: 11, name: "memory_edge_scope_identity" },
+          { version: 12, name: "planning_retry_continuation" },
+        ],
+        currentVersion: 12,
       });
       expect(database.prepare(`
         SELECT DISTINCT status, decision_actor, decision_reason
@@ -308,6 +379,28 @@ describe("Command OS database foundation", () => {
         "lesson_attack_chain_details",
         "lesson_attack_chain_items",
         "lesson_attack_chain_sources",
+        "control_plane_leases",
+        "capability_registry_snapshots",
+        "engagement_log_records",
+        "observations",
+        "evidence_candidates",
+        "attack_attempts",
+        "failure_diagnoses",
+        "run_metrics_snapshots",
+        "topology_nodes",
+        "topology_edges",
+        "asset_layer_observations",
+        "cve_applicability_records",
+        "plan_change_requests",
+        "plan_step_versions",
+        "script_artifacts",
+        "page_captures",
+        "model_configurations",
+        "agent_model_assignments",
+        "provider_exposure_receipts",
+        "research_campaigns",
+        "experiments",
+        "integrity_receipts",
         "audit_records",
       ]) {
         expect(names.has(expected)).toBe(true);
@@ -442,7 +535,7 @@ describe("Command OS database foundation", () => {
       `).run(now);
 
       const result = migrateDatabase(database);
-      expect(result.applied.map((migration) => migration.version)).toEqual([6, 7, 8, 9]);
+      expect(result.applied.map((migration) => migration.version)).toEqual([6, 7, 8, 9, 10, 11, 12]);
       expect(database.prepare(`
         SELECT comparison_status, reason, prior_run_id, metrics_json
         FROM run_evaluation_comparisons WHERE evaluation_id = 'evaluation-legacy'
@@ -496,7 +589,7 @@ describe("Command OS database foundation", () => {
       `).run("b".repeat(64), now);
 
       const result = migrateDatabase(database);
-      expect(result.applied.map((migration) => migration.version)).toEqual([7, 8, 9]);
+      expect(result.applied.map((migration) => migration.version)).toEqual([7, 8, 9, 10, 11, 12]);
       expect(database.prepare(
         "SELECT journey, record_hash FROM audit_records WHERE id = 'audit-legacy'",
       ).get()).toEqual({ journey: "guided", record_hash: "legacy-record-hash" });

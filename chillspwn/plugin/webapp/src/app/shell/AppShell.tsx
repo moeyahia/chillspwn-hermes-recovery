@@ -5,6 +5,7 @@ import { AppLink, useNavigation } from "../router/navigation";
 import { isNavigationItemActive, PRIMARY_NAVIGATION, USER_MANUAL_NAVIGATION } from "../router/routes";
 import { CommandPalette } from "../command-palette/CommandPalette";
 import { NotificationCenter } from "../../features/notifications/NotificationCenter";
+import { assetUrl } from "../../lib/assetUrl";
 
 export function AppShell({ children }: { children: ReactNode }) {
   const { pathname } = useNavigation();
@@ -48,8 +49,8 @@ export function AppShell({ children }: { children: ReactNode }) {
           <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h16" /></svg>
         </button>
         <AppLink href="/" className="os-brand" aria-label="ChillsPwn Command OS home">
-          <img src="/Logo.svg" alt="" />
-          <span><strong>COMMAND OS</strong><small>ChillsPwn · V2.1</small></span>
+          <img src={assetUrl("Logo.svg")} alt="" />
+          <span><strong>COMMAND OS</strong><small>ChillsPwn · V2.4 live</small></span>
         </AppLink>
         <button type="button" className="os-command-trigger" aria-label="Search or run a command" onClick={() => setPaletteOpen(true)}>
           <svg aria-hidden="true" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7" /><path d="m16 16 5 5" /></svg>

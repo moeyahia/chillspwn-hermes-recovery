@@ -143,7 +143,7 @@ test.describe("Command OS populated canonical browser journeys", () => {
     });
     expect(count.ok()).toBe(true);
     expect(count.headers()["x-request-id"]).toBe("e2e-notification-count");
-    expect(await count.json()).toEqual({ schemaVersion: "2.1", unreadCount: persistedUnreadCount });
+    expect(await count.json()).toEqual({ schemaVersion: "2.4", unreadCount: persistedUnreadCount });
 
     await reloadedTrigger.click();
     const reloadedNotificationPanel = page.getByRole("dialog", { name: "In-app notifications" });
@@ -221,7 +221,9 @@ test.describe("Command OS populated canonical browser journeys", () => {
     await page.goto("/missions");
     await page.getByLabel("Mission, phase, run, or next action").fill("Completed Autonomous review");
     await page.getByRole("button", { name: "Apply filters" }).click();
-    await page.getByRole("checkbox", { name: "Select [E2E fixture] Completed Autonomous review" }).check();
+    await page.getByRole("checkbox", {
+      name: "Select mission [E2E fixture] Completed Autonomous review (mission-e2e-auto-complete)",
+    }).check();
     await expect(page.getByText("1 selected", { exact: true })).toBeVisible();
     await page.getByRole("button", { name: "Export redacted metadata" }).click();
     const dialog = page.getByRole("dialog", { name: "Confirm redacted metadata export" });
@@ -275,7 +277,7 @@ test.describe("Command OS populated canonical browser journeys", () => {
 
     await page.goto("/intelligence/artifacts/report-e2e-complete");
     await expect(page.getByText("Metadata only", { exact: true })).toBeVisible();
-    await expect(page.getByText(/Artifact content remains metadata-only/u)).toBeVisible();
+    await expect(page.getByText("This artifact has no approved canonical content-delivery adapter.")).toBeVisible();
     await expect(page.getByRole("link", { name: "Download verified content" })).toHaveCount(0);
 
     await page.goto("/reports/report-e2e-complete");
@@ -374,7 +376,7 @@ test.describe("Command OS populated canonical browser journeys", () => {
     const checkpoint = recovery.getByRole("region", { name: "Checkpoint" });
     await expect(checkpoint.getByRole("heading", { level: 3, name: "Checkpoint" })).toBeVisible();
     await expect(checkpoint.getByText("safe_no_in_flight_action")).toBeVisible();
-    await expect(page.getByText("No action is dispatched")).toBeVisible();
+    await expect(checkpoint.getByText("In-flight actions").locator("..")).toContainText("0");
   });
 
   test("transient failures and repeated-action loops expose bounded recovery truth in both journeys", async ({ page }) => {

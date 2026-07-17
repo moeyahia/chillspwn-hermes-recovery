@@ -6,11 +6,17 @@ import { join } from "node:path";
 import express from "express";
 import type { Server } from "node:http";
 import type { AddressInfo } from "node:net";
+import {
+  ControlPlaneLeaseError,
+  ControlPlaneLeaseService,
+  type ControlPlaneLease,
+} from "../../control-plane";
 import { createDatabaseConnection, migrateDatabase, type SqliteDatabase } from "../../db";
 import { MemoryRepository } from "../../memory";
 import { canonicalJson } from "../../missions/canonical";
 import { GuidedCommanderRepository } from "../GuidedCommanderRepository";
 import { createGuidedCommanderRouter } from "../GuidedCommanderRouter";
+import { createGuidedMemoryCandidateRouter } from "../GuidedMemoryCandidateRouter";
 import { GuidedCommanderService } from "../GuidedCommanderService";
 import type {
   GuidedCommanderPort,
@@ -20,6 +26,13 @@ import type {
 
 const servers: Server[] = [];
 const FINGERPRINT = "a".repeat(64);
+const AUTHORITY_NOW = "2026-07-15T10:00:00.000Z";
+const CONTROL_LEASE_OWNER = "guided-runtime-test";
+const CONTROL_LEASE_TOKEN = "guided-runtime-test-token-00000001";
+const TAKEOVER_LEASE_OWNER = "guided-runtime-takeover";
+const TAKEOVER_LEASE_TOKEN = "guided-runtime-takeover-token-0001";
+type LeaseMode = "valid" | "missing" | "wrong_token" | "wrong_fence" | "takeover";
+interface AuthorityState { mode: LeaseMode }
 const IDS = {
   mission: "mission-guided-commander",
   run: "run-guided-commander",
@@ -48,7 +61,7 @@ class PlanningOnlyPort implements GuidedCommanderPort {
     if (signal.aborted) throw new DOMException("Aborted", "AbortError");
     this.calls.push(input);
     if (this.response) return this.response(input);
-    const remembered = input.memoryContext[0];
+    const remembered = input.brainContext.items[0];
     return {
       body: input.action === "interpret_result"
         ? "The submitted output adds evidence for the current step, but the operator must still decide what to run next."
@@ -58,7 +71,7 @@ class PlanningOnlyPort implements GuidedCommanderPort {
       observations: ["The mission remains paused at the exact represented step"],
       recommendedNextStep: "Review the existing action card and choose one deliberate control.",
       contextUse: remembered ? [{
-        nodeId: remembered.id,
+        nodeId: remembered.nodeId,
         used: true,
         relevanceReason: "Confirmed preference applies to Guided explanations",
         influenceSummary: "Kept the explanation concise and evidence-led",
@@ -130,13 +143,13 @@ class ExpiringOwnerPort implements GuidedCommanderPort {
       return new Promise<GuidedCommanderPortResponse>((resolve) => {
         this.#resolveFirst = () => resolve(this.response(
           "Expired owner returned after its reservation was replaced.",
-          input.memoryContext[0]?.id,
+          input.brainContext.items[0]?.nodeId,
         ));
       });
     }
     return Promise.resolve(this.response(
       "Recovered owner completed after the expired lease.",
-      input.memoryContext[0]?.id,
+      input.brainContext.items[0]?.nodeId,
     ));
   }
 
@@ -162,7 +175,7 @@ class ExpiringOwnerPort implements GuidedCommanderPort {
 }
 
 function seedGuidedRuntime(database: SqliteDatabase): void {
-  const now = "2026-07-15T10:00:00.000Z";
+  const now = AUTHORITY_NOW;
   database.prepare(`
     INSERT INTO missions (
       id, name, objective, journey, status, authorization_status, engagement_id,
@@ -275,7 +288,7 @@ function seedGuidedRuntime(database: SqliteDatabase): void {
     summary: "Use concise evidence-led explanations in Guided missions",
     body: "Explain why the evidence matters before presenting the deliberate next step.",
     scope: { kind: "global" },
-    sensitivity: "private",
+    sensitivity: "internal",
     confidence: 1,
     lifecycleStatus: "confirmed",
     confirmationState: "confirmed",
@@ -290,20 +303,86 @@ function seedGuidedRuntime(database: SqliteDatabase): void {
     },
     authorType: "operator",
     authorId: "operator-test",
-    retentionPolicy: { allowGuided: true },
+    retentionPolicy: { allowGuided: true, publicProviderDisclosure: "sanitized" },
+  });
+  new MemoryRepository(database).createNode({
+    id: "memory-guided-local-only",
+    nodeType: "lesson",
+    title: "Validate lab evidence local-only detail",
+    summary: "This summary is intentionally local-only",
+    body: "LOCAL_ONLY_BODY_MUST_NOT_REACH_PROVIDER",
+    scope: { kind: "mission", missionId: IDS.mission },
+    sensitivity: "private",
+    confidence: 1,
+    lifecycleStatus: "verified",
+    confirmationState: "not_required",
+    provenance: {
+      method: "derived",
+      explanation: "Local-only provider-boundary fixture",
+      sources: [{ sourceType: "message", sourceId: "local-only-source", acquiredAt: now }],
+    },
+    authorType: "system",
+    authorId: "brain-test",
+    retentionPolicy: { allowGuided: true, publicProviderDisclosure: "local_only" },
   });
 }
 
-async function application(port = new PlanningOnlyPort()) {
+async function application(): Promise<{
+  database: SqliteDatabase;
+  port: PlanningOnlyPort;
+  url: string;
+  authority: AuthorityState;
+}>;
+async function application<Port extends GuidedCommanderPort>(
+  port: Port,
+  options?: { readonly attachLeaseResolver?: boolean },
+): Promise<{
+  database: SqliteDatabase;
+  port: Port;
+  url: string;
+  authority: AuthorityState;
+}>;
+async function application(
+  port: GuidedCommanderPort = new PlanningOnlyPort(),
+  options: { readonly attachLeaseResolver?: boolean } = {},
+) {
   const database = createDatabaseConnection({ filename: ":memory:" });
   migrateDatabase(database);
   seedGuidedRuntime(database);
+  const authority: AuthorityState = { mode: "valid" };
+  const leases = new ControlPlaneLeaseService(database);
+  leases.acquire({
+    runId: IDS.run,
+    controlPlane: "command_os_v2",
+    leaseOwner: CONTROL_LEASE_OWNER,
+    leaseToken: CONTROL_LEASE_TOKEN,
+    ttlMs: 300_000,
+    now: new Date(AUTHORITY_NOW),
+  });
   const app = express();
   app.use(express.json({ limit: "256kb" }));
   app.use(createGuidedCommanderRouter({
     database,
     port,
     resolveActor: () => "operator-test",
+    options: { clock: () => new Date(AUTHORITY_NOW) },
+    ...((options.attachLeaseResolver ?? true) ? {
+      assertRunMutationLease: ({ runId }: { readonly runId: string }) => {
+        if (authority.mode === "missing") return undefined;
+        const proof = leases.assertMutationAuthority({
+          runId,
+          controlPlane: "command_os_v2",
+          leaseOwner: authority.mode === "takeover" ? TAKEOVER_LEASE_OWNER : CONTROL_LEASE_OWNER,
+          leaseToken: authority.mode === "wrong_token"
+            ? "wrong-guided-runtime-token-000000"
+            : authority.mode === "takeover" ? TAKEOVER_LEASE_TOKEN : CONTROL_LEASE_TOKEN,
+          now: new Date(AUTHORITY_NOW),
+        });
+        return authority.mode === "wrong_fence"
+          ? { ...proof, version: proof.version + 1 } satisfies ControlPlaneLease
+          : proof;
+      },
+    } : {}),
   }));
   const server = app.listen(0, "127.0.0.1");
   servers.push(server);
@@ -311,6 +390,59 @@ async function application(port = new PlanningOnlyPort()) {
   return {
     database,
     port,
+    authority,
+    url: `http://127.0.0.1:${(server.address() as AddressInfo).port}`,
+  };
+}
+
+async function memoryApplication(options: { readonly attachLeaseResolver?: boolean } = {}): Promise<{
+  database: SqliteDatabase;
+  url: string;
+  authority: AuthorityState;
+}> {
+  const database = createDatabaseConnection({ filename: ":memory:" });
+  migrateDatabase(database);
+  seedGuidedRuntime(database);
+  const authority: AuthorityState = { mode: "valid" };
+  const leases = new ControlPlaneLeaseService(database);
+  leases.acquire({
+    runId: IDS.run,
+    controlPlane: "command_os_v2",
+    leaseOwner: CONTROL_LEASE_OWNER,
+    leaseToken: CONTROL_LEASE_TOKEN,
+    ttlMs: 300_000,
+    now: new Date(AUTHORITY_NOW),
+  });
+  const app = express();
+  app.use(express.json({ limit: "256kb" }));
+  app.use(createGuidedMemoryCandidateRouter({
+    database,
+    resolveActor: () => "operator-test",
+    options: { clock: () => new Date(AUTHORITY_NOW) },
+    ...((options.attachLeaseResolver ?? true) ? {
+      assertRunMutationLease: ({ runId }: { readonly runId: string }) => {
+        if (authority.mode === "missing") return undefined;
+        const proof = leases.assertMutationAuthority({
+          runId,
+          controlPlane: "command_os_v2",
+          leaseOwner: authority.mode === "takeover" ? TAKEOVER_LEASE_OWNER : CONTROL_LEASE_OWNER,
+          leaseToken: authority.mode === "wrong_token"
+            ? "wrong-guided-memory-token-00000000"
+            : authority.mode === "takeover" ? TAKEOVER_LEASE_TOKEN : CONTROL_LEASE_TOKEN,
+          now: new Date(AUTHORITY_NOW),
+        });
+        return authority.mode === "wrong_fence"
+          ? { ...proof, version: proof.version + 1 } satisfies ControlPlaneLease
+          : proof;
+      },
+    } : {}),
+  }));
+  const server = app.listen(0, "127.0.0.1");
+  servers.push(server);
+  await new Promise<void>((resolve) => server.once("listening", resolve));
+  return {
+    database,
+    authority,
     url: `http://127.0.0.1:${(server.address() as AddressInfo).port}`,
   };
 }
@@ -340,6 +472,343 @@ async function responseJson(response: Response): Promise<Record<string, any>> {
 }
 
 describe("Guided Commander durable HTTP boundary", () => {
+  test("fails closed on every provider and memory mutation when no trusted run-lease resolver is mounted", async () => {
+    const port = new PlanningOnlyPort();
+    const provider = await application(port, { attachLeaseResolver: false });
+    const memory = await memoryApplication({ attachLeaseResolver: false });
+    try {
+      const providerRequests: Array<{ readonly action: string; readonly body: Record<string, unknown> }> = [
+        { action: "explain-more", body: actionBody() },
+        { action: "show-next-step", body: actionBody() },
+        { action: "use-another-approach", body: actionBody({ note: "Compare one bounded alternative" }) },
+        {
+          action: "interpret-result",
+          body: actionBody({
+            result: {
+              source: "paste",
+              mediaType: "text/plain",
+              byteSize: 18,
+              text: "443/tcp open https",
+            },
+          }),
+        },
+      ];
+      for (const [index, request] of providerRequests.entries()) {
+        const response = await fetch(
+          `${provider.url}/api/v2/guided/${IDS.mission}/commander/${request.action}`,
+          mutation(`guided-no-runtime-authority-${index}`, request.body),
+        );
+        expect(response.status).toBe(409);
+        expect(await response.json()).toMatchObject({
+          error: { code: "control_plane_lease_missing", retryable: false },
+        });
+      }
+      expect(port.calls).toHaveLength(0);
+      expect(provider.database.prepare("SELECT COUNT(*) AS count FROM evidence").get()).toEqual({ count: 0 });
+      expect(provider.database.prepare("SELECT COUNT(*) AS count FROM provider_turns").get()).toEqual({ count: 0 });
+      expect(provider.database.prepare("SELECT COUNT(*) AS count FROM memory_context_packs").get()).toEqual({ count: 0 });
+      expect(provider.database.prepare(`
+        SELECT COUNT(*) AS count FROM settings
+        WHERE key LIKE 'idempotency.guided-commander.%'
+      `).get()).toEqual({ count: 0 });
+
+      const remember = await fetch(
+        `${memory.url}/api/v2/guided/${IDS.mission}/commander/remember`,
+        mutation("guided-memory-no-runtime-authority", actionBody({
+          sourceMessageId: IDS.initialMessage,
+          nodeType: "preference",
+          title: "Must not be retained without runtime authority",
+          summary: "This candidate must never be created",
+          scope: "global",
+          sensitivity: "private",
+        })),
+      );
+      const suppress = await fetch(
+        `${memory.url}/api/v2/guided/${IDS.mission}/commander/do-not-remember`,
+        mutation("guided-suppression-no-runtime-authority", actionBody({
+          candidateId: "candidate-not-authorized",
+          reason: "This request has no runtime authority",
+        })),
+      );
+      for (const response of [remember, suppress]) {
+        expect(response.status).toBe(409);
+        expect(await response.json()).toMatchObject({
+          error: { code: "control_plane_lease_missing", retryable: false },
+        });
+      }
+      expect(memory.database.prepare("SELECT COUNT(*) AS count FROM memory_candidates").get())
+        .toEqual({ count: 0 });
+      expect(memory.database.prepare("SELECT COUNT(*) AS count FROM memory_suppressions").get())
+        .toEqual({ count: 0 });
+    } finally {
+      provider.database.close();
+      memory.database.close();
+    }
+  });
+
+  test("requires V2 ownership and a current server-held lease before provider replay or scope resolution", async () => {
+    const { database, port, authority, url } = await application();
+    const endpoint = `${url}/api/v2/guided/${IDS.mission}/commander/explain-more`;
+    try {
+      database.prepare("UPDATE missions SET control_plane = 'legacy' WHERE id = ?").run(IDS.mission);
+      const legacyMission = await fetch(endpoint, mutation("guided-legacy-mission", actionBody()));
+      expect(legacyMission.status).toBe(409);
+      expect(await legacyMission.json()).toMatchObject({ error: { code: "control_plane_mismatch" } });
+      database.prepare("UPDATE missions SET control_plane = 'command_os_v2' WHERE id = ?").run(IDS.mission);
+
+      database.prepare("UPDATE runs SET control_plane = 'legacy' WHERE id = ?").run(IDS.run);
+      const legacyRun = await fetch(endpoint, mutation("guided-legacy-run", actionBody()));
+      expect(legacyRun.status).toBe(409);
+      expect(await legacyRun.json()).toMatchObject({ error: { code: "control_plane_mismatch" } });
+      database.prepare("UPDATE runs SET control_plane = 'command_os_v2' WHERE id = ?").run(IDS.run);
+
+      authority.mode = "wrong_token";
+      const wrongToken = await fetch(endpoint, mutation("guided-wrong-token", actionBody()));
+      expect(wrongToken.status).toBe(409);
+      expect(await wrongToken.json()).toMatchObject({
+        error: { code: "control_plane_lease_authority_invalid" },
+      });
+
+      authority.mode = "wrong_fence";
+      const wrongFence = await fetch(endpoint, mutation("guided-wrong-fence", actionBody()));
+      expect(wrongFence.status).toBe(409);
+      expect(await wrongFence.json()).toMatchObject({
+        error: { code: "control_plane_lease_fence_invalid" },
+      });
+
+      authority.mode = "valid";
+      database.prepare("UPDATE control_plane_leases SET expires_at = ? WHERE run_id = ?")
+        .run("2026-07-15T09:59:59.000Z", IDS.run);
+      const expired = await fetch(endpoint, mutation("guided-expired-lease", actionBody()));
+      expect(expired.status).toBe(409);
+      expect(await expired.json()).toMatchObject({ error: { code: "control_plane_lease_expired" } });
+      database.prepare("UPDATE control_plane_leases SET expires_at = ? WHERE run_id = ?")
+        .run("2026-07-15T10:05:00.000Z", IDS.run);
+
+      const wrongMission = await fetch(
+        `${url}/api/v2/guided/mission-other/commander/explain-more`,
+        mutation("guided-wrong-mission-scope", actionBody()),
+      );
+      expect(wrongMission.status).toBe(404);
+      expect(await wrongMission.json()).toMatchObject({ error: { code: "guided_scope_not_found" } });
+
+      const request = mutation("guided-replay-authority", actionBody());
+      const valid = await fetch(endpoint, request);
+      expect(valid.status).toBe(200);
+      expect(port.calls).toHaveLength(1);
+
+      authority.mode = "missing";
+      const replayWithoutAuthority = await fetch(endpoint, request);
+      expect(replayWithoutAuthority.status).toBe(409);
+      expect(await replayWithoutAuthority.json()).toMatchObject({
+        error: { code: "control_plane_lease_missing" },
+      });
+      expect(port.calls).toHaveLength(1);
+      expect(database.prepare("SELECT COUNT(*) AS count FROM messages").get()).toEqual({ count: 3 });
+    } finally {
+      database.close();
+    }
+  });
+
+  test("refreshes a healthy heartbeat proof before committing a long-running provider response", async () => {
+    const port = new DeferredPlanningOnlyPort();
+    const { database, url } = await application(port);
+    try {
+      const pending = fetch(
+        `${url}/api/v2/guided/${IDS.mission}/commander/explain-more`,
+        mutation("guided-heartbeat-in-flight", actionBody()),
+      );
+      await port.started;
+      expect(port.calls).toHaveLength(1);
+      new ControlPlaneLeaseService(database).heartbeat({
+        runId: IDS.run,
+        controlPlane: "command_os_v2",
+        leaseOwner: CONTROL_LEASE_OWNER,
+        leaseToken: CONTROL_LEASE_TOKEN,
+        ttlMs: 300_000,
+        now: new Date("2026-07-15T10:01:00.000Z"),
+      });
+      port.releaseAll();
+
+      const response = await pending;
+      expect(response.status).toBe(200);
+      expect(database.prepare("SELECT COUNT(*) AS count FROM messages").get()).toEqual({ count: 3 });
+      expect(database.prepare(`
+        SELECT COUNT(*) AS count FROM events
+        WHERE event_type = 'guided.commander.explain_more'
+      `).get()).toEqual({ count: 1 });
+      expect(database.prepare("SELECT status, error_category FROM provider_turns").get())
+        .toEqual({ status: "completed", error_category: null });
+    } finally {
+      port.releaseAll();
+      database.close();
+    }
+  });
+
+  test("fences an interpreted-result completion after controller takeover without duplicating conversation state", async () => {
+    const port = new DeferredPlanningOnlyPort();
+    const { database, authority, url } = await application(port);
+    const leases = new ControlPlaneLeaseService(database);
+    const resultText = "443/tcp open https";
+    try {
+      const pending = fetch(
+        `${url}/api/v2/guided/${IDS.mission}/commander/interpret-result`,
+        mutation("guided-takeover-in-flight", actionBody({
+          result: {
+            source: "paste",
+            mediaType: "text/plain",
+            byteSize: Buffer.byteLength(resultText, "utf8"),
+            text: resultText,
+          },
+        })),
+      );
+      await port.started;
+      expect(port.calls).toHaveLength(1);
+      leases.release({
+        runId: IDS.run,
+        controlPlane: "command_os_v2",
+        leaseOwner: CONTROL_LEASE_OWNER,
+        leaseToken: CONTROL_LEASE_TOKEN,
+        now: new Date("2026-07-15T10:00:30.000Z"),
+      });
+      leases.acquire({
+        runId: IDS.run,
+        controlPlane: "command_os_v2",
+        leaseOwner: TAKEOVER_LEASE_OWNER,
+        leaseToken: TAKEOVER_LEASE_TOKEN,
+        ttlMs: 300_000,
+        now: new Date("2026-07-15T10:00:31.000Z"),
+      });
+      authority.mode = "takeover";
+      port.releaseAll();
+
+      const response = await pending;
+      expect(response.status).toBe(409);
+      expect(await response.json()).toMatchObject({
+        error: { code: "control_plane_lease_fence_invalid" },
+      });
+      // The operator-supplied observation was validly acquired before the
+      // takeover; the stale provider response cannot interpret or converse.
+      expect(database.prepare("SELECT COUNT(*) AS count FROM evidence").get()).toEqual({ count: 1 });
+      expect(database.prepare("SELECT COUNT(*) AS count FROM messages").get()).toEqual({ count: 1 });
+      expect(database.prepare(`
+        SELECT COUNT(*) AS count FROM events
+        WHERE event_type = 'guided.commander.interpret_result'
+      `).get()).toEqual({ count: 0 });
+      expect(database.prepare("SELECT status, error_category FROM provider_turns").get())
+        .toEqual({ status: "failed", error_category: "persistence_error" });
+      expect(database.prepare(`
+        SELECT COUNT(*) AS count FROM settings
+        WHERE key LIKE 'idempotency.guided-commander.%'
+      `).get()).toEqual({ count: 0 });
+    } finally {
+      port.releaseAll();
+      database.close();
+    }
+  });
+
+  test("requires fresh authority for a memory replay and rechecks it inside the idempotent write transaction", async () => {
+    const { database, authority, url } = await memoryApplication();
+    const request = mutation("guided-memory-replay-authority", actionBody({
+      sourceMessageId: IDS.initialMessage,
+      nodeType: "preference",
+      title: "Retain only under current Guided authority",
+      summary: "Keep evidence explanations concise",
+      scope: "global",
+      sensitivity: "private",
+    }));
+    try {
+      const first = await fetch(
+        `${url}/api/v2/guided/${IDS.mission}/commander/remember`,
+        request,
+      );
+      expect(first.status).toBe(201);
+      const firstBody = await responseJson(first);
+      expect(database.prepare("SELECT COUNT(*) AS count FROM memory_candidates").get())
+        .toEqual({ count: 1 });
+
+      authority.mode = "missing";
+      const replay = await fetch(
+        `${url}/api/v2/guided/${IDS.mission}/commander/remember`,
+        request,
+      );
+      expect(replay.status).toBe(409);
+      expect(await replay.json()).toMatchObject({ error: { code: "control_plane_lease_missing" } });
+      expect(database.prepare("SELECT COUNT(*) AS count FROM memory_candidates").get())
+        .toEqual({ count: 1 });
+
+      authority.mode = "valid";
+      const suppressionRequest = mutation("guided-memory-suppression-replay-authority", actionBody({
+        candidateId: firstBody.result.candidateId,
+        reason: "Do not retain this candidate",
+      }));
+      const suppressed = await fetch(
+        `${url}/api/v2/guided/${IDS.mission}/commander/do-not-remember`,
+        suppressionRequest,
+      );
+      expect(suppressed.status).toBe(200);
+      authority.mode = "missing";
+      const suppressionReplay = await fetch(
+        `${url}/api/v2/guided/${IDS.mission}/commander/do-not-remember`,
+        suppressionRequest,
+      );
+      expect(suppressionReplay.status).toBe(409);
+      expect(await suppressionReplay.json()).toMatchObject({
+        error: { code: "control_plane_lease_missing" },
+      });
+      expect(database.prepare("SELECT COUNT(*) AS count FROM memory_suppressions").get())
+        .toEqual({ count: 1 });
+    } finally {
+      database.close();
+    }
+  });
+
+  test("aborts a memory write when authority is lost between its fast replay check and commit", () => {
+    const database = createDatabaseConnection({ filename: ":memory:" });
+    migrateDatabase(database);
+    seedGuidedRuntime(database);
+    const service = new GuidedCommanderService({
+      repository: new GuidedCommanderRepository(database),
+    });
+    let authorityChecks = 0;
+    try {
+      expect(() => service.remember({
+        missionId: IDS.mission,
+        request: {
+          runId: IDS.run,
+          stepId: IDS.step,
+          expectedFingerprint: FINGERPRINT,
+          sourceMessageId: IDS.initialMessage,
+          nodeType: "preference",
+          title: "Must not survive an authority race",
+          summary: "No candidate may be committed",
+          scope: "global",
+          sensitivity: "private",
+        },
+        idempotencyKey: "guided-memory-transaction-race",
+        actorId: "operator-test",
+        assertMutationAuthority: () => {
+          authorityChecks += 1;
+          if (authorityChecks === 2) {
+            throw new ControlPlaneLeaseError(
+              "lease_fence_invalid",
+              "The controller changed before the idempotent commit",
+            );
+          }
+        },
+      })).toThrow("controller changed");
+      expect(authorityChecks).toBe(2);
+      expect(database.prepare("SELECT COUNT(*) AS count FROM memory_candidates").get())
+        .toEqual({ count: 0 });
+      expect(database.prepare(`
+        SELECT COUNT(*) AS count FROM settings
+        WHERE key LIKE 'idempotency.guided-commander.%'
+      `).get()).toEqual({ count: 0 });
+    } finally {
+      database.close();
+    }
+  });
+
   test("explains the exact represented step, persists context use, and replays idempotently", async () => {
     const { database, port, url } = await application();
     try {
@@ -367,12 +836,29 @@ describe("Guided Commander durable HTTP boundary", () => {
         constraints: { executeTools: false, mutatePlan: false },
         step: { id: IDS.step, actionFingerprint: FINGERPRINT },
       });
-      expect(port.calls[0]!.memoryContext[0]).toMatchObject({ id: "memory-guided-explanation" });
-      expect(port.calls[0]!.presentationPreferences).toEqual([expect.objectContaining({
+      expect(port.calls[0]!.brainContext.items[0]).toMatchObject({
         nodeId: "memory-guided-explanation",
-        directive: expect.stringContaining("concise evidence-led explanations"),
-        confidence: 1,
-      })]);
+        summary: expect.stringContaining("concise evidence-led explanations"),
+      });
+      expect(port.calls[0]!.brainContext).toMatchObject({
+        status: "ready",
+        exposureReceiptId: expect.stringMatching(/^exposure_/u),
+      });
+      expect(JSON.stringify(port.calls[0]!.brainContext)).not.toContain("Explain why the evidence matters");
+      expect(JSON.stringify(port.calls[0]!.brainContext)).not.toContain("LOCAL_ONLY_BODY_MUST_NOT_REACH_PROVIDER");
+      expect(port.calls[0]!.brainContext.rejected).toContainEqual({
+        reason: "lesson_not_canonically_verified",
+        count: 1,
+      });
+      expect(database.prepare(`
+        SELECT provider_turn_id, selected_context_ids_json, rejected_context_ids_json, blocked
+        FROM provider_exposure_receipts
+      `).get()).toMatchObject({
+        provider_turn_id: expect.any(String),
+        selected_context_ids_json: JSON.stringify(["memory-guided-explanation"]),
+        rejected_context_ids_json: JSON.stringify(["memory-guided-local-only"]),
+        blocked: 0,
+      });
 
       const replay = await responseJson(await fetch(
         `${url}/api/v2/guided/${IDS.mission}/commander/explain-more`,
@@ -387,7 +873,6 @@ describe("Guided Commander durable HTTP boundary", () => {
         SELECT used, influence_summary FROM memory_context_items
         WHERE context_pack_id = ? AND node_id = 'memory-guided-explanation'
       `).get(first.result.contextPackId)).toMatchObject({ used: 1, influence_summary: expect.any(String) });
-
       const transcript = await responseJson(await fetch(
         `${url}/api/v2/guided/${IDS.mission}/commander/transcript?runId=${IDS.run}`,
       ));
@@ -463,6 +948,29 @@ describe("Guided Commander durable HTTP boundary", () => {
         SELECT COUNT(*) AS count FROM messages WHERE role IN ('operator', 'assistant')
           AND id != ?
       `).get(IDS.initialMessage)).toEqual({ count: 2 });
+      const brainHookAudit = database.prepare(`
+        SELECT action, actor_type, actor_id, resource_id, details_json FROM audit_records
+        WHERE action = 'brain.context_hook.invoked'
+      `).get() as {
+        action: string;
+        actor_type: string;
+        actor_id: string;
+        resource_id: string;
+        details_json: string;
+      };
+      expect(brainHookAudit).toMatchObject({
+        action: "brain.context_hook.invoked",
+        actor_type: "agent",
+        actor_id: "guided-commander",
+        resource_id: first.result.contextPackId,
+      });
+      expect(JSON.parse(brainHookAudit.details_json)).toMatchObject({
+        hook: "phase_transition",
+        status: "ready",
+        contextPackId: first.result.contextPackId,
+        availabilityPolicy: "degraded_allowed",
+        retrievedCount: 2,
+      });
     } finally {
       port.releaseAll();
       database.close();
@@ -498,6 +1006,7 @@ describe("Guided Commander durable HTTP boundary", () => {
       idempotencyKey: key,
       actorId: "operator-test",
       signal: new AbortController().signal,
+      assertMutationAuthority: () => {},
     });
     const counts = () => ({
       contextPacks: (database.prepare("SELECT COUNT(*) AS count FROM memory_context_packs").get() as { count: number }).count,
@@ -562,6 +1071,7 @@ describe("Guided Commander durable HTTP boundary", () => {
       idempotencyKey: "guided-owner-failure-release-0001",
       actorId: "operator-test",
       signal: new AbortController().signal,
+      assertMutationAuthority: () => {},
     };
     try {
       await expect(service.respond(request)).rejects.toMatchObject({
@@ -611,6 +1121,7 @@ describe("Guided Commander durable HTTP boundary", () => {
       idempotencyKey: "guided-expired-reservation-0001",
       actorId: "operator-test",
       signal: new AbortController().signal,
+      assertMutationAuthority: () => {},
     };
     try {
       const stalePending = firstService.respond(request);
@@ -636,15 +1147,16 @@ describe("Guided Commander durable HTTP boundary", () => {
         { status: "cancelled", error_category: "idempotent_replay" },
         { status: "completed", error_category: null },
       ]);
-      expect(database.prepare(`
+      const contextRows = database.prepare(`
         SELECT p.message_id, i.used, i.influence_summary
         FROM memory_context_packs p
         JOIN memory_context_items i ON i.context_pack_id = p.id
         ORDER BY p.rowid
-      `).all()).toEqual([
-        { message_id: null, used: 0, influence_summary: null },
-        { message_id: expect.any(String), used: 1, influence_summary: expect.any(String) },
-      ]);
+      `).all() as Array<{ message_id: string | null; used: number; influence_summary: string | null }>;
+      expect(contextRows).toHaveLength(4);
+      expect(contextRows.filter((row) => row.message_id === null && row.used === 0)).toHaveLength(2);
+      expect(contextRows.filter((row) => row.message_id !== null && row.used === 1)).toHaveLength(1);
+      expect(contextRows.filter((row) => row.message_id !== null && row.used === 0)).toHaveLength(1);
 
       // A stale owner cannot release a newer in-progress takeover.
       const directKey = "guided-owner-release-fence-0001";
@@ -655,6 +1167,7 @@ describe("Guided Commander durable HTTP boundary", () => {
         requestHash: directHash,
         actorId: "operator-test",
         leaseMs: 1_000,
+        assertMutationAuthority: () => {},
       });
       expect(oldOwner.status).toBe("reserved");
       nowMs += 1_001;
@@ -664,6 +1177,7 @@ describe("Guided Commander durable HTTP boundary", () => {
         requestHash: directHash,
         actorId: "operator-test",
         leaseMs: 1_000,
+        assertMutationAuthority: () => {},
       });
       expect(newOwner.status).toBe("reserved");
       if (oldOwner.status !== "reserved" || newOwner.status !== "reserved") throw new Error("reservation fixture failed");
@@ -679,6 +1193,7 @@ describe("Guided Commander durable HTTP boundary", () => {
         requestHash: directHash,
         actorId: "operator-test",
         leaseMs: 1_000,
+        assertMutationAuthority: () => {},
       })).toMatchObject({ status: "in_progress" });
       expect(secondRepository.releaseProviderMutationReservation({
         scope: `explain_more:${IDS.mission}`,
@@ -810,8 +1325,13 @@ describe("Guided Commander durable HTTP boundary", () => {
   });
 
   test("creates only a reviewable memory candidate and supports do-not-relearn suppression", async () => {
-    const { database, url } = await application();
+    const { database, url } = await memoryApplication();
     try {
+      const providerAction = await fetch(
+        `${url}/api/v2/guided/${IDS.mission}/commander/show-next-step`,
+        mutation("guided-provider-not-mounted-0001", actionBody()),
+      );
+      expect(providerAction.status).toBe(404);
       const rememberRequest = mutation("guided-remember-0001", actionBody({
         sourceMessageId: IDS.initialMessage,
         nodeType: "preference",

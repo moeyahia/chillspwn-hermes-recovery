@@ -43,12 +43,31 @@ function seed(database: ReturnType<typeof createDatabaseConnection>): void {
   `).run(NOW);
   database.prepare(`
     INSERT INTO agents (
-      id, role, display_name, status, version, created_at, updated_at
+      id, role, display_name, status, tool_policy_json, version, created_at, updated_at
     ) VALUES (
       'ReconScout', 'reconnaissance', 'ReconScout',
-      'available', '1', ?, ?
+      'available', '{"allowedTools":["quick_scan"],"deniedTools":[],"approvalRequiredTools":[]}',
+      '1', ?, ?
     )
   `).run(NOW, NOW);
+  database.prepare(`
+    INSERT INTO agent_capabilities (
+      agent_id, capability, source, enabled, metadata_json
+    ) VALUES (
+      'ReconScout', 'quick_scan', 'test-runtime-manifest', 1, '{}'
+    )
+  `).run();
+  database.prepare(`
+    INSERT INTO mcp_servers (
+      id, name, transport, status, capabilities_json, policy_json,
+      last_checked_at, created_at, updated_at
+    ) VALUES (
+      'sechub-reconnaissance', 'sechub-reconnaissance', 'stdio', 'healthy',
+      '["quick_scan"]',
+      '{"enabled":true,"startPermitted":true,"assignedAgents":["ReconScout"]}',
+      ?, ?, ?
+    )
+  `).run(NOW, NOW, NOW);
   database.prepare(`
     INSERT INTO mission_contracts (
       id, mission_id, version, state, contract_hash, authorization_json,
@@ -113,7 +132,11 @@ function seed(database: ReturnType<typeof createDatabaseConnection>): void {
     },
     authorType: "operator",
     authorId: "reviewer-independent",
-    retentionPolicy: { allowAutonomous: true, allowGuided: true },
+    retentionPolicy: {
+      allowAutonomous: true,
+      allowGuided: true,
+      publicProviderDisclosure: "sanitized",
+    },
   });
 }
 
@@ -211,7 +234,10 @@ async function application() {
   const server = app.listen(0, "127.0.0.1");
   servers.push(server);
   await new Promise<void>((resolve) => server.once("listening", resolve));
-  return { database, url: `http://127.0.0.1:${(server.address() as AddressInfo).port}` };
+  return {
+    database,
+    url: `http://127.0.0.1:${(server.address() as AddressInfo).port}`,
+  };
 }
 
 function requestBody(reason = "Validate the verified lesson against a fresh bounded attempt"): RequestInit {
@@ -223,6 +249,32 @@ function requestBody(reason = "Validate the verified lesson against a fresh boun
 }
 
 describe("canonical follow-up run HTTP boundary", () => {
+  test("requires exclusive V2 ownership while allowing terminal lease cleanup and idempotent replay", async () => {
+    const replay = await application();
+    try {
+      const first = await fetch(`${replay.url}/api/v2/operations/runs/run-source/follow-up`, requestBody());
+      expect(first.status).toBe(201);
+      const firstRunId = ((await first.json()) as { run: { id: string } }).run.id;
+      const replayed = await fetch(`${replay.url}/api/v2/operations/runs/run-source/follow-up`, requestBody());
+      expect(replayed.status).toBe(201);
+      expect(((await replayed.json()) as { run: { id: string } }).run.id).toBe(firstRunId);
+      expect(replay.database.prepare("SELECT COUNT(*) AS count FROM runs").get()).toEqual({ count: 2 });
+    } finally {
+      replay.database.close();
+    }
+
+    const imported = await application();
+    try {
+      imported.database.prepare("UPDATE runs SET control_plane = 'legacy' WHERE id = 'run-source'").run();
+      const response = await fetch(`${imported.url}/api/v2/operations/runs/run-source/follow-up`, requestBody());
+      expect(response.status).toBe(409);
+      expect(await response.json()).toMatchObject({ error: { code: "control_plane_mismatch" } });
+      expect(imported.database.prepare("SELECT COUNT(*) AS count FROM runs").get()).toEqual({ count: 1 });
+    } finally {
+      imported.database.close();
+    }
+  });
+
   test("a live MissionRuntimeEngine scheduler discovers the HTTP-created follow-up and dispatches its Autonomous action", async () => {
     const { database, url } = await application();
     const execution = new SchedulerExecution();
@@ -260,6 +312,23 @@ describe("canonical follow-up run HTTP boundary", () => {
       expect(database.prepare(`
         SELECT COUNT(*) AS count FROM lesson_usage WHERE run_id = ?
       `).get(created.run.id)).toEqual({ count: 0 });
+      // The production Grok adapter creates the provider-facing Context Pack;
+      // this scheduler fixture deliberately injects a local planner. Prove the
+      // exact lesson selection survived into the follow-up without pretending
+      // the fixture exercised the public-provider boundary.
+      expect(database.prepare(`
+        SELECT node_id FROM run_context_selections
+        WHERE run_id = ? AND selection_type = 'verified_lesson'
+      `).get(created.run.id)).toEqual({
+        node_id: canonicalLessonMemoryNodeId("lesson-follow-up"),
+      });
+      expect(database.prepare(`
+        SELECT control_plane, lease_owner
+        FROM runs WHERE id = ?
+      `).get(created.run.id)).toEqual({
+        control_plane: "command_os_v2",
+        lease_owner: "follow-up-scheduler-test",
+      });
     } finally {
       await runtime.stop();
       database.close();
@@ -326,6 +395,11 @@ describe("canonical follow-up run HTTP boundary", () => {
         .toEqual({ count: 0 });
 
       await first.stop();
+      // A shutdown after plan commit intentionally leaves the durable worker
+      // lease for expiry-based restart classification; it must not pretend the
+      // in-flight continuation completed cleanly.
+      expect(database.prepare(`SELECT lease_owner FROM runs WHERE id = ?`).get(created.run.id))
+        .toEqual({ lease_owner: "follow-up-before-restart" });
       nowMs += 2_000;
       await replacement.start();
       expect(replacementExecution.dispatched).toHaveLength(1);
@@ -333,6 +407,13 @@ describe("canonical follow-up run HTTP boundary", () => {
         runId: created.run.id,
         actionType: "reconnaissance",
         target: "lab.internal",
+      });
+      expect(database.prepare(`
+        SELECT control_plane, lease_owner
+        FROM runs WHERE id = ?
+      `).get(created.run.id)).toEqual({
+        control_plane: "command_os_v2",
+        lease_owner: "follow-up-after-restart",
       });
 
       await replacement.scanOnce();
@@ -377,7 +458,7 @@ describe("canonical follow-up run HTTP boundary", () => {
       expect(first.status).toBe(201);
       const created = await first.json() as any;
       expect(created).toMatchObject({
-        schemaVersion: "2.1",
+        schemaVersion: "2.4",
         sourceRunId: "run-source",
         run: {
           missionId: "mission-follow-up",

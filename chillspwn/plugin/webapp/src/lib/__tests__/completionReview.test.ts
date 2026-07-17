@@ -71,7 +71,7 @@ describe("terminal run completion model", () => {
 
   test("parses and formats a canonical measured comparison without inventing a claim", () => {
     const page = parseEvaluationPage({
-      schemaVersion: "2.1",
+      schemaVersion: "2.4",
       nextCursor: null,
       items: [{
         id: "evaluation-current",

@@ -58,6 +58,113 @@ Backups can contain sensitive engagement data. Encrypt them, restrict access, de
 6. Deploy and review both service states, health, logs, canonical database reads/writes, memory scope/forgetting, vault sync, and a non-destructive session flow.
 7. Retain the prior build and state backup until validation completes.
 
+## Historical engagement import and approved Vault projection
+
+Historical import and Obsidian projection are deliberately separate. Import
+never writes the Vault. Projection requires the completed migration's exact
+reconciliation hash, the exact node-selection hash from a read-only preview,
+an existing connected Vault ID, and explicit operator approval.
+
+Set the deployed paths and use only source roots that exist on that host:
+
+```bash
+cd /opt/chillspwn/plugin/webapp
+DB=/var/lib/chillspwn/command-os-v2.sqlite
+VAULT_ROOT=/var/lib/chillspwn/brain-vaults
+IMPORT_OUT=/var/lib/chillspwn/migrations/legacy-$(date -u +%Y%m%dT%H%M%SZ)
+```
+
+Discovery/hash-only preview (writes only its reconciliation preview below
+`IMPORT_OUT`; it does not write SQLite or Obsidian):
+
+```bash
+bun run server/migration/cli.ts migrate \
+  --db "$DB" \
+  --source /root/htb/boxes \
+  --source /root/engagements \
+  --output "$IMPORT_OUT" \
+  --dry-run
+```
+
+Review every included, excluded, and quarantined path. Quiesce V2 canonical and
+Vault writers before the apply run. Legacy source directories remain read-only
+from the importer's perspective:
+
+```bash
+bun run server/migration/cli.ts migrate \
+  --db "$DB" \
+  --source /root/htb/boxes \
+  --source /root/engagements \
+  --output "$IMPORT_OUT"
+```
+
+Record the returned `migrationId`, then read the database-backed reconciliation
+receipt and choose the exact active Vault connection:
+
+```bash
+MIGRATION_ID='<returned migrationId>'
+bun run db:reconcile --db "$DB" --migration-id "$MIGRATION_ID"
+RECONCILIATION_HASH='<reportHash from db:reconcile>'
+sqlite3 "$DB" \
+  "SELECT id, display_name, vault_path, status FROM vault_connections ORDER BY updated_at DESC;"
+CONNECTION_ID='<reviewed connected Vault ID>'
+```
+
+Preview the exact imported-node projection. This command opens SQLite read-only
+and does not write approval rows, sync state, notes, or attachments:
+
+```bash
+bun run brain:project-legacy \
+  --db "$DB" \
+  --vault-root "$VAULT_ROOT" \
+  --migration-id "$MIGRATION_ID" \
+  --reconciliation-hash "$RECONCILIATION_HASH" \
+  --connection "$CONNECTION_ID" \
+  --dry-run
+PROJECTION_HASH='<projectionHash from the reviewed preview>'
+```
+
+Apply only the reviewed selection. A fresh filesystem write/read/rename/delete
+round-trip must pass before the approval or any note is written:
+
+```bash
+bun run brain:project-legacy \
+  --db "$DB" \
+  --vault-root "$VAULT_ROOT" \
+  --migration-id "$MIGRATION_ID" \
+  --reconciliation-hash "$RECONCILIATION_HASH" \
+  --projection-hash "$PROJECTION_HASH" \
+  --connection "$CONNECTION_ID" \
+  --approved-by 'operator:local' \
+  --approve-projection
+bun run brain:sync-verify \
+  --db "$DB" --vault-root "$VAULT_ROOT" --connection "$CONNECTION_ID"
+```
+
+Expected reconciliation behavior:
+
+- dry-run reports source hashes, classified engagement manifests, exclusions,
+  and predicted counts without creating a database backup or canonical rows;
+- apply creates a verified database backup and protected, hash-checked source
+  backup before import, preserves timestamps, quarantines unsafe/malformed
+  material, and leaves original sources unchanged;
+- imported missions remain authorization-unverified and historical runs remain
+  blocked; raw logs are not promoted to verified evidence, while evidence and
+  lesson candidates retain provenance for review;
+- engagement manifests deterministically create connected mission, run, source,
+  artifact, and evidence-candidate Brain nodes and edges;
+- replaying an unchanged import produces deduplicated rather than duplicate
+  canonical rows;
+- projection preview reports `mapped`, `eligible`, and
+  `excludedByPolicyOrConnectionScope` counts plus the exact projection hash;
+- projection refuses stale reconciliation/projection hashes, a disconnected or
+  unhealthy Vault, missing explicit approval, or an empty eligible selection;
+- existing operator-edited notes are never overwritten: conflicts and
+  vault-ahead states return `attention_required` (exit 2), while hard export
+  failures return exit 1; a clean projection returns exit 0;
+- replaying the same approved projection is idempotent and reports current notes
+  as skipped rather than duplicating them.
+
 ## Rollback
 
 Rolling back code may not roll back additive schema changes or rewritten JSON. Restore code first only when the prior version tolerates the current data shape. Otherwise stop the service and restore the matching, encrypted state backup.

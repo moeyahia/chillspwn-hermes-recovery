@@ -32,7 +32,7 @@ test.describe("Global Command Palette", () => {
       const response = await request.get(path);
       expect(response.ok(), path).toBe(true);
       const body = await response.json() as { schemaVersion: string; items: unknown[] };
-      expect(body.schemaVersion).toBe("2.1");
+      expect(body.schemaVersion).toBe("2.4");
       expect(Array.isArray(body.items)).toBe(true);
     }
 
@@ -42,6 +42,6 @@ test.describe("Global Command Palette", () => {
     await search.fill("Start Guided Mission");
     await page.keyboard.press("Enter");
     await expect(page).toHaveURL(/\/missions\/new\/guided$/u);
-    await expect(page.getByRole("heading", { level: 1, name: "Start with the authorized objective" })).toBeVisible();
+    await expect(page.getByRole("heading", { level: 1, name: "Begin with one authorized target" })).toBeVisible();
   });
 });
