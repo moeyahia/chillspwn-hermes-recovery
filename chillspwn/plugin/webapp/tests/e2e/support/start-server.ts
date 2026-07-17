@@ -179,9 +179,19 @@ server.once("error", (error) => {
 });
 
 server.once("exit", (code, signal) => {
-  cleanup();
   if (!stopping) {
-    console.error(`[e2e] isolated Command OS server exited unexpectedly (${signal || code})`);
+    // Preserve the disposable database, logs, and Vault projection after an
+    // unexpected child exit. Deleting this state here made one-off browser
+    // server failures impossible to diagnose because the only correlated
+    // evidence disappeared before Playwright reported the first ECONNREFUSED.
+    // Normal Playwright teardown still follows the `stopping` branch below
+    // and removes the isolated root.
+    console.error(
+      `[e2e] isolated Command OS server exited unexpectedly (${signal || code}); `
+      + `retained diagnostic state at ${isolatedRoot}`,
+    );
     process.exitCode = code && code !== 0 ? code : 1;
+    return;
   }
+  cleanup();
 });
