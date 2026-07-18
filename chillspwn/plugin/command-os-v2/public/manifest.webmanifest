@@ -1,0 +1,12 @@
+{
+  "name": "ChillsPwn Command OS V2 Preview",
+  "short_name": "Command OS V2",
+  "id": "/?source=command-os-v2",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#edf2f1",
+  "theme_color": "#ffffff",
+  "description": "A parallel preview control plane for authorized ChillsPwn security missions.",
+  "icons": []
+}

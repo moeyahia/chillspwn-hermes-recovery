@@ -6,12 +6,20 @@
  */
 
 import { spawn } from "child_process";
+import { chmodSync, mkdtempSync, rmSync } from "fs";
+import { tmpdir } from "os";
+import { join } from "path";
 import type { McpServerSpec, JsonRpcResponse } from "./McpTypes";
 import { MCP_PROTOCOL_VERSION } from "./McpTypes";
+import { v2McpChildPath } from "./V2TrustedToolPath";
 
-export interface ExecOptions { timeoutMs: number; allowDocker: boolean; env?: NodeJS.ProcessEnv }
+export interface ExecOptions {
+  timeoutMs: number;
+  allowDocker: boolean;
+  env?: NodeJS.ProcessEnv;
+  signal?: AbortSignal;
+}
 
-const MCP_CHILD_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 const SAFE_STATIC_ENV = new Set(["MCP_TRANSPORT", "NODE_ENV", "PYTHONUNBUFFERED"]);
 const DANGEROUS_ENV = /^(?:DASHBOARD_TOKEN|CHILLSPWN_DASHBOARD_TOKEN|NODE_OPTIONS|BUN_OPTIONS|PYTHONPATH|PYTHONSTARTUP|BASH_ENV|ENV|SHELLOPTS|GIT_SSH_COMMAND|LD_.+|DYLD_.+)$/;
 
@@ -22,7 +30,7 @@ function allowedExplicitEnvName(name: string): boolean {
 /** Build a least-privilege environment for an untrusted third-party MCP process. */
 export function buildMcpChildEnv(spec: McpServerSpec, source: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {
-    PATH: MCP_CHILD_PATH,
+    PATH: v2McpChildPath(spec.name),
     HOME: "/var/empty",
     TMPDIR: "/tmp",
     LANG: typeof source.LANG === "string" && source.LANG.length <= 64 ? source.LANG : "C.UTF-8",
@@ -61,18 +69,56 @@ interface RawResult { ok: boolean; result?: any; error?: string }
 
 /** Run a single JSON-RPC session: initialize → (optional) tools/list → method/params → close. */
 async function rpcSession(cmd: { command: string; args: string[]; cwd?: string; env?: Record<string, string> }, method: string, params: unknown, opts: ExecOptions): Promise<RawResult> {
+  // Several local MCP implementations need a writable HOME for bounded cache
+  // and state files. Give every stdio session a private, disposable directory
+  // instead of exposing the service account's real home or sharing state across
+  // calls. The directory is removed on success, error, cancellation, or timeout.
+  const sessionHome = mkdtempSync(join(tmpdir(), "chillspwn-mcp-home-"));
+  chmodSync(sessionHome, 0o700);
+  const cleanupSessionHome = () => {
+    try { rmSync(sessionHome, { recursive: true, force: true }); } catch { /* best effort after process termination */ }
+  };
   return await new Promise<RawResult>((resolve) => {
     let child: ReturnType<typeof spawn>;
     try {
-      child = spawn(cmd.command, cmd.args, { cwd: cmd.cwd, env: opts.env ?? {}, stdio: ["pipe", "pipe", "pipe"] });
-    } catch (e) { return resolve({ ok: false, error: `spawn failed: ${(e as Error).message}` }); }
+      child = spawn(cmd.command, cmd.args, {
+        cwd: cmd.cwd,
+        env: { ...(opts.env ?? {}), HOME: sessionHome },
+        stdio: ["pipe", "pipe", "pipe"],
+        // A separate process group lets cancellation clean up helpers spawned
+        // by an MCP server instead of orphaning them after the stdio client exits.
+        detached: process.platform !== "win32",
+      });
+    } catch (e) {
+      cleanupSessionHome();
+      return resolve({ ok: false, error: `spawn failed: ${(e as Error).message}` });
+    }
 
     let buf = "";
     let nextId = 1;
     let settled = false;
     const pending = new Map<number, (r: JsonRpcResponse) => void>();
-    const done = (r: RawResult) => { if (settled) return; settled = true; clearTimeout(timer); try { child.kill("SIGKILL"); } catch {} resolve(r); };
+    const terminate = () => {
+      try {
+        if (process.platform !== "win32" && child.pid) process.kill(-child.pid, "SIGKILL");
+        else child.kill("SIGKILL");
+      } catch {
+        try { child.kill("SIGKILL"); } catch {}
+      }
+    };
+    const onAbort = () => done({ ok: false, error: "MCP call cancelled" });
+    const done = (r: RawResult) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      opts.signal?.removeEventListener("abort", onAbort);
+      terminate();
+      cleanupSessionHome();
+      resolve(r);
+    };
     const timer = setTimeout(() => done({ ok: false, error: `MCP call timed out after ${opts.timeoutMs}ms` }), opts.timeoutMs);
+    if (opts.signal?.aborted) return done({ ok: false, error: "MCP call cancelled" });
+    opts.signal?.addEventListener("abort", onAbort, { once: true });
 
     const send = (msg: object) => { try { child.stdin!.write(JSON.stringify(msg) + "\n"); } catch {} };
     const request = (m: string, p?: unknown) => new Promise<JsonRpcResponse>((res) => { const id = nextId++; pending.set(id, res); send({ jsonrpc: "2.0", id, method: m, params: p }); });

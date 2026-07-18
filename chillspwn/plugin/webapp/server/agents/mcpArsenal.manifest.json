@@ -506,21 +506,21 @@
       "category": "reconnaissance",
       "riskClass": "network",
       "toolNames": [
-        "nmap",
+        "nmapScan",
+        "generateWordlist",
+        "runJohnTheRipper",
         "gobuster",
         "nikto",
-        "dnsenum",
-        "whois",
-        "dig",
-        "sslscan",
-        "wpscan",
-        "hashcat"
+        "httpxProbe",
+        "ffufScan",
+        "nucleiScan",
+        "hydraBruteforce",
+        "extractionSweep"
       ],
       "requiredBinaries": [
         "nmap",
         "gobuster",
-        "nikto",
-        "hashcat"
+        "nikto"
       ],
       "requiredDockerImages": [
         "pentest-mcp (optional)"
@@ -536,7 +536,7 @@
         "WebBreaker",
         "CredSmith"
       ],
-      "notes": "Modular TS toolkit; tool surface SPLIT across specialists by category in agentMcpMap (recon\u2192ReconScout, nikto/wpscan\u2192WebBreaker, hashcat\u2192CredSmith)."
+      "notes": "Configured exposure subset only. The complete 19-tool installed surface is reviewed in McpToolDispositionRegistry; process-global, host-audit, packet-capture, and noncanonical-report tools remain suppressed. Active network and credential tools are Guided-only."
     },
     {
       "mcpServerName": "chillspwn-reporting",
@@ -615,7 +615,12 @@
         "check_package_vulns",
         "get_attack_mapping",
         "calculate_risk_score",
-        "health_check"
+        "health_check",
+        "get_vendor_advisory",
+        "check_exploit_availability",
+        "get_cve_timeline",
+        "check_poc_exists",
+        "compare_cves"
       ],
       "requiredBinaries": [],
       "requiredDockerImages": [],
@@ -633,7 +638,7 @@
       "assignedAgents": [
         "VulnIntel"
       ],
-      "notes": "Read-only CVE/EPSS/KEV/ATT&CK intelligence. NVD works keyless (rate-limited).",
+      "notes": "Configured CVE-focused exposure subset only. The complete 27-tool installed surface is reviewed in McpToolDispositionRegistry; OSINT, raw-manifest disclosure, secret search, and noncanonical-report tools remain suppressed. NVD works keyless (rate-limited).",
       "optionalEnv": [
         "NVD_API_KEY",
         "VIRUSTOTAL_KEY",

@@ -4,15 +4,18 @@
 
 ChillsPwn intentionally stores operational state outside the repository. Principal locations include:
 
-- `${HERMES_HOME:-$HOME/.hermes}/kanban.db` for the Mission Board;
-- `CHILLSPWN_STATE_DIR` (default: the `chillspwn` child of `HERMES_HOME`) for runtime state, logs, artifacts, reports, and UI data;
-- `CHILLSPWN_PERSONAS_DIR` (default: the `personas` child of `CHILLSPWN_STATE_DIR`) for deployed personas;
+- `COMMAND_OS_DB_PATH=/var/lib/chillspwn/command-os-v2.sqlite` for canonical V2 mission, event, evidence, memory, lesson, and audit state;
+- `CHILLSPWN_VAULT_ROOT=/var/lib/chillspwn/brain-vaults` for the synchronized Obsidian-compatible projection;
+- `CHILLSPWN_STATE_DIR=/var/lib/chillspwn/state` for compatibility runtime state, logs, artifacts, reports, and UI data;
+- `CHILLSPWN_PERSONAS_DIR=/opt/chillspwn/plugin/webapp/server/agents/personas` for reviewed deployed personas;
 - `CHILLSPWN_SESSIONS_DIR` (default: the `sessions` child of `CHILLSPWN_STATE_DIR`) for ChillsPwn sessions;
 - the `osint-jobs` child of `CHILLSPWN_STATE_DIR` for detached OSINT job snapshots and worker logs;
-- `${HERMES_HOME:-$HOME/.hermes}` for Hermes configuration, conversations, protected reusable memory, scripts, and provider state;
+- `HERMES_HOME=/var/lib/chillspwn/hermes` for Hermes mutable state and configuration;
 - the ordered `ALLOWED_WORKSPACE_ROOTS` for engagements, reports, and OSINT output artifacts.
 
-The integrated recovery services set `HERMES_HOME=/root/.hermes` and the ChillsPwn paths under `/root/.hermes/chillspwn`. Historical phase documents may mention `~/.claude/chillspwn`; that is not the maintained recovery layout.
+Historical phase documents may mention `~/.claude/chillspwn` or
+`/root/.hermes`; those are migration sources, not the maintained V2 runtime
+layout.
 
 OSINT job control state is not trusted merely because it was written previously. Rehydration revalidates the job ID and structured fields, resolves the recorded output directory beneath the current workspace allowlist, rejects symlinks and traversal, and uses bounded no-follow reads for state, stdout tails, and artifacts. Changing `ALLOWED_WORKSPACE_ROOTS` can therefore make an older job intentionally unavailable until its output is moved through an operator-reviewed migration.
 
@@ -20,27 +23,27 @@ These locations may contain credentials, target details, proof artifacts, raw mo
 
 ## SQLite contract
 
-The dashboard expects an existing Hermes database with base tables such as `tasks`, `task_events`, and `task_runs`. Application startup creates `board_columns` and performs limited additive alterations, but it does not bootstrap the complete base schema.
-
-Consequences:
-
-- a blank database is not a supported full setup;
-- schema ownership currently spans projects;
-- there is no version table or transactional migration directory;
-- deployment must verify schema compatibility before restarting.
+Command OS owns a versioned SQLite schema and migration directory, enables WAL,
+foreign keys, and a busy timeout, and uses prepared repositories and explicit
+transactions. The legacy Hermes Kanban database remains a compatibility/import
+source during controlled migration; it is not canonical V2 authority.
 
 ## JSON and JSONL stores
 
-Runtime modules persist run events, memory proposals, attack lessons, evidence references, artifacts, and related state in external JSON/JSONL stores. Readers may tolerate older shapes, but those implicit upgrades are not a substitute for a versioned migration process.
-
-Reusable flat memory is not an ordinary service-owned JSON/Markdown store in the recovered deployment. `/root/.hermes/memories` is root-only; the dashboard and gateway use `chillspwn-memory.service` for policy-filtered reads and validated additive writes. Operational backups must preserve that ownership boundary, and operator curation must use the root-only CLI path rather than changing permissions for the service account.
+Legacy JSON, JSONL, Markdown, artifact directories, and Kanban SQLite are imported
+idempotently with source hashes and provenance. Originals remain untouched
+through cutover and rollback. New mission and Second Brain state is canonical in
+the V2 database; the vault is a versioned projection/import surface. There is no
+root memory-broker dependency in the hardened unit graph.
 
 ## Backup
 
-Stop or quiesce the memory broker, dashboard, and gateway before backing up state. For SQLite, use SQLite's backup mechanism rather than copying a live database file:
+Stop or quiesce the dashboard, gateway, migration, and vault writers before an
+offline restore. Use SQLite's backup mechanism rather than copying a live file:
 
 ```bash
-sqlite3 "$HOME/.hermes/kanban.db" ".backup '/secure-backup/kanban.db'"
+sqlite3 /var/lib/chillspwn/command-os-v2.sqlite \
+  ".backup '/secure-backup/command-os-v2.sqlite'"
 ```
 
 Backups can contain sensitive engagement data. Encrypt them, restrict access, define retention, and keep them outside the Git worktree.
@@ -51,9 +54,116 @@ Backups can contain sensitive engagement data. Encrypt them, restrict access, de
 2. Back up the board with SQLite's online backup API and hash it; back up other external stores consistently and encrypt them.
 3. Build and validate the candidate release before service interruption, including `bun run check:server-entry`.
 4. Inspect startup schema changes, memory-policy changes, and provider path changes in the candidate diff.
-5. Quiesce `chillspwn-memory.service`, `chillspwn.service`, and `hermes-gateway.service` before migration.
-6. Deploy and review all three service states, health, logs, board reads/writes, broker-mediated memory reads, and a non-destructive session flow.
+5. Quiesce `chillspwn.service`, `hermes-gateway.service`, migration, and vault writers before migration.
+6. Deploy and review both service states, health, logs, canonical database reads/writes, memory scope/forgetting, vault sync, and a non-destructive session flow.
 7. Retain the prior build and state backup until validation completes.
+
+## Historical engagement import and approved Vault projection
+
+Historical import and Obsidian projection are deliberately separate. Import
+never writes the Vault. Projection requires the completed migration's exact
+reconciliation hash, the exact node-selection hash from a read-only preview,
+an existing connected Vault ID, and explicit operator approval.
+
+Set the deployed paths and use only source roots that exist on that host:
+
+```bash
+cd /opt/chillspwn/plugin/webapp
+DB=/var/lib/chillspwn/command-os-v2.sqlite
+VAULT_ROOT=/var/lib/chillspwn/brain-vaults
+IMPORT_OUT=/var/lib/chillspwn/migrations/legacy-$(date -u +%Y%m%dT%H%M%SZ)
+```
+
+Discovery/hash-only preview (writes only its reconciliation preview below
+`IMPORT_OUT`; it does not write SQLite or Obsidian):
+
+```bash
+bun run server/migration/cli.ts migrate \
+  --db "$DB" \
+  --source /root/htb/boxes \
+  --source /root/engagements \
+  --output "$IMPORT_OUT" \
+  --dry-run
+```
+
+Review every included, excluded, and quarantined path. Quiesce V2 canonical and
+Vault writers before the apply run. Legacy source directories remain read-only
+from the importer's perspective:
+
+```bash
+bun run server/migration/cli.ts migrate \
+  --db "$DB" \
+  --source /root/htb/boxes \
+  --source /root/engagements \
+  --output "$IMPORT_OUT"
+```
+
+Record the returned `migrationId`, then read the database-backed reconciliation
+receipt and choose the exact active Vault connection:
+
+```bash
+MIGRATION_ID='<returned migrationId>'
+bun run db:reconcile --db "$DB" --migration-id "$MIGRATION_ID"
+RECONCILIATION_HASH='<reportHash from db:reconcile>'
+sqlite3 "$DB" \
+  "SELECT id, display_name, vault_path, status FROM vault_connections ORDER BY updated_at DESC;"
+CONNECTION_ID='<reviewed connected Vault ID>'
+```
+
+Preview the exact imported-node projection. This command opens SQLite read-only
+and does not write approval rows, sync state, notes, or attachments:
+
+```bash
+bun run brain:project-legacy \
+  --db "$DB" \
+  --vault-root "$VAULT_ROOT" \
+  --migration-id "$MIGRATION_ID" \
+  --reconciliation-hash "$RECONCILIATION_HASH" \
+  --connection "$CONNECTION_ID" \
+  --dry-run
+PROJECTION_HASH='<projectionHash from the reviewed preview>'
+```
+
+Apply only the reviewed selection. A fresh filesystem write/read/rename/delete
+round-trip must pass before the approval or any note is written:
+
+```bash
+bun run brain:project-legacy \
+  --db "$DB" \
+  --vault-root "$VAULT_ROOT" \
+  --migration-id "$MIGRATION_ID" \
+  --reconciliation-hash "$RECONCILIATION_HASH" \
+  --projection-hash "$PROJECTION_HASH" \
+  --connection "$CONNECTION_ID" \
+  --approved-by 'operator:local' \
+  --approve-projection
+bun run brain:sync-verify \
+  --db "$DB" --vault-root "$VAULT_ROOT" --connection "$CONNECTION_ID"
+```
+
+Expected reconciliation behavior:
+
+- dry-run reports source hashes, classified engagement manifests, exclusions,
+  and predicted counts without creating a database backup or canonical rows;
+- apply creates a verified database backup and protected, hash-checked source
+  backup before import, preserves timestamps, quarantines unsafe/malformed
+  material, and leaves original sources unchanged;
+- imported missions remain authorization-unverified and historical runs remain
+  blocked; raw logs are not promoted to verified evidence, while evidence and
+  lesson candidates retain provenance for review;
+- engagement manifests deterministically create connected mission, run, source,
+  artifact, and evidence-candidate Brain nodes and edges;
+- replaying an unchanged import produces deduplicated rather than duplicate
+  canonical rows;
+- projection preview reports `mapped`, `eligible`, and
+  `excludedByPolicyOrConnectionScope` counts plus the exact projection hash;
+- projection refuses stale reconciliation/projection hashes, a disconnected or
+  unhealthy Vault, missing explicit approval, or an empty eligible selection;
+- existing operator-edited notes are never overwritten: conflicts and
+  vault-ahead states return `attention_required` (exit 2), while hard export
+  failures return exit 1; a clean projection returns exit 0;
+- replaying the same approved projection is idempotent and reports current notes
+  as skipped rather than duplicating them.
 
 ## Rollback
 

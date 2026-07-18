@@ -1,12 +1,14 @@
 """Regression tests for the recovery snapshot's ChillsPwn board MCP server.
 
-Run: /root/hermes-venv/bin/python integration/test_board_mcp_server.py
+Run: python3 integration/test_board_mcp_server.py
 """
 import importlib.util
+import io
 import json
 import os
 import sys
 import types
+import urllib.error
 from pathlib import Path
 
 
@@ -39,8 +41,8 @@ except ImportError:
 BOARD_MCP_SERVER = os.environ.get(
     "CHILLSPWN_BOARD_MCP_SERVER",
     str(
-        Path(__file__).resolve().parents[4]
-        / "hermes/runtime/skills/red-teaming/council-of-ais/scripts/board_mcp_server.py"
+        Path(__file__).resolve().parents[1]
+        / "server/providers/grok-commander-mcp/board_mcp_server.py"
     ),
 )
 
@@ -55,6 +57,26 @@ def load_board_mcp_server():
 
 
 board = load_board_mcp_server()
+
+
+real_http = board._http
+real_urlopen = board.urllib.request.urlopen
+
+
+def reject_with_reason(_request, timeout=15):
+    del timeout
+    raise urllib.error.HTTPError(
+        "http://127.0.0.1:3131/api/kanban",
+        400,
+        "Bad Request",
+        None,
+        io.BytesIO(b'{"error":"engagement must identify an existing configured workspace"}'),
+    )
+
+
+board.urllib.request.urlopen = reject_with_reason
+rejected_request = real_http("POST", "/api/kanban", {"title": "Plan"})
+board.urllib.request.urlopen = real_urlopen
 
 
 class FakeClock:
@@ -93,6 +115,11 @@ result = json.loads(board.board_await(["blocked-card"], timeout=600))
 card = result["results"]["blocked-card"]
 
 checks = {
+    "HTTP rejection preserves the server correction": rejected_request.get("error") == (
+        "HTTP 400: engagement must identify an existing configured workspace"
+    ),
+    "HTTP rejection includes a stable status": rejected_request.get("status") == 400,
+    "HTTP 400 is not mislabeled retryable": rejected_request.get("retryable") is False,
     "blocked card returns successfully": result.get("ok") is True,
     "blocked status is preserved": card.get("status") == "blocked",
     "blocked result is preserved": card.get("result") == "target reset required",

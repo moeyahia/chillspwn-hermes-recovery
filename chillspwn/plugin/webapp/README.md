@@ -1,48 +1,52 @@
-# ChillsPwn Dashboard
+# ChillsPwn Command OS
 
-ChillsPwn is a local-first operator dashboard and agent runtime for coordinating AI-assisted, authorized security-testing workflows across Claude, OpenRouter, Codex, Gemini, and Grok ACP integrations.
+ChillsPwn Command OS is a local-first mission, agent-orchestration, evidence, and learning system for authorized security operations. It provides exactly two operator journeys: **Autonomous** execution under a signed mission contract, and **Guided** step-by-step collaboration.
 
-> **Project status:** pre-release and environment-coupled. The web application builds and its portable tests run from this repository, but full operation currently requires separately managed Hermes services, personas, provider CLIs, and local security tooling. See [Architecture](docs/architecture.md) and [Integrations](docs/integrations.md) before deploying.
+> **Status:** V2.1 pre-release implementation candidate under validation. The canonical mission, run, event, evidence, learning, and Second Brain state is SQLite-backed. Legacy dashboard routes and file-state adapters remain temporarily available during controlled migration.
 
-Use ChillsPwn only on systems and targets you are authorized to test. Secure defaults disable terminal, proxy, file-write, security-tool, and MCP execution. The process-termination route remains available but is restricted to dashboard-managed processes or exact approved runner commands; review the security model before deployment.
+Use ChillsPwn only on systems and targets you are authorized to test. Autonomous launch is fail-closed when authorization, provider enforcement, specialist routing, or required MCP execution is unavailable.
 
-## Features
+## Product capabilities
 
-- React operator dashboard with chat, Mission Board, agent cockpit, reports, logs, runtime controls, and system views.
-- Bun/Express backend with REST and WebSocket transports.
-- Provider paths for Claude CLI, OpenRouter-backed models, Codex, Gemini, and OAuth-backed Grok ACP.
-- Commander/specialist delegation, tool-policy decisions, approvals, evidence, artifacts, run reports, and training memory.
-- Optional MCP arsenal, wordlist, hashcat, vulnerability-intelligence, OSINT, and report-generation integrations.
-- Loopback-first networking, token authentication for exposed deployments, and explicit gates for risky capabilities.
+- Durable Mission and Run workspaces instead of chat-owned execution state.
+- Autonomous contracts with exact scope, action, retry, replan, time, concurrency, evidence, memory, and safe-stop boundaries.
+- Guided explain → recommend → choose → observe → interpret → record → advance workflow with fingerprint-bound decisions.
+- Planning-only OAuth-backed Grok ACP commander behind ChillsPwn's delegation and tool boundary; the commander has no direct shell or target-tool surface.
+- Specialist-owned MCP execution, immutable evidence hashes, findings, artifacts, reports, correlated events, and semantic observability.
+- Run leases, heartbeats, checkpoints, restart recovery, cancellation propagation, loop detection, bounded retry/replan, budgets, and circuit breakers.
+- User-owned Second Brain with provenance, consent, engagement isolation, context-pack transparency, forgetting, and an optional two-way Obsidian-compatible vault.
+- Evidence-gated evaluations and attack-chain or failed-attempt lesson candidates that cannot self-approve.
+- Responsive React shell, keyboard command palette, reduced-motion support, and accessible list alternatives for graph data.
 
-## Screenshot
+## Screenshots and demo
 
-A sanitized dashboard screenshot is intentionally deferred until all engagement names, targets, logs, and user information can be removed from the capture.
+Production screenshots are intentionally withheld until their mission names, targets, evidence, logs, and operator information can be proven sanitized. The implementation evidence directory is [docs/command-os-v2/screenshots](docs/command-os-v2/screenshots); do not add captures from live engagements.
 
 ## Technology stack
 
 | Area | Technology |
 |---|---|
 | Runtime and package manager | Bun 1.3.14 |
-| Client | React 19, TypeScript, Vite 6, Tailwind CSS 4, xterm.js |
-| Server | Bun, Express 4, WebSockets |
-| State | Hermes SQLite board plus JSON/JSONL runtime stores |
-| Mobile wrapper | Capacitor 8 (optional; native Android source is retained, generated web assets are not) |
-| Tests | Bun test runner and portable Python integration checks |
+| Client | React 19, strict TypeScript, Vite 6, Tailwind CSS 4 |
+| Server | Bun, Express 4, WebSocket/SSE compatibility surfaces |
+| Canonical state | SQLite through `better-sqlite3`, WAL, foreign keys, migrations, FTS5 |
+| Live delivery | Transactional event outbox, replayable SSE, bounded reconnect and polling fallback |
+| Terminal compatibility | xterm.js, disabled by secure default |
+| Mobile wrapper | Capacitor 8; generated Android web assets are not tracked |
+| Tests | Bun test, Playwright, portable Python integration checks |
 
 ## Prerequisites
 
-For the portable dashboard build and test suite:
+For portable development and CI:
 
 - Bun 1.3.14
-- Node.js 22 or newer for Vite and Capacitor tooling
-- Python 3 for the portable gate and Board MCP regressions
+- Node.js 22 or newer for Vite/Capacitor tooling
+- Python 3.11 or newer
+- `sqlite3` for retained legacy Board compatibility checks
 
-For a functional local runtime, also install `sqlite3` and provide the external persona and Hermes contracts described in [Integrations](docs/integrations.md). Provider-specific CLIs and credentials are optional unless their personas are enabled.
+A functional deployment additionally needs the separately installed provider CLIs and only the reviewed MCP servers its mission policy permits. OAuth state, API credentials, databases, engagement data, and artifacts are never included in this repository.
 
-The current production environment is Linux/Kali-oriented. Windows and macOS may support frontend development, but the complete runtime assumes Linux process, filesystem, and security-tool behavior.
-
-## Installation
+## Install
 
 ```bash
 git clone git@github.com:moeyahia/chillspwn-hermes-recovery.git
@@ -51,42 +55,22 @@ bun install --frozen-lockfile
 cp .env.example .env
 ```
 
-Review `.env` before enabling any risky feature. Never copy live provider credentials, engagement data, or a production environment file into the repository.
-
-## Environment configuration
-
-The tracked [.env.example](.env.example) contains secure dashboard and runtime defaults. Optional MCP vendor key names are documented separately in [.env.mcp.example](.env.mcp.example).
-
-Important defaults:
-
-- `CHILLSPWN_BIND=127.0.0.1`: local access only.
-- `DASHBOARD_TOKEN=`: required when binding to a non-loopback address.
-- Terminal, proxy, file-write, security-tool, and MCP execution gates are disabled.
-- `ALLOWED_WORKSPACE_ROOTS=/root/htb/boxes:/root/engagements`: one ordered allowlist for file browsing/writes, engagement APIs and working directories, Claude workspace access, and OSINT output.
-- Grok uses the installed CLI's OAuth state through `GROK_AUTH_PATH`; it does not require an xAI API key on this path.
-- Gemini's current direct API path consumes `GEMINI_API_KEY` through the external Hermes orchestrator.
-- Capacitor packages local assets unless `CAPACITOR_SERVER_URL` is explicitly supplied at build time.
-
-See [Configuration](docs/configuration.md) for the configuration model and exposure rules.
+Review `.env` before starting. The tracked [.env.example](.env.example) uses loopback networking and keeps terminal, proxy, file-write, security-tool, and MCP execution gates disabled. Optional MCP variable names are documented in [.env.mcp.example](.env.mcp.example). Real `.env` files and provider auth stores are ignored.
 
 ## Local development
-
-Start the backend on port 3131 and the Vite client on port 3132:
 
 ```bash
 bun run dev
 ```
 
-Open `http://127.0.0.1:3132`. Vite proxies `/api` and `/ws` to the backend.
-
-To run each process separately:
+The backend listens on `127.0.0.1:3131`; Vite serves the client on `127.0.0.1:3132` and proxies API/WebSocket traffic. To run them separately:
 
 ```bash
 bun run server
 bun run client
 ```
 
-If no external personas are installed under `CHILLSPWN_PERSONAS_DIR`, the UI can load but chat will report that no personas are configured. The default is `${HERMES_HOME:-$HOME/.hermes}/chillspwn/personas`; the integrated recovery units set `/root/.hermes/chillspwn/personas` explicitly.
+The first screen is the Command Center. Choose **Go Autonomous** to compose a complete contract, or **Start Guided Mission** for deliberate step-by-step work. Internal provider selection is policy-driven and is not a third journey.
 
 ## Build and production-like serving
 
@@ -95,19 +79,25 @@ bun run build
 bun run serve
 ```
 
-The build writes the frontend to `dist/`. The Bun server serves that directory and the API from `http://127.0.0.1:3131` by default.
+`bun run build` writes the route-split client to `dist/`. `bun run serve` provides both the API and built client on the configured loopback address. `bun run preview` is frontend-only and does not provide mission APIs.
 
-`bun run preview` starts Vite's frontend-only preview server; API-dependent pages still need the Bun backend.
+For Android packaging:
 
-Production deployment and rollback are documented in [Deployment](docs/deployment.md). No unattended or remote deployment workflow is included; the outer recovery helper is an explicit, guarded operator action because the target and secret-management design are environment-specific.
+```bash
+bun run build
+bunx cap sync android
+```
 
-## Tests and checks
+Do not commit generated `android/app/src/main/assets` output.
 
-Run the complete portable validation sequence:
+## Validation
+
+Run the complete portable gate:
 
 ```bash
 bun run check
-bun audit
+bun run test:e2e:run
+bun audit --production
 ```
 
 Or run checks individually:
@@ -116,80 +106,141 @@ Or run checks individually:
 bun run check:server-entry
 bun run typecheck
 bun run typecheck:client
-bun test ./server ./src/lib
+bun run typecheck:e2e
+bun test ./server ./src/lib --timeout 30000
 python3 integration/test_or_gate_client.py
 python3 integration/test_board_mcp_server.py
 bun run build
+bun run test:e2e:run
 ```
 
-The server typecheck covers modular server code but intentionally excludes the legacy `server/index.ts`; that file has existing type debt and is executed directly by Bun. `bun run check` compensates by parsing and bundling the production entry before the strict modular typechecks. The board MCP regression loads the retained Hermes script and stubs only its transport dependency when MCP is unavailable, so it is portable and runs in CI without a live board or provider.
-
-## Linting and formatting
-
-The repository currently has no established repo-wide linter or formatter, and existing source has not been mass-reformatted. Editor behavior is normalized through `.editorconfig` and `.gitattributes`. Before opening a pull request, run:
+Performance evidence can be regenerated with:
 
 ```bash
-git diff --check
-bun run typecheck
-bun run typecheck:client
+bun run performance:bundle
+bun run performance:runtime
+bun run performance:check
 ```
 
-Introduce a formatter or linter in a dedicated baseline change so functional diffs remain reviewable.
+The optional live OAuth/MCP smoke test is deliberately separate from portable CI. It accepts only a loopback server and requires an explicit confirmation variable. It creates isolated test missions, uses the reviewed no-network `local-selftest.quick_scan` MCP for Autonomous validation, and cleans up nonterminal runs:
 
-## Usage
+```bash
+CHILLSPWN_LIVE_TEST_URL=http://127.0.0.1:33132 \
+CHILLSPWN_LIVE_TEST_CONFIRM=authorized-local-selftest \
+bun run test:live:grok-oauth
+```
 
-1. Start the dashboard with a secure local configuration.
-2. Configure external personas and only the provider integrations you intend to use.
-3. Create or select an authorized engagement.
-4. Use the Mission Board and delegated specialist flows for multi-step execution.
-5. Review approvals, evidence, artifacts, reports, and proposed training-memory lessons before accepting them.
+Do not point this test at a production database.
 
-The HTTP surface is currently an internal UI contract, not a versioned public API. Route groups and authentication behavior are summarized in [API](docs/api.md).
+## Database and migration operations
+
+SQLite is the V2.1 transactional source of truth. The Obsidian vault is a synchronized human-readable projection, not an execution-state database.
+
+```bash
+bun run db:migrate
+bun run db:migrate:legacy -- --dry-run
+bun run db:verify
+bun run db:backup
+bun run db:reconcile
+```
+
+Restore is an explicit operator action:
+
+```bash
+bun run db:restore -- --help
+```
+
+Legacy migration creates a timestamped backup, hashes inputs, supports resume, quarantines malformed records, preserves originals, and produces a reconciliation report. Quiesce writers before a real cutover. Follow [migration.md](docs/command-os-v2/migration.md) and [rollback.md](docs/command-os-v2/rollback.md); never infer a production command from an example.
+
+Obsidian bridge commands:
+
+```bash
+bun run brain:import-obsidian -- --help
+bun run brain:export-obsidian -- --help
+bun run brain:sync-verify -- --help
+```
+
+Vault access requires an explicitly permitted root and connection. Synchronization never modifies `.obsidian` settings.
+
+## Environment and security essentials
+
+- Keep `CHILLSPWN_BIND=127.0.0.1` for local or SSH-tunnel access. A non-loopback bind requires a strong dashboard token and a reviewed exposure design.
+- `ALLOWED_WORKSPACE_ROOTS` is the sole allowlist for engagement and workspace paths.
+- Grok Command OS uses the CLI's refreshable OAuth state through `GROK_AUTH_PATH`; `XAI_API_KEY` is removed from the child environment so this path does not spend xAI API credits.
+- The Grok auth directory must be service-owned mode `0700`; the auth file must be service-owned mode `0600` and refreshable by that service account.
+- The commander plans, routes, evaluates, and synthesizes. Specialists own tool execution. Do not weaken `ENFORCE_CHILLSPWN_DELEGATION`, `ENFORCE_CHILLSPWN_NO_HANDS`, or exact specialist assignment to make readiness pass.
+- Never store credentials, session tokens, private keys, or raw confidential payloads in reusable memory, logs, lessons, or vault notes.
+- Autonomous work outside the signed contract safe-stops. Guided work executes only the exact represented fingerprint after a deliberate decision.
+
+See [security.md](docs/command-os-v2/security.md), [memory-privacy.md](docs/command-os-v2/memory-privacy.md), and the repository [SECURITY.md](../../../SECURITY.md).
+
+## API and architecture documentation
+
+The V2 API is an internal application contract. Start with:
+
+- [Current-state audit](docs/command-os-v2/current-state-audit.md)
+- [Architecture map](docs/command-os-v2/architecture-map.md)
+- [Journey model](docs/command-os-v2/journey-model.md)
+- [Domain and database model](docs/command-os-v2/domain-model.md)
+- [Event model](docs/command-os-v2/event-model.md)
+- [Run supervisor](docs/command-os-v2/run-supervisor.md)
+- [Second Brain](docs/command-os-v2/second-brain.md)
+- [Obsidian bridge](docs/command-os-v2/obsidian-bridge.md)
+- [Existing API reference](docs/api.md)
 
 ## Project structure
 
 ```text
-src/            React client, pages, shared UI state
-server/         API, WebSocket server, runtime, agents, providers, MCP, security
-integration/    Portable and live-environment integration checks/patches
-scripts/        Operational inventory and setup helpers
-docs/           Architecture, configuration, integration, and operations guidance
-public/         Static assets and PWA metadata
-deploy/         Sanitized deployment examples
+src/app/                 shell, router, providers, command palette
+src/design-system/       tokens, primitives, reusable components
+src/features/            missions, runs, Guided, brain, intelligence, operations
+src/data/                typed API, schemas, cache, event stream
+server/app/              composition and live runtime adapters
+server/db/               connection, migrations, health, backups, repositories
+server/command-runtime/  durable two-journey mission engine
+server/orchestration/    leases, checkpoints, action boundary
+server/supervisor/       progress, loops, retries, budgets, recovery
+server/memory/           canonical Second Brain and controls
+server/vault/            Obsidian projection, watcher, conflicts, portable export
+server/learning/         evaluations and evidence-gated attack-chain lessons
+server/operations/       scoped operational query repositories
+server/events/           durable events, outbox, replay, SSE
+tests/e2e/               isolated credential-free browser tests
+docs/command-os-v2/      architecture, safety, performance, test, and rollback evidence
 ```
-
-Runtime state, credentials, engagement data, logs, generated builds, Android output, and dependencies are deliberately excluded from Git.
 
 ## Troubleshooting
 
-### `No personas configured`
+### Autonomous launch is blocked
 
-Install sanitized persona definitions under `${CHILLSPWN_PERSONAS_DIR}/<name>/persona.json`. The integrated recovery layout uses `/root/.hermes/chillspwn/personas`; tracked persona Markdown files are source material and are not automatically deployed by a standalone webapp checkout.
+Open the readiness details and repair the named dependency. Common causes are missing authorization, insecure/unavailable OAuth state, a non-enforcing provider path, disabled MCP startup, or no reviewed specialist binding. Do not bypass the server-side readiness gate.
 
-### Mission Board database errors
+### A run appears stuck
 
-The dashboard expects the base Hermes board schema in `${HERMES_HOME:-$HOME/.hermes}/kanban.db`. A standalone webapp start does not bootstrap the full `tasks`, `task_events`, and `task_runs` schema; the outer recovery helper initializes it through the pinned Hermes interpreter and then applies ChillsPwn's additive schema. Review [Data and migrations](docs/data-and-migrations.md).
+Inspect its heartbeat, last meaningful event, checkpoint, provider/MCP health, and Recovery panel. The supervisor transitions expired or repeated work to `recovering` or `blocked`; it does not treat raw tool output as progress. Use pause/resume only after the stated dependency is healthy, or cancel to propagate cleanup to child work.
 
-### Provider does not start
+### Grok OAuth is unavailable
 
-Confirm that the provider CLI or Hermes component is installed for the service account. Keep refreshable OAuth state narrowly service-owned; keep API-secret systemd environment files root-owned and unreadable by the service after startup. Do not solve permission errors by making either class group/world-readable.
+Authenticate the Grok CLI as the service account, then verify the configured binary, protected auth path ownership/mode, commander profile, Soul, plugin, hooks, and MCP attestation. Do not add an xAI API key as a workaround for the OAuth-backed path.
 
-### Exposed server refuses to start
+### Guided explanation is waiting
 
-Set a strong `DASHBOARD_TOKEN` whenever `CHILLSPWN_BIND` is not loopback. This fail-closed behavior is intentional.
+Planning must first persist a versioned plan and one exact decision. A Guided Commander explanation is planning-only and cannot grant tool authority. Refresh the current checkpoint; if planning failed, follow its recovery reason rather than repeating the request.
 
-### UI is running but API calls fail
+### Obsidian sync is degraded
 
-Use `bun run dev` for the proxied development setup, or build and use `bun run serve`. `bun run preview` alone does not provide the API.
+Check the Memory Control Center, connected vault permission, sandbox path, and conflict inbox. Database and vault changes are never silently overwritten. Run `brain:sync-verify` against a backup-safe configuration before resolving conflicts.
 
-## Contributing and security
+### The UI loads but APIs fail
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) before proposing a change. Report security vulnerabilities privately using [SECURITY.md](SECURITY.md); do not disclose unpatched issues publicly.
+Use `bun run dev` for the proxied development setup or `bun run build && bun run serve`. `bun run preview` alone is insufficient.
 
-## License
+## Contributing, security, and license
 
-No license has been selected. Until the maintainer adds an explicit license, no permission is granted to copy, modify, or redistribute this project. The maintainer must review code and asset provenance before choosing an open-source license.
+Follow the repository [CONTRIBUTING.md](../../../CONTRIBUTING.md) and [Code of Conduct](../../../CODE_OF_CONDUCT.md). Report vulnerabilities privately using [SECURITY.md](../../../SECURITY.md); never publish an unpatched issue or engagement evidence.
+
+No repository-wide license has been selected. Until the maintainer chooses one, no permission is granted to copy, modify, or redistribute ChillsPwn. Retained third-party components remain subject to their own licenses.
 
 ## Acknowledgments
 
-ChillsPwn integrates with independently maintained tools and services, including Bun, React, Vite, Capacitor, Anthropic Claude, OpenRouter, OpenAI Codex, Google Gemini, xAI Grok, MCP-compatible servers, and the broader open-source security-tool ecosystem. Their respective licenses and terms apply.
+ChillsPwn integrates with independently maintained tools and services including Bun, React, Vite, Capacitor, Anthropic Claude, OpenRouter, OpenAI Codex, Google Gemini, xAI Grok, Obsidian-compatible Markdown, MCP-compatible servers, and the broader authorized-security-tool ecosystem. Their licenses and service terms apply.

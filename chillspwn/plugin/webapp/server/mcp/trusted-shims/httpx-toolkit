@@ -1,0 +1,18 @@
+#!/bin/sh
+set -eu
+
+if [ "$#" -eq 1 ] && [ "$1" = "-version" ]; then
+  echo "ProjectDiscovery httpx version v1.9.0 (Command OS V2 reviewed wrapper)"
+  exit 0
+fi
+
+for argument in "$@"; do
+  case "$argument" in
+    -up|--update)
+      echo "Command OS V2 blocks httpx self-update; install reviewed updates through the trusted-tool manifest." >&2
+      exit 64
+      ;;
+  esac
+done
+
+exec /usr/bin/httpx-toolkit -duc "$@"

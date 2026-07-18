@@ -155,6 +155,61 @@ export class AgentRunStore {
     return this.getDoc(runId)?.toolCalls.find((t) => t.id === toolCallId) ?? null;
   }
 
+  /**
+   * Atomically move one durably approved tool call into execution and attach
+   * its exact approval claim. Replays and claims whose approval is not still
+   * approved fail closed without changing the run document.
+   */
+  claimApprovedMcpToolCall(
+    runId: string,
+    toolCallId: string,
+    claim: NonNullable<ToolCall["mcpApprovalClaim"]>,
+  ): ToolCall | null {
+    let claimed: ToolCall | null = null;
+    this.mutate(runId, (doc) => {
+      const index = doc.toolCalls.findIndex((toolCall) => toolCall.id === toolCallId);
+      if (index === -1) return;
+      const current = doc.toolCalls[index]!;
+      const approval = doc.approvals.find((candidate) => candidate.id === claim.approvalId);
+      if (
+        current.status !== "approved" ||
+        current.mcpApprovalClaim ||
+        current.approvalId !== claim.approvalId ||
+        !approval ||
+        approval.status !== "approved" ||
+        approval.toolCallId !== current.id
+      ) return;
+      const next: ToolCall = { ...current, status: "executing", mcpApprovalClaim: claim };
+      doc.toolCalls[index] = next;
+      claimed = next;
+    });
+    return claimed;
+  }
+
+  /** Atomically consume a previously persisted MCP approval claim exactly once. */
+  consumeMcpApprovalClaim(
+    runId: string,
+    toolCallId: string,
+    claimId: string,
+    consumedAt: string,
+  ): ToolCall | null {
+    let consumed: ToolCall | null = null;
+    this.mutate(runId, (doc) => {
+      const index = doc.toolCalls.findIndex((toolCall) => toolCall.id === toolCallId);
+      if (index === -1) return;
+      const current = doc.toolCalls[index]!;
+      const claim = current.mcpApprovalClaim;
+      if (current.status !== "executing" || !claim || claim.claimId !== claimId || claim.consumedAt) return;
+      const next: ToolCall = {
+        ...current,
+        mcpApprovalClaim: { ...claim, consumedAt },
+      };
+      doc.toolCalls[index] = next;
+      consumed = next;
+    });
+    return consumed;
+  }
+
   addWorkerResult(runId: string, rec: WorkerResultRecord): void {
     this.mutate(runId, (doc) => { doc.workerResults.push(rec); });
   }

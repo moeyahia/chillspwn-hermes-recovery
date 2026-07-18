@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""ChillsPwn continuous-learning cron — reviews FINISHED ChillsPwn sessions.
+"""Legacy ChillsPwn full-context learning scheduler (contained in V2.4).
 
-Scans ~/.hermes/conversations for new ChillsPwn transcripts (written by the
-dashboard on session close), runs chillspwn_learn.py on each (which saves
-durable memory + skills), and records what it processed so nothing is reviewed
-twice. Registered as a no_agent script cron in jobs.json.
+The retained implementation documents and tests the historical state machine,
+but production execution is disabled because it can pass complete native
+sessions or conversation.mcp payloads to a public model. The replacement must
+use a sanitized LearningCandidateBrief plus ProviderExposureReceipt.
 """
 import json, os, subprocess, sys, time
 from pathlib import Path
@@ -39,6 +39,7 @@ LEARN_LOG = LOG_ROOT / "chillspwn-learning.log"  # detached reviewer stdout/stde
 SUCCESS_DIR = STATE_ROOT / "success"
 RETRY_GRACE_SECONDS = int(os.environ.get("CHILLSPWN_LEARN_RETRY_GRACE_SECONDS", "1200"))
 DRY = "--dry-run" in sys.argv
+LEGACY_FULL_CONTEXT_PUBLIC_REVIEW_DISABLED = True
 
 
 def resolve_cli_session(md_name):
@@ -126,6 +127,12 @@ def reconcile_inflight(done, offsets, inflight, now):
     return changed
 
 def main():
+    if LEGACY_FULL_CONTEXT_PUBLIC_REVIEW_DISABLED:
+        print(
+            "[learn-cron] blocked: the legacy full-context public-model reviewer is disabled; "
+            "use the V2 sanitized candidate and exposure-receipt workflow"
+        )
+        return
     if not REVIEWER.is_file():
         print("[learn-cron] configured reviewer script is missing", file=sys.stderr)
         raise SystemExit(2)

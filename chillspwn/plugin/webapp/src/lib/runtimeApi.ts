@@ -39,7 +39,13 @@ export const runtimeApi = {
     if (!r.ok) throw new Error(`${r.status}`);
   },
   /** Phase 7.4 — client feature flags (drives the managed-run launcher visibility). */
-  flags: () => jget<{ managedChatEnabled: boolean; planningEnabled: boolean; requirePlanApproval: boolean; chatAgentRunsEnabled: boolean }>("/api/runtime/flags"),
+  flags: () => jget<{
+    legacyExecutionEnabled: boolean;
+    managedChatEnabled: boolean;
+    planningEnabled: boolean;
+    requirePlanApproval: boolean;
+    chatAgentRunsEnabled: boolean;
+  }>("/api/runtime/flags"),
   /** Phase 7.4 — launch a runtime-managed chat run (creates run + strict plan; NO execution). */
   createManagedChatRun: (body: { objective: string; persona?: string; provider?: string }) =>
     jpost<{ ok: boolean; run: AgentRun; steps: unknown[] }>("/api/runs/managed-chat", body),

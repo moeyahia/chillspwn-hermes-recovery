@@ -81,6 +81,9 @@ jobs:
             scripts/verify-snapshot.sh \
             chillspwn/plugin/webapp/scripts/setup-mcp-arsenal.sh \
             chillspwn/plugin/webapp/scripts/setup-security-assets.sh
+          find chillspwn/plugin/webapp/scripts/command-os-v2 \
+            -maxdepth 1 -type f -name '*.sh' -print0 \
+            | xargs -0 -n1 bash -n
 
       - name: Install ChillsPwn dependencies
         working-directory: chillspwn/plugin/webapp
@@ -98,6 +101,10 @@ jobs:
         working-directory: chillspwn/plugin/webapp
         run: bun run typecheck:client
 
+      - name: Typecheck browser journeys
+        working-directory: chillspwn/plugin/webapp
+        run: bun run typecheck:e2e
+
       - name: Run ChillsPwn unit tests
         working-directory: chillspwn/plugin/webapp
         run: bun test ./server ./src/lib
@@ -111,6 +118,37 @@ jobs:
       - name: Build production client
         working-directory: chillspwn/plugin/webapp
         run: bun run build
+
+      - name: Validate production bundle budgets
+        working-directory: chillspwn/plugin/webapp
+        run: bun run performance:bundle
+
+      - name: Validate canonical database and event runtime budgets
+        working-directory: chillspwn/plugin/webapp
+        run: bun run performance:runtime
+
+      - name: Validate representative mission comparisons
+        working-directory: chillspwn/plugin/webapp
+        run: bun run performance:missions
+
+      - name: Install Playwright Chromium
+        working-directory: chillspwn/plugin/webapp
+        run: bunx playwright install --with-deps chromium
+
+      - name: Run Command OS browser journeys
+        working-directory: chillspwn/plugin/webapp
+        run: bun run test:e2e:run
+
+      - name: Retain browser failure evidence
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: command-os-browser-failure-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            chillspwn/plugin/webapp/test-results/
+            chillspwn/plugin/webapp/playwright-report/
+          if-no-files-found: ignore
+          retention-days: 14
 
       - name: Audit web dependencies
         working-directory: chillspwn/plugin/webapp

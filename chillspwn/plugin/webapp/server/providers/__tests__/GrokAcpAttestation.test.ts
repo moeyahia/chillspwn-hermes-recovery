@@ -56,7 +56,7 @@ describe("Grok ACP commander launch attestation", () => {
       handlerType: "command",
       disabled: false,
       matcher: null,
-      command: "/root/.bun/bin/bun \"/app/guard.ts\"",
+      command: "\"/opt/chillspwn-runtime/bin/bun\" \"/app/guard.ts\"",
       timeoutMs: 5_000,
       sourceDir: "/isolated/.grok/hooks",
     }] } };

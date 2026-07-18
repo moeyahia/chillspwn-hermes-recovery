@@ -1,6 +1,9 @@
 # API overview
 
-The HTTP and WebSocket interfaces are internal dashboard contracts. They are not yet versioned, generated from an OpenAPI schema, or guaranteed stable for third-party clients.
+The HTTP and WebSocket interfaces are internal dashboard contracts. Command OS
+resources are versioned below `/api/v2`; retained unversioned endpoints are
+temporary compatibility contracts and are not guaranteed stable for third-party
+clients.
 
 ## Base URLs
 
@@ -24,6 +27,7 @@ The server also supports its dashboard cookie flow. Avoid query-string tokens in
 
 | Prefix | Responsibility |
 |---|---|
+| `/api/v2` | Canonical Autonomous/Guided missions, runs, decisions, events, intelligence, Second Brain, learning, reports, and system readiness |
 | `/api/health`, `/api/build-id` | Basic process/build status |
 | `/api/personas`, `/api/sessions`, `/api/cli-sessions` | Persona and conversation/session lifecycle |
 | `/api/runs`, `/api/observe` | Agent runs, plans, approvals, tool gates, evidence, artifacts, and reports |
@@ -40,9 +44,22 @@ The server also supports its dashboard cookie flow. Avoid query-string tokens in
 
 Not every route is read-only. File writes, terminal access, process termination, provider execution, MCP calls, and report generation can affect the host and are subject to their respective feature and policy gates.
 
+In the secure default configuration, unversioned `GET`, `HEAD`, and `OPTIONS`
+requests remain available for historical inspection and migration, but every
+unversioned mutation, `/proxy` request, legacy chat/terminal WebSocket command,
+and compatibility background executor is disabled. Such a request returns
+`403` with code `legacy_execution_disabled`. The explicit
+`ENABLE_LEGACY_EXECUTION_API=true` opt-in reopens this entire weaker boundary,
+emits a startup warning, and degrades V2 readiness; it is intended only for a
+time-bounded rollback. It does not affect canonical `/api/v2` mutations.
+
 `ALLOWED_WORKSPACE_ROOTS` is shared across `/api/files`, `/api/engagements`, engagement/report resolution, provider working directories, and `/api/osint`. New engagement and OSINT directories use the first configured root that is present and writable by the service. The server rejects unsafe names, symlinked roots/children, traversal, and real paths outside the configured roots.
 
-In the integrated recovery deployment, `GET /api/memory` returns only the two policy-filtered flat-memory projections obtained through `chillspwn-memory.service`. It returns `503 MEMORY_BROKER_UNAVAILABLE` when validated reads are unavailable. `PUT /api/memory/:file` is retained only as a compatibility denial and returns `403 MEMORY_MUTATION_MEDIATED`; it never writes the protected memory files.
+Legacy `/api/memory` routes are compatibility surfaces and do not own V2
+memory. Command OS Second Brain resources are backed by the canonical database,
+context-pack policy, and vault projection. A compatibility endpoint may remain
+read-only or unavailable when its legacy adapter is not configured; it must
+never bypass V2 scope, lifecycle, audit, or forgetting controls.
 
 ## Errors
 

@@ -40,7 +40,7 @@ WorkerResult with web findings (endpoints/params/vulns) + evidenceIds; hand any 
 Each vuln/endpoint cites the request/response evidenceId; redact secrets.
 
 ## Approval behavior
-These tools REQUIRE operator approval via the Cockpit before they run: ffuf_custom, sqlmap_assess, searchsploit_examine, ffufScan, nucleiScan. Wait for approval; never bypass the runtime gate.
+Guided requires one exact operator decision for every consequential tool step. ffufScan, gobuster, and httpxProbe remain Guided-only until complete per-call rate, concurrency, redirect, raw-option, wordlist-path, and target-expansion policies pass canary tests. ffuf_custom, sqlmap_assess, searchsploit_examine, nucleiScan, nikto, and extractionSweep also remain approval-required.
 
 ## Handoff rules
 - When you find credentials / hashes → create a handoff record to **CredSmith**.

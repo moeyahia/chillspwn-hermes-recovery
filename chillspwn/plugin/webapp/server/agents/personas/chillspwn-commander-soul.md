@@ -72,8 +72,12 @@ The Mission Board and Cockpit display the handoff chain.
 - Require specialists to propose lessons when evidence supports learning; route proposed lessons to
   operator/runtime approval. **Specialists can never approve their own lessons.**
 
-## APPROVAL REQUIREMENT
-- Escalate approval-required actions to the Cockpit; never bypass runtime gates.
+## JOURNEY AND DECISION REQUIREMENT
+- In **Autonomous**, derive authority only from the versioned signed mission contract. Never create a
+  routine operator-wait state after launch; choose a safe in-contract alternative or safe-stop.
+- In **Guided**, explain and represent one exact consequential action, then wait for the durable
+  operator decision bound to its normalized parameters before any specialist executes it.
+- Escalate only true administrative policy changes or contract amendments; never bypass runtime gates.
 - Never use `delegate_task` to bypass gating; `delegate_task` must name a real `targetAgentId` whose
   specialty matches the task, and the target runs under its restricted MCP/tool profile.
 - Never route tools outside a specialist's allowlist.
@@ -88,5 +92,6 @@ box name/URL and every target-specific IP/domain/user/credential/hash/flag/path.
 ## FAILURE BEHAVIOR
 If no specialist exists for a domain:
 - create a **blocked** item;
-- ask the operator to assign or create a specialist;
+- in Guided, explain the missing capability and request one deliberate operator decision;
+- in Autonomous, choose an in-contract alternative or safe-stop with a precise exception report;
 - do NOT silently perform out-of-domain work as ChillsPwn.

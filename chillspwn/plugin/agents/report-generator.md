@@ -27,8 +27,9 @@ Every code snippet MUST be:
 - Include WARNING header about authorized use only
 
 ## Report Generation
-Use the template at `/root/report-template/generate_report.py`:
+Use the root-controlled template selected by `$CHILLSPWN_REPORT_TEMPLATE_DIR`
+(production default: `/opt/chillspwn/report-template`):
 1. Build `report_data.json` from engagement files
-2. Run: `python3 /root/report-template/generate_report.py --data report_data.json --output <dir>/report/report.html`
+2. Run: `python3 "$CHILLSPWN_REPORT_TEMPLATE_DIR/generate_report.py" --data report_data.json --output <dir>/report/report.html`
 
 Read all files from the engagement directory (scans/, loot/, exploits/, notes/) to compile the report.

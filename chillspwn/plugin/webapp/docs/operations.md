@@ -2,20 +2,23 @@
 
 ## Health and readiness
 
-`GET /api/health` confirms that the HTTP process is alive. It does not prove that personas, the Mission Board schema, provider CLIs, OAuth sessions, report tooling, MCP servers, or engagement paths are ready.
+`GET /api/health` confirms that the HTTP process is alive. It does not prove that personas, the Mission Board schema, provider CLIs, live OAuth sessions, report tooling, MCP servers, specialist routes, or engagement paths are ready.
 
-Perform an integration readiness review after every deployment and credential change. A future readiness endpoint should report dependency names and states without reading or returning credential values.
+Perform an integration readiness review after every deployment and credential change. Launch
+readiness must use live, non-secret provider/MCP attestations and must fail closed when a required
+journey executor or specialist route is not callable. The UI may report dependency names, state,
+reason, and remediation, but must never read back or return credential values.
 
-The integrated recovery deployment consists of three cooperating units:
+The hardened deployment consists of two cooperating application units:
 
-- `chillspwn-memory.service`: root-owned validated memory broker;
 - `chillspwn.service`: unprivileged dashboard and agent runtime; and
 - `hermes-gateway.service`: unprivileged Hermes message adapters and cron scheduler.
 
-Check all three together because the application units require the broker:
+Both run as `chillspwn` with explicitly empty supplementary groups and no
+capabilities:
 
 ```bash
-systemctl status chillspwn-memory.service chillspwn.service hermes-gateway.service --no-pager
+systemctl status chillspwn.service hermes-gateway.service --no-pager
 ```
 
 ## Logs
@@ -32,7 +35,7 @@ The recovery systemd unit redirects application stdout/stderr to the service-own
 
 ```bash
 journalctl -u chillspwn.service -n 200 --no-pager
-tail -F /root/.hermes/chillspwn/logs/dashboard.log
+tail -F /var/log/chillspwn/dashboard.log /var/log/chillspwn/hermes-gateway.log
 ```
 
 Deployments that do not redirect standard output can follow the full application stream with:
@@ -67,8 +70,9 @@ After an abnormal shutdown, check:
 Before restarting after a Hermes configuration change, run the deployed root-owned validator:
 
 ```bash
-/root/hermes-venv/bin/python /opt/chillspwn/libexec/validate-hermes-config.py \
-  --allow-missing /root/.hermes/config.yaml
+/opt/chillspwn-runtime/hermes-venv/bin/python \
+  /opt/chillspwn/libexec/validate-hermes-config.py \
+  --allow-missing /var/lib/chillspwn/hermes/config.yaml
 ```
 
 The validator reports paths and violation types but does not print secret values.
@@ -79,20 +83,42 @@ Follow [Data and migrations](data-and-migrations.md). Separate source recovery f
 
 ## Workspace and engagement roots
 
-Treat `ALLOWED_WORKSPACE_ROOTS` as a security boundary, not just a file-browser preference. It controls file routes, engagement discovery/creation and working directories, interactive Claude `--add-dir` roots, and OSINT output. The recovery helper provisions only `/root/htb/boxes` and `/root/engagements`. For every custom root, pre-create a real non-symlink directory, grant `chillspwn` read/write/traverse access plus suitable child inheritance, and verify it as that identity before restarting. Do not use `/root`, a provider-auth directory, protected memory, reviewed source, or the repository checkout.
+Treat `ALLOWED_WORKSPACE_ROOTS` as a security boundary, not just a file-browser preference. It controls file routes, engagement discovery/creation and working directories, interactive Claude `--add-dir` roots, and OSINT output. Production allows only `/var/lib/chillspwn/workspaces/htb/boxes` and `/var/lib/chillspwn/workspaces/engagements`; tracked `.mount` units bind the existing operator data into those paths. Verify both with `findmnt` and as the service identity after every reboot. Do not allow `/root`, provider-auth state, the canonical database/vault root, reviewed source, or the repository checkout.
 
 Detached OSINT snapshots and worker logs live under `CHILLSPWN_STATE_DIR/osint-jobs`, while findings and reports live in an `osint-*` directory below the first writable allowed root. On restart, malformed or out-of-root persisted jobs are skipped; this is fail-closed behavior. Review the configured allowlist before treating a missing historical job as data loss.
 
 ## Provider operations
 
-- **Claude:** verify CLI authentication and distinguish observe-only UI state from enforceable runtime controls.
-- **OpenRouter:** verify key availability without printing it; roll out gating in dry-run first.
-- **Codex/Gemini:** verify the external Hermes orchestrator and its authentication.
-- **Grok ACP:** verify OAuth file permissions, isolated runtime assets, hook/MCP attestation, and Mission Board delegation before starting an engagement.
+- **Claude:** treat native CLI compatibility as advisory unless the selected journey's exact scope,
+  tool, and decision boundary can be enforced; never expose it as a third journey.
+- **OpenRouter:** verify credential availability without printing it and require the managed,
+  fail-closed gate before consequential journey execution.
+- **Codex/Gemini:** verify the external Hermes orchestrator, authentication, specialist routing, and
+  policy-enforcement compatibility.
+- **Grok ACP:** require a live OAuth/ACP readiness probe in addition to file permissions; verify the
+  isolated runtime assets, hook/MCP attestation, and Mission Board delegation before launch. A local
+  executable or readable auth file alone is not proof of a healthy provider.
+
+Provider selection remains secondary and policy-driven. Operators create only Autonomous or Guided
+missions; an unavailable or non-enforceable provider is excluded or blocks preflight rather than
+silently degrading the journey contract.
 
 ## Reusable memory
 
-Do not make `/root/.hermes/memories` readable or writable by `chillspwn`. Normal service access must go through `/run/chillspwn-memory/broker.sock`; direct root/operator curation must use the reviewed CLI with broker client mode deliberately disabled. A broker outage is expected to fail closed: provider context omits reusable memory, and the dashboard memory endpoint returns `503` rather than reading raw files.
+Command OS V2 memory is canonical in
+`/var/lib/chillspwn/command-os-v2.sqlite` and projected to
+`/var/lib/chillspwn/brain-vaults`. There is no root memory-broker service in the
+supported unit graph. Back up SQLite transactionally, stop vault sync before a
+vault restore, preserve provenance/lifecycle state, and verify that forgetting
+removes future retrieval and synchronized projections.
+
+## Service privilege checks
+
+After every unit or account change, verify the running processes have the
+`chillspwn` UID/GID, no supplementary groups, no effective/permitted
+capabilities, no sudo permission, and no Docker socket access. Do not solve a
+path failure by adding `root`, `adm`, `sudo`, or `docker` membership. Correct
+the explicit `/opt`, `/var/lib/chillspwn`, log, or bind-mount path instead.
 
 ## Incident response
 

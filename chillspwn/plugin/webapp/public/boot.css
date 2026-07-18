@@ -1,0 +1,43 @@
+#boot {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 16px;
+  color: #526f00;
+  background:
+    linear-gradient(rgba(48, 79, 70, 0.08) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(48, 79, 70, 0.08) 1px, transparent 1px),
+    #edf2f1;
+  background-size: 32px 32px;
+  font-family: system-ui, -apple-system, sans-serif;
+}
+
+.boot-title {
+  font-size: 13px;
+  letter-spacing: 0.15em;
+  opacity: 0.9;
+}
+
+#boot-msg {
+  color: #5d7069;
+  font-size: 12px;
+}
+
+#boot-msg.boot-failed {
+  color: #b4233d;
+}
+
+#boot-retry {
+  min-height: 44px;
+  margin-top: 8px;
+  padding: 10px 22px;
+  border: 1px solid #526f00;
+  border-radius: 7px;
+  color: #ffffff;
+  background: #526f00;
+  font: inherit;
+  cursor: pointer;
+}

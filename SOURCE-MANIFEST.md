@@ -27,7 +27,13 @@ ChillsPwn application source refreshed: `2026-07-15T05:02:52Z`
 - Deployment-specific QR/prototype files and generated Android web assets were removed. The retained Android native project is regenerated from the sanitized `dist/` build with Capacitor.
 - Outer plugin files, active personas, Hermes-linked skills, reporting templates, and systemd deployment files remain from the curated recovery snapshot unless explicitly noted.
 - Recovery helpers include root-only systemd environment-file enforcement, a startup validator that rejects literal credentials in the untracked live Hermes `config.yaml` without printing values, provider-specific child environments, and a root-owned broker for validated reusable-memory access.
-- The integrated deployment comprises `chillspwn-memory.service`, `chillspwn.service`, and `hermes-gateway.service`. The application units use isolated Claude, Codex, and Grok state paths; Grok is launched from the root-owned absolute `/opt/chillspwn/bin/grok` while its refreshable OAuth file remains service-owned under `/root/.hermes/auth/grok`.
+- The hardened V2 deployment comprises `chillspwn.service`,
+  `hermes-gateway.service`, and two exact workspace bind mounts. Application and
+  provider state is service-owned below `/var/lib/chillspwn`; Grok launches from
+  root-owned `/opt/chillspwn/bin/grok` while its refreshable OAuth file remains
+  service-owned under `/var/lib/chillspwn/grok-auth`. The pre-V2 root memory
+  broker is retained only under `deployment/legacy/` and is not an active
+  dependency.
 
 ## Snapshot model
 

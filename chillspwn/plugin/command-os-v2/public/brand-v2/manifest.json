@@ -1,0 +1,207 @@
+{
+  "schemaVersion": "1.0",
+  "generatedAt": "2026-07-15T01:20:00Z",
+  "workspace": "ChillsPwn Command OS V2.1",
+  "provenance": {
+    "generator": "Higgsfield MCP",
+    "licenseNote": "Generated specifically for ChillsPwn in the authenticated project workspace. Use remains subject to the Higgsfield terms applicable on the generation date.",
+    "logoPolicy": "No generated asset contains or replaces the ChillsPwn logo. The application composites the unchanged public/Logo.svg at runtime.",
+    "safetyReview": "Production assets were visually reviewed. SVG assets were checked for script, foreignObject, event-handler, text, image, and external-reference elements before inclusion."
+  },
+  "assets": [
+    {
+      "id": "moodboard-graphite-command-intelligence",
+      "kind": "research-moodboard",
+      "selected": false,
+      "sourcePrompt": "Graphite Command Intelligence: an original premium B2B operations-system moodboard with near-black graphite foundations, restrained acid-lime identity signals, systems topology, evidence and precise controlled motion; text-free, logo-free, and free of cyberpunk or hacker clichés.",
+      "model": "Z Image",
+      "tool": "Higgsfield MCP generate_image",
+      "date": "2026-07-15",
+      "source": { "path": "source/moodboard-graphite-command-intelligence.png", "width": 2048, "height": 1152, "bytes": 2972163 },
+      "derivedVariants": [],
+      "intendedPlacement": "Design research only; never loaded by the production shell.",
+      "alt": "Graphite command intelligence visual research board.",
+      "notes": "Rejected because generated code-like and textual artifacts reduced product clarity."
+    },
+    {
+      "id": "moodboard-precision-operations",
+      "kind": "research-moodboard",
+      "selected": false,
+      "sourcePrompt": "Precision Operations: an original premium B2B operations-system moodboard with near-black graphite foundations, crisp geometry, restrained acid-lime and semantic blue, visible systems topology and evidence; text-free, logo-free, and free of cyberpunk or hacker clichés.",
+      "model": "Z Image",
+      "tool": "Higgsfield MCP generate_image",
+      "date": "2026-07-15",
+      "source": { "path": "source/moodboard-precision-operations.png", "width": 2048, "height": 1152, "bytes": 2060809 },
+      "derivedVariants": [],
+      "intendedPlacement": "Design research only; never loaded by the production shell.",
+      "alt": "Precision operations visual research board.",
+      "notes": "Rejected because unwanted generated typography competed with the interface."
+    },
+    {
+      "id": "moodboard-calm-autonomous-systems",
+      "kind": "research-moodboard",
+      "selected": true,
+      "sourcePrompt": "Calm Autonomous Systems: an original premium B2B operations-system moodboard with near-black graphite foundations, quiet depth, restrained acid-lime identity signals, systems topology, evidence and controlled motion; text-free, logo-free, and free of cyberpunk or hacker clichés.",
+      "model": "Z Image",
+      "tool": "Higgsfield MCP generate_image",
+      "date": "2026-07-15",
+      "source": { "path": "source/moodboard-calm-autonomous-systems.png", "width": 2048, "height": 1152, "bytes": 2410836 },
+      "derivedVariants": [],
+      "intendedPlacement": "Selected design research direction; never loaded by the production shell.",
+      "alt": "Calm autonomous systems visual research board.",
+      "notes": "Selected for operational legibility, calm hierarchy, originality, and suitability behind real UI."
+    },
+    {
+      "id": "ambient-command-center",
+      "kind": "production-ambient",
+      "jobId": "5f7e0f17-b1c4-4f83-9537-2a9609eee51f",
+      "sourcePrompt": "Text-free ambient background for a premium enterprise command operations application. Near-black graphite foundation (#07090B), extremely subtle layered neutral depth, sparse fine topology lines and small controlled acid-lime signals (#B6F23A), hints of muted information blue (#5B8CFF), broad quiet negative space across center and left for readable UI, calm autonomous intelligence, evidence constellation, precise and restrained, no panels, no dashboard mockup, no letters, no numbers, no words, no logos, no people, no terminal code, no cyberpunk city, no bloom overload.",
+      "model": "recraft_v4_1",
+      "tool": "Higgsfield MCP generate_image",
+      "date": "2026-07-15",
+      "source": { "path": "source/ambient-command-center.png", "width": 2688, "height": 1536, "bytes": 541682 },
+      "derivedVariants": [
+        { "path": "optimized/ambient-command-center-1920.avif", "width": 1890, "height": 1080, "bytes": 16955 },
+        { "path": "optimized/ambient-command-center-1920.webp", "width": 1890, "height": 1080, "bytes": 28078 },
+        { "path": "optimized/ambient-command-center-1280.avif", "width": 1260, "height": 720, "bytes": 11008 },
+        { "path": "optimized/ambient-command-center-1280.webp", "width": 1260, "height": 720, "bytes": 16338 },
+        { "path": "optimized/ambient-command-center-768.avif", "width": 756, "height": 432, "bytes": 5362 }
+      ],
+      "intendedPlacement": "Lazy, noncritical Command Center ambient background.",
+      "alt": "Abstract graphite operational topology with restrained lime and blue signals.",
+      "notes": "The image is decorative and should normally use an empty alt attribute in the UI."
+    },
+    {
+      "id": "onboarding-journeys",
+      "kind": "production-onboarding",
+      "jobId": "0216b2d3-b104-4185-895f-d44d08277394",
+      "sourcePrompt": "Text-free onboarding ambient illustration for a premium enterprise mission command product. Near-black graphite canvas, two distinct calm paths emerging from the lower edge: one precise continuous acid-lime autonomous trajectory and one measured blue guided step-by-step trajectory, both resolving into a small evidence constellation in the upper right. Fine lines, restrained luminous markers, generous negative space, crisp vector-like precision, no UI mockup, no panels, no words, no letters, no numbers, no logos, no people, no terminal code, no cyberpunk.",
+      "model": "recraft_v4_1",
+      "tool": "Higgsfield MCP generate_image",
+      "date": "2026-07-15",
+      "source": { "path": "source/onboarding-journeys.png", "width": 1344, "height": 768, "bytes": 78074 },
+      "derivedVariants": [
+        { "path": "optimized/onboarding-journeys-1344.avif", "width": 1344, "height": 768, "bytes": 4652 },
+        { "path": "optimized/onboarding-journeys-1344.webp", "width": 1344, "height": 768, "bytes": 9228 }
+      ],
+      "intendedPlacement": "Lazy onboarding and journey-selection ambient visual.",
+      "alt": "A continuous Autonomous path and a stepped Guided path converging on evidence.",
+      "notes": "Contains no embedded text or logo."
+    },
+    {
+      "id": "empty-no-missions",
+      "kind": "production-empty-state",
+      "sourcePrompt": "Minimal text-free empty-state illustration for a premium enterprise command application, centered composition, near-black graphite background, clean restrained utility vector style, thin precise lines, acid-lime and muted blue accents, no words, letters, numbers, logos, people, or terminal code. Subject: no missions yet, a calm unstarted operational path and neutral mission node.",
+      "model": "recraft_v4_1",
+      "tool": "Higgsfield MCP generate_image / utility_vector",
+      "date": "2026-07-15",
+      "source": { "path": "source/empty-no-missions.svg", "width": 1024, "height": 1024, "bytes": 2366 },
+      "derivedVariants": [
+        { "path": "optimized/empty-no-missions-512.avif", "width": 512, "height": 512, "bytes": 1557 },
+        { "path": "optimized/empty-no-missions-512.webp", "width": 512, "height": 512, "bytes": 2278 }
+      ],
+      "intendedPlacement": "No-missions empty state.",
+      "alt": "An unstarted operational path awaiting its first mission.",
+      "notes": "Optimized raster variants are preferred in untrusted rendering contexts."
+    },
+    {
+      "id": "empty-guided-decisions",
+      "kind": "production-empty-state",
+      "sourcePrompt": "Minimal text-free empty-state illustration for a premium enterprise command application, centered composition, near-black graphite background, clean restrained utility vector style, thin precise lines, acid-lime and muted blue accents, no words, letters, numbers, logos, people, or terminal code. Subject: no Guided decisions waiting, a bounded decision gate in a calm resolved state.",
+      "model": "recraft_v4_1",
+      "tool": "Higgsfield MCP generate_image / utility_vector",
+      "date": "2026-07-15",
+      "source": { "path": "source/empty-guided-decisions.svg", "width": 1024, "height": 1024, "bytes": 12726 },
+      "derivedVariants": [
+        { "path": "optimized/empty-guided-decisions-512.avif", "width": 512, "height": 512, "bytes": 2147 },
+        { "path": "optimized/empty-guided-decisions-512.webp", "width": 512, "height": 512, "bytes": 3184 }
+      ],
+      "intendedPlacement": "Empty Guided-decision inbox.",
+      "alt": "A resolved decision gate with no action waiting.",
+      "notes": "Optimized raster variants are preferred in untrusted rendering contexts."
+    },
+    {
+      "id": "empty-evidence",
+      "kind": "production-empty-state",
+      "sourcePrompt": "Minimal text-free empty-state illustration for a premium enterprise command application, centered composition, near-black graphite background, clean restrained utility vector style, thin precise lines, acid-lime and muted blue accents, no words, letters, numbers, logos, people, or terminal code. Subject: an empty evidence vault with a neutral immutable evidence node and an open acquisition path.",
+      "model": "recraft_v4_1",
+      "tool": "Higgsfield MCP generate_image / utility_vector",
+      "date": "2026-07-15",
+      "source": { "path": "source/empty-evidence.svg", "width": 1024, "height": 1024, "bytes": 18173 },
+      "derivedVariants": [
+        { "path": "optimized/empty-evidence-512.avif", "width": 512, "height": 512, "bytes": 2437 },
+        { "path": "optimized/empty-evidence-512.webp", "width": 512, "height": 512, "bytes": 3558 }
+      ],
+      "intendedPlacement": "Empty Evidence Vault.",
+      "alt": "An empty evidence node with an open acquisition path.",
+      "notes": "Optimized raster variants are preferred in untrusted rendering contexts."
+    },
+    {
+      "id": "empty-brain",
+      "kind": "production-empty-state",
+      "sourcePrompt": "Minimal text-free empty-state illustration for a premium enterprise command application, centered composition, near-black graphite background, clean restrained utility vector style, thin precise lines, acid-lime and muted blue accents, no words, letters, numbers, logos, people, or terminal code. Subject: an empty Second Brain, one central operator node ready to form its first transparent memory relationships.",
+      "model": "recraft_v4_1",
+      "tool": "Higgsfield MCP generate_image / utility_vector",
+      "date": "2026-07-15",
+      "source": { "path": "source/empty-brain.svg", "width": 1024, "height": 1024, "bytes": 10926 },
+      "derivedVariants": [
+        { "path": "optimized/empty-brain-512.avif", "width": 512, "height": 512, "bytes": 2455 },
+        { "path": "optimized/empty-brain-512.webp", "width": 512, "height": 512, "bytes": 3062 }
+      ],
+      "intendedPlacement": "Empty Second Brain and memory graph.",
+      "alt": "A central operator node ready to form transparent memory relationships.",
+      "notes": "Optimized raster variants are preferred in untrusted rendering contexts."
+    },
+    {
+      "id": "empty-vault-offline",
+      "kind": "production-empty-state",
+      "jobId": "cba0d184-a4b4-421a-a6fa-3f967686a7ba",
+      "sourcePrompt": "Minimal text-free empty-state illustration for a premium enterprise command application, centered composition, near-black graphite background, clean restrained utility vector style, thin precise lines, acid-lime and muted blue accents, no words, no letters, no numbers, no logos, no people, no terminal code. Subject: an offline local note-vault bridge, two neutral note nodes separated by a safely broken sync line, no trademark symbols.",
+      "model": "recraft_v4_1",
+      "tool": "Higgsfield MCP generate_image / utility_vector",
+      "date": "2026-07-15",
+      "source": { "path": "source/empty-vault-offline.svg", "width": 1024, "height": 1024, "bytes": 11702 },
+      "derivedVariants": [
+        { "path": "optimized/empty-vault-offline-512.avif", "width": 512, "height": 512, "bytes": 2731 },
+        { "path": "optimized/empty-vault-offline-512.webp", "width": 512, "height": 512, "bytes": 3762 }
+      ],
+      "intendedPlacement": "Obsidian-compatible vault offline state.",
+      "alt": "Two local note nodes separated by an interrupted synchronization link.",
+      "notes": "SVG source passed active-content and external-reference checks."
+    },
+    {
+      "id": "empty-recovery-required",
+      "kind": "production-empty-state",
+      "jobId": "865bc791-e734-4677-83ee-7ef4a6c495d3",
+      "sourcePrompt": "Minimal text-free empty-state illustration for a premium enterprise command application, centered composition, near-black graphite background, clean restrained utility vector style, thin precise lines, acid-lime and muted blue accents, no words, no letters, no numbers, no logos, no people, no terminal code. Subject: recovery required, an interrupted operational path bending safely around a graphite obstacle with one restrained amber diagnostic marker.",
+      "model": "recraft_v4_1",
+      "tool": "Higgsfield MCP generate_image / utility_vector",
+      "date": "2026-07-15",
+      "source": { "path": "source/empty-recovery-required.svg", "width": 1024, "height": 1024, "bytes": 3375 },
+      "derivedVariants": [
+        { "path": "optimized/empty-recovery-required-512.avif", "width": 512, "height": 512, "bytes": 1241 },
+        { "path": "optimized/empty-recovery-required-512.webp", "width": 512, "height": 512, "bytes": 1664 }
+      ],
+      "intendedPlacement": "Recovery-required and stalled-run state.",
+      "alt": "An operational path safely routing around an obstacle with a diagnostic marker.",
+      "notes": "SVG source passed active-content and external-reference checks."
+    },
+    {
+      "id": "empty-mission-complete",
+      "kind": "production-empty-state",
+      "jobId": "3d55bcae-77c6-4974-bc30-1bf97565b126",
+      "sourcePrompt": "Minimal text-free empty-state illustration for a premium enterprise command application, centered composition, near-black graphite background, clean restrained utility vector style, thin precise lines, acid-lime and muted blue accents, no words, no letters, no numbers, no logos, no people, no terminal code. Subject: mission complete, a continuous acid-lime path arriving at a verified evidence node with a simple geometric completion mark.",
+      "model": "recraft_v4_1",
+      "tool": "Higgsfield MCP generate_image / utility_vector",
+      "date": "2026-07-15",
+      "source": { "path": "source/empty-mission-complete.svg", "width": 1024, "height": 1024, "bytes": 5748 },
+      "derivedVariants": [
+        { "path": "optimized/empty-mission-complete-512.avif", "width": 512, "height": 512, "bytes": 2424 },
+        { "path": "optimized/empty-mission-complete-512.webp", "width": 512, "height": 512, "bytes": 3602 }
+      ],
+      "intendedPlacement": "Mission Completion Review.",
+      "alt": "A completed operational path arriving at a verified evidence node.",
+      "notes": "SVG source passed active-content and external-reference checks."
+    }
+  ]
+}

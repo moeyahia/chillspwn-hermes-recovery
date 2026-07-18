@@ -1,0 +1,28 @@
+{
+  "schemaVersion": 1,
+  "pathBoundary": "/usr/local/libexec/chillspwn-command-os-v2",
+  "installRoot": "/usr/local/libexec/chillspwn-command-os-v2",
+  "binPath": "/usr/local/libexec/chillspwn-command-os-v2/bin",
+  "provenancePath": "/usr/local/libexec/chillspwn-command-os-v2/provenance.json",
+  "tools": {
+    "httpx-toolkit": {
+      "sourcePath": "/usr/bin/httpx-toolkit",
+      "sourceSha256": "685b5c3acd46c92be272fa648e97b91b81454acaeded3058fd47ef6c1f0194da",
+      "wrapperAsset": "server/mcp/trusted-shims/httpx-toolkit",
+      "executablePath": "/usr/local/libexec/chillspwn-command-os-v2/bin/httpx-toolkit",
+      "sha256": "262c537bb8af3a5702b4d1d15cb332812dff10508a767942b93dfbdcb85f2dbf",
+      "version": "1.9.0",
+      "mode": "0755",
+      "enforcedOptions": ["-duc"]
+    },
+    "nmap": {
+      "sourcePath": "/usr/lib/nmap/nmap",
+      "sourceSha256": "5b42c994b6f5804be11726deae943defc868dbe91d8362b3a2686b7d5160667f",
+      "executablePath": "/usr/local/libexec/chillspwn-command-os-v2/bin/nmap",
+      "sha256": "5b42c994b6f5804be11726deae943defc868dbe91d8362b3a2686b7d5160667f",
+      "version": "7.99",
+      "mode": "0755",
+      "allowedTechnique": "Connect"
+    }
+  }
+}

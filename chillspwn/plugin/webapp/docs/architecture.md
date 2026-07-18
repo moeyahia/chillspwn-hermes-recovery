@@ -16,8 +16,9 @@ flowchart LR
   Browser[React dashboard] -->|REST /api| Server[Bun + Express]
   Browser <-->|WebSocket /ws| Server
   Server --> Runtime[Agent runtime and policy]
-  Runtime --> Board[(Hermes SQLite board)]
-  Runtime --> Stores[(JSON and JSONL stores)]
+  Runtime --> DB[(Command OS SQLite)]
+  Runtime --> Vault[Obsidian vault projection]
+  DB --> Vault
   Runtime --> Providers[Provider execution paths]
   Providers --> Claude[Claude CLI]
   Providers --> Hermes[Hermes orchestrator]
@@ -29,7 +30,11 @@ flowchart LR
 
 ## Browser application
 
-`index.html` loads `src/main.tsx`, which mounts `src/App.tsx`. The app lazy-loads pages for chat, Mission Board, agent cockpit, reports, logs, settings, files, system state, and specialized workflows.
+`index.html` loads `src/main.tsx`, which mounts the small `src/App.tsx` composition root. The
+query-aware router lazy-loads the Command Center, mission portfolio and workspace, Autonomous Live
+Operations, Guided Workspace, Decisions, Intelligence, Agents, Second Brain, Learning,
+Observability, Reports, and System surfaces. Conversation is contextual to a mission; it is not the
+owner of execution state.
 
 During development, Vite listens on port 3132 and proxies `/api` and `/ws` to the Bun server on port 3131. In a production build, the Bun server serves `dist/` and the API from the same origin.
 
@@ -43,6 +48,10 @@ During development, Vite listens on port 3132 and proxies `/api` and `/ws` to th
 - `server/mcp/`: MCP registry, execution policy, and arsenal bridge.
 - `server/routes/`: extracted API route groups.
 - `server/security/`: startup configuration, authentication, safe paths, and legacy obfuscation controls.
+- `server/security/LegacyExecutionGate.ts`: default-off boundary that keeps
+  compatibility reads available but denies every unversioned mutation, legacy
+  chat/terminal command, and background compatibility executor unless the
+  rollback-only `ENABLE_LEGACY_EXECUTION_API` opt-in is set.
 - `server/assets/`: wordlist, hashcat, and vulnerability-intelligence catalogs.
 
 `server/index.ts` remains a large legacy composition root and is intentionally excluded from strict TypeScript checking. Modular server code is checked by `tsconfig.server.json`; `bun run check:server-entry` parses and bundles the production entry so syntax and import-graph failures cannot bypass validation. This bundle check is not a substitute for bringing the composition root under strict typing; reducing and typing it remains technical debt.
@@ -58,27 +67,34 @@ sequenceDiagram
   participant B as Mission Board
   participant S as Specialist
 
-  O->>UI: Submit objective
-  UI->>R: Create or observe run
-  R->>C: Plan/coordinate under configured boundary
+  O->>UI: Select Autonomous or Guided
+  UI->>R: Create mission and versioned journey contract
+  R->>C: Plan/coordinate under journey boundary
   C->>B: Create assigned task
   B->>S: Dispatch specialist work
   S->>B: Return result and evidence
   B->>C: Awaited result
-  R->>UI: Events, approvals, evidence, final report
+  R->>UI: Events, decisions, evidence, completion review
 ```
 
-The exact enforcement boundary depends on the provider path. Grok commander ACP uses an isolated profile, an attested tool surface, and a fail-closed pre-tool guard. Other provider paths may be managed, gated, or observe-only as documented in `SECURITY.md` and the runtime flags.
+There are exactly two user-facing journeys. Autonomous executes only through a provider path that
+can enforce its signed contract and must recover in-contract or safe-stop. Guided permits only the
+exact represented step covered by the current operator decision. Provider selection is secondary,
+policy-driven, and inspectable. Grok commander ACP additionally uses an isolated profile, live
+readiness attestation, a constrained tool surface, and a fail-closed pre-tool guard. An advisory or
+observe-only compatibility substrate is never represented as an enforceable journey executor.
 
 ## Persistence
 
-The application reads and writes state outside the repository. In the integrated recovery deployment the explicit systemd variables below are authoritative; local runs use the same defaults derived from `HERMES_HOME` and `CHILLSPWN_STATE_DIR`:
+The application reads and writes state outside the repository. In the hardened
+deployment the explicit systemd variables below are authoritative:
 
-- `${HERMES_HOME:-$HOME/.hermes}/kanban.db`: Mission Board SQLite data (the integrated units set `HERMES_HOME=/root/.hermes`).
-- `CHILLSPWN_STATE_DIR` (default: the `chillspwn` child of `HERMES_HOME`): runtime data, logs, reports, artifacts, and UI state.
-- `CHILLSPWN_PERSONAS_DIR` (default: the `personas` child of `CHILLSPWN_STATE_DIR`): deployed persona JSON and Soul state.
-- `CHILLSPWN_SESSIONS_DIR` (default: the `sessions` child of `CHILLSPWN_STATE_DIR`): ChillsPwn session records.
-- `${HERMES_HOME:-$HOME/.hermes}`: Hermes configuration, conversations, protected reusable memory, scripts, provider profiles, and other Hermes state.
+- `COMMAND_OS_DB_PATH=/var/lib/chillspwn/command-os-v2.sqlite`: canonical mission, event, evidence, memory, and learning state.
+- `CHILLSPWN_VAULT_ROOT=/var/lib/chillspwn/brain-vaults`: synchronized Obsidian-compatible projections.
+- `CHILLSPWN_STATE_DIR=/var/lib/chillspwn/state`: compatibility runtime data, reports, artifacts, and UI state.
+- `CHILLSPWN_PERSONAS_DIR=/opt/chillspwn/plugin/webapp/server/agents/personas`: reviewed persona and Soul source.
+- `CHILLSPWN_SESSIONS_DIR=/var/lib/chillspwn/state/sessions`: compatibility ChillsPwn session records.
+- `HERMES_HOME=/var/lib/chillspwn/hermes`: Hermes mutable state and configuration.
 - Workspace/engagement roots configured by `ALLOWED_WORKSPACE_ROOTS`. The same ordered roots drive file browsing, engagement APIs and working directories, interactive Claude `--add-dir` access, and OSINT output placement.
 
 These paths may contain credentials and target data. They must never be copied into the Git worktree. See [Data and migrations](data-and-migrations.md) and [Operations](operations.md).
@@ -91,8 +107,14 @@ These paths may contain credentials and target data. They must never be copied i
 - File, engagement, report, and OSINT artifact routes are confined to configured workspace roots with real-path/no-follow checks. Persisted OSINT control state and worker stdout/stderr live separately under the `osint-jobs` child of `CHILLSPWN_STATE_DIR`; state/artifact reads and stdout tail reads use bounded no-follow helpers.
 - API secrets are injected by systemd from root-owned mode-`0600` environment files that the service account cannot reopen. Refreshable provider OAuth stores remain narrowly service-owned where the CLI must update them.
 - Provider children receive explicit provider-specific environment subsets. Because they still share the dashboard's UID, this prevents accidental inheritance but is not strong process isolation; same-UID `/proc` access and service-readable OAuth stores remain residual risks.
-- Reusable memory is root-only and reached through the validated `chillspwn-memory.service` Unix-socket broker; model-facing processes do not receive direct filesystem access to it.
+- Second Brain memory is database-mediated with provenance, scope, consent,
+  sensitivity, lifecycle, context-pack audit, and forgetting; the hardened
+  services have no root memory-broker dependency.
 - The Grok ACP commander receives a reduced environment and OAuth credential path, not an API key value.
+- Both services run as `chillspwn` with no supplementary groups or capabilities;
+  code/runtimes are root-controlled under `/opt` and state is service-owned under
+  `/var/lib/chillspwn`.
+- Docker MCP remains disabled because Docker socket access is root-equivalent.
 
 The detailed application threat model is in [SECURITY.md](../SECURITY.md).
 
@@ -103,4 +125,6 @@ The detailed application threat model is in [SECURITY.md](../SECURITY.md).
 - **Deployment is manual.** CI validates source but does not deploy.
 - **Android native source is retained.** Gradle output and `android/app/src/main/assets/` are generated and ignored; reproducible signed mobile release work remains future scope.
 - **No formatter baseline yet.** Repository-wide formatting should be introduced separately from behavior changes.
-- **No versioned database migrations yet.** Startup performs limited additive schema checks, while the base board schema remains external.
+- **V2 owns versioned database migrations.** Legacy Board/JSON/JSONL sources are
+  imported through an idempotent backup-first compatibility migration and are
+  not permanent canonical stores.

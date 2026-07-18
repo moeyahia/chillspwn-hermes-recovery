@@ -33,6 +33,7 @@
 
 # Runtime/authentication material must never enter this repository.
 **/auth.json*
+**/credentials.json*
 **/active_sessions.json*
 **/state.db*
 **/kanban.db*
@@ -60,7 +61,6 @@
 **/id_ed25519*
 **/.grok/
 **/.codex/
-**/conversations/
 **/sessions/
 **/session-logs/
 **/shell_snapshots/

@@ -16,12 +16,12 @@ export const AGENT_ROSTER: AgentSpec[] = [
     personaId: "reconscout", defaultProvider: "openrouter",
     allowedMcpServers: ["sechub-reconnaissance", "pentest-mcp-recon"],
     allowedTools: ["quick_scan", "port_scan", "os_detection", "masscan_scan", "masscan_top_ports", "run_masscan", "get_scan_results", "list_active_scans", "nmap", "dig", "whois", "dnsenum", "sslscan",
-      "nmapScan", "gobuster", "subfinderEnum", "httpxProbe", "extractionSweep", // 16.2 real pentest-mcp tools
+      "nmapScan", "gobuster", "httpxProbe", // reviewed pentest-mcp tools; Subfinder is suppressed pending reproducible provisioning
       // 17.1 — operational tools the orchestrator actually implements (specialists execute via terminal/
       // SURFACE + save evidence via write_file; the MCP allowlist alone left workers with no scan/fs tool):
       "terminal", "read_file", "write_file", "search_files", "execute_code", "use_skill", "recall_conversation"],
     deniedTools: ["hashcat", "sqlmap", "create_session", "execute"],
-    approvalRequiredTools: ["masscan_scan", "run_masscan", "masscan_top_ports", "nmapScan", "gobuster", "extractionSweep"],
+    approvalRequiredTools: ["masscan_scan", "run_masscan", "masscan_top_ports", "nmapScan", "gobuster", "httpxProbe"],
     riskProfile: "network", canProposeTrainingLessons: true, canApproveTrainingLessons: NO_SELF_APPROVE,
     memoryNamespace: "agent:reconscout",
     outputContract: "WorkerResult with discovered hosts/ports/services + evidenceIds; recommend WebBreaker for web ports.",
@@ -36,9 +36,9 @@ export const AGENT_ROSTER: AgentSpec[] = [
     personaId: "webbreaker", defaultProvider: "openrouter",
     allowedMcpServers: ["sechub-web-security", "sechub-exploitation", "pentest-mcp-recon"],
     allowedTools: ["ffuf_dir", "ffuf_vhost", "ffuf_param", "ffuf_custom", "analyze_urls", "fetch_wayback_urls", "get_fuzz_results", "get_fetch_results", "nikto", "wpscan", "searchsploit_search", "searchsploit_examine",
-      "ffufScan", "nucleiScan", "httpxProbe", "gobuster"], // 16.2 real pentest-mcp tools
+      "ffufScan", "nucleiScan", "httpxProbe", "gobuster", "extractionSweep"], // reviewed pentest-mcp tools
     deniedTools: ["hashcat", "create_session", "execute", "bloodhound_collect"],
-    approvalRequiredTools: ["ffuf_custom", "sqlmap_assess", "searchsploit_examine", "ffufScan", "nucleiScan"],
+    approvalRequiredTools: ["ffuf_custom", "sqlmap_assess", "searchsploit_examine", "ffufScan", "nucleiScan", "httpxProbe", "gobuster", "nikto", "extractionSweep"],
     riskProfile: "network", canProposeTrainingLessons: true, canApproveTrainingLessons: NO_SELF_APPROVE,
     memoryNamespace: "agent:webbreaker",
     outputContract: "WorkerResult with web findings (endpoints/params/vulns) + evidenceIds; hand any discovered creds to CredSmith.",
@@ -53,9 +53,9 @@ export const AGENT_ROSTER: AgentSpec[] = [
     personaId: "credsmith", defaultProvider: "openrouter",
     allowedMcpServers: ["sechub-password-cracking", "pentest-mcp-recon"],
     allowedTools: ["hashcat_identify", "hashcat_crack", "get_crack_results", "hashcat",
-      "runHashcat", "runJohnTheRipper", "generateWordlist", "hydraBruteforce"], // 16.2 real pentest-mcp tools
+      "runJohnTheRipper", "generateWordlist", "hydraBruteforce"], // runHashcat suppressed until vendor argv + compute runtime are repaired
     deniedTools: ["create_session", "execute", "ffuf_dir", "prowler_scan"],
-    approvalRequiredTools: ["hashcat_crack", "hashcat", "runHashcat", "runJohnTheRipper", "hydraBruteforce"],
+    approvalRequiredTools: ["hashcat_crack", "hashcat", "runJohnTheRipper", "generateWordlist", "hydraBruteforce"],
     riskProfile: "credential-sensitive", canProposeTrainingLessons: true, canApproveTrainingLessons: NO_SELF_APPROVE,
     memoryNamespace: "agent:credsmith",
     outputContract: "WorkerResult with hash types + crack outcome (cracked: yes/no, NO plaintext in reusable memory) + evidenceIds.",
@@ -194,7 +194,8 @@ export const AGENT_ROSTER: AgentSpec[] = [
     personaId: "reportsmith", defaultProvider: "openrouter",
     allowedMcpServers: ["chillspwn-reporting"],
     // Native operational tools the OR orchestrator actually implements. `terminal` is granted so the
-    // report deliverable is produced by FILLING THE CANONICAL TEMPLATE at /root/report-template/ via
+    // report deliverable is produced by filling the canonical template selected by
+    // CHILLSPWN_REPORT_TEMPLATE_DIR via
     // generate_report.py + embed_logos.py + chromium PDF (see the pentest-report-pdf skill) — without
     // it the agent free-hands an off-brand HTML and cannot render a PDF ("no execution tool"). Scope is
     // local report assembly only; offensive tools stay denied below.
@@ -217,6 +218,7 @@ export const AGENT_ROSTER: AgentSpec[] = [
     allowedTools: [
       // 17.1 — REAL keyless read-only tools (python cve-mcp + node nvd, verified via tools/list):
       "lookup_cve", "search_cves", "get_cve_summary", "get_epss_score", "check_kev", "parse_cvss", "check_package_vulns", "get_attack_mapping", "calculate_risk_score", "health_check", "get_cve_details",
+      "get_vendor_advisory", "check_exploit_availability", "get_cve_timeline", "check_poc_exists", "compare_cves",
       // local cve-search (when CVE_SEARCH_BASE provided):
       "cve_search_query", "cve_browse", "cve_by_vendor"],
     deniedTools: ["create_session", "execute", "hashcat", "runHashcat", "ffuf_dir", "ffufScan", "nmapScan", "nucleiScan", "sqlmap", "prowler_scan", "bloodhound_collect", "boofuzz_run_fuzzer", "searchsploit_examine"],

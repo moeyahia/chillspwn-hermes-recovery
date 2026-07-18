@@ -56,6 +56,15 @@ import {
 } from "./ToolPolicy";
 import { parseAndValidatePlan, materializePlanSteps } from "./Planner";
 import { decideApproval, type ApprovalPolicyConfig } from "./ApprovalPolicy";
+import {
+  DEFAULT_MCP_APPROVAL_ATTESTATION_TTL_MS,
+  MCP_APPROVAL_ATTESTATION_VERSION,
+  hashMcpArguments,
+  validateMcpApprovalAttestation,
+  type LegacyToolApprovalAttestation,
+  type McpApprovalVerificationRequest,
+  type McpApprovalVerificationResult,
+} from "../mcp/McpApprovalAttestation";
 
 export interface AgentRuntimeDeps {
   store: AgentRunStore;
@@ -573,6 +582,165 @@ export class AgentRuntime {
 
   getApproval(runId: string, approvalId: string): ApprovalRequest | null {
     return this.store.getApproval(runId, approvalId);
+  }
+
+  getToolCall(runId: string, toolCallId: string): ToolCall | null {
+    return this.store.getToolCall(runId, toolCallId);
+  }
+
+  /**
+   * Claim one exact, durably approved legacy MCP tool call before dispatch.
+   * The claim is persisted together with the ToolCall and changes its status to
+   * `executing`, so a second caller cannot mint another attestation.
+   */
+  claimApprovedMcpToolCall(input: {
+    runId: string;
+    stepId: string;
+    toolCallId: string;
+    specialistAgentId: string;
+    mcpServer: string;
+    toolName: string;
+    arguments?: unknown;
+    approvalTtlMs?: number;
+  }): LegacyToolApprovalAttestation {
+    const run = this.requireRun(input.runId);
+    const toolCall = this.store.getToolCall(input.runId, input.toolCallId);
+    if (!toolCall) throw new RuntimeError(`tool call not found in this run: ${input.toolCallId}`);
+    if (toolCall.status !== "approved") {
+      throw new RuntimeError(`tool call ${input.toolCallId} is '${toolCall.status}', not available for an approval claim`);
+    }
+    if (!toolCall.stepId || toolCall.stepId !== input.stepId) {
+      throw new RuntimeError("approved tool call does not match the requested run step");
+    }
+    if (toolCall.toolName !== input.toolName || !toolCall.approvalId) {
+      throw new RuntimeError("approved tool call does not match an approval-gated tool binding");
+    }
+    const approval = this.store.getApproval(input.runId, toolCall.approvalId);
+    if (
+      !approval ||
+      approval.status !== "approved" ||
+      approval.toolCallId !== toolCall.id ||
+      approval.stepId !== toolCall.stepId ||
+      approval.toolName !== toolCall.toolName ||
+      !approval.resolvedAt ||
+      !approval.resolvedBy
+    ) {
+      throw new RuntimeError("the durable approval is missing, unresolved, or no longer matches this tool call");
+    }
+    const stored = toolCall.arguments as Record<string, unknown>;
+    const {
+      __mcpServer: storedServer,
+      __specialist: storedSpecialist,
+      ...storedArguments
+    } = stored;
+    if (storedServer !== input.mcpServer || storedSpecialist !== input.specialistAgentId) {
+      throw new RuntimeError("approved tool call does not match the requested specialist MCP binding");
+    }
+    const argumentsHash = hashMcpArguments(input.arguments);
+    if (hashMcpArguments(storedArguments) !== argumentsHash) {
+      throw new RuntimeError("approved tool call arguments changed after approval");
+    }
+    const ttlMs = input.approvalTtlMs ?? DEFAULT_MCP_APPROVAL_ATTESTATION_TTL_MS;
+    if (!Number.isSafeInteger(ttlMs) || ttlMs < 1_000 || ttlMs > 15 * 60_000) {
+      throw new RuntimeError("MCP approval attestation TTL is outside the supported bounds");
+    }
+    const nowMs = Date.now();
+    const resolvedAtMs = Date.parse(approval.resolvedAt);
+    const expiresAtMs = resolvedAtMs + ttlMs;
+    if (!Number.isFinite(resolvedAtMs) || resolvedAtMs > nowMs || expiresAtMs <= nowMs) {
+      throw new RuntimeError("the durable MCP approval has expired");
+    }
+    const attestation: LegacyToolApprovalAttestation = {
+      version: MCP_APPROVAL_ATTESTATION_VERSION,
+      kind: "legacy_tool_approval",
+      claimId: newId("mcpclaim"),
+      runId: input.runId,
+      stepId: input.stepId,
+      toolCallId: toolCall.id,
+      approvalId: approval.id,
+      specialistAgentId: input.specialistAgentId,
+      mcpServer: input.mcpServer,
+      toolName: input.toolName,
+      argumentsHash,
+      actorId: approval.resolvedBy,
+      resolvedAt: approval.resolvedAt,
+      expiresAt: new Date(expiresAtMs).toISOString(),
+    };
+    const claimed = this.store.claimApprovedMcpToolCall(input.runId, input.toolCallId, attestation);
+    if (!claimed) throw new RuntimeError("the approved MCP tool call was already claimed or changed concurrently");
+    this.emit("security_event", run, {
+      event: "mcp_approval_claimed",
+      claimId: attestation.claimId,
+      toolCallId: attestation.toolCallId,
+      approvalId: attestation.approvalId,
+      specialistAgentId: attestation.specialistAgentId,
+      mcpServer: attestation.mcpServer,
+      toolName: attestation.toolName,
+      argumentsHash: attestation.argumentsHash,
+      expiresAt: attestation.expiresAt,
+    }, input.stepId);
+    return attestation;
+  }
+
+  /**
+   * Durable verifier for the bridge's `legacy_tool_approval` kind. A production
+   * bridge composes this with the canonical Guided verifier and routes by kind.
+   */
+  verifyAndConsumeMcpApprovalAttestation(
+    request: McpApprovalVerificationRequest,
+  ): McpApprovalVerificationResult {
+    const { attestation, binding, verifiedAt } = request;
+    if (attestation.kind !== "legacy_tool_approval") {
+      return { approved: false, reason: "the legacy runtime cannot verify this approval kind" };
+    }
+    const invalid = validateMcpApprovalAttestation(attestation, binding, verifiedAt);
+    if (invalid) return { approved: false, reason: invalid };
+    const run = this.store.getRun(attestation.runId);
+    const toolCall = this.store.getToolCall(attestation.runId, attestation.toolCallId);
+    const approval = this.store.getApproval(attestation.runId, attestation.approvalId);
+    const claim = toolCall?.mcpApprovalClaim;
+    if (
+      !run ||
+      !toolCall ||
+      toolCall.status !== "executing" ||
+      toolCall.stepId !== attestation.stepId ||
+      toolCall.toolName !== attestation.toolName ||
+      toolCall.approvalId !== attestation.approvalId ||
+      !claim ||
+      claim.consumedAt ||
+      claim.claimId !== attestation.claimId ||
+      claim.argumentsHash !== attestation.argumentsHash ||
+      claim.specialistAgentId !== attestation.specialistAgentId ||
+      claim.mcpServer !== attestation.mcpServer ||
+      claim.toolName !== attestation.toolName ||
+      claim.actorId !== attestation.actorId ||
+      claim.resolvedAt !== attestation.resolvedAt ||
+      claim.expiresAt !== attestation.expiresAt ||
+      !approval ||
+      approval.status !== "approved" ||
+      approval.toolCallId !== toolCall.id ||
+      approval.stepId !== toolCall.stepId ||
+      approval.toolName !== toolCall.toolName ||
+      approval.resolvedAt !== attestation.resolvedAt ||
+      approval.resolvedBy !== attestation.actorId
+    ) {
+      return { approved: false, reason: "the durable approval claim is missing, changed, or already consumed" };
+    }
+    const consumed = this.store.consumeMcpApprovalClaim(
+      attestation.runId,
+      attestation.toolCallId,
+      attestation.claimId,
+      verifiedAt,
+    );
+    if (!consumed) return { approved: false, reason: "the durable approval claim was already consumed" };
+    this.emit("security_event", run, {
+      event: "mcp_approval_consumed",
+      claimId: attestation.claimId,
+      toolCallId: attestation.toolCallId,
+      approvalId: attestation.approvalId,
+      argumentsHash: attestation.argumentsHash,
+    }, attestation.stepId);
+    return { approved: true };
   }
 
   /**

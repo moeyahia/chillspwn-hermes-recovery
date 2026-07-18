@@ -25,6 +25,19 @@ describe("engagement working-directory boundary", () => {
     expect(resolveEngagementWorkingDirectory("client-alpha", [first, second])).toBe(valid);
   });
 
+  test("resolves a unique existing workspace when display-name casing differs", () => {
+    const valid = join(second, "reapertwo");
+    mkdirSync(valid);
+    expect(resolveEngagementWorkingDirectory("ReaperTwo", [first, second])).toBe(valid);
+  });
+
+  test("fails closed when case-insensitive workspace matching is ambiguous", () => {
+    mkdirSync(join(second, "reapertwo"));
+    mkdirSync(join(second, "ReaperTwo"));
+    expect(() => resolveEngagementWorkingDirectory("REAPERTWO", [first, second]))
+      .toThrow("ambiguous");
+  });
+
   test("rejects traversal, missing names, and symlinked engagements", () => {
     expect(() => resolveEngagementWorkingDirectory("../../.ssh", [first, second])).toThrow();
     expect(() => resolveEngagementWorkingDirectory("missing", [first, second])).toThrow("does not identify");

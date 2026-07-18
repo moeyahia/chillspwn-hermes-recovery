@@ -14,12 +14,17 @@ dist-*/
 build/
 coverage/
 htmlcov/
+playwright-report/
+test-results/
 .vite/
 android/.gradle/
 android/build/
 android/app/build/
 android/app/src/main/assets/
 android/capacitor-cordova-android-plugins/build/
+android/app/google-services.json
+android/key.properties
+android/keystore.properties
 *.tsbuildinfo
 
 # ── Logs & runtime data ──

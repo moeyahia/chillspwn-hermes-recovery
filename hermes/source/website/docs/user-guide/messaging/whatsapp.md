@@ -99,6 +99,10 @@ WHATSAPP_MODE=bot                          # "bot" or "self-chat"
 WHATSAPP_ALLOWED_USERS=15551234567         # Comma-separated phone numbers (with country code, no +)
 # WHATSAPP_ALLOWED_USERS=*                 # OR use * to allow everyone
 # WHATSAPP_ALLOW_ALL_USERS=true            # OR set this flag instead (same effect as *)
+
+# Required only when Hermes sends local images, audio, video, or documents.
+# The directory must already exist, be absolute, and must not be a symlink.
+WHATSAPP_ALLOWED_MEDIA_ROOT=/home/hermes/.hermes/whatsapp/outbound-media
 ```
 
 :::tip Allow-all shorthand
@@ -129,6 +133,31 @@ sudo hermes gateway install --system   # Linux only: boot-time system service
 ```
 
 The gateway starts the WhatsApp bridge automatically using the saved session.
+
+---
+
+## Outbound Media Boundary
+
+The bridge's `/send-media` endpoint is deliberately **fail closed**. It will not read a local
+file unless `WHATSAPP_ALLOWED_MEDIA_ROOT` names an existing absolute directory that is not a
+symbolic link. The filesystem root is rejected as too broad. Create a dedicated outbox rather
+than pointing this setting at your home directory, repository root, or `~/.hermes`, because
+those locations can contain credentials or other files that must never be sent.
+
+For example:
+
+```bash
+install -d -m 700 /home/hermes/.hermes/whatsapp/outbound-media
+```
+
+Generate or copy outbound attachments into that directory, then pass their absolute paths to
+Hermes. The bridge rejects relative paths, missing files, directories, direct symlinks, sibling
+prefix tricks, traversal outside the outbox, and paths that resolve outside the outbox through
+an intermediate symlink. Audio conversion also runs `ffmpeg` without a shell, so media filenames
+are treated as data rather than command text.
+
+If Hermes never sends local media, leave the variable unset; text messaging continues to work
+and `/send-media` remains disabled.
 
 ---
 
@@ -213,6 +242,7 @@ When the agent calls tools (web search, file operations, etc.), WhatsApp display
 | **Bot stops working after WhatsApp update** | Update Hermes to get the latest bridge version, then re-pair. |
 | **macOS: "Node.js not installed" but node works in terminal** | launchd services don't inherit your shell PATH. Run `hermes gateway install` to re-snapshot your current PATH into the plist, then `hermes gateway start`. See the [Gateway Service docs](./index.md#macos-launchd) for details. |
 | **Messages not being received** | Verify `WHATSAPP_ALLOWED_USERS` includes the sender's number (with country code, no `+` or spaces), or set it to `*` to allow everyone. Set `WHATSAPP_DEBUG=true` in `.env` and restart the gateway to see raw message events in `bridge.log`. |
+| **Local media is rejected** | Set `WHATSAPP_ALLOWED_MEDIA_ROOT` to an existing absolute, non-symlink directory, restart the gateway, and ensure the requested path is an absolute regular file inside that directory rather than a symlink. |
 | **Bot replies to strangers with a pairing code** | Set `whatsapp.unauthorized_dm_behavior: ignore` in `~/.hermes/config.yaml` if you want unauthorized DMs to be silently ignored instead. |
 
 ---
@@ -235,6 +265,7 @@ whatsapp:
 
 - The `~/.hermes/platforms/whatsapp/session` directory contains full session credentials — protect it like a password
 - Set file permissions: `chmod 700 ~/.hermes/platforms/whatsapp/session`
+- Keep `WHATSAPP_ALLOWED_MEDIA_ROOT` narrow and dedicated to outbound attachments; never set it to `/`, your home directory, a repository root, or a directory containing secrets
 - Use a **dedicated phone number** for the bot to isolate risk from your personal account
 - If you suspect compromise, unlink the device from WhatsApp → Settings → Linked Devices
 - Phone numbers in logs are partially redacted, but review your log retention policy

@@ -41,6 +41,23 @@ import subprocess
 import sys
 from pathlib import Path
 
+# V2.4 containment boundary: this legacy reviewer resumes a public-model session
+# with complete native tool context or falls back to an unbounded engagement
+# transcript. That trust model cannot produce the required sanitized
+# LearningCandidateBrief or ProviderExposureReceipt, so direct execution is
+# deliberately disabled before reading any transcript, memory, or environment
+# configuration. Keep the module importable for the additive local validators
+# used by chillspwn_mem.py and chillspwn_skill.py. A replacement belongs in the
+# V2 Research/Learning service and must promote only through human review.
+LEGACY_FULL_CONTEXT_PUBLIC_REVIEW_DISABLED = True
+if __name__ == "__main__" and LEGACY_FULL_CONTEXT_PUBLIC_REVIEW_DISABLED:
+    print(
+        "[learn] blocked: the legacy full-context public-model reviewer is disabled; "
+        "use the V2 sanitized candidate and exposure-receipt workflow",
+        flush=True,
+    )
+    raise SystemExit(78)
+
 HERMES_SRC = os.environ.get("CHILLSPWN_HERMES_SRC", "").strip()
 if not HERMES_SRC:
     raise RuntimeError("CHILLSPWN_HERMES_SRC is required")

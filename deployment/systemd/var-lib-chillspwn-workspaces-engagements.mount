@@ -1,0 +1,12 @@
+[Unit]
+Description=ChillsPwn engagement workspace bind mount
+Before=chillspwn.service hermes-gateway.service
+
+[Mount]
+What=/root/engagements
+Where=/var/lib/chillspwn/workspaces/engagements
+Type=none
+Options=bind
+
+[Install]
+WantedBy=local-fs.target
