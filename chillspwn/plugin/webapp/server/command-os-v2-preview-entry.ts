@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import { activateCommandOsV2PreviewRuntime } from "./runtime/CommandOsPreviewRuntime";
 
 const REQUEST_ID = /^[A-Za-z0-9._:-]{1,128}$/u;
 
@@ -48,9 +49,17 @@ export function createCommandOsV2KillSwitchServer(): Server {
   return createServer(disabledResponse);
 }
 
+/** Activate the internal preview marker before evaluating the shared runtime. */
+export async function loadCommandOsV2Runtime(
+  importer: () => Promise<unknown> = () => import("./index"),
+): Promise<void> {
+  activateCommandOsV2PreviewRuntime();
+  await importer();
+}
+
 async function main(): Promise<void> {
   if (!commandOsV2KillSwitchEnabled()) {
-    await import("./index");
+    await loadCommandOsV2Runtime();
     return;
   }
 

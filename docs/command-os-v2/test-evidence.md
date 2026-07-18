@@ -2,10 +2,13 @@
 
 Status: **implementation validation snapshot — not a release candidate or cutover approval**
 Evidence date: `2026-07-18` UTC
-Source authority: committed live baseline `c07c49ef438c763b0d6f2104bcff908ae2624184`
-on `deploy/command-os-v24-live`; later exact-run artifacts in this validation
-snapshot are identified by their own paths and hashes. This report is not an
-immutable release attestation.
+Source authority: candidate work evolved from committed base
+`66c7f176a7cfbc421a1903be5d15deb80c663125` on
+`deploy/command-os-v24-live`. The exact resulting source revision is captured
+by the subsequent Git commit and immutable staging manifest; no dirty source
+may be deployed. Exact-run artifacts in this validation snapshot are identified
+by their own paths and hashes. This report is not an immutable release
+attestation.
 
 This report records executed checks and preserved artifacts. Configured projects,
 unexecuted fixtures, failure-only screenshots, and a prior-source pass are never
@@ -13,15 +16,15 @@ presented as current release proof.
 
 ## 2026-07-18 operational-truth update
 
-The final candidate rerun of the registry-driven executable-tool gate passed
+The most recent completed rerun of the registry-driven executable-tool gate passed
 **18/18 exposed bindings** across four exact servers. It used these bound
 receipts:
 
-- NVD: `nvd_canary_f07da739f7aedfccb4382783d5138676` (2 exposed);
+- NVD: `nvd_canary_78502c6b667e30d0158ab217179c0ac6` (2 exposed);
 - VulnIntel CVE:
-  `vulnintel_cve_canary_0593e45cd27255be7f1de18845da8b5b` (8 exposed);
+  `vulnintel_cve_canary_fca6382af68fc1efef73f7628c5ff1bb` (8 exposed);
 - Pentest Recon:
-  `pentest_recon_canary_20b1e2402dabaddbba8b363682aa3995` (8 exposed).
+  `pentest_recon_canary_6ca0bf23292ad7c176865b0fe33be149` (8 exposed).
 
 The V2-only trusted recon directory passed its root-run installation check. It
 contains the reviewed capability-free Nmap copy and no-update `httpx-toolkit`
@@ -48,13 +51,16 @@ settings-backed receipts: completed responses remain replayable, while
 interrupted reservations enter expired and require canonical reconciliation
 instead of a fabricated success.
 
-The isolated standalone V2 package gate completed **720 tests, 10,631
-assertions, and 0 failures**, including type checks and production build. It
-was followed by the hybrid package gate: **1,351 tests, 8,531 assertions, and 0
-failures**, plus 34/34 runtime-gate integration checks, 20/20 Mission Board MCP
-checks, all TypeScript projects, and the production build. These gates do not
-replace the still-required complete browser matrix, visual approval,
-migration/restore rehearsal, soak, preview acceptance, or release sign-off.
+The isolated standalone V2 package gate completed **723 tests, 10,637
+assertions, and 0 failures**, including type checks and production build. The
+latest hybrid package gate then completed **1,361 Bun tests with 0 failures**,
+plus 34/34 runtime-gate integration checks, 20/20 Mission Board MCP checks, all
+TypeScript projects, and the production build. The hybrid gate recorded
+**8,566 assertions**. An immutable full-log archive remains pending; it is not
+inferred here. These
+gates do not replace the still-required complete browser matrix, visual
+approval, migration/restore rehearsal, soak, preview acceptance, or release
+sign-off.
 
 The clean critical Chromium aggregate then completed **129/129 tests** with 0
 failures, 0 skipped tests, and 0 flaky results using one worker. It covered the
@@ -68,6 +74,66 @@ matrix.
 Passing the tool and package gates does **not** open the cutover gate. The
 legacy application remains the default, and no release-candidate or human
 approval is implied.
+
+## Runtime evidence bridge — published, final live consumption pending
+
+The tool audit can now publish its passing receipts through the explicit
+`--write-runtime-evidence` option. Publication occurs only when the aggregate
+tool and provider audit is releasable. The writer creates a same-directory
+temporary file, flushes it, changes it to root ownership with read-only service
+group access (`0640` in production), atomically renames it, and flushes the
+parent directory. The configured production path is:
+
+`/var/lib/chillspwn-attestations/command-os-v2-tool-evidence.json`
+
+The runtime does not trust the existence of that file alone. Before using any
+receipt it verifies the root-controlled non-symlink parent, regular-file type,
+owner, exact `0600`/`0640` mode and service group, bounded size, bundle ID and
+content integrity, seven-day freshness with a small clock-skew allowance, and
+each canary receipt's own verifier. It independently hashes the currently
+installed MCP server assets and active registry configuration and accepts only
+receipt records whose hashes match an enabled, live-attested route. Receipts
+for disabled routes are ignored rather than treated as authority.
+
+Missing, malformed, edited, stale, future-dated, weakly permissioned,
+symlinked, owner-mismatched, asset-drifted, or configuration-drifted evidence
+produces no executable coverage. Readiness remains fail-closed and explains
+that runtime tool evidence is unavailable or invalid. A five-second keyed
+validation cache avoids repeatedly hashing unchanged assets while invalidating
+on evidence-file identity/mtime or route-attestation changes.
+
+The startup path now schedules bounded provider and eligible MCP live
+attestations before the first readiness request. This warm-up is nonblocking
+and does not grant execution authority merely because a probe was scheduled.
+Readiness reports `probing`/initialization state until a fresh attestation
+actually succeeds, and reports unavailable while scheduling or probing cannot
+establish authority.
+
+Focused negative coverage exercises atomic publication, private production
+mode, missing evidence, weak permissions, untrusted ownership/parent,
+symlinks, edited JSON, stale/future receipts, asset/configuration drift, and
+disabled-route isolation. Startup tests prove probes begin without granting
+authority and scheduling failure remains nonblocking and fail-closed. These
+tests are included in the green 1,361-test hybrid gate above. A subsequent
+client-contract test and build retained the exact MCP probing and Guided tool-
+execution fields; that focused check passed 1/1 after the full hybrid gate.
+
+Final production evidence fields are intentionally left open until the exact
+aggregate is rerun, the candidate is deployed, and `/api/v2/health` is queried
+after startup:
+
+| Field | Final value |
+|---|---|
+| Aggregate result | **PASS — 18/18 exposed tools, 1/1 provider route, 0 route/config blockers** |
+| Runtime evidence bundle ID | `runtime_tool_evidence_b502fc8be05cf1c182e766aae93b7de4` |
+| Runtime evidence SHA-256 | `451c84db23174eb24ca719f1d9c4d8d484ebf9c6533493ede8aa369f363bc0d5` |
+| Runtime evidence owner/mode | `root:chillspwn`, `0640`, 53,685 bytes |
+| Accepted runtime routes/tools | **PENDING — live readiness verification** |
+| Runtime validation blockers | **PENDING — must be zero for execution readiness** |
+| Provider/MCP startup state | **PENDING — post-warm-up live health** |
+
+No placeholder above is release evidence and none may be replaced from an
+earlier canary receipt or a fixture-only response.
 
 ## Historical complete package gate (2026-07-17)
 
@@ -613,12 +679,12 @@ benchmarks after all shared/backend changes are frozen.
 
 ## Active Obsidian Vault evidence
 
-The live schema-13 service has one real, sandboxed Vault connection:
+The live schema-14 V2 preview service has one real, sandboxed Vault connection:
 `ChillsPwn Second Brain` at
 `/var/lib/chillspwn/brain-vaults/ChillsPwn-Brain` (connection
 `vault_b1bfa728-3271-4ad1-8e4a-220096e56a73`). The current verified readback
 reports **64,697 tracked Vault notes** and **zero conflicts**. The canonical V2
-database contains **73,521 memory nodes** and **73,430 memory edges**. A real
+database contains **73,523 memory nodes** and **73,431 memory edges**. A real
 filesystem write/read/rename/delete round trip is green, left no health residue,
 and did not change `.obsidian`. Full receipts and historical screenshots are
 recorded in
@@ -631,23 +697,24 @@ Vault cardinality:
 
 The earlier schema-2.1 projector snapshot exposed one unresolved link from a
 verified run evaluation to a candidate lesson excluded by projection policy.
-The schema-13 V2.4 implementation has an exact regression for that record pair,
+The schema-14 V2.4 implementation has an exact regression for that record pair,
 enforces live lifecycle and connection scope on links, preserves existing
 compact sync-state paths, and creates the complete V2.4 taxonomy for new notes.
 Persisted paths and managed headings,
 aliases, and relationship explanations also reject or encode Markdown/control
 delimiters so imported filenames or memory text cannot inject links,
-relationship markers, comments, or lines. The current package gate passes
-**702/702** with 10,423 assertions across 131 files, plus
+relationship markers, comments, or lines. The current standalone package gate
+passes **723/723** with 10,637 assertions, plus
 browser/server and E2E TypeScript checks, logo/isolation checks, and the
 production build, while the hardened
 Vault lifecycle passes **18/18** retry-free browser journeys, six each in
-Chromium, Firefox, and WebKit. The `c07c49e` handoff checkpoint promoted the
-schema-13 product to port `3131` with the connected `ChillsPwn-Brain` Vault.
-The exact current live source is recorded by the immutable deployment manifest;
-the later test/audit receipts in this document do not themselves claim formal
-release approval. Complete matrix, visual approval, soak, and cutover evidence
-remain open.
+Chromium, Firefox, and WebKit. Candidate base `66c7f176a7cf` is running on V2
+preview port `3132` with the connected `ChillsPwn-Brain` Vault; the legacy
+application remains the working service on port `3131`. The exact current
+preview source is recorded by its immutable deployment manifest; the later
+test/audit receipts in this document do not themselves claim formal release
+approval. Complete matrix, visual approval, soak, and cutover evidence remain
+open.
 
 The mounted repair/reindex journey first exposed and closed a React Strict Mode
 query-cache suspension defect. Subsequent adversarial review drove durable
@@ -662,9 +729,9 @@ and reload, bounded path denial and safe retry, projection export/import/sync/
 download, concurrent conflict resolution, repair/reindex with symlink and
 offline fail-closed behavior, and degraded-connection recovery. All six passed
 inside the complete Chromium project. This is browser evidence against a
-disposable V2 fixture service. The committed `c07c49e` schema-13 application
-and connected Vault have since been promoted live under a separate verified
-backup/rollback boundary; these fixture journeys still do not prove native
+disposable V2 fixture service. The committed `66c7f176a7cf` schema-14 preview
+application and connected Vault are deployed on port `3132` under a separate
+verified backup boundary; these fixture journeys still do not prove native
 Obsidian desktop activation on this headless host.
 
 The isolated standalone process boundary now has focused restart/Vault

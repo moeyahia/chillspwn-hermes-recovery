@@ -11,6 +11,8 @@ export interface RuntimeReadinessSnapshot {
   readonly execution: {
     readonly autonomous: ExecutionReadiness;
     readonly guided: ExecutionReadiness;
+    /** Exact-step Guided tool dispatch; manual Guided work may still be available when this is not. */
+    readonly guidedToolExecution: ExecutionReadiness;
     readonly actionBoundaryActive: boolean;
     readonly delegationEnforced: boolean;
     readonly noHandsCommanderEnforced: boolean;
@@ -18,10 +20,22 @@ export interface RuntimeReadinessSnapshot {
   readonly dependencies: {
     readonly providers: {
       readonly status: "available" | "unavailable";
+      readonly initializing: boolean;
+      readonly probing: number;
+      readonly reason: string | null;
       readonly declared: number;
       readonly callable: number;
       readonly enforcing: number;
       readonly guidedCapable: number;
+    };
+    readonly mcp: {
+      readonly status: "available" | "unavailable";
+      readonly initializing: boolean;
+      readonly probingServers: number;
+      readonly reason: string | null;
+      readonly configuredServers: number;
+      readonly runnableServers: number;
+      readonly executionMode: "disabled" | "dry-run" | "enabled";
     };
   };
   readonly checkedAt: string;

@@ -6,7 +6,10 @@ import {
   sechubBinaryReceiptCoverageEvidence,
   type SechubBinaryAnalysisCanaryReceipt,
 } from "./SechubBinaryAnalysisCanary";
-import type { NvdToolLiveCanaryReceipt } from "./NvdToolLiveCanary";
+import {
+  verifyNvdToolLiveCanaryReceipt,
+  type NvdToolLiveCanaryReceipt,
+} from "./NvdToolLiveCanary";
 export {
   pentestReconCoverageEvidenceFromReceipt,
   pentestReconRegistrationsWithRuntime,
@@ -38,6 +41,12 @@ export function v2ToolCoverageEvidenceFromSechubBinaryReceipt(
 export function nvdToolCoverageEvidenceFromReceipt(
   receipt: Readonly<NvdToolLiveCanaryReceipt>,
 ): readonly V2ToolCoverageEvidence[] {
+  // Conversion proves structure/integrity; the runtime store separately owns
+  // wall-clock freshness so deterministic fixture dates never become flaky.
+  if (!verifyNvdToolLiveCanaryReceipt(receipt, {
+    now: new Date(receipt.observedAt),
+    maximumAgeMs: 1,
+  })) return [];
   return receipt.tools.map((tool) => ({
     serverName: "vulnintel-nvd",
     toolName: tool.toolName,

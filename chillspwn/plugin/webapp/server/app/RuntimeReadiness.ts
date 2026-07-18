@@ -29,6 +29,8 @@ export interface McpReadiness {
   readonly startPermitted: boolean;
   readonly configuredServers: number;
   readonly runnableServers: number;
+  /** Routes whose bounded live tools/list attestation is currently running. */
+  readonly probingServers?: number;
   readonly missingDependencies: number;
   readonly missingSecrets: number;
 }

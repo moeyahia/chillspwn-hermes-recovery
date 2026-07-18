@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { AGENT_ROSTER, getAgent } from "../../server/agents/agentRoster";
 import { specialistToolDecision } from "../../server/agents/agentMcpMap";
@@ -40,8 +40,26 @@ import {
   runPentestReconLiveCanary,
   type PentestReconLiveCanaryReceipt,
 } from "../../server/mcp/PentestReconLiveCanary";
+import {
+  DEFAULT_RUNTIME_TOOL_EVIDENCE_PATH,
+  createRuntimeToolEvidenceBundle,
+  writeRuntimeToolEvidenceBundle,
+} from "../../server/mcp/RuntimeToolEvidenceStore";
 
-const args = new Set(process.argv.slice(2));
+const argv = process.argv.slice(2);
+const args = new Set(argv);
+function optionValue(name: string): string | undefined {
+  const inline = argv.find((value) => value.startsWith(`${name}=`));
+  if (inline) return inline.slice(name.length + 1).trim();
+  const index = argv.indexOf(name);
+  if (index < 0) return undefined;
+  const next = argv[index + 1];
+  return next && !next.startsWith("--") ? next.trim() : "";
+}
+const runtimeEvidenceOption = optionValue("--write-runtime-evidence");
+const runtimeEvidencePath = runtimeEvidenceOption === undefined
+  ? undefined
+  : resolve(runtimeEvidenceOption || DEFAULT_RUNTIME_TOOL_EVIDENCE_PATH);
 const reportOnly = args.has("--report-only");
 const jsonOutput = args.has("--json");
 const allowDocker = args.has("--allow-docker");
@@ -52,6 +70,15 @@ const configPath = resolve(
   process.env.MCP_ARSENAL_CONFIG || "/opt/chillspwn-mcp-arsenal/.mcp.arsenal.json",
 );
 const manifestPath = resolve(import.meta.dir, "../../server/agents/mcpArsenal.manifest.json");
+
+function groupGid(name: string): number {
+  const line = readFileSync("/etc/group", "utf8")
+    .split("\n")
+    .find((entry) => entry.split(":", 1)[0] === name);
+  const value = Number(line?.split(":")[2]);
+  if (!Number.isInteger(value) || value < 0) throw new Error(`System group ${name} is unavailable`);
+  return value;
+}
 
 const bridge = new McpArsenalBridge({
   configPath,
@@ -397,8 +424,48 @@ if (bridge.loadError()) {
     staticRosterAgents: AGENT_ROSTER.length,
   };
 
+  let runtimeEvidenceWrite: {
+    readonly requested: boolean;
+    readonly passed: boolean;
+    readonly path?: string;
+    readonly bundleId?: string;
+    readonly error?: string;
+  } = { requested: runtimeEvidencePath !== undefined, passed: runtimeEvidencePath === undefined };
+  if (runtimeEvidencePath) {
+    try {
+      if (!result.releasable) {
+        throw new Error("The aggregate release audit did not pass; runtime evidence was not published");
+      }
+      const bundle = createRuntimeToolEvidenceBundle({
+        ...(nvdReceipt ? { nvd: nvdReceipt } : {}),
+        ...(vulnIntelReceipt ? { vulnIntelCve: vulnIntelReceipt } : {}),
+        ...(pentestReceipt ? { pentestRecon: pentestReceipt } : {}),
+      });
+      writeRuntimeToolEvidenceBundle(runtimeEvidencePath, bundle, {
+        trustedParentOwnerUid: 0,
+        finalOwnerUid: 0,
+        finalGroupGid: groupGid(process.env.COMMAND_OS_V2_SERVICE_GROUP || "chillspwn"),
+        finalMode: 0o640,
+      });
+      runtimeEvidenceWrite = {
+        requested: true,
+        passed: true,
+        path: runtimeEvidencePath,
+        bundleId: bundle.bundleId,
+      };
+    } catch (error) {
+      runtimeEvidenceWrite = {
+        requested: true,
+        passed: false,
+        path: runtimeEvidencePath,
+        error: error instanceof Error ? error.message : String(error),
+      };
+    }
+  }
+  const outputResult = { ...result, runtimeEvidenceWrite };
+
   if (jsonOutput) {
-    console.log(JSON.stringify(result, null, 2));
+    console.log(JSON.stringify(outputResult, null, 2));
   } else {
     console.log([
       "V2 runtime tool coverage audit",
@@ -418,9 +485,14 @@ if (bridge.loadError()) {
       `  VulnIntel local canary: ${result.vulnIntelLocalCanary.requested ? (result.vulnIntelLocalCanary.passed ? `EVIDENCE (${result.vulnIntelLocalCanary.receipt?.receiptId}; ${result.vulnIntelLocalCanary.receipt?.tools.filter(({ blocker }) => blocker === null).length}/10 releasable)` : `FAIL (${result.vulnIntelLocalCanary.error})`) : "not requested"}`,
       `  Pentest recon live canary: ${result.pentestReconLiveCanary.requested ? (result.pentestReconLiveCanary.passed ? `EVIDENCE (${result.pentestReconLiveCanary.receipt?.receiptId}; ${result.pentestReconLiveCanary.receipt?.blockers.some(({ toolName }) => toolName === null) ? 0 : result.pentestReconLiveCanary.receipt?.tools.filter(({ blockers }) => blockers.length === 0).length}/12 without blockers)` : `FAIL (${result.pentestReconLiveCanary.error})`) : "not requested"}`,
       `  unmapped bindings: ${unmappedBindings.length} configured / ${enabledUnmappedBindings.length} enabled`,
+      `  runtime evidence: ${runtimeEvidenceWrite.requested
+        ? (runtimeEvidenceWrite.passed
+          ? `PUBLISHED (${runtimeEvidenceWrite.bundleId})`
+          : `NOT PUBLISHED (${runtimeEvidenceWrite.error})`)
+        : "not requested"}`,
       `  release gate: ${result.releasable ? "PASS" : "FAIL"}`,
       "Use --json for exact route, tool, and blocker records.",
     ].join("\n"));
   }
-  process.exitCode = result.releasable || reportOnly ? 0 : 1;
+  process.exitCode = (result.releasable || reportOnly) && runtimeEvidenceWrite.passed ? 0 : 1;
 }

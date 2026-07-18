@@ -163,6 +163,19 @@ function runtimeAttestation(serverSource: string, pyproject: string, registryCon
   };
 }
 
+/** Recompute the installed vendor/config binding used by persisted receipts. */
+export function vulnIntelCveRuntimeAttestation(
+  vendorRootInput: string,
+  registryConfigPath: string,
+): ToolRuntimeAttestation {
+  const vendorRoot = realpathSync(vendorRootInput);
+  return runtimeAttestation(
+    resolve(vendorRoot, "src/cve_mcp/server.py"),
+    resolve(vendorRoot, "pyproject.toml"),
+    registryConfigPath,
+  );
+}
+
 function exactRegistrations(
   registrations: readonly RegisteredV2Tool[],
 ): ReadonlyMap<VulnIntelCveCanaryTool, RegisteredV2Tool> {
@@ -378,7 +391,7 @@ export function runVulnIntelCveLocalCanary(
     options.harnessPath ?? resolve(import.meta.dir, "fixtures/vulnintel-cve-mcp-offline-canary.py"),
     "VulnIntel offline harness",
   );
-  const runtime = runtimeAttestation(serverSource, pyproject, options.registryConfigPath);
+  const runtime = vulnIntelCveRuntimeAttestation(vendorRoot, options.registryConfigPath);
   const executeHarness = options.executeHarness ?? executeOfflineVulnIntelCveHarness;
   const harness = executeHarness(options);
   if (

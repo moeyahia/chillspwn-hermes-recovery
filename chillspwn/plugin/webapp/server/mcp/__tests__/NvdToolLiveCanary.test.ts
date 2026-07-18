@@ -145,7 +145,7 @@ describe("live public NVD tool coverage canary", () => {
     expect(calls).toBe(0);
   });
 
-  test("stale server/config evidence does not pass the release audit", async () => {
+  test("an edited or structurally invalid receipt never becomes coverage evidence", async () => {
     const files = fixtureFiles();
     const runtime = nvdRuntimeAttestation(files.assets, files.config);
     const receipt = {
@@ -173,6 +173,13 @@ describe("live public NVD tool coverage canary", () => {
     };
     const report = auditV2ToolCoverage(registrations(runtime), nvdToolCoverageEvidenceFromReceipt(receipt));
     expect(report.releasable).toBe(false);
-    expect(report.blockers.map(({ code }) => code)).toEqual(["schema_test_is_stale", "stale_server_asset", "schema_test_is_stale", "stale_server_asset"]);
+    expect(report.blockers.map(({ code }) => code)).toEqual([
+      "missing_schema_validation_test",
+      "missing_safe_success_path_test",
+      "missing_failure_classification_test",
+      "missing_schema_validation_test",
+      "missing_safe_success_path_test",
+      "missing_failure_classification_test",
+    ]);
   });
 });

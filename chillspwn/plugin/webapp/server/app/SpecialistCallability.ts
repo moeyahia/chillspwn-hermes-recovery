@@ -5,6 +5,8 @@ import type { FleetAgentProjection } from "./RuntimeProjectionService";
 export interface AttestedMcpRoute {
   readonly name: string;
   readonly verified: boolean;
+  /** True only while the bounded live tools/list attestation is running. */
+  readonly probing?: boolean;
   readonly tools: readonly string[];
   /** Fresh tools/list input schemas keyed by exact tool name. */
   readonly toolSchemas?: Readonly<Record<string, Readonly<Record<string, unknown>>>>;

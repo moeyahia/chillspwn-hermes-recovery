@@ -12,6 +12,11 @@ Safety: zero engagement targets and zero public-LLM calls.
 This is a bounded tool-validation gate, not a product release or cutover pass.
 The complete Command OS release gate remains closed.
 
+This result describes the most recent completed aggregate audit. Production
+runtime consumption of that evidence is a separate fail-closed boundary. The
+new bridge is implemented and package-tested, and its final bundle has been
+published. Post-deployment consumption and health remain pending below.
+
 | Inventory measure | Servers | Bindings/routes |
 |---|---:|---:|
 | Configured MCP inventory | 19 | 134 |
@@ -32,18 +37,63 @@ match the current implementation and registry hashes.
 
 The passing combined gate used:
 
-- public NVD: `nvd_canary_f07da739f7aedfccb4382783d5138676`
+- public NVD: `nvd_canary_78502c6b667e30d0158ab217179c0ac6`
   — 2 exposed bindings;
 - VulnIntel CVE:
-  `vulnintel_cve_canary_0593e45cd27255be7f1de18845da8b5b`
+  `vulnintel_cve_canary_fca6382af68fc1efef73f7628c5ff1bb`
   — 8 exposed bindings;
 - Pentest Recon:
-  `pentest_recon_canary_20b1e2402dabaddbba8b363682aa3995`
+  `pentest_recon_canary_6ca0bf23292ad7c176865b0fe33be149`
   — 8 exposed bindings.
 
 The single callable provider route also passes its success and typed
 rate-limit, unavailable-provider, and missing-authentication coverage: 1/1.
 The run contacted no engagement target and sent no context to a public LLM.
+
+## Production runtime evidence bridge
+
+The aggregate audit now accepts `--write-runtime-evidence=<absolute-path>`.
+It refuses publication unless the exact route/schema reconciliation, every
+exposed tool's safe-success and deterministic-failure evidence, and provider
+coverage all pass. A successful publication contains the self-verifying NVD,
+VulnIntel, and Pentest Recon receipts in one versioned, integrity-bound bundle.
+
+Production expects a root-owned, service-group-readable file at
+`/var/lib/chillspwn-attestations/command-os-v2-tool-evidence.json`. Publication
+uses a same-directory `0600` temporary file, `fsync`, root/service-group
+ownership, final mode `0640`, atomic rename, and parent-directory `fsync`. The
+runtime accepts only a regular, non-symlink file in a trusted-owner,
+non-group/world-writable, non-symlink parent directory.
+
+Loading repeats receipt integrity and freshness checks and independently
+recomputes each installed server-asset hash and the live registry-config hash.
+Only an exact match for a currently live-attested route enters the executable
+denominator. A missing or invalid bundle, a stale or future-dated receipt,
+permissions/ownership failure, tampering, changed server asset, changed
+registry, or absent route leaves that route uncovered and execution
+fail-closed. A receipt for a disabled route is retained only as ignored audit
+input; it cannot expose a tool.
+
+Startup also warms the existing bounded provider/MCP attestation caches so
+readiness can distinguish `probing` from unavailable. Scheduling a probe is
+not authority: execution remains unavailable until the fresh provider/MCP
+attestation and the persisted per-tool evidence both validate.
+
+### Final publication and live-consumption receipt
+
+| Check | Status |
+|---|---|
+| Exact aggregate after bridge changes | **PASS — 18/18 tools, 1/1 provider, zero route/config blockers** |
+| Published bundle ID | `runtime_tool_evidence_b502fc8be05cf1c182e766aae93b7de4` |
+| Published file SHA-256 | `451c84db23174eb24ca719f1d9c4d8d484ebf9c6533493ede8aa369f363bc0d5` |
+| Root owner / service group / `0640` | **PASS — `root:chillspwn`, `0640`, 53,685 bytes** |
+| Runtime accepted routes | **PENDING — live health check** |
+| Runtime fully covered tools | **PENDING — must equal 18/18** |
+| Runtime route/config blockers | **PENDING — must equal 0** |
+| Provider route readiness | **PENDING — post-startup warm-up** |
+
+The exact runtime-consumption values remain pending until the candidate service
+has loaded this bundle and exposed its health projection.
 
 ## Exact disposition
 
@@ -77,6 +127,23 @@ From `chillspwn/plugin/webapp`:
 ./scripts/command-os-v2/manage-trusted-tool-shims.sh check
 bun run test:v2-tool-coverage
 ```
+
+The root-run production publication form is:
+
+```bash
+install -d -o root -g chillspwn -m 0750 /var/lib/chillspwn-attestations
+bun run scripts/command-os-v2/audit-v2-tool-coverage.ts \
+  --allow-docker \
+  --local-vulnintel-canary \
+  --live-pentest-recon-canary \
+  --live-public-nvd-canary \
+  --write-runtime-evidence=/var/lib/chillspwn-attestations/command-os-v2-tool-evidence.json
+```
+
+This command performs only the documented loopback/disposable local canaries
+and the bounded read-only NVD authority calls. It must not receive or derive an
+engagement target. The writer will not replace the runtime bundle if the
+aggregate is non-releasable.
 
 Individual canaries remain available as:
 

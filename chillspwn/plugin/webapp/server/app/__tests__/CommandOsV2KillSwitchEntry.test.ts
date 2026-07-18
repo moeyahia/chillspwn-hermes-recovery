@@ -4,7 +4,9 @@ import type { Server } from "node:http";
 import {
   commandOsV2KillSwitchEnabled,
   createCommandOsV2KillSwitchServer,
+  loadCommandOsV2Runtime,
 } from "../../command-os-v2-preview-entry";
+import { isCommandOsV2PreviewRuntime } from "../../runtime/CommandOsPreviewRuntime";
 
 let server: Server | undefined;
 
@@ -49,5 +51,16 @@ describe("Command OS V2 hybrid preview kill switch entry", () => {
         timestamp: expect.any(String),
       },
     });
+  });
+
+  test("marks the process as V2 preview before evaluating the shared runtime", async () => {
+    // The protected legacy entry imports server/index.ts directly and therefore
+    // sees the marker's fail-safe default without scheduling V2 warm-up probes.
+    expect(isCommandOsV2PreviewRuntime()).toBe(false);
+    let markerObservedByImporter = false;
+    await loadCommandOsV2Runtime(async () => {
+      markerObservedByImporter = isCommandOsV2PreviewRuntime();
+    });
+    expect(markerObservedByImporter).toBe(true);
   });
 });

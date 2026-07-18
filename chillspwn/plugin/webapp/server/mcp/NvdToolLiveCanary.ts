@@ -17,6 +17,10 @@ const PUBLIC_DETAIL_FIXTURE = "CVE-2021-44228";
 const PUBLIC_SEARCH_FIXTURE = "Apache Log4j";
 const PUBLIC_MISSING_FIXTURE = "CVE-2099-999999";
 export const NVD_KEYLESS_MIN_INTERVAL_MS = 6_500;
+export const NVD_CANARY_RECEIPT_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1_000;
+const RECEIPT_FUTURE_TOLERANCE_MS = 5 * 60 * 1_000;
+const SHA256 = /^[a-f0-9]{64}$/u;
+const RECEIPT_ID = /^nvd_canary_[a-f0-9]{32}$/u;
 
 export interface NvdToolCanaryReceiptItem {
   readonly toolName: NvdCoveredTool;
@@ -71,6 +75,72 @@ function canonical(value: unknown): string {
   const encoded = JSON.stringify(value);
   if (encoded === undefined) throw new Error("NVD canary receipt contains a non-JSON value");
   return encoded;
+}
+
+function record(value: unknown): value is Readonly<Record<string, unknown>> {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value));
+}
+
+/**
+ * Verify a persisted public-NVD receipt before it is allowed to become runtime
+ * coverage evidence. The receipt ID binds every field, while the bounded age
+ * prevents an old successful network observation from being treated as
+ * current operational proof indefinitely.
+ */
+export function verifyNvdToolLiveCanaryReceipt(
+  value: unknown,
+  options: {
+    readonly now?: Date;
+    readonly maximumAgeMs?: number;
+  } = {},
+): value is NvdToolLiveCanaryReceipt {
+  if (!record(value)) return false;
+  const receipt = value as unknown as NvdToolLiveCanaryReceipt;
+  const maximumAgeMs = options.maximumAgeMs ?? NVD_CANARY_RECEIPT_MAX_AGE_MS;
+  const nowMs = (options.now ?? new Date()).getTime();
+  const observedAtMs = Date.parse(receipt.observedAt);
+  if (
+    !Number.isFinite(maximumAgeMs)
+    || maximumAgeMs <= 0
+    || !Number.isFinite(nowMs)
+    || receipt.receiptVersion !== 1
+    || !RECEIPT_ID.test(receipt.receiptId)
+    || !Number.isFinite(observedAtMs)
+    || observedAtMs > nowMs + RECEIPT_FUTURE_TOLERANCE_MS
+    || nowMs - observedAtMs > maximumAgeMs
+    || receipt.authority !== "services.nvd.nist.gov"
+    || !Number.isFinite(receipt.minimumRequestIntervalMs)
+    || receipt.minimumRequestIntervalMs < NVD_KEYLESS_MIN_INTERVAL_MS
+    || receipt.publicRequests !== 3
+    || receipt.publicLlmCalls !== 0
+    || receipt.clientTargetsContacted !== 0
+    || receipt.rateLimitInduced !== false
+    || !SHA256.test(receipt.serverAssetSha256)
+    || !SHA256.test(receipt.registryConfigSha256)
+    || !Array.isArray(receipt.tools)
+    || receipt.tools.length !== NVD_COVERED_TOOLS.length
+  ) return false;
+
+  const names = receipt.tools.map((tool) => tool?.toolName).sort();
+  const expectedNames = [...NVD_COVERED_TOOLS].sort();
+  if (names.some((name, index) => name !== expectedNames[index])) return false;
+  for (const candidate of receipt.tools) {
+    if (!record(candidate)) return false;
+    const tool = candidate as unknown as NvdToolCanaryReceiptItem;
+    if (
+      !NVD_COVERED_TOOLS.includes(tool.toolName)
+      || !SHA256.test(tool.schemaSha256)
+      || !SHA256.test(tool.resultSha256)
+      || !SHA256.test(tool.invalidInputProofSha256)
+      || !SHA256.test(tool.deterministicFailureProofSha256)
+      || !SHA256.test(tool.rateLimitProofSha256)
+      || tool.invalidInputCategory !== "invalid_input"
+      || tool.deterministicFailureCategory !== "deterministic_tool_error"
+      || tool.rateLimitFailureCategory !== "rate_limit"
+    ) return false;
+  }
+  const { receiptId: _receiptId, ...core } = receipt;
+  return receipt.receiptId === `nvd_canary_${sha256(canonical(core)).slice(0, 32)}`;
 }
 
 function trustedFileHash(path: string): { readonly path: string; readonly bytes: number; readonly sha256: string } {

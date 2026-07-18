@@ -2,13 +2,15 @@
 
 Formal decision: **closed — the complete release gate is not satisfied**.
 
-Operational override: on 2026-07-17 the operator explicitly authorized the
-latest integrated V2.4 candidate to become the live default without the
-parallel-isolation or preview-wait requirement. The deployment must still use
-a checksum-verified offline database/Vault backup, an immutable release path,
-an atomic pointer swap, health validation, and a rehearsed rollback. This
-override is not recorded as completion of the soak, full browser matrix, or
-human visual-approval requirements below.
+Operational history: on 2026-07-17 the operator temporarily authorized an
+accelerated V2.4 deployment without the parallel-isolation or preview-wait
+requirement, then explicitly restored the legacy application as the working
+service on port `3131` and moved Command OS V2 to preview port `3132`. The
+legacy application is therefore still the default and no cutover is active.
+Any later cutover must still use a checksum-verified offline database/Vault
+backup, an immutable release path, an atomic pointer swap, health validation,
+and a rehearsed rollback. The prior override is not recorded as completion of
+the soak, full browser matrix, or human visual-approval requirements below.
 
 ## Evidence available
 
@@ -19,6 +21,14 @@ human visual-approval requirements below.
   `public/Logo.svg` each remain
   `0a3dfd69f74a00d41bb0cb20d6af1097dffa265d4c1e54c9228fe4b55f85c955`;
 - registry-backed two-journey intake and focused Chromium mission paths;
+- a source-validated, fail-closed runtime-evidence bridge that publishes only
+  after a releasable exact aggregate, atomically installs a root-owned
+  service-group-readable bundle, revalidates receipt freshness/integrity and
+  current server/configuration hashes, and grants no authority on missing,
+  stale, tampered, permission-invalid, or drifted evidence;
+- nonblocking startup provider/MCP attestation warm-up with an explicit
+  `probing` readiness state; scheduling a probe does not grant execution
+  authority;
 - canonical operational truth, run intelligence, CVE applicability, direct
   versioned plan proposals, Second Brain/Vault, learning, and Research Lab
   fail-closed foundations;
@@ -80,10 +90,10 @@ human visual-approval requirements below.
   `test-results/results/firefox-route-palette-stress-r1.json` (SHA-256
   `ca21a8c12e8a5121afee2eac87e3d7ba510326d5386aa4e4eeb7238b0f4207d2`).
   This is bounded stability evidence, not a complete Firefox project run;
-- one real Obsidian Vault connected to the live schema-13 service at
+- one real Obsidian Vault connected to the live schema-14 preview service at
   `/var/lib/chillspwn/brain-vaults/ChillsPwn-Brain`; current verification reports
   **64,697 tracked notes**, **zero conflicts**, and a canonical Brain graph of
-  **73,521 memory nodes** and **73,430 memory edges**. The 2026-07-17 05:48 UTC
+  **73,523 memory nodes** and **73,431 memory edges**. The 2026-07-17 05:48 UTC
   rendered bootstrap capture below showed three projections and five Context
   Packs and is retained only as historical evidence:
   `docs/command-os-v2/evidence/obsidian-vault-live-20260717.png` (SHA-256
@@ -168,11 +178,20 @@ human visual-approval requirements below.
   `RegistryMissionIntakePage` instead of the stale free-form contract page, but
   focused browser acceptance of its checklist, defaults, and launch path is
   still required;
-- the user-authorized live handoff of committed `c07c49e` is complete with a
-  verified schema-13 database backup, Vault archive, immutable release
-  manifest, and preserved previous-release pointer. Formal service/data
-  rollback rehearsal, signed release attestation, and human release sign-off
-  remain open;
+- committed candidate base `66c7f176a7cfbc421a1903be5d15deb80c663125`
+  is running only on the V2 preview service at port `3132`, alongside the
+  untouched legacy service on port `3131`, with schema-14 database backups.
+  Deployment of the candidate runtime-evidence bridge, creation/verification
+  of the dedicated V2 previous-release pointer, formal service/data rollback
+  rehearsal, signed release attestation, and human release sign-off remain
+  open;
+- final production consumption of the new runtime-evidence bundle remains
+  open. Publication passed with bundle
+  `runtime_tool_evidence_b502fc8be05cf1c182e766aae93b7de4`, SHA-256
+  `451c84db23174eb24ca719f1d9c4d8d484ebf9c6533493ede8aa369f363bc0d5`,
+  `root:chillspwn` mode `0640`, 18/18 exposed tool coverage, and zero aggregate
+  blockers. Accepted live route count and post-warm-up provider/MCP health must
+  still be archived from the deployed service rather than inferred from tests;
 - production legacy import/reconciliation is present, but the complete
   migration, restore, process-restart, and one-command rollback matrix still
   needs final archived release evidence;
@@ -196,8 +215,9 @@ human visual-approval requirements below.
 - zero release-scope defects;
 - explicit human release sign-off.
 
-The operator explicitly authorized the current live promotion without the
-parallel-isolation prerequisite. That exception does not close the formal
-release gate: legacy code/data and the previous-release pointer must remain
-available, and no legacy decommissioning or rollback-window closure is
-authorized until every blocker is closed and its artifacts are archived.
+The prior accelerated-deployment authorization did not close the formal
+release gate and was followed by an explicit return to legacy-on-`3131` and
+V2-preview-on-`3132`. Legacy code/data and the previous-release pointer must
+remain available, and no legacy decommissioning, default-route change, or
+rollback-window closure is authorized until every blocker is closed and its
+artifacts are archived.

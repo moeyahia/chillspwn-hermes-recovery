@@ -7,6 +7,7 @@ import {
 import {
   auditV2ToolCoverage,
   type RegisteredV2Tool,
+  type ToolRuntimeAttestation,
   type V2ToolCoverageEvidence,
   type V2ToolCoverageReport,
   v2ToolKey,
@@ -64,6 +65,7 @@ function validationInventory(
  */
 export function registeredV2ToolsFromAttestedRoutes(
   routes: readonly AttestedMcpRoute[],
+  runtimeAttestations: Readonly<Record<string, ToolRuntimeAttestation>> = {},
 ): readonly RegisteredV2Tool[] {
   const registrations: RegisteredV2Tool[] = [];
   for (const route of routes) {
@@ -83,6 +85,9 @@ export function registeredV2ToolsFromAttestedRoutes(
         toolName,
         agentIds,
         inputSchema: route.toolSchemas?.[toolName] ?? {},
+        ...(runtimeAttestations[route.name]
+          ? { runtimeAttestation: runtimeAttestations[route.name] }
+          : {}),
       });
     }
   }
@@ -97,8 +102,9 @@ export function registeredV2ToolsFromAttestedRoutes(
 export function evaluateRuntimeToolValidation(
   routes: readonly AttestedMcpRoute[],
   evidence: readonly V2ToolCoverageEvidence[] = V2_TOOL_COVERAGE_EVIDENCE,
+  runtimeAttestations: Readonly<Record<string, ToolRuntimeAttestation>> = {},
 ): RuntimeToolValidationReport {
-  const registrations = registeredV2ToolsFromAttestedRoutes(routes);
+  const registrations = registeredV2ToolsFromAttestedRoutes(routes, runtimeAttestations);
   const report = auditV2ToolCoverage(registrations, evidence);
   return Object.assign(report, {
     [RUNTIME_TOOL_VALIDATION_INVENTORY]: { registrations, evidence },

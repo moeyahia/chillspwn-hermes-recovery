@@ -359,10 +359,14 @@ export function createCommandOsApplication(
     const enforcingProviders = callableProviders.filter((provider) =>
       provider.enforcesAutonomousBoundary);
     const guidedProviders = callableProviders.filter((provider) => provider.supportsGuided);
+    const probingProviders = runtime.providers.filter((provider) =>
+      provider.circuitState === "probing");
+    const providersInitializing = callableProviders.length === 0 && probingProviders.length > 0;
     const mcpReady = runtime.mcp.enabled
       && runtime.mcp.executionMode === "enabled"
       && runtime.mcp.startPermitted
       && runtime.mcp.runnableServers > 0;
+    const probingMcpServers = runtime.mcp.probingServers ?? 0;
     const sharedBoundaryReady = runtime.delegationEnforced
       && runtime.noHandsCommanderEnforced
       && runtime.directCommanderToolsDenied
@@ -395,6 +399,14 @@ export function createCommandOsApplication(
       dependencies: {
         providers: {
           status: callableProviders.length > 0 ? "available" : "unavailable",
+          initializing: providersInitializing,
+          probing: probingProviders.length,
+          reason: providersInitializing
+            ? "Live provider attestation is in progress; execution remains unavailable until it succeeds."
+            : callableProviders.length > 0
+              ? "At least one provider has a fresh live execution attestation."
+              : runtime.providers.find((provider) => provider.reason)?.reason
+                ?? "No provider has completed a fresh live execution attestation.",
           declared: runtime.providers.length,
           callable: callableProviders.length,
           enforcing: enforcingProviders.length,
@@ -402,6 +414,13 @@ export function createCommandOsApplication(
         },
         mcp: {
           status: mcpReady ? "available" : "unavailable",
+          initializing: !mcpReady && probingMcpServers > 0,
+          probingServers: probingMcpServers,
+          reason: !mcpReady && probingMcpServers > 0
+            ? "Live MCP route attestation is in progress; tool execution remains unavailable until a reviewed route succeeds."
+            : mcpReady
+              ? "At least one enabled MCP route has a fresh live tools/list attestation."
+              : "No enabled MCP route has completed a fresh live tools/list attestation.",
           configuredServers: runtime.mcp.configuredServers,
           runnableServers: runtime.mcp.runnableServers,
           executionMode: runtime.mcp.executionMode,

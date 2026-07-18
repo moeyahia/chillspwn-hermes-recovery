@@ -121,6 +121,8 @@ import {
   LiveAttestationCache,
   type LiveAttestationResult,
 } from "./runtime/LiveAttestationCache";
+import { warmCommandOsStartupAttestations } from "./runtime/CommandOsAttestationWarmup";
+import { isCommandOsV2PreviewRuntime } from "./runtime/CommandOsPreviewRuntime";
 import { generatePlanPreview, createOpenRouterCaller, PlanPreviewError } from "./runtime/PlanPreviewService";
 import { generateStrictPlan } from "./runtime/ManagedPlanService";
 import { selectExecutionPersona } from "./runtime/PersonaSelect";
@@ -137,6 +139,15 @@ import { classifySessionKind, structuredSessionName, filterSessionsForList, type
 import { registerMcpRoutes } from "./routes/mcpRoutes";
 import { registerAssetRoutes } from "./routes/assetRoutes";
 import { McpArsenalBridge } from "./mcp/McpArsenalBridge";
+import { nvdRuntimeAttestation } from "./mcp/NvdToolLiveCanary";
+import { pentestReconRuntimeAttestation } from "./mcp/PentestReconLiveCanary";
+import { vulnIntelCveRuntimeAttestation } from "./mcp/VulnIntelCveLocalCanary";
+import {
+  DEFAULT_RUNTIME_TOOL_EVIDENCE_PATH,
+  loadRuntimeToolEvidenceBundle,
+} from "./mcp/RuntimeToolEvidenceStore";
+import { PENTEST_RECON_VENDOR_ROOT } from "./mcp/McpServerImplementationAttestation";
+import type { ToolRuntimeAttestation } from "./mcp/V2ToolCoverageAudit";
 import {
   attestReviewedMcpToolSchemas,
   reconcileMcpToolSurface,
@@ -5617,6 +5628,31 @@ const mcpRouteAttestations = new LiveAttestationCache<string, LiveMcpRouteValue>
   maximumConcurrency: 2,
   describeKey: (name) => `MCP route ${name}`,
 });
+
+function warmCommandOsLiveAttestationsOnStartup(): ReturnType<typeof warmCommandOsStartupAttestations> | null {
+  // server/index.ts is also the protected legacy entrypoint. Only the dedicated
+  // preview entry may proactively consume provider or MCP capacity at startup.
+  if (!isCommandOsV2PreviewRuntime()) return null;
+  try {
+    const bridge = getMcpBridge();
+    return warmCommandOsStartupAttestations({
+      providerEnabled: !e2eLiveAttestationFixture,
+      providerId: "grok-acp",
+      providerAttestations: grokReadinessAttestations,
+      mcpEnabled: !e2eLiveAttestationFixture && Boolean(bridge?.isEnabled()),
+      mcpStartPermitted: SECURITY.mcpArsenalStartServers,
+      mcpRoutes: bridge?.listServers().map(({ spec, health }) => ({
+        name: spec.name,
+        enabled: spec.enabled,
+        healthState: health.state,
+      })) ?? [],
+      mcpAttestations: mcpRouteAttestations,
+    });
+  } catch {
+    log("warn", "Command OS live-attestation warm-up could not be scheduled; readiness remains fail-closed");
+    return null;
+  }
+}
 registerMcpRoutes(app, {
   bridge: getMcpBridge,
   agentRuntime,
@@ -5890,6 +5926,7 @@ function commandOsAttestedMcpRoutes(): AttestedMcpRoute[] {
     return {
       name: spec.name,
       verified: snapshot.verified,
+      probing: snapshot.inFlight,
       tools: snapshot.verified ? snapshot.value?.tools ?? [] : [],
       toolSchemas: snapshot.verified ? snapshot.value?.toolSchemas ?? {} : {},
       assignedAgentIds: spec.assignedAgents,
@@ -5913,6 +5950,7 @@ function commandOsMcpProjection(attestedRoutes = commandOsAttestedMcpRoutes()): 
         startPermitted: true,
         configuredServers: 1,
         runnableServers: 1,
+        probingServers: 0,
         missingDependencies: 0,
         missingSecrets: 0,
       },
@@ -5945,6 +5983,7 @@ function commandOsMcpProjection(attestedRoutes = commandOsAttestedMcpRoutes()): 
         startPermitted: false,
         configuredServers: 0,
         runnableServers: 0,
+        probingServers: 0,
         missingDependencies: 0,
         missingSecrets: 0,
       },
@@ -5968,6 +6007,7 @@ function commandOsMcpProjection(attestedRoutes = commandOsAttestedMcpRoutes()): 
       startPermitted: SECURITY.mcpArsenalStartServers,
       configuredServers: records.length,
       runnableServers: attestedRoutes.filter((route) => route.verified).length,
+      probingServers: attestedRoutes.filter((route) => route.probing).length,
       missingDependencies: health.filter((item) => item.state === "missing_dependency").length,
       missingSecrets: health.filter((item) => item.state === "missing_secret").length,
     },
@@ -6060,7 +6100,108 @@ function commandOsRuntimeProjection(): RuntimeProjectionInput {
 const commandOsDatabasePath = resolve(
   process.env.COMMAND_OS_DB_PATH || join(RUNTIME_DATA_DIR, "command-os-v2.sqlite"),
 );
-const commandOsToolValidation = () => evaluateRuntimeToolValidation(commandOsAttestedMcpRoutes());
+const commandOsToolEvidencePath = resolve(
+  process.env.COMMAND_OS_V2_TOOL_EVIDENCE_PATH || DEFAULT_RUNTIME_TOOL_EVIDENCE_PATH,
+);
+let commandOsToolEvidenceWarning = "";
+let commandOsToolAttestationWarning = "";
+let commandOsToolValidationCache: {
+  readonly key: string;
+  readonly expiresAtMs: number;
+  readonly report: ReturnType<typeof evaluateRuntimeToolValidation>;
+} | null = null;
+
+function commandOsInstalledToolAttestations(
+  routes: readonly AttestedMcpRoute[],
+): Readonly<Record<string, ToolRuntimeAttestation>> {
+  const verified = new Set(routes.filter((route) => route.verified).map((route) => route.name));
+  const bridge = getMcpBridge();
+  if (!bridge) return {};
+  const records = new Map(bridge.listServers().map(({ spec }) => [spec.name, spec] as const));
+  const attestations: Record<string, ToolRuntimeAttestation> = {};
+  for (const serverName of verified) {
+    try {
+      if (serverName === "vulnintel-nvd") {
+        const spec = records.get(serverName);
+        if (!spec?.cwd || !spec.args?.[0]) continue;
+        attestations[serverName] = nvdRuntimeAttestation([
+          resolve(spec.cwd, spec.args[0]),
+          resolve(spec.cwd, "package.json"),
+          resolve(spec.cwd, "package-lock.json"),
+        ], SECURITY.mcpArsenalConfig);
+      } else if (serverName === "pentest-mcp-recon") {
+        attestations[serverName] = pentestReconRuntimeAttestation([
+          join(PENTEST_RECON_VENDOR_ROOT, "dist/index.js"),
+          join(PENTEST_RECON_VENDOR_ROOT, "package.json"),
+          join(PENTEST_RECON_VENDOR_ROOT, "package-lock.json"),
+        ], SECURITY.mcpArsenalConfig);
+      } else if (serverName === "vulnintel-cve-mcp") {
+        attestations[serverName] = vulnIntelCveRuntimeAttestation(
+          resolve(process.env.CHILLSPWN_VULNINTEL_VENDOR_ROOT
+            || "/opt/chillspwn-assets/vuln-intel/cve-mcp-server"),
+          SECURITY.mcpArsenalConfig,
+        );
+      }
+    } catch (error) {
+      const message = `Installed ${serverName} tool assets could not be hash-attested: ${String((error as Error)?.message || error).slice(0, 300)}`;
+      if (commandOsToolAttestationWarning !== message) {
+        commandOsToolAttestationWarning = message;
+        log("warn", message);
+      }
+    }
+  }
+  return attestations;
+}
+
+const commandOsToolValidation = () => {
+  const routes = commandOsAttestedMcpRoutes();
+  let evidenceFileVersion = "missing";
+  try {
+    const stat = lstatSync(commandOsToolEvidencePath);
+    evidenceFileVersion = `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeMs}`;
+  } catch {}
+  const cacheKey = JSON.stringify({
+    evidenceFileVersion,
+    routes: routes.map((route) => [route.name, route.verified, route.attestedAt, route.expiresAt]),
+  });
+  if (commandOsToolValidationCache
+    && commandOsToolValidationCache.key === cacheKey
+    && commandOsToolValidationCache.expiresAtMs > Date.now()) {
+    return commandOsToolValidationCache.report;
+  }
+  const installedAttestations = commandOsInstalledToolAttestations(routes);
+  try {
+    const loaded = loadRuntimeToolEvidenceBundle(
+      commandOsToolEvidencePath,
+      installedAttestations,
+    );
+    if (loaded.rejectedServerNames.length > 0) {
+      const message = `Runtime tool evidence does not match installed assets for: ${loaded.rejectedServerNames.join(", ")}`;
+      if (commandOsToolEvidenceWarning !== message) {
+        commandOsToolEvidenceWarning = message;
+        log("warn", message);
+      }
+    } else {
+      commandOsToolEvidenceWarning = "";
+    }
+    const report = evaluateRuntimeToolValidation(
+      routes,
+      loaded.evidence,
+      loaded.runtimeAttestations,
+    );
+    commandOsToolValidationCache = { key: cacheKey, expiresAtMs: Date.now() + 5_000, report };
+    return report;
+  } catch (error) {
+    const message = `Runtime tool evidence is unavailable or invalid; execution remains fail-closed: ${String((error as Error)?.message || error).slice(0, 300)}`;
+    if (commandOsToolEvidenceWarning !== message) {
+      commandOsToolEvidenceWarning = message;
+      log("warn", message);
+    }
+    const report = evaluateRuntimeToolValidation(routes);
+    commandOsToolValidationCache = { key: cacheKey, expiresAtMs: Date.now() + 5_000, report };
+    return report;
+  }
+};
 commandOsApplication = createCommandOsApplication({
   databasePath: commandOsDatabasePath,
   readinessProviders: () => [
@@ -11066,6 +11207,17 @@ if (!_startup.ok) {
   process.exit(1);
 }
 try {
+  const attestationWarmup = warmCommandOsLiveAttestationsOnStartup();
+  if (attestationWarmup) {
+    log("info", "Command OS live-attestation warm-up scheduled", {
+      providerState: attestationWarmup.provider.state,
+      providerReason: attestationWarmup.provider.reason,
+      mcpState: attestationWarmup.mcp.state,
+      eligibleMcpRoutes: attestationWarmup.mcp.eligibleRoutes,
+      probingMcpRoutes: attestationWarmup.mcp.probingRoutes,
+      mcpReason: attestationWarmup.mcp.reason,
+    });
+  }
   commandOsApplication?.start();
   obsidianVaultWatcher?.start();
   const runtimeLifecycle = await commandOsMissionRuntime?.start();
