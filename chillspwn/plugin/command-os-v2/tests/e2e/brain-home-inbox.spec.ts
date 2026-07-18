@@ -188,15 +188,17 @@ test(`${TEST_IDS.homeNavigation} traverses every Second Brain home link against 
   expect(summaryResponse.status()).toBe(200);
   expect(nodesResponse.status()).toBe(200);
   const summaryPayload = await summaryResponse.json() as {
-    counts: { confirmed: number; candidates: number; edges: number };
+    counts: { confirmed: number; verified: number; candidates: number; edges: number };
     health: { database: string; fts: string };
   };
   expect(summaryPayload.counts.confirmed).toBeGreaterThanOrEqual(1);
+  expect(summaryPayload.counts.verified).toBeGreaterThanOrEqual(1);
   expect(summaryPayload.counts.candidates).toBeGreaterThanOrEqual(4);
   expect(summaryPayload.counts.edges).toBeGreaterThanOrEqual(1);
   expect(summaryPayload.health).toEqual({ database: "healthy", fts: "healthy" });
   await expectHeading(page, "Second Brain");
   await expect(page.getByRole("region", { name: "Memory health", exact: true })).toContainText("Confirmed");
+  await expect(page.getByRole("region", { name: "Memory health", exact: true })).toContainText("Verified");
   await expect(page.getByRole("heading", { name: "Canonical memory health", exact: true })).toBeVisible();
   await expect(page.getByRole("heading", { name: "Obsidian vault", exact: true })).toBeVisible();
 

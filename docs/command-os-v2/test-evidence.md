@@ -1,49 +1,113 @@
 # Command OS V2.4 test evidence
 
 Status: **implementation validation snapshot — not a release candidate or cutover approval**
-Evidence date: `2026-07-17` UTC
-Source authority: `main` pinned at `343f6ac5a05f7286a0d66aee8c5dbd6e78a41aee`; implementation branch `feat/command-os-v2-4-parallel`.
+Evidence date: `2026-07-18` UTC
+Source authority: committed live baseline `c07c49ef438c763b0d6f2104bcff908ae2624184`
+on `deploy/command-os-v24-live`; later exact-run artifacts in this validation
+snapshot are identified by their own paths and hashes. This report is not an
+immutable release attestation.
 
 This report records executed checks and preserved artifacts. Configured projects,
 unexecuted fixtures, failure-only screenshots, and a prior-source pass are never
 presented as current release proof.
 
-## Most recent complete package gate
+## 2026-07-18 operational-truth update
 
-The exact current source tree completed `bun run check` after the run-recovery,
+The final candidate rerun of the registry-driven executable-tool gate passed
+**18/18 exposed bindings** across four exact servers. It used these bound
+receipts:
+
+- NVD: `nvd_canary_f07da739f7aedfccb4382783d5138676` (2 exposed);
+- VulnIntel CVE:
+  `vulnintel_cve_canary_0593e45cd27255be7f1de18845da8b5b` (8 exposed);
+- Pentest Recon:
+  `pentest_recon_canary_20b1e2402dabaddbba8b363682aa3995` (8 exposed).
+
+The V2-only trusted recon directory passed its root-run installation check. It
+contains the reviewed capability-free Nmap copy and no-update `httpx-toolkit`
+wrapper and is absent from the legacy and preview-global PATH. The separate
+Pentest diagnostic receipt
+`pentest_recon_canary_b66bd012dd2e8c38aa850152c6152df5` recorded 12/12 exact
+schemas, 10/12 diagnostic successes, 12/12 deterministic failures, and 8/8
+exposed bindings passing. `runHashcat`, `subfinderEnum`, `httpxProbe`, and
+`nucleiScan` are suppressed, not counted as passes. Binary analysis remains
+32/32 schema-attested but 0 exposed because all bindings are suppressed.
+
+The current inventory is 19 configured MCP servers/134 configured bindings,
+4 enabled servers/56 enabled bindings, 87 total/18 enabled policy mappings,
+38 suppressed, 9 unmapped/0 enabled, 4 exact servers/18 exposed, and 18/18
+exposed bindings fully covered. The one callable provider
+route remains 1/1 covered. These canaries used no engagement target and no
+public LLM.
+
+Migration `014_runtime_mutation_receipts` adds a dedicated durable receipt
+table for fenced runtime mutations. It represents `in_progress`, `succeeded`,
+and sanitized `failed` outcomes, owner tokens and expiry, canonical boundary,
+replayable response/error, and timestamps. It conservatively imports older
+settings-backed receipts: completed responses remain replayable, while
+interrupted reservations enter expired and require canonical reconciliation
+instead of a fabricated success.
+
+The isolated standalone V2 package gate completed **720 tests, 10,631
+assertions, and 0 failures**, including type checks and production build. It
+was followed by the hybrid package gate: **1,351 tests, 8,531 assertions, and 0
+failures**, plus 34/34 runtime-gate integration checks, 20/20 Mission Board MCP
+checks, all TypeScript projects, and the production build. These gates do not
+replace the still-required complete browser matrix, visual approval,
+migration/restore rehearsal, soak, preview acceptance, or release sign-off.
+
+The clean critical Chromium aggregate then completed **129/129 tests** with 0
+failures, 0 skipped tests, and 0 flaky results using one worker. It covered the
+active Vault/Brain lifecycle, accessibility, intake, operational truth,
+recovery, interaction-manifest coverage, and the complete route/internal-link
+crawl. Run ID: `critical-chromium-20260718T041319Z`; isolated UI/API ports:
+`43470`/`43471`. The run did not touch live ports `3131` or `3132`. This is the
+current critical Chromium gate, not the still-pending full release browser
+matrix.
+
+Passing the tool and package gates does **not** open the cutover gate. The
+legacy application remains the default, and no release-candidate or human
+approval is implied.
+
+## Historical complete package gate (2026-07-17)
+
+The then-current source tree completed `bun run check` after the run-recovery,
 browser-lifecycle, Brain intake/reporting, accessibility, and visual-manifest
-hardening. This remains a source/build regression gate,
+hardening. This was a source/build regression gate,
 not a release-candidate browser, visual, accessibility, performance, migration,
 soak, or sign-off gate.
 
 | Gate | Result |
 |---|---|
 | Logo verification | Exact required SHA-256 |
-| V2/legacy source isolation | Pass |
+| V2 application boundary | Pass, with one operator-authorized Recovery Panel compatibility mirror in `plugin/webapp`; fresh webapp gate passed 1,233/1,233 |
 | Browser and server TypeScript | Pass |
 | E2E TypeScript | Pass |
-| Unit/integration tests | **685 passed, 0 failed, 10,050 assertions, 128 files** |
+| Unit/integration tests | **702 passed, 0 failed, 10,423 assertions, 131 files** |
 | Production Vite build | Pass |
 | Dependency audit | Separate prior `bun audit` checkpoint; not part of `bun run check` |
 
-Logo verification, V2/legacy isolation, browser/server TypeScript, E2E
+Logo verification, the V2 application boundary, browser/server TypeScript, E2E
 TypeScript, and the production Vite build also passed in the same full check.
+That V2 check predates the authorized `plugin/webapp` compatibility mirror. A
+separate fresh webapp package gate is recorded under Legacy compatibility
+evidence below.
 The older local log
 `/tmp/v2-check-obsidian-final-20260717T0353Z.log` (SHA-256
 `ba42fa7de32dbde54ee4f824b89da7e3d52d4b11c4415c17ac28bc2779f9f1a4`)
-predates this 684-test gate and is retained only as historical evidence. The
-current full check still needs a run-specific immutable archive before release
+predates this 702-test gate and is retained only as historical evidence. That
+full check still needed a run-specific immutable archive before release
 candidacy.
 
-The current emitted build measures:
+That emitted build measured:
 
 | Asset | Raw | Gzip |
 |---|---:|---:|
-| Main application | 362.18 kB | 105.56 kB |
+| Main application | 362.80 kB | 105.76 kB |
 | React vendor | 11.73 kB | 4.20 kB |
-| Minimum initial JavaScript | 373.91 kB | 109.76 kB |
-| Global V2 CSS | 136.86 kB | 19.57 kB |
-| Run Workspace route | 271.16 kB | 67.26 kB |
+| Minimum initial JavaScript | 374.53 kB | 109.96 kB |
+| Global V2 CSS | 137.18 kB | 19.63 kB |
+| Run Workspace route | 278.94 kB | 69.15 kB |
 | Lazy Artifact Intelligence route | 36.79 kB | 9.17 kB |
 
 The main entry and Run Workspace remain below their practical gzip budgets;
@@ -54,7 +118,7 @@ visual, accessibility, performance, migration, soak, or release-signoff proof.
 
 ## Local immutable-source attestation
 
-An earlier `bun run release:attest:local` completed before the current 684-test
+An earlier `bun run release:attest:local` completed before the historical 702-test
 package gate and wrote
 `chillspwn/plugin/command-os-v2/test-results/attestations/command-os-v2-release-attestation.json`
 (SHA-256
@@ -86,8 +150,28 @@ Evidence and Finding review; Brain canvas and accessible table; a connected
 Obsidian Vault after a real filesystem round trip; structured recovery;
 Research; trace and report review; and System Policies and Settings.
 
-Each project runs 27 serial tests and emits 28 axe receipts. The Chromium-first
-pass completed **27/27**. The final `chromium-1440`, `firefox-1440`, and
+The current gate pins direct `axe-core` 4.12.1, preloads `axe.min.js` before
+document initialization, and passes only a compact, version-checked scan
+function through `page.evaluate`. A browser canary rejects an evaluated
+function larger than 64 KiB and the policy test rejects the prior oversized
+runtime-source transport, `AxeBuilder`, rule disabling, and exclusions. Each
+project now runs **28 serial tests** and emits **29 axe receipts**: the added
+transport canary scans Overview, and one Brain test scans both canvas and table.
+
+The current direct-preload implementation completed **84/84** across
+`chromium-1440`, `firefox-1440`, and `webkit-1440` in 195,950.758 ms,
+producing **87 scans** with zero automated A/AA violations, zero unexpected,
+skipped, or flaky results, and retries disabled. JSON:
+`test-results/results/accessibility-direct-all3-20260717-r1.json`
+(SHA-256
+`646380edb1001873e027203b308f2f2565305f4c66404b2817bcee493e96d223`).
+HTML:
+`test-results/html/accessibility-direct-all3-20260717-r1/index.html`
+(SHA-256
+`7abec0c4b83b4c2326f629ac68225a83df6a5d8cf940f3ca4930552ff5bb7599`).
+
+The most recent complete three-engine artifact is retained as **archived
+pre-direct-transport evidence**. Its `chromium-1440`, `firefox-1440`, and
 `webkit-1440` matrix completed **81/81 in 115,689.921 ms**, producing **84 axe
 scans with 0 WCAG A/AA violations**, **0 failed, 0 skipped, and 0 retries**.
 JSON:
@@ -99,7 +183,11 @@ HTML:
 (SHA-256
 `f050dfdf24fb9d95bc77794d5b7007e82343b2ae9563ecee7f20aa2d7b44429a`).
 
-No A/AA rule was disabled or excluded. The report retains **84 incomplete
+The archived 81/81 result remains historical and is not relabeled as proof of
+the new transport; the current 84/84 artifact above is authoritative for that
+boundary.
+
+No A/AA rule was disabled or excluded. The archived report retains **84 incomplete
 gradient color-contrast determinations** and **15 incomplete ARIA-support
 determinations** for manual review; they are neither suppressed nor claimed as
 passes. The gate found and closed two frontend defects before the final run:
@@ -147,6 +235,19 @@ archived, blocked, or evidence-reconciliation states and does not execute all
 489 material interactions. It is therefore not full route-state, interaction,
 or cutover proof.
 
+The current route-readiness and command-palette settlement boundaries also
+completed a repeat-five Firefox stress slice: **150/150** passed in 235,569.658
+ms, with zero unexpected, skipped, or flaky results and retries disabled. Each
+repeat exercised all 29 static route cases plus canonical mission/run/agent/
+evidence palette navigation. JSON:
+`test-results/results/firefox-route-palette-stress-r1.json` (SHA-256
+`ca21a8c12e8a5121afee2eac87e3d7ba510326d5386aa4e4eeb7238b0f4207d2`).
+HTML:
+`test-results/html/firefox-route-palette-stress-r1/index.html` (SHA-256
+`95dd992b3987fc81e442a77c6d443fe49bff68841d16bbf6c7467421c0a38464`).
+This is a bounded Firefox stability receipt, not a replacement for the final
+all-spec, all-project matrix.
+
 ### Exact browser-lifecycle and request audit
 
 Popup permission is now prospective and bound to the opener, exact URL, popup
@@ -158,17 +259,11 @@ hung-request defect. Document and EventSource teardown are correlated to exact
 pre-existing request/page/URL/lifecycle receipts rather than a broad timing
 exception.
 
-Validation is retry-free:
-
-- policy/ledger/AST unit suite: **18/18**, 134 assertions;
-- popup/download/request/stream positive and negative canaries: **18/18** across
-  Chromium, Firefox, and WebKit;
-- impacted verified artifact download, generated mission export, CVE source
-  popup, and System contract popup paths: **12/12** across those engines;
-- E2E TypeScript check: pass;
-- skipped/flaky: **0**.
-
-Artifacts:
+The previous retry-free validation artifacts are retained below as historical
+checkpoints. A new cross-document receipt-isolation negative canary expands the
+current suite; its replacement all-engine result is not yet verified, so this
+snapshot does not claim a current aggregate canary count. The earlier artifacts
+are:
 `test-results/results/browser-audit-p1-canaries-r3-chromium-20260716.json`,
 `test-results/results/browser-audit-p1-canaries-r3-crossbrowser-20260716.json`,
 and `test-results/results/browser-audit-p1-impacted-r2-20260716.json`.
@@ -214,8 +309,9 @@ passed **11/11 with 99 assertions**.
 This is focused defect-closure evidence only. It does not attest an immutable
 source/build, replace a complete retry-free 13-project release run, or close
 visual, accessibility, performance, migration, restart/rollback, soak, preview,
-zero-defect, or human-sign-off requirements. Legacy remains the default and no
-release or cutover is authorized.
+zero-defect, or human-sign-off requirements. The operator-authorized live
+promotion is an explicit exception and does not satisfy formal release or
+cutover approval.
 
 #### Focused strict history-boundary repair
 
@@ -269,8 +365,9 @@ This evidence closes only the reproduced history-boundary defect. It does not
 attest immutable source or artifacts, replace the full retry-free 13-project
 release run, modify any global interaction/gate count, or close visual,
 accessibility, performance, migration, restart/rollback, soak, preview,
-zero-defect, or human-sign-off requirements. Legacy remains the default and no
-release or cutover is authorized.
+zero-defect, or human-sign-off requirements. The operator-authorized live
+promotion is an explicit exception and does not satisfy formal release or
+cutover approval.
 
 ### Local source/artifact digest receipt
 
@@ -405,12 +502,13 @@ every browser.
 | Groups assigned to dedicated fixture IDs | 381 | Every material option/state |
 | Fixture-required groups still owned only by generic audit | 0 | 0 |
 | Static/non-fixture groups | 108 | Complete executable traversal still required |
-| Persistent-navigation projects | Current crawl: 8 projects; 478 applicable groups; 868/868 controls matched per project | Extend proof to material states and every option |
-| Compact/reflow projects | Current crawl: 5 projects; 479 applicable groups; 582/582 controls matched per project | Extend proof to material states and every option |
-| Cross-project initial-state result | Current 479-group crawl: 13/13; 0 missing, 0 unresolved, 0 stale, 0 unexpected/skipped/flaky | Same result across all material states and options |
-| Nonempty `screenshotsRequired` arrays | 18/489 | Approved mapping for every required visual |
+| Persistent-navigation projects | Archived 479-group crawl: 8 projects; 478 applicable groups; 868/868 controls matched per project | Rerun current 489 groups, then extend proof to material states and every option |
+| Compact/reflow projects | Archived 479-group crawl: 5 projects; 479 applicable groups; 582/582 controls matched per project | Rerun current 489 groups, then extend proof to material states and every option |
+| Cross-project initial-state result | Archived 479-group crawl: 13/13; 0 missing, 0 unresolved, 0 stale, 0 unexpected/skipped/flaky | Same result for current 489 groups and across all material states/options |
+| Nonempty `screenshotsRequired` arrays | 30/489 | Approved mapping for every required visual |
 
-The latest complete initial-state artifact covers the current 479-group inventory:
+The latest complete initial-state artifact covers the archived 479-group
+revision that preceded the current 489-group inventory:
 `test-results/results/manifest-current-479-all13-enforced-20260717-r2.json`
 (SHA-256
 `840616394a5b875c1791315bd6f38eb2ed37099c7c7e3330a1ea1241c73524a7`):
@@ -425,14 +523,18 @@ each applied 479 groups and matched 582/582.
 This is a bounded initial-state manifest crawl only. It does not render every
 material hidden, degraded, error, connected-Vault, dialog, or drawer state and
 does not activate every grouped option. A checked-in visual registry now maps
-**18/489** manifest groups to **12** deterministic Chromium 1440/Linux
-baselines; **471** groups remain unmapped and `humanReleaseApproval` remains
+**30/489** manifest groups to **13** deterministic Chromium 1440/Linux
+baselines; **459** groups remain unmapped and `humanReleaseApproval` remains
 `false`. Six baselines cover the connected-Vault lifecycle. Six additional
 material screenshots cover minimal Autonomous intake review, structured blocked
 recovery, Guided waiting decision, Second Brain canvas/table modes, and targeted
-node projection with a sanitized native Obsidian deep link after reload. The
-earlier five-screenshot focused replay passed **3/3** in 27,940.205 ms; registry reverse mapping and
-file-integrity tests passed **21/21 with 3,486 assertions**. JSON:
+node projection with a sanitized native Obsidian deep link after reload. A
+thirteenth baseline covers the complete independent evidence-verification gate
+before mutation. The
+current 13-baseline registry reverse mapping and file-integrity suite passed
+**21/21 with 3,554 assertions**. The earlier five-screenshot focused replay
+passed **3/3** in 27,940.205 ms, and its archived registry revision passed
+**21/21 with 3,486 assertions**. JSON for that archived run:
 `test-results/results/59786-1784264454738.json` (SHA-256
 `fc72e41f27b524cb3591825ccc29339bc3f9e95bd394ed764f40fc9a8371ef6c`).
 The targeted node projection baseline additionally passed a strict no-update
@@ -440,6 +542,13 @@ Chromium-1440 replay **1/1** in
 `test-results/results/brain-node-vault-visual-verify-20260717.json` (SHA-256
 `e0ae9315f91d791da5b87dcdc0b95cb5cfd57b89a872e827112f96a7442dbcf7`).
 This is partial visual evidence, not cross-browser or human visual approval.
+
+The independent evidence-verification baseline passed its strict no-update
+Chromium-1440 replay **1/1** in 9,818.544 ms with zero skipped, unexpected, or
+flaky results. JSON:
+`test-results/results/visual-operational-truth-evidence-verification-verify-20260717.json`
+(SHA-256
+`60a474e18b001b4bd06fcac7e84c1f048a6575712841e6890fda0e0a35626d65`).
 
 Stable-ID journey, agent, trace, and report record families separately passed
 12/12 across Chromium, Firefox, and WebKit in
@@ -462,10 +571,10 @@ still need complete
 assertion-level option ownership, keyboard, refresh/reconnect, error, visual,
 and full browser-matrix proof.
 
-## Protected legacy evidence
+## Legacy compatibility evidence
 
-The protected legacy application remains unchanged in the current worktree. Its
-latest complete baseline is **644/644** aggregate tests:
+Before the operator-authorized live-surface compatibility mirror, the legacy
+application's latest complete baseline was **644/644** aggregate tests:
 
 - `bun run check`: exit 0; server entry bundle 71 modules;
   server/client TypeScript checks passed; **593/593 tests**, 2,138 assertions,
@@ -475,11 +584,26 @@ latest complete baseline is **644/644** aggregate tests:
 
 The legacy server/client type checks and production build also passed.
 
-The protected legacy log is
+The historical legacy log is
 `/tmp/legacy-check-obsidian-final-20260717T0356Z.log`
 (SHA-256
 `a5745e95537666b4c28ceed370f5c845b0c4bbc700d65257228ad1f50c1f15cd`).
-The legacy source diff remained clean.
+The operator subsequently authorized the identical Recovery Panel terminal-
+refresh fix to be mirrored into `plugin/webapp`, because systemd serves that
+live surface. The legacy source diff is therefore intentionally nonempty. A
+fresh post-mirror `bun run check` passed: server entry bundle **305 modules**;
+server, client, and E2E TypeScript green; **1,182/1,182 Bun tests** with 7,069
+expect calls across 162 files; **34/34** OpenRouter portable tests; **17/17** Board
+MCP tests; and a **142-module** production build in 2.66 seconds. This is
+**1,233/1,233 aggregate tests**. The interactive receipt is current, but an
+immutable run log still needs to be archived for release candidacy.
+
+The served webapp's `/missions/new/autonomous` route previously used the stale
+free-form contract page. `AutonomousContractPage` now delegates to
+`RegistryMissionIntakePage` with `journey="autonomous"`, matching the registry-
+backed Guided intake boundary. The package gate above proves compilation and
+unit/integration compatibility; focused browser acceptance of the Autonomous
+registry checklist and launch path remains pending.
 
 Both `public/Logo.svg` files currently hash to
 `0a3dfd69f74a00d41bb0cb20d6af1097dffa265d4c1e54c9228fe4b55f85c955`.
@@ -489,40 +613,41 @@ benchmarks after all shared/backend changes are frozen.
 
 ## Active Obsidian Vault evidence
 
-The currently deployed integrated schema-2.1 service now has one real,
-sandboxed Vault connection: `ChillsPwn Second Brain` at
+The live schema-13 service has one real, sandboxed Vault connection:
+`ChillsPwn Second Brain` at
 `/var/lib/chillspwn/brain-vaults/ChillsPwn-Brain` (connection
-`vault_b1bfa728-3271-4ad1-8e4a-220096e56a73`). The 2026-07-17 05:48 UTC
-read-only live readback reports exactly one `connected` connection, three
-synchronized projections, zero sync errors, zero review rows, zero open
-conflicts, and five Context Packs. A filesystem
-round trip passed as the isolated `chillspwn` service account, left no health
-residue, and did not change `.obsidian`. The connection used the mounted API;
-no direct SQL connection or service restart occurred. Full receipts, backup
-hash, projection hashes, and screenshot are recorded in
+`vault_b1bfa728-3271-4ad1-8e4a-220096e56a73`). The current verified readback
+reports **64,697 tracked Vault notes** and **zero conflicts**. The canonical V2
+database contains **73,521 memory nodes** and **73,430 memory edges**. A real
+filesystem write/read/rename/delete round trip is green, left no health residue,
+and did not change `.obsidian`. Full receipts and historical screenshots are
+recorded in
 [obsidian-vault-connection-evidence.md](obsidian-vault-connection-evidence.md).
-The fresh rendered live-state capture is
+The 05:48 UTC rendered capture below records the earlier three-projection/five-
+Context-Pack bootstrap state and is retained as historical evidence, not current
+Vault cardinality:
 `docs/command-os-v2/evidence/obsidian-vault-live-20260717.png` (SHA-256
 `9006445488e2c73f126f382d15d8839b70081dadb615fe3de378d3d29aeea77e`).
 
-The deployed 2.1 projector exposed one unresolved link from a verified run
-evaluation to a candidate lesson excluded by projection policy. V2.4 now has an
-exact regression for that record pair, enforces live lifecycle and connection
-scope on links, preserves existing compact sync-state paths, and creates the
-complete V2.4 taxonomy for new notes. Persisted paths and managed headings,
+The earlier schema-2.1 projector snapshot exposed one unresolved link from a
+verified run evaluation to a candidate lesson excluded by projection policy.
+The schema-13 V2.4 implementation has an exact regression for that record pair,
+enforces live lifecycle and connection scope on links, preserves existing
+compact sync-state paths, and creates the complete V2.4 taxonomy for new notes.
+Persisted paths and managed headings,
 aliases, and relationship explanations also reject or encode Markdown/control
 delimiters so imported filenames or memory text cannot inject links,
-relationship markers, comments, or lines. The final package gate passes
-**685/685** with 10,050 assertions across 128 files, plus
+relationship markers, comments, or lines. The current package gate passes
+**702/702** with 10,423 assertions across 131 files, plus
 browser/server and E2E TypeScript checks, logo/isolation checks, and the
 production build, while the hardened
 Vault lifecycle passes **18/18** retry-free browser journeys, six each in
-Chromium, Firefox, and WebKit. Deployment verification remains open; this source proof
-does not rewrite the protected live service. Port `3131` is the existing
-`chillspwn.service` integrated release, not the isolated standalone V2.4 app;
-the standalone source expects database schema 11 and must not be pointed at the
-live schema-7 store. A schema-compatible backport or a separately provisioned
-V2.4 service/database is required for controlled deployment.
+Chromium, Firefox, and WebKit. The `c07c49e` handoff checkpoint promoted the
+schema-13 product to port `3131` with the connected `ChillsPwn-Brain` Vault.
+The exact current live source is recorded by the immutable deployment manifest;
+the later test/audit receipts in this document do not themselves claim formal
+release approval. Complete matrix, visual approval, soak, and cutover evidence
+remain open.
 
 The mounted repair/reindex journey first exposed and closed a React Strict Mode
 query-cache suspension defect. Subsequent adversarial review drove durable
@@ -536,9 +661,11 @@ The final combined strict Chromium run also executed all six accumulated
 and reload, bounded path denial and safe retry, projection export/import/sync/
 download, concurrent conflict resolution, repair/reindex with symlink and
 offline fail-closed behavior, and degraded-connection recovery. All six passed
-inside the complete Chromium project. This is browser evidence against the
-isolated V2 fixture service; it does not deploy schema 11 onto the protected
-schema-7 live store or prove native Obsidian desktop activation.
+inside the complete Chromium project. This is browser evidence against a
+disposable V2 fixture service. The committed `c07c49e` schema-13 application
+and connected Vault have since been promoted live under a separate verified
+backup/rollback boundary; these fixture journeys still do not prove native
+Obsidian desktop activation on this headless host.
 
 The isolated standalone process boundary now has focused restart/Vault
 persistence evidence in
@@ -620,8 +747,9 @@ approval, soak/preview evidence, or human release approval.
 
 Cutover remains blocked by all of the following:
 
-- the current 479-group bounded initial-state crawl is green across all 13
-  configured projects, but assertion-level every-option receipts and material
+- the archived 479-group bounded initial-state crawl is green across all 13
+  configured projects; the current 489-group revision still needs the same
+  all-project crawl, and assertion-level every-option receipts plus material
   hidden, degraded, error, dialog, drawer, and connected-Vault states remain
   incomplete;
 - the 390/390 route/href crawl is green across all 13 configured projects for
@@ -634,12 +762,14 @@ Cutover remains blocked by all of the following:
   journey, so focused zero-failure evidence is not a global network claim;
 - enterprise Chromium emulation is not actual Microsoft Edge proof;
 - the 200% project proves reflow geometry, not native browser-chrome zoom;
-- only 18/489 manifest groups map to 12 Chromium baselines; 471 remain
+- only 30/489 manifest groups map to 13 Chromium baselines; 459 remain
   unmapped, and cross-browser baselines and human visual approval remain absent;
-- the expanded axe matrix passed 81/81 across Chromium, Firefox, and WebKit for
-  12 primary and 16 material states with zero A/AA violations, but retained
-  gradient/ARIA manual-review determinations and does not complete mobile,
-  native-zoom, focus-order, screen-reader, or assistive-technology approval;
+- the current direct-preload axe gate passed 84/84 across Chromium, Firefox,
+  and WebKit for 12 primary and 16 material states plus its transport canary;
+  the archived pre-direct-transport matrix passed 81/81 and remains historical.
+  The evidence retains gradient/ARIA manual-review determinations and does not
+  complete mobile, native-zoom, focus-order, screen-reader, or assistive-
+  technology approval;
 - field Web Vitals, browser-rendered large-graph frame-rate/cancellation, large
   Vault sync, concurrent legacy/V2 resource budgets, and long-session memory
   measurements remain open. Canonical 50,000-node FTS search (2.1 ms p95),
@@ -652,5 +782,48 @@ Cutover remains blocked by all of the following:
   migration reconciliation, restart/rollback rehearsal, 72-hour soak, seven-day
   preview, zero-defect review, and explicit human sign-off remain incomplete.
 
-Accordingly, the evidence supports continued isolated implementation and
-validation only. Legacy remains the default and no cutover is authorized.
+Accordingly, the evidence supports continued validation, not formal gate
+completion. The operator-authorized live promotion and compatibility mirror do
+not waive the remaining cutover, rollback, soak, visual, accessibility, or
+human-sign-off requirements.
+
+## Autonomous exact full-TCP capability — 2026-07-18
+
+The ReaperTwo full-port software blocker now has a narrow fail-closed path in
+source. Every ordinary or direct Nmap request remains capped at 1,024 selected
+ports. Only the canonical V2 runtime adapter can issue a one-use exception for
+the exact `pentest-mcp-recon.nmapScan` TCP Connect selection covering ports
+1–65,535 after final action, scope, plan, assignment, contract, specialist,
+non-destructive-policy, target, arguments, and finite-budget validation.
+
+Issuance and consumption use deterministic, hash-chained `audit_records` bound
+to the exact Autonomous mission/run/journey. They are serialized with
+`BEGIN IMMEDIATE`; existing immutable audit triggers reject UPDATE and DELETE.
+The bridge atomically re-reads canonical authority and consumes the exact claim
+before applying the narrow port-cap exception. No capability is stored in the
+mutable settings table.
+
+Recorded validation:
+
+- webapp TypeScript: pass (`bunx tsc --noEmit`);
+- Command OS V2 TypeScript: pass (`bunx tsc --noEmit`);
+- runtime/coordinator/Guided approval/full-TCP policy/bridge/mission focused
+  regression: **125/125 passed, 0 failed, 894 assertions**;
+- focused MCP policy/bridge/claim slice: **41/41 passed, 0 failed,
+  206 assertions**;
+- V2 mission and intake default/budget propagation slice: **28/28 passed,
+  0 failed, 160 assertions**.
+
+Negative evidence covers direct and forged calls, absent durable verifier,
+changed arguments and target scope, forged runtime actor/envelope, stale plan
+and contract, Guided journey, legacy control plane, missing/changed/exhausted
+finite budgets, duplicate issuance, UPDATE/DELETE attempts, concurrent
+two-connection consumption, and replay. The positive runtime integration uses
+a local MCP fixture only; it performs no target connection.
+
+This is not live promotion evidence. No target command, trusted-tool install,
+service restart, database mutation, deployment, or port change was performed.
+The release gate remains closed pending root-controlled trusted Nmap staging,
+a fresh no-engagement-target live canary, and the broader release gates already
+listed above. Pre-existing runs without a signed finite tool-call budget remain
+ineligible and must not be silently grandfathered.

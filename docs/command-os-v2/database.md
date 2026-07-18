@@ -1,6 +1,6 @@
 # Command OS V2 database
 
-Status: implementation audit of the dedicated V2 SQLite layer as of 2026-07-16. This document distinguishes durable behavior present in code from schema-only preparation and release work that remains.
+Status: implementation audit of the dedicated V2 SQLite layer as of 2026-07-18. This document distinguishes durable behavior present in code from schema-only preparation and release work that remains.
 
 ## Canonical-store boundary
 
@@ -9,7 +9,7 @@ Command OS V2 uses a dedicated SQLite database, normally `data/command-os-v2.sql
 The principal implementation is under:
 
 - `server/db/connection.ts` and `server/db/transaction.ts`;
-- `server/db/migrations/001_core.ts` through `012_planning_retry_continuation.ts`;
+- `server/db/migrations/001_core.ts` through `014_runtime_mutation_receipts.ts`;
 - domain repositories under `server/**`;
 - `server/db/backup.ts` and database health helpers;
 - migration/import services under `server/migration/`.
@@ -36,7 +36,7 @@ Writable file databases are configured with:
 
 Migrations are ordered, additive, and checksummed. Applied versions are recorded in `schema_migrations`; an applied checksum mismatch or an unknown future version fails closed. Each migration is applied in its own `IMMEDIATE` transaction.
 
-The current chain creates 101 ordinary tables plus six FTS5 virtual tables, excluding FTS5 internal tables and including the application tables introduced across the following versions:
+The current chain creates 102 ordinary tables plus six FTS5 virtual tables, excluding FTS5 internal tables and including the application tables introduced across the following versions:
 
 | Version | Durable model introduced |
 |---|---|
@@ -52,6 +52,8 @@ The current chain creates 101 ordinary tables plus six FTS5 virtual tables, excl
 | `010_v24_operational_truth` | Control-plane ownership, operational truth, attack attempts and metrics, recon digital twin and OSI observations, CVE applicability, plan changes, script/page-capture records, model assignments, disclosure receipts, and Research Lab schema. |
 | `011_memory_edge_scope_identity` | Complete mission/engagement identity on scoped Brain edges, with conservative normalization of older rows. |
 | `012_planning_retry_continuation` | A dedicated owner-fenced continuation kind for delayed provider-planning retries; the expand migration preserves every schema-eleven continuation row and lease field. |
+| `013_imported_legacy_control_plane` | Conservatively reclassifies only importer-provenance legacy missions/runs as legacy-owned and expires any imported V2 lease; V2-native records are not inferred or changed. |
+| `014_runtime_mutation_receipts` | Durable, fenced idempotency receipts for runtime mutations, including owner/expiry, canonical boundary, replayable success or sanitized failure, and conservative import of earlier settings-backed receipts. |
 
 There are no down migrations. Rollback is therefore backup-and-restore or application-version rollback against a compatible database copy, not destructive schema reversal.
 
@@ -96,7 +98,8 @@ Migration `010` deliberately contains both shipped vertical slices and future-sa
 
 | Area | Database status | Service/runtime status |
 |---|---|---|
-| Control plane | `control_plane` on Mission/Run and `control_plane_leases`. | Lease acquire/heartbeat/release service exists, but mutation-wide enforcement is not wired. |
+| Control plane | `control_plane` on Mission/Run and `control_plane_leases`. | V2 runtime mutation authority is asserted through the control-plane lease service; imported legacy ownership is repaired conservatively by migration 013. |
+| Mutation idempotency | `runtime_mutation_receipts` with state/lease/boundary/response/error fields and an expiry index. | Runtime reservations are owner-fenced and replay completed success or sanitized failure; expired ambiguous work requires canonical reconciliation instead of blind repetition. |
 | Logs to evidence | Logs, observations, log sources, candidates, evidence, and diagnoses. | Mounted service/router/UI establishes the semantic ladder. |
 | Attack/run intelligence | Attack attempts, evidence joins, metric snapshots. | Mounted read/write services and mission views. |
 | Topology/OSI/CVE | Nodes, edges, evidence links, layer observations, CVE applicability. | Mounted topology/OSI and CVE services with evidence/scope checks. |
@@ -137,19 +140,27 @@ The schema and migration services contain much of this foundation, but complete 
 
 ## Verification present in the repository
 
-Database tests cover the complete migration sequence, WAL and foreign-key settings, busy timeout, core schema presence, constraints/triggers, transaction behavior, and backup primitives. Domain integration tests additionally exercise mission idempotency, event/outbox atomicity, evidence gates, Guided decision uniqueness, runtime continuity, and parts of the Brain/Vault model.
+Database tests cover the complete migration sequence through version 14, WAL and foreign-key settings, busy timeout, core schema presence, constraints/triggers, transaction behavior, and backup primitives. Domain integration tests additionally exercise mission and runtime-mutation idempotency, expired-receipt recovery, event/outbox atomicity, evidence gates, Guided decision uniqueness, runtime continuity, and parts of the Brain/Vault model.
 
 This is meaningful implementation evidence, not the final release gate. The release still requires migration interruption/resume, production-sized import, corruption recovery, backup/restore rehearsal, concurrent legacy/V2 contention, query benchmarks, and long-running soak evidence.
 
 ## Release-blocking gaps
 
-1. Mount and prove nonterminal-run lease/checkpoint recovery before V2 accepts post-restart mutations; the existing-database integrity gate is now implemented.
-2. Prove `db:reconcile` against completed and interrupted historical imports, then archive a production-sized migrate/verify/backup/restore receipt.
-3. Enforce control-plane lease ownership on every V2 mutation, not only in a standalone service.
-4. Complete and reconcile the historical importer without mutating legacy sources.
-5. Add operational services for schema-only script, page-capture, capability-registry, model-assignment, and provider-exposure domains before claiming those features.
-6. Prove bounded retention/compaction for high-volume events, logs, outbox, telemetry, and raw payloads.
-7. Publish measured query plans and latency for large runs, evidence sets, topology graphs, and 50,000-node Brain data.
-8. Rehearse backup, restore, preview rollback, and cutover rollback with archived evidence.
+1. Archive a release-bound restart/continuation receipt for nonterminal work and
+   verify every mutation surface uses the control-plane and durable-receipt
+   boundaries; focused implementation tests are not a production rehearsal.
+2. Prove `db:reconcile` against completed and interrupted historical imports,
+   then archive a production-sized migrate/verify/backup/restore receipt.
+3. Complete and reconcile the historical importer without mutating legacy
+   sources.
+4. Add operational services for schema-only script, page-capture,
+   model-assignment, and provider-exposure domains before claiming those
+   features.
+5. Prove bounded retention/compaction for high-volume events, logs, outbox,
+   telemetry, and raw payloads.
+6. Publish measured query plans and latency for large runs, evidence sets,
+   topology graphs, and 50,000-node Brain data.
+7. Rehearse backup, restore, preview rollback, and cutover rollback with
+   archived evidence.
 
 No database cutover should be approved until these gaps and the complete release gate are closed.

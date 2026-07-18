@@ -80,7 +80,13 @@ describe("automated accessibility gate policy", () => {
       "wcag21aa",
       "wcag22aa",
     ]);
-    expect(source).toContain(".withTags(WCAG_TAGS)");
+    expect(source).toContain('runOnly: { type: "tag", values: input.tags }');
+    expect(source).toContain("iframes: true");
+    expect(source).toContain("page.addInitScript({ path: AXE_MIN_PATH })");
+    expect(source).toContain("runtime.version !== input.expectedVersion");
+    expect(source).toContain("MAX_RUNTIME_EVALUATION_SOURCE_BYTES");
+    expect(source).not.toContain("AxeBuilder");
+    expect(source).not.toContain("page.evaluate(this.script())");
     expect(source).not.toContain(".disableRules(");
     expect(source).not.toContain(".exclude(");
     expect(source).toContain("violations,");

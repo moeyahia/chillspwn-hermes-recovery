@@ -679,6 +679,7 @@ export class AutonomousBranchService {
         boundedDestructiveTargets: policy.boundedDestructiveTargets ?? [],
         evidenceRequirements: policy.evidenceRequirements,
         timeBudgetMinutes: budgets.timeBudgetMinutes,
+        toolCallBudget: budgets.toolCalls ?? budgets.toolCallBudget ?? undefined,
         tokenBudget: budgets.tokenBudget ?? undefined,
         costBudget: budgets.costBudget ?? undefined,
         retryBudget: budgets.retryBudget,
@@ -838,6 +839,9 @@ export class AutonomousBranchService {
   ): void {
     const budget = {
       timeBudgetMinutes: request.contract.timeBudgetMinutes,
+      ...(request.contract.toolCallBudget === undefined
+        ? {}
+        : { toolCalls: request.contract.toolCallBudget }),
       tokenBudget: request.contract.tokenBudget ?? null,
       costBudget: request.contract.costBudget ?? null,
       retryBudget: request.contract.retryBudget,

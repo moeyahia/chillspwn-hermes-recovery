@@ -8,22 +8,28 @@ async function missionCount(request: APIRequestContext): Promise<number> {
 }
 
 async function completeRequiredAutonomousFields(page: Page): Promise<void> {
-  await page.getByLabel("Mission title").fill("Fail-closed browser test");
-  await page.getByLabel("Authorized objective").fill("Validate the isolated authorized lab boundary");
-  await page.getByLabel("Measurable success criteria").fill("No mission is persisted when readiness is blocked");
-  await page.getByLabel("Required final deliverables").fill("Readiness exception report");
+  await page.getByLabel("Authorized targets or environment references", { exact: false }).fill("lab.invalid");
+  await page.getByRole("checkbox", { name: /I confirm these targets and the selected action policy are authorized/u }).check();
   await page.getByRole("button", { name: "Continue" }).click();
+  await expect(page.getByRole("group", { name: "Outcome and collaboration" })).toBeVisible();
 
-  await page.getByLabel("Allowed targets and boundaries").fill("lab.invalid");
-  await page.getByLabel("I confirm this mission is authorized").check();
   await page.getByRole("button", { name: "Continue" }).click();
+  const contract = page.getByRole("group", { name: "Autonomous operating contract" });
+  await expect(contract).toBeVisible();
+  await expect(page.getByLabel("Pre-authorized action classes")).toHaveCount(0);
+  await expect(page.getByLabel("Safe-stop conditions")).toHaveCount(0);
 
-  await page.getByLabel("Pre-authorized action classes").fill("reconnaissance");
-  await page.getByLabel("Safe-stop conditions").fill("Any dependency or scope conflict");
+  const actionMatrix = page.locator("summary").filter({ hasText: "Action-class policy matrix" });
+  await actionMatrix.click();
+  await expect(actionMatrix.locator("xpath=..").getByRole("combobox", { name: / policy$/u }).first()).toBeVisible();
+  const evidence = page.locator("summary").filter({ hasText: "Evidence requirements" });
+  await evidence.click();
+  await expect(evidence.locator("xpath=..").getByRole("checkbox").first()).toBeVisible();
+  const safeStops = page.locator("summary").filter({ hasText: "Safe-stop behavior" });
+  await safeStops.click();
+  await expect(safeStops.locator("xpath=..").locator(".os-mandatory-stop")).toHaveCount(8);
   await page.getByRole("button", { name: "Continue" }).click();
-
-  await expect(page.getByText("Autonomous blockers detected.")).toBeVisible();
-  await page.getByRole("button", { name: "Continue" }).click();
+  await expect(page.getByRole("group", { name: "Review the resolved mission" })).toBeVisible();
 }
 
 test.describe("Command OS V2.4 real application journeys", () => {
@@ -135,9 +141,8 @@ test.describe("Command OS V2.4 real application journeys", () => {
     await page.goto("/missions/new/autonomous");
     await completeRequiredAutonomousFields(page);
 
-    await expect(page.getByRole("alert")).toContainText("Select at least one compatible specialist");
-    await expect(page.getByRole("group", { name: "Team and readiness" })).toBeVisible();
-    await expect(page.getByRole("button", { name: "Launch Autonomous Mission" })).toHaveCount(0);
+    await expect(page.locator(".os-readiness-summary")).toContainText("blocked");
+    await expect(page.getByRole("button", { name: "Launch Autonomous Mission" })).toBeDisabled();
 
     const bypassAttempt = await request.post("/api/v2/missions", {
       headers: {

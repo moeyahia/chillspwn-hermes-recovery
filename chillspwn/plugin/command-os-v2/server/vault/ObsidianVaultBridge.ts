@@ -1010,6 +1010,21 @@ export class ObsidianVaultBridge {
     const connection = this.requireConnection(connectionId);
     this.assertVaultSyncAllowed();
     this.#purgeRevokedConnectionProjections(connection);
+    return this.#selectExportableNodeIds(connection);
+  }
+
+  /**
+   * Read-only export selection for operator previews. Unlike
+   * `exportableNodeIds`, this never removes revoked projections or portable
+   * archives and never updates synchronization state.
+   */
+  previewExportableNodeIds(connectionId: string): readonly string[] {
+    const connection = this.requireConnection(connectionId);
+    this.assertVaultSyncAllowed();
+    return this.#selectExportableNodeIds(connection);
+  }
+
+  #selectExportableNodeIds(connection: VaultConnection): readonly string[] {
     const lifecycleStatuses = this.#connectionScopeValues(
       connection,
       "lifecycleStatuses",

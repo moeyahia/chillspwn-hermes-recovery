@@ -6,8 +6,12 @@
   align-items: center;
   justify-content: center;
   gap: 16px;
-  color: #b8f341;
-  background: #080b0d;
+  color: #526f00;
+  background:
+    linear-gradient(rgba(48, 79, 70, 0.08) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(48, 79, 70, 0.08) 1px, transparent 1px),
+    #edf2f1;
+  background-size: 32px 32px;
   font-family: system-ui, -apple-system, sans-serif;
 }
 
@@ -18,22 +22,22 @@
 }
 
 #boot-msg {
-  color: #727d77;
+  color: #5d7069;
   font-size: 12px;
 }
 
 #boot-msg.boot-failed {
-  color: #ff667a;
+  color: #b4233d;
 }
 
 #boot-retry {
   min-height: 44px;
   margin-top: 8px;
   padding: 10px 22px;
-  border: 1px solid #b8f341;
-  border-radius: 8px;
-  color: #b8f341;
-  background: rgb(184 243 65 / 12%);
+  border: 1px solid #526f00;
+  border-radius: 7px;
+  color: #ffffff;
+  background: #526f00;
   font: inherit;
   cursor: pointer;
 }

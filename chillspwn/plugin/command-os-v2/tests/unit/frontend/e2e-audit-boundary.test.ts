@@ -2,7 +2,10 @@ import { readdirSync, readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { describe, expect, test } from "bun:test";
 import ts from "typescript";
-import { e2eAuditProfile } from "../../e2e/support/browserAudit";
+import {
+  e2eAuditProfile,
+  eventStreamLifecyclePairCausallyMatchesRequest,
+} from "../../e2e/support/browserAudit";
 
 const E2E_ROOT = resolve(import.meta.dir, "../../e2e");
 const EXPECTED_BROWSER_SPECIFICATIONS = [
@@ -24,6 +27,7 @@ const EXPECTED_BROWSER_SPECIFICATIONS = [
   "direct-plan-editor.spec.ts",
   "failure-diagnosis.spec.ts",
   "interaction-manifest.spec.ts",
+  "light-technology-theme.spec.ts",
   "manifest-coverage-audit.spec.ts",
   "mission-intake.spec.ts",
   "mission-portfolio.spec.ts",
@@ -376,5 +380,25 @@ describe("automatic E2E browser-audit boundary", () => {
     expect(() => e2eAuditProfile({ COMMAND_OS_V2_E2E_PROFILE: "release", COMMAND_OS_V2_E2E_REQUIRE_API: "0" })).toThrow(
       "Required V2 API auditing can be relaxed only by the explicit degraded profile",
     );
+  });
+
+  test("binds an EventSource lifecycle pair only inside its exact document-to-close clock interval", () => {
+    const exact = {
+      receiptUrl: "http://127.0.0.1:43140/api/v2/events/stream?runId=one",
+      receiptOrdinal: 1,
+      documentStartedAt: 100,
+      closedAt: 120,
+      requestUrl: "http://127.0.0.1:43140/api/v2/events/stream?runId=one",
+      requestOrdinal: 1,
+      requestStartedAt: 110,
+    } as const;
+    expect(eventStreamLifecyclePairCausallyMatchesRequest(exact)).toBe(true);
+    expect(eventStreamLifecyclePairCausallyMatchesRequest({ ...exact, requestStartedAt: 99 })).toBe(false);
+    expect(eventStreamLifecyclePairCausallyMatchesRequest({ ...exact, requestStartedAt: 121 })).toBe(false);
+    expect(eventStreamLifecyclePairCausallyMatchesRequest({ ...exact, requestOrdinal: 2 })).toBe(false);
+    expect(eventStreamLifecyclePairCausallyMatchesRequest({
+      ...exact,
+      requestUrl: `${exact.requestUrl}&different=true`,
+    })).toBe(false);
   });
 });

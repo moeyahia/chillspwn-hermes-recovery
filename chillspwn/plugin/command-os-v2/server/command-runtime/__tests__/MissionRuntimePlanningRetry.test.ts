@@ -130,6 +130,18 @@ describe("MissionRuntimeEngine durable planning retries", () => {
       planner: {
         async plan() {
           calls += 1;
+          database.prepare(`
+            INSERT INTO provider_turns (
+              id, run_id, provider, model, status, error_category,
+              latency_ms, started_at, ended_at
+            ) VALUES (?, ?, 'xai-grok-oauth', 'grok-4.5', 'failed', ?, 125, ?, ?)
+          `).run(
+            `provider-turn-first-${calls}`,
+            fixture.runId,
+            calls === 1 ? "rate_limit" : "policy_denied",
+            clock.now().toISOString(),
+            clock.now().toISOString(),
+          );
           if (calls === 1) throw rateLimit(2_000);
           throw policyDenial();
         },
@@ -179,6 +191,41 @@ describe("MissionRuntimeEngine durable planning retries", () => {
           notBefore: clock.iso(2_000),
         },
       });
+      const diagnosis = database.prepare(`
+        SELECT category, retryable, state, retry_history_json,
+          automatic_recovery_json, preserved_refs_json
+        FROM failure_diagnoses WHERE run_id = ?
+        ORDER BY created_at DESC, id DESC LIMIT 1
+      `).get(fixture.runId) as {
+        category: string;
+        retryable: number;
+        state: string;
+        retry_history_json: string;
+        automatic_recovery_json: string;
+        preserved_refs_json: string;
+      };
+      expect(diagnosis).toMatchObject({ category: "rate_limit", retryable: 1, state: "active" });
+      expect(JSON.parse(diagnosis.retry_history_json)).toEqual([
+        expect.objectContaining({
+          providerTurnId: "provider-turn-first-1",
+          provider: "xai-grok-oauth",
+          model: "grok-4.5",
+          providerTurnStatus: "failed",
+          errorCategory: "rate_limit",
+          httpStatus: 429,
+          retryAfterMs: 2_000,
+        }),
+      ]);
+      expect(JSON.parse(diagnosis.automatic_recovery_json)).toMatchObject({
+        directive: "retry",
+        scheduled: true,
+        continuationId: continuation.id,
+        retryCount: 1,
+        retryAfterMs: 2_000,
+      });
+      expect(JSON.parse(diagnosis.preserved_refs_json)).toEqual([
+        expect.objectContaining({ id: checkpoint.id, kind: "checkpoint" }),
+      ]);
 
       clock.at(1_999);
       expect(await engine.replayContinuations(fixture.runId, ["planning_retry_to_dispatch"])).toBe(0);
@@ -190,6 +237,113 @@ describe("MissionRuntimeEngine durable planning retries", () => {
         .toEqual({ status: "blocked" });
       await engine.replayContinuations(fixture.runId, ["planning_retry_to_dispatch"]);
       expect(calls).toBe(2);
+    } finally {
+      await engine.stop();
+    }
+  });
+
+  test("persists nested HTTP status and Retry-After from a provider response", async () => {
+    const database = memoryDatabase();
+    const clock = new TestClock();
+    const fixture = seed(database, "response-metadata");
+    const providerError = Object.assign(new Error("Grok provider returned too many requests"), {
+      response: {
+        status: 429,
+        headers: { get: (name: string) => name.toLowerCase() === "retry-after" ? "3" : null },
+      },
+    });
+    const engine = runtime({
+      database,
+      clock,
+      workerId: "planning-retry-response-metadata",
+      random: () => 0,
+      planner: { async plan() { throw providerError; } },
+    });
+    try {
+      await engine.processRunNow(fixture.runId);
+      const continuation = database.prepare(`
+        SELECT available_at FROM runtime_continuations
+        WHERE run_id = ? AND kind = 'planning_retry_to_dispatch'
+      `).get(fixture.runId) as { available_at: string };
+      expect(continuation.available_at).toBe(clock.iso(3_000));
+      const row = database.prepare(`
+        SELECT category, retry_history_json, automatic_recovery_json
+        FROM failure_diagnoses WHERE run_id = ? LIMIT 1
+      `).get(fixture.runId) as {
+        category: string;
+        retry_history_json: string;
+        automatic_recovery_json: string;
+      };
+      expect(row.category).toBe("rate_limit");
+      expect(JSON.parse(row.retry_history_json)[0]).toMatchObject({
+        providerTurnStatus: "failed",
+        errorCategory: "rate_limit",
+        httpStatus: 429,
+        retryAfterMs: 3_000,
+      });
+      expect(JSON.parse(row.automatic_recovery_json)).toMatchObject({
+        directive: "retry",
+        notBefore: clock.iso(3_000),
+        retryAfterMs: 3_000,
+      });
+    } finally {
+      await engine.stop();
+    }
+  });
+
+  test("safe-stops instead of shortening a provider wait beyond the automatic limit", async () => {
+    const database = memoryDatabase();
+    const clock = new TestClock();
+    const fixture = seed(database, "retry-after-bound");
+    const requestedWaitMs = 30 * 60_000 + 1;
+    let calls = 0;
+    const engine = runtime({
+      database,
+      clock,
+      workerId: "planning-retry-after-bound",
+      planner: { async plan() { calls += 1; throw rateLimit(requestedWaitMs); } },
+    });
+    try {
+      await expect(engine.processRunNow(fixture.runId)).rejects.toMatchObject({
+        code: "mission_runtime_rate_limit_retry_after_exceeds_bound",
+        options: {
+          humanMessage: expect.stringContaining("did not shorten that window or retry early"),
+          details: expect.objectContaining({
+            retriesUsed: 0,
+            retryReason: "provider_retry_after_exceeds_bound",
+            retryAfterMs: requestedWaitMs,
+          }),
+        },
+      });
+      expect(calls).toBe(1);
+      const run = database.prepare(`
+        SELECT status, retry_count, status_reason, budget_usage_json
+        FROM runs WHERE id = ?
+      `).get(fixture.runId) as {
+        status: string;
+        retry_count: number;
+        status_reason: string;
+        budget_usage_json: string;
+      };
+      expect(run.status).toBe("blocked");
+      expect(run.retry_count).toBe(0);
+      expect(run.status_reason).toContain("requested a wait longer");
+      expect(JSON.parse(run.budget_usage_json)).toMatchObject({ providerTurns: 1, retries: 0 });
+      expect(database.prepare(`
+        SELECT COUNT(*) AS count FROM runtime_continuations
+        WHERE run_id = ? AND kind = 'planning_retry_to_dispatch'
+      `).get(fixture.runId)).toEqual({ count: 0 });
+      const diagnosis = database.prepare(`
+        SELECT retryable, automatic_recovery_json
+        FROM failure_diagnoses WHERE run_id = ? ORDER BY created_at DESC, id DESC LIMIT 1
+      `).get(fixture.runId) as { retryable: number; automatic_recovery_json: string };
+      expect(diagnosis.retryable).toBe(0);
+      expect(JSON.parse(diagnosis.automatic_recovery_json)).toMatchObject({
+        directive: "safe_stop",
+        scheduled: false,
+        retriesUsed: 0,
+        retryAfterMs: requestedWaitMs,
+      });
     } finally {
       await engine.stop();
     }

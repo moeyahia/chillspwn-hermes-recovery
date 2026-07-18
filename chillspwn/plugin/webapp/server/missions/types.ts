@@ -47,6 +47,8 @@ export interface AutonomousMissionRequest {
     readonly boundedDestructiveTargets?: readonly string[];
     readonly evidenceRequirements: readonly string[];
     readonly timeBudgetMinutes: number;
+    /** Finite supervisor ceiling for all MCP/tool dispatches in this run. */
+    readonly toolCallBudget?: number;
     readonly tokenBudget?: number;
     readonly costBudget?: number;
     readonly retryBudget: number;

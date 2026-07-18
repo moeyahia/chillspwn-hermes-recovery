@@ -41,9 +41,39 @@ export interface GuidedExactStepAttestation extends McpApprovalAttestationBase {
   readonly guidedDecisionId: string;
 }
 
+/**
+ * One-use capability for the only reviewed Nmap request above the ordinary
+ * 1,024-port ceiling: an exact 1–65,535 TCP Connect scan in a current,
+ * pre-authorized Autonomous `port_service_enumeration` action. The envelope
+ * is not self-authorizing. The runtime adapter persists an issuance receipt,
+ * and the bridge's canonical verifier must atomically re-read and consume it.
+ */
+export interface AutonomousFullTcpAttestation extends McpApprovalAttestationBase {
+  readonly kind: "autonomous_full_tcp";
+  readonly actionId: string;
+  readonly actionFingerprint: string;
+  readonly missionId: string;
+  readonly assignmentId: string;
+  readonly planId: string;
+  readonly planVersion: number;
+  readonly contractId: string;
+  readonly contractVersion: number;
+  readonly contractHash: string;
+  readonly normalizedTarget: string;
+  readonly actionClass: "port_service_enumeration";
+  readonly controlPlane: "command_os_v2";
+  readonly destructive: false;
+  readonly destructivePolicy: "prohibited" | "validate_without_executing";
+  readonly wallClockLimitMs: number;
+  readonly remainingWallClockMs: number;
+  readonly toolCallLimit: number;
+  readonly remainingToolCalls: number;
+}
+
 export type McpApprovalAttestation =
   | LegacyToolApprovalAttestation
-  | GuidedExactStepAttestation;
+  | GuidedExactStepAttestation
+  | AutonomousFullTcpAttestation;
 
 export interface McpApprovalVerificationRequest {
   readonly attestation: McpApprovalAttestation;
@@ -107,7 +137,11 @@ export function validateMcpApprovalAttestation(
 ): string | null {
   if (!attestation || typeof attestation !== "object") return "approval attestation is required";
   if (attestation.version !== MCP_APPROVAL_ATTESTATION_VERSION) return "approval attestation version is unsupported";
-  if (attestation.kind !== "legacy_tool_approval" && attestation.kind !== "guided_exact_step") {
+  if (
+    attestation.kind !== "legacy_tool_approval"
+    && attestation.kind !== "guided_exact_step"
+    && attestation.kind !== "autonomous_full_tcp"
+  ) {
     return "approval attestation kind is unsupported";
   }
   for (const [label, value] of [
@@ -137,8 +171,46 @@ export function validateMcpApprovalAttestation(
     if (!validIdentifier(attestation.toolCallId) || !validIdentifier(attestation.approvalId)) {
       return "legacy approval identity is invalid";
     }
-  } else if (!validIdentifier(attestation.actionId) || !validIdentifier(attestation.guidedDecisionId)) {
-    return "Guided decision identity is invalid";
+  } else if (attestation.kind === "guided_exact_step") {
+    if (!validIdentifier(attestation.actionId) || !validIdentifier(attestation.guidedDecisionId)) {
+      return "Guided decision identity is invalid";
+    }
+  } else {
+    for (const [label, value] of [
+      ["action ID", attestation.actionId],
+      ["mission ID", attestation.missionId],
+      ["assignment ID", attestation.assignmentId],
+      ["plan ID", attestation.planId],
+      ["contract ID", attestation.contractId],
+    ] as const) {
+      if (!validIdentifier(value)) return `Autonomous full-TCP ${label} is invalid`;
+    }
+    if (!SHA256.test(attestation.actionFingerprint)) return "Autonomous full-TCP action fingerprint is invalid";
+    if (!SHA256.test(attestation.contractHash)) return "Autonomous full-TCP contract hash is invalid";
+    if (
+      !Number.isSafeInteger(attestation.planVersion) || attestation.planVersion < 1
+      || !Number.isSafeInteger(attestation.contractVersion) || attestation.contractVersion < 1
+    ) return "Autonomous full-TCP version binding is invalid";
+    if (
+      typeof attestation.normalizedTarget !== "string"
+      || attestation.normalizedTarget.length < 1
+      || attestation.normalizedTarget.length > 253
+      || attestation.normalizedTarget !== attestation.normalizedTarget.trim()
+    ) return "Autonomous full-TCP normalized target is invalid";
+    if (
+      attestation.actionClass !== "port_service_enumeration"
+      || attestation.controlPlane !== "command_os_v2"
+      || attestation.destructive !== false
+      || !["prohibited", "validate_without_executing"].includes(attestation.destructivePolicy)
+    ) return "Autonomous full-TCP policy binding is invalid";
+    if (
+      !Number.isSafeInteger(attestation.wallClockLimitMs) || attestation.wallClockLimitMs < 1
+      || !Number.isSafeInteger(attestation.remainingWallClockMs) || attestation.remainingWallClockMs < 1
+      || attestation.remainingWallClockMs > attestation.wallClockLimitMs
+      || !Number.isSafeInteger(attestation.toolCallLimit) || attestation.toolCallLimit < 1
+      || !Number.isSafeInteger(attestation.remainingToolCalls) || attestation.remainingToolCalls < 1
+      || attestation.remainingToolCalls > attestation.toolCallLimit
+    ) return "Autonomous full-TCP finite budget binding is invalid";
   }
 
   if (

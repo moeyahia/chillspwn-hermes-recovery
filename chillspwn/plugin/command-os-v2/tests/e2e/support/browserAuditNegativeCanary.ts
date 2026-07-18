@@ -21,6 +21,110 @@ async function isolatedAudit(
   return { context, session };
 }
 
+async function withCanaryDeadline<T>(operation: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      operation,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`${label} exceeded ${timeoutMs}ms`)), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+export async function pageWorldUnavailableAuditCanary(
+  browser: Browser,
+  baseUrl: string,
+): Promise<{ readonly evaluateCalls: number; readonly pageClosed: boolean }> {
+  const { context, session } = await isolatedAudit(browser);
+  const hostPath = "/audit-boundary/unavailable-page-world-host";
+  await context.route(`**${hostPath}`, (route) => route.fulfill({
+    status: 200,
+    contentType: "text/html; charset=utf-8",
+    body: "<!doctype html><title>Browser audit unavailable page-world host</title>",
+  }));
+  const page = await context.newPage();
+  session.attach(page);
+  await page.goto(new URL(hostPath, baseUrl).href, { waitUntil: "load" });
+  const originalDescriptor = Object.getOwnPropertyDescriptor(page, "evaluate");
+  let evaluateCalls = 0;
+  Object.defineProperty(page, "evaluate", {
+    configurable: true,
+    value: () => {
+      evaluateCalls += 1;
+      return new Promise<never>(() => undefined);
+    },
+  });
+  try {
+    await withCanaryDeadline(session.assertObservedClean(), 2_000, "Browser-audit assertion");
+    await withCanaryDeadline(session.closeAuditedPage(page), 2_000, "Browser-audit page teardown");
+    return { evaluateCalls, pageClosed: page.isClosed() };
+  } finally {
+    if (originalDescriptor) Object.defineProperty(page, "evaluate", originalDescriptor);
+    else delete (page as unknown as { evaluate?: unknown }).evaluate;
+    session.dispose();
+    await context.close().catch(() => undefined);
+  }
+}
+
+export async function rapidExplicitEventSourceCloseCanary(
+  browser: Browser,
+  baseUrl: string,
+  storageState: Awaited<ReturnType<BrowserContext["storageState"]>>,
+): Promise<{
+  readonly requestUrl: string;
+  readonly failureText: string;
+  readonly pageClosed: boolean;
+}> {
+  const { context, session } = await isolatedAudit(browser, storageState);
+  const hostPath = "/audit-boundary/rapid-event-source-close-host";
+  const streamPath = "/api/v2/events/stream?runId=audit-canary-rapid-close&afterSequence=0";
+  const expectedStreamUrl = new URL(streamPath, baseUrl).href;
+  await context.route(`**${hostPath}`, (route) => route.fulfill({
+    status: 200,
+    contentType: "text/html; charset=utf-8",
+    body: `<!doctype html>
+      <button id="rapid-close" type="button">Open and close stream</button>
+      <script>
+        document.getElementById("rapid-close").addEventListener("click", () => {
+          const stream = new EventSource(${JSON.stringify(streamPath)}, { withCredentials: true });
+          setTimeout(() => stream.close(), 250);
+        });
+      </script>`,
+  }));
+  const page = await context.newPage();
+  session.attach(page);
+  try {
+    await page.goto(new URL(hostPath, baseUrl).href, { waitUntil: "load" });
+    const request = withCanaryDeadline(
+      context.waitForEvent("request", (candidate) => candidate.url() === expectedStreamUrl),
+      7_000,
+      "Rapid-close EventSource request",
+    );
+    const failure = withCanaryDeadline(
+      context.waitForEvent("requestfailed", (candidate) => candidate.url() === expectedStreamUrl),
+      7_000,
+      "Rapid-close EventSource failure",
+    );
+    await page.locator("#rapid-close").click();
+    const [observedRequest, observedFailure] = await Promise.all([request, failure]);
+    await withCanaryDeadline(session.assertObservedClean(), 2_000, "Rapid-close browser-audit assertion");
+    await withCanaryDeadline(session.closeAuditedPage(page), 2_000, "Rapid-close browser-audit page teardown");
+    return {
+      requestUrl: observedRequest.url(),
+      failureText: observedFailure.failure()?.errorText ?? "",
+      pageClosed: page.isClosed(),
+    };
+  } finally {
+    if (!page.isClosed()) await session.closeAuditedPage(page).catch(() => undefined);
+    session.dispose();
+    await context.close().catch(() => undefined);
+  }
+}
+
 export async function unsolicitedPopupCanary(browser: Browser, baseUrl: string): Promise<readonly string[]> {
   const { context, session } = await isolatedAudit(browser);
   const hostPath = "/audit-boundary/negative-popup-host";
@@ -171,6 +275,111 @@ export async function unwrappedEventSourceNavigationCanary(
       if (!messages.some((message) => message.includes(
         "tracked EventSource request had no correlated close, navigation, or page-close receipt",
       ))) throw error;
+      return messages;
+    }
+  } finally {
+    session.dispose();
+    await context.close().catch(() => undefined);
+  }
+}
+
+export async function crossDocumentStaleEventSourceCloseCanary(
+  browser: Browser,
+  baseUrl: string,
+  storageState: Awaited<ReturnType<BrowserContext["storageState"]>>,
+  testInfo: TestInfo,
+): Promise<readonly string[]> {
+  const { context, session } = await isolatedAudit(browser, storageState);
+  const firstPath = "/audit-boundary/cross-document-stream-source";
+  const secondPath = "/audit-boundary/cross-document-stream-destination";
+  const streamPath = "/api/v2/events/stream?runId=audit-canary-cross-document&afterSequence=0";
+  const exactStreamUrl = new URL(streamPath, baseUrl).href;
+  await context.route(`**${firstPath}`, (route) => route.fulfill({
+    status: 200,
+    contentType: "text/html; charset=utf-8",
+    body: `<!doctype html>
+      <button id="replace-document" type="button">Replace document</button>
+      <script>
+        const oldDocumentStream = new EventSource(${JSON.stringify(streamPath)});
+        document.getElementById("replace-document").addEventListener("click", () => {
+          oldDocumentStream.close();
+          location.assign(${JSON.stringify(secondPath)});
+        });
+      </script>`,
+  }));
+  await context.route(`**${secondPath}`, (route) => route.fulfill({
+    status: 200,
+    contentType: "text/html; charset=utf-8",
+    body: `<!doctype html>
+      <title>Cross-document stream destination</title>
+      <script>
+        const NativeEventSource = Object.getPrototypeOf(window.EventSource);
+        window.__auditNativeCrossDocumentStream = new NativeEventSource(${JSON.stringify(streamPath)});
+      </script>`,
+  }));
+  const page = await context.newPage();
+  session.attach(page);
+  try {
+    const firstRequestPromise = context.waitForEvent("request", (request) => request.url() === exactStreamUrl);
+    const firstResponsePromise = context.waitForEvent("response", (response) => response.url() === exactStreamUrl);
+    await page.goto(new URL(firstPath, baseUrl).href, { waitUntil: "load" });
+    const firstRequest = await withCanaryDeadline(
+      firstRequestPromise,
+      3_000,
+      "Old-document wrapped EventSource request",
+    );
+    const firstResponse = await withCanaryDeadline(
+      firstResponsePromise,
+      3_000,
+      "Old-document wrapped EventSource response",
+    );
+    if (firstResponse.request() !== firstRequest || firstResponse.status() !== 200) {
+      throw new Error("Old-document EventSource did not establish its exact 200 response");
+    }
+    const firstFailurePromise = context.waitForEvent("requestfailed", (request) => request === firstRequest);
+    const secondRequestPromise = context.waitForEvent("request", (request) => (
+      request !== firstRequest && request.url() === exactStreamUrl
+    ));
+    const secondResponsePromise = context.waitForEvent("response", (response) => (
+      response.request() !== firstRequest && response.url() === exactStreamUrl
+    ));
+    await Promise.all([
+      page.waitForURL(new URL(secondPath, baseUrl).href, { waitUntil: "load" }),
+      page.locator("#replace-document").click(),
+    ]);
+    const secondRequest = await withCanaryDeadline(
+      secondRequestPromise,
+      3_000,
+      "New-document unwrapped EventSource request",
+    );
+    const secondResponse = await withCanaryDeadline(
+      secondResponsePromise,
+      3_000,
+      "New-document unwrapped EventSource response",
+    );
+    if (secondResponse.request() !== secondRequest || secondResponse.status() !== 200) {
+      throw new Error("New-document EventSource did not establish its exact 200 response");
+    }
+    const secondFailurePromise = context.waitForEvent("requestfailed", (request) => request === secondRequest);
+    await page.evaluate(() => {
+      const runtime = window as unknown as Window & { __auditNativeCrossDocumentStream?: EventSource };
+      runtime.__auditNativeCrossDocumentStream?.close();
+      delete runtime.__auditNativeCrossDocumentStream;
+    });
+    await withCanaryDeadline(
+      Promise.all([firstFailurePromise, secondFailurePromise]),
+      3_000,
+      "Cross-document EventSource failures",
+    );
+    try {
+      await session.finalize(testInfo);
+      throw new Error("A stale old-document EventSource close receipt incorrectly authorized the new document request");
+    } catch (error) {
+      const messages = session.unexpected.map((issue) => issue.message);
+      const unreceipted = messages.filter((message) => message.includes(
+        "tracked EventSource request had no correlated close, navigation, or page-close receipt",
+      ));
+      if (messages.length !== 1 || unreceipted.length !== 1) throw error;
       return messages;
     }
   } finally {

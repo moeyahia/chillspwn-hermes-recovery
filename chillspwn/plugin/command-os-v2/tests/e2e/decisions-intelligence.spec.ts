@@ -807,10 +807,20 @@ test(`${TEST_IDS.artifacts} exercises artifact tabs, exact-type filter, cursor, 
   await expect(relationlessArtifact.getByText("No run relation was retained.", { exact: true })).toBeVisible();
   await expect(relationlessArtifact.getByText("No evidence records reference this artifact.", { exact: true })).toBeVisible();
   await expect(relationlessArtifact.getByRole("link", { name: /evidence/u })).toHaveCount(0);
-  await audit.withExpectedDocumentNavigationTeardown(page, () => page.reload({ waitUntil: "domcontentloaded" }));
-  await expect(page.getByRole("heading", { name: fixture.relationlessArtifactType, exact: true })).toBeVisible();
   await audit.withExpectedHistoryTraversal(page, () => page.goBack({ waitUntil: "domcontentloaded" }));
-  await expect.poll(() => new URL(page.url()).pathname).toBe(`/intelligence/artifacts/${fixture.primaryArtifactId}`);
+  await expect(page).toHaveURL(new RegExp(`/intelligence/artifacts/${fixture.primaryArtifactId}$`, "u"));
+  await expect(page.getByRole("heading", { name: fixture.primaryArtifactType, exact: true })).toBeVisible();
+  await audit.withExpectedHistoryTraversal(page, () => page.goForward({ waitUntil: "domcontentloaded" }));
+  await expect(page).toHaveURL(new RegExp(`/intelligence/artifacts/${fixture.relationlessArtifactId}$`, "u"));
+  await expect(page.getByRole("heading", { name: fixture.relationlessArtifactType, exact: true })).toBeVisible();
+  await audit.withExpectedDocumentNavigationTeardown(page, () => page.reload({ waitUntil: "domcontentloaded" }));
+  await expect(page).toHaveURL(new RegExp(`/intelligence/artifacts/${fixture.relationlessArtifactId}$`, "u"));
+  await expect(page.getByRole("heading", { name: fixture.relationlessArtifactType, exact: true })).toBeVisible();
+  await audit.withExpectedDocumentNavigationTeardown(page, () => page.goto(
+    `/intelligence/artifacts/${fixture.primaryArtifactId}`,
+    { waitUntil: "domcontentloaded" },
+  ));
+  await expect(page).toHaveURL(new RegExp(`/intelligence/artifacts/${fixture.primaryArtifactId}$`, "u"));
   await expect(page.getByRole("heading", { name: fixture.primaryArtifactType, exact: true })).toBeVisible();
   const evidenceTab = page.getByRole("link", { name: "Evidence", exact: true });
   const evidenceListResponse = apiResponse(page, "/api/v2/intelligence/evidence");

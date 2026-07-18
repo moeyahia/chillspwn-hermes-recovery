@@ -10,6 +10,7 @@ import { inImmediateTransaction } from "../db";
 import {
   ActionRepository,
   CheckpointRepository,
+  type CompleteActionResult,
   DurableOrchestrationError,
   DurableRunCoordinator,
   type DurableAction,
@@ -17,7 +18,13 @@ import {
 } from "../orchestration";
 import { RunRepository } from "../orchestration";
 import { canonicalJson } from "../orchestration/serialization";
+import { hashCanonical } from "../missions/canonical";
 import { RunLearningService } from "../learning";
+import { FailureDiagnosisService } from "../intelligence-v24/FailureDiagnosisService";
+import type {
+  FailureCategory as OperationalFailureCategory,
+  FailureOperatorAction,
+} from "../intelligence-v24/types";
 import {
   classifyFailure,
   FAILURE_CATEGORIES,
@@ -59,6 +66,24 @@ interface HeartbeatLease {
   stop(): Promise<RunLeaseToken>;
 }
 
+export interface ResumeRunBoundary {
+  readonly expectedRunVersion: number;
+  readonly expectedRunStatus: "blocked";
+  readonly expectedCheckpointId: string;
+  readonly expectedCheckpointStateHash: string;
+  readonly expectedCheckpointEventSequence: number;
+}
+
+/** Exact Guided stop context committed only with the fenced cancellation. */
+export interface GuidedStopCancellationContext {
+  readonly kind: "guided_stop";
+  readonly decisionId: string;
+  readonly missionId: string;
+  readonly stepId: string;
+  readonly actionFingerprint: string;
+  readonly parameterHash: string;
+}
+
 class RuntimeCrashAfterCommit extends Error {
   constructor(readonly point: string) {
     super(`Injected process crash after durable commit: ${point}`);
@@ -80,15 +105,25 @@ function errorRecord(error: unknown): Readonly<Record<string, unknown>> {
   return error && typeof error === "object" ? error as Readonly<Record<string, unknown>> : {};
 }
 
+function nestedResponseRecord(error: unknown): Readonly<Record<string, unknown>> {
+  const response = errorRecord(error).response;
+  return response && typeof response === "object" && !Array.isArray(response)
+    ? response as Readonly<Record<string, unknown>>
+    : {};
+}
+
+function planningHttpStatus(error: unknown): number | undefined {
+  const item = errorRecord(error);
+  const response = nestedResponseRecord(error);
+  const value = item.status ?? item.statusCode ?? response.status ?? response.statusCode;
+  if (typeof value === "number" && Number.isSafeInteger(value) && value >= 100 && value <= 599) return value;
+  if (error instanceof CommandRuntimeError && Number.isSafeInteger(error.status)) return error.status;
+  return undefined;
+}
+
 function failureSignal(error: unknown): Parameters<typeof classifyFailure>[0] {
   const item = errorRecord(error);
-  const status = typeof item.status === "number"
-    ? item.status
-    : typeof item.statusCode === "number"
-      ? item.statusCode
-      : error instanceof CommandRuntimeError
-        ? error.status
-        : undefined;
+  const status = planningHttpStatus(error);
   const message = error instanceof Error ? error.message : "";
   return {
     ...(typeof item.code === "string" ? { code: item.code } : error instanceof Error ? { code: error.name } : {}),
@@ -124,7 +159,7 @@ function planningRetryAfterMs(error: unknown, now: Date): number | undefined {
       if (fromDetails !== undefined) return fromDetails;
     }
   }
-  const headers = item.headers;
+  const headers = item.headers ?? nestedResponseRecord(error).headers;
   const raw = headers && typeof headers === "object" && "get" in headers
     && typeof (headers as { get?: unknown }).get === "function"
     ? (headers as { get(name: string): unknown }).get("retry-after")
@@ -225,6 +260,82 @@ function asRuntimeError(error: unknown): CommandRuntimeError {
   });
 }
 
+function operationalFailureCategory(
+  category: FailureCategory | undefined,
+  actionKind: import("../orchestration").DurableActionKind,
+): OperationalFailureCategory {
+  if (category === "authentication_missing") return "authentication_missing";
+  if (category === "dependency_missing") return "dependency_missing";
+  if (category === "mcp_unavailable") return "mcp_unavailable";
+  if (category === "provider_unavailable") return "provider_unavailable";
+  if (category === "rate_limit") return "rate_limit";
+  if (category === "timeout") return "timeout";
+  if (category === "worker_lost") return "worker_lost";
+  if (category === "scope_conflict" || category === "authorization_denied") return "scope_denied";
+  if (category === "policy_denied") return "policy_denied";
+  if (category === "evidence_insufficient") return "evidence_insufficient";
+  if (category === "invalid_input" || category === "deterministic_tool_error") return "deterministic_tool_error";
+  if (category === "process_crash") return "restart_recovery_required";
+  if (category === "transient_network") return actionKind === "tool" ? "mcp_unavailable" : "provider_unavailable";
+  return "unknown";
+}
+
+function failureOperatorActions(
+  category: OperationalFailureCategory,
+  retryable: boolean,
+): readonly FailureOperatorAction[] {
+  const actions: FailureOperatorAction[] = [];
+  if (category === "mcp_unavailable" || category === "provider_unavailable" || category === "rate_limit" || category === "timeout") {
+    actions.push({
+      kind: "test_connection",
+      label: "Test the failed dependency",
+      consequence: "Runs a non-mutating health check before any new execution attempt.",
+      requiresConfirmation: false,
+    });
+    actions.push({
+      kind: "use_compatible_fallback",
+      label: "Use a compatible fallback",
+      consequence: "Starts future work with another already-approved compatible route; the failed action is not replayed silently.",
+      requiresConfirmation: true,
+    });
+  } else if (category === "authentication_missing" || category === "dependency_missing") {
+    actions.push({
+      kind: "configure_dependency",
+      label: "Configure the missing dependency",
+      consequence: "Changes local configuration only after an operator verifies the required dependency or credential reference.",
+      requiresConfirmation: true,
+    });
+  } else {
+    actions.push({
+      kind: "amend_plan",
+      label: "Amend the failed plan step",
+      consequence: "Creates a versioned replacement with corrected canonical parameters; it does not mutate the failed action.",
+      requiresConfirmation: true,
+    });
+  }
+  if (retryable) {
+    actions.push({
+      kind: "retry_bounded",
+      label: "Retry once within the remaining budget",
+      consequence: "Creates a new idempotent action reservation after the declared backoff; it never redispatches the failed record.",
+      requiresConfirmation: true,
+    });
+  }
+  actions.push({
+    kind: "start_new_run",
+    label: "Start a new run from the mission",
+    consequence: "Preserves this failure and begins another execution attempt from a newly reviewed plan and contract binding.",
+    requiresConfirmation: true,
+  });
+  actions.push({
+    kind: "terminate_gracefully",
+    label: "Keep the safe stop",
+    consequence: "Leaves the current run stopped with all checkpoints, logs, and evidence references preserved.",
+    requiresConfirmation: true,
+  });
+  return actions;
+}
+
 export class MissionRuntimeEngine implements ExecutionResultSink {
   readonly repository: RuntimeRepository;
   readonly continuations: RuntimeContinuationRepository;
@@ -263,7 +374,7 @@ export class MissionRuntimeEngine implements ExecutionResultSink {
     this.leaseTtlMs = options.leaseTtlMs ?? 30_000;
     this.decisionTtlMs = options.decisionTtlMs ?? 24 * 60 * 60 * 1_000;
     this.maxPlanSteps = options.maxPlanSteps ?? 32;
-    if (this.scanIntervalMs < 50 || this.leaseTtlMs < 500 || this.decisionTtlMs < 1_000) {
+    if (this.scanIntervalMs < 50 || this.leaseTtlMs < 1_000 || this.decisionTtlMs < 1_000) {
       throw new RangeError("Runtime scan, lease, or decision timing is below its safe minimum");
     }
     this.coordinator = new DurableRunCoordinator(options.database, options.execution, {
@@ -276,6 +387,9 @@ export class MissionRuntimeEngine implements ExecutionResultSink {
       afterCancellationCleanup: (runId) => {
         this.crashAfterCommit("cancellation_cleanup_before_finalize", runId);
       },
+      assertCancellationAuthority: (runId) => {
+        this.assertCurrentControlPlaneAuthority(runId);
+      },
     });
     const unbind = options.execution.bindResultSink?.(this);
     if (typeof unbind === "function") this.unbindResultSink = unbind;
@@ -283,6 +397,76 @@ export class MissionRuntimeEngine implements ExecutionResultSink {
 
   private timestamp(): string {
     return this.now().toISOString();
+  }
+
+  /** Read-only ownership assertion used before an operator control is accepted or replayed. */
+  assertV2ControlPlaneOwnership(runId: string): void {
+    const run = this.database.prepare(
+      `SELECT r.control_plane, m.control_plane AS mission_control_plane
+       FROM runs r JOIN missions m ON m.id = r.mission_id
+       WHERE r.id = ?`,
+    ).get(runId) as {
+      control_plane: "legacy" | "command_os_v2";
+      mission_control_plane: "legacy" | "command_os_v2";
+    } | undefined;
+    if (!run) throw new ControlPlaneLeaseError("run_not_found", `Run ${runId} does not exist`);
+    if (
+      run.control_plane !== "command_os_v2" ||
+      run.mission_control_plane !== "command_os_v2"
+    ) {
+      throw new ControlPlaneLeaseError(
+        "control_plane_mismatch",
+        `Run ${runId} is not exclusively owned by command_os_v2`,
+      );
+    }
+  }
+
+  private ensureControlPlaneAuthority(runId: string): void {
+    const existingToken = this.controlPlaneTokens.get(runId);
+    const acquired = this.controlPlaneLeases.acquire({
+      runId,
+      controlPlane: "command_os_v2",
+      leaseOwner: this.workerId,
+      ...(existingToken ? { leaseToken: existingToken } : {}),
+      ttlMs: this.leaseTtlMs,
+      now: this.now(),
+    });
+    if (acquired.leaseToken) this.controlPlaneTokens.set(runId, acquired.leaseToken);
+  }
+
+  private releaseControlPlaneAuthority(runId: string): void {
+    const leaseToken = this.controlPlaneTokens.get(runId);
+    if (!leaseToken) return;
+    try {
+      this.controlPlaneLeases.release({
+        runId,
+        controlPlane: "command_os_v2",
+        leaseOwner: this.workerId,
+        leaseToken,
+        now: this.now(),
+      });
+    } finally {
+      this.controlPlaneTokens.delete(runId);
+    }
+  }
+
+  /** Revalidate the private controller token inside the mutation transaction. */
+  private assertCurrentControlPlaneAuthority(runId: string): ControlPlaneLease {
+    this.assertV2ControlPlaneOwnership(runId);
+    const leaseToken = this.controlPlaneTokens.get(runId);
+    if (!leaseToken) {
+      throw new ControlPlaneLeaseError(
+        "lease_missing",
+        `Run ${runId} has no active Command OS V2 controller authority`,
+      );
+    }
+    return this.controlPlaneLeases.assertMutationAuthority({
+      runId,
+      controlPlane: "command_os_v2",
+      leaseOwner: this.workerId,
+      leaseToken,
+      now: this.now(),
+    });
   }
 
   /**
@@ -530,6 +714,9 @@ export class MissionRuntimeEngine implements ExecutionResultSink {
   async start(): Promise<RuntimeLifecycleResult> {
     if (this.scanTimer) return { recoveredRuns: 0, scheduledRuns: 0 };
     this.stopping = false;
+    // Recreate only missing explanatory records from an exact, verified
+    // pre-plan checkpoint. This never changes run state or grants authority.
+    this.reconcilePlanningFailureDiagnoses();
     this.continuations.reconcileFromCanonicalState(this.timestamp());
     // Cancellation wins over ordinary action recovery. A process that died
     // after child cleanup but before aggregate finalization must never resume
@@ -580,6 +767,7 @@ export class MissionRuntimeEngine implements ExecutionResultSink {
     const results = await this.coordinator.recoverOnStartup(this.workerId);
     const actions = new ActionRepository(this.database);
     for (const result of results) {
+      this.assertV2ControlPlaneOwnership(result.runId);
       if (result.disposition !== "resumed_idempotently") continue;
       const durable = this.coordinator.getRun(result.runId);
       if (!durable.lease) continue;
@@ -624,10 +812,15 @@ export class MissionRuntimeEngine implements ExecutionResultSink {
     return scheduled;
   }
 
-  async processRunNow(runId: string, planningRetryContinuationId?: string): Promise<void> {
+  async processRunNow(
+    runId: string,
+    planningRetryContinuationId?: string,
+    recoveryContinuationId?: string,
+  ): Promise<void> {
+    this.assertV2ControlPlaneOwnership(runId);
     const existing = this.processing.get(runId);
     if (existing) return existing;
-    const work = this.processRun(runId, planningRetryContinuationId)
+    const work = this.processRun(runId, planningRetryContinuationId, recoveryContinuationId)
       .finally(() => this.processing.delete(runId));
     this.processing.set(runId, work);
     return work;
@@ -637,6 +830,7 @@ export class MissionRuntimeEngine implements ExecutionResultSink {
     runId?: string,
     kinds?: readonly RuntimeContinuationKind[],
   ): Promise<number> {
+    if (runId) this.assertV2ControlPlaneOwnership(runId);
     const runIds = runId ? [runId] : this.continuations.readyRunIds(this.timestamp(), 200);
     let processed = 0;
     for (const candidate of runIds) {
@@ -653,6 +847,7 @@ export class MissionRuntimeEngine implements ExecutionResultSink {
     runId: string,
     kinds?: readonly RuntimeContinuationKind[],
   ): Promise<number> {
+    this.assertV2ControlPlaneOwnership(runId);
     let processed = 0;
     for (let index = 0; index < 64 && !this.stopping; index += 1) {
       const continuation = this.continuations.claimNext({
@@ -733,6 +928,7 @@ export class MissionRuntimeEngine implements ExecutionResultSink {
   }
 
   private async handleContinuation(continuation: RuntimeContinuation): Promise<void> {
+    this.assertV2ControlPlaneOwnership(continuation.runId);
     const run = this.coordinator.getRun(continuation.runId);
     if (isTerminalRunState(run.run.state) && continuation.kind !== "evaluation_pending") {
       this.completeContinuation(continuation);
@@ -812,7 +1008,7 @@ export class MissionRuntimeEngine implements ExecutionResultSink {
           this.completeContinuation(continuation);
           return;
         }
-        await this.processRunNow(continuation.runId);
+        await this.processRunNow(continuation.runId, undefined, continuation.id);
         this.completeContinuation(continuation);
         return;
       }
@@ -1146,15 +1342,22 @@ export class MissionRuntimeEngine implements ExecutionResultSink {
       return;
     }
     const lease = this.continuationLease(continuation.runId);
+    const heartbeat = this.heartbeat(lease);
     this.controllers.get(continuation.runId)?.abort(reason);
-    await this.options.execution.cancelRun(continuation.runId, reason);
+    try {
+      await this.options.execution.cancelRun(continuation.runId, reason);
+    } catch (error) {
+      await heartbeat.stop().catch(() => undefined);
+      throw error;
+    }
+    const finalLease = await heartbeat.stop();
     const now = this.timestamp();
     inImmediateTransaction(this.database, () => {
       // Close child aggregates before the terminal transition creates its
       // checkpoint so the checkpoint cannot retain ghost in-flight work.
       this.repository.cancelOpenWork(continuation.runId, actorId, reason, now);
       const transition = this.coordinator.transitionRun({
-        lease,
+        lease: finalLease,
         to: "cancelled",
         reason,
       });
@@ -1195,7 +1398,12 @@ export class MissionRuntimeEngine implements ExecutionResultSink {
     }
   }
 
-  private async processRun(runId: string, planningRetryContinuationId?: string): Promise<void> {
+  private async processRun(
+    runId: string,
+    planningRetryContinuationId?: string,
+    recoveryContinuationId?: string,
+  ): Promise<void> {
+    this.assertV2ControlPlaneOwnership(runId);
     let planningRun = this.repository.getPlanningRun(runId);
     if (planningRun.state !== "planning" && planningRun.state !== "recovering") return;
     const mission = this.repository.getMission(planningRun.missionId);
@@ -1212,10 +1420,69 @@ export class MissionRuntimeEngine implements ExecutionResultSink {
     }
     const recovery = durableAtStart.control.recovery;
     if (
+      planningRun.journey === "autonomous" &&
+      planningRun.state === "recovering" &&
+      !recovery
+    ) {
+      const boundary = this.database.prepare(`
+        SELECT current_plan_id, current_step_id,
+          (SELECT COUNT(*) FROM actions a
+            WHERE a.run_id = r.id AND a.status IN ('queued', 'running')) AS active_actions,
+          (SELECT COUNT(*) FROM actions a WHERE a.run_id = r.id) AS total_actions
+        FROM runs r WHERE r.id = ?
+      `).get(runId) as {
+        current_plan_id: string | null;
+        current_step_id: string | null;
+        active_actions: number;
+        total_actions: number;
+      };
+      const exactResume = recoveryContinuationId
+        ? this.continuations.get(recoveryContinuationId)
+        : undefined;
+      const exactPrePlanResume = exactResume?.runId === runId
+        && exactResume.kind === "resume_recovery_pending"
+        && exactResume.status === "processing"
+        && boundary.current_plan_id === null
+        && boundary.current_step_id === null
+        && boundary.total_actions === 0;
+
+      // A safely resumed idempotent action owns this recovery. It must finish
+      // through its exact action result path, never through the planner.
+      if (boundary.active_actions > 0) return;
+      if (!exactPrePlanResume) {
+        const error = new CommandRuntimeError(
+          409,
+          "autonomous_recovery_authority_missing",
+          "Autonomous recovery has no exact retry, replan, or pre-plan resume authority",
+          {
+            humanMessage: boundary.current_plan_id
+              ? "Safe-stopped: the saved recovery state does not prove which existing plan and step may continue, so ChillsPwn did not create or replace a plan."
+              : "Safe-stopped: the saved recovery state is missing the exact continuation that authorized planning to resume.",
+            category: "data_integrity",
+            details: {
+              planId: boundary.current_plan_id,
+              stepId: boundary.current_step_id,
+              activeActions: boundary.active_actions,
+            },
+            remediation: boundary.current_plan_id
+              ? "Start a new run from this mission so it receives a new signed plan and checkpoint boundary."
+              : "Refresh the recovery panel and resume only from its current verified checkpoint, or start a new run.",
+          },
+        );
+        const stopLease = durableAtStart.lease?.ownerId === this.workerId
+          && Date.parse(durableAtStart.lease.expiresAt) > Date.parse(this.timestamp())
+          ? durableAtStart.lease
+          : this.coordinator.acquireRunLease(runId, this.workerId, this.leaseTtlMs);
+        await this.safeStopPlanning(runId, stopLease, error);
+        return;
+      }
+    }
+    if (
       planningRun.journey === "autonomous" && planningRun.state === "recovering" &&
       recovery?.kind === "retry" && Date.parse(recovery.notBefore) > Date.parse(this.timestamp())
     ) return;
     let lease = durableAtStart.lease?.ownerId === this.workerId
+      && Date.parse(durableAtStart.lease.expiresAt) > Date.parse(this.timestamp())
       ? durableAtStart.lease
       : this.coordinator.acquireRunLease(runId, this.workerId, this.leaseTtlMs);
     if (scheduledPlanningRetry && planningRetryContinuationId) {
@@ -1360,6 +1627,21 @@ export class MissionRuntimeEngine implements ExecutionResultSink {
             guidedDecisionId: plan.guidedDecisionId,
           });
         }
+        const completedPlanningTurn = planned.usage?.providerTurnId
+          ? this.database.prepare(`
+              SELECT 1 AS present FROM provider_turns
+              WHERE id = ? AND run_id = ? AND status = 'completed' AND ended_at IS NOT NULL
+            `).get(planned.usage.providerTurnId, runId) as { present: number } | undefined
+          : undefined;
+        if (completedPlanningTurn && planned.usage?.providerTurnId) {
+          new FailureDiagnosisService(this.database, { clock: this.now })
+            .supersedePlanningFailureAfterPlanActivation({
+              runId,
+              planId: plan.planId,
+              providerTurnId: planned.usage.providerTurnId,
+              actor: { id: this.workerId, type: "worker" },
+            });
+        }
         if (planningRun.journey === "autonomous") {
           this.continuations.enqueue({
             runId,
@@ -1401,26 +1683,54 @@ export class MissionRuntimeEngine implements ExecutionResultSink {
             ...(this.options.retryRandom ? { random: this.options.retryRandom } : {}),
           });
           if (scheduled.scheduled) {
+            // This hook deliberately sits at the real crash boundary: the
+            // retry/checkpoint is durable, while its explanatory diagnosis is
+            // still recoverable derived state.
             this.crashAfterCommit("planning_retry_scheduled", runId, scheduled.continuationId);
+            this.persistPlanningFailureDiagnosis({
+              runId,
+              originalError: error,
+              runtimeError,
+              category,
+              retryAfterMs,
+              checkpointId: scheduled.checkpointId,
+              retryScheduled: {
+                continuationId: scheduled.continuationId,
+                notBefore: scheduled.notBefore,
+                retryCount: scheduled.retryCount,
+              },
+              terminal: false,
+            });
             return;
           }
+          const retriesUsed = this.coordinator.getRun(runId).control.retryCount;
+          const providerWaitExceedsBound = scheduled.reason === "provider_retry_after_exceeds_bound";
           const exhausted = scheduled.reason === "signed_budget_exhausted"
             ? ` The signed ${scheduled.exhausted.join(", ")} budget leaves no room for another provider turn.`
-            : " The default bounded retry allowance of two automatic retries is exhausted.";
+            : providerWaitExceedsBound
+              ? " The provider requested a wait longer than V2's configured automatic-retry safety limit; V2 did not shorten that window or retry early."
+              : " The default bounded retry allowance of two automatic retries is exhausted.";
           runtimeError = new CommandRuntimeError(
             429,
-            `mission_runtime_${category}_retry_exhausted`,
+            providerWaitExceedsBound
+              ? `mission_runtime_${category}_retry_after_exceeds_bound`
+              : `mission_runtime_${category}_retry_exhausted`,
             "Autonomous planning retry path exhausted",
             {
-              humanMessage: `Safe-stopped: Autonomous planning remained unavailable after ${this.coordinator.getRun(runId).control.retryCount} bounded automatic retries.${exhausted}`,
+              humanMessage: providerWaitExceedsBound
+                ? `Safe-stopped: Autonomous planning cannot retry safely.${exhausted} ${retriesUsed} bounded automatic ${retriesUsed === 1 ? "retry was" : "retries were"} used before this response.`
+                : `Safe-stopped: Autonomous planning remained unavailable after ${retriesUsed} bounded automatic retries.${exhausted}`,
               retryable: false,
               category,
               details: {
-                retriesUsed: this.coordinator.getRun(runId).control.retryCount,
+                retriesUsed,
                 retryReason: scheduled.reason,
+                ...(retryAfterMs === undefined ? {} : { retryAfterMs }),
                 exhausted: [...scheduled.exhausted],
               },
-              remediation: "Wait for the provider window to recover, then start a new run or explicitly resume from the preserved checkpoint.",
+              remediation: providerWaitExceedsBound
+                ? "Wait for the provider window to recover, test provider readiness, then start a new run from the preserved mission."
+                : "Wait for the provider window to recover, then start a new run from the preserved mission.",
             },
           );
         }
@@ -1431,45 +1741,564 @@ export class MissionRuntimeEngine implements ExecutionResultSink {
         });
         if (accounted.allowed && accounted.run.lease) lease = accounted.run.lease;
       }
-      await this.safeStopPlanning(runId, lease, runtimeError);
+      const checkpointId = await this.safeStopPlanning(runId, lease, runtimeError);
+      if (planningProviderFailed) {
+        if (checkpointId) this.crashAfterCommit("planning_safe_stop_committed", runId, checkpointId);
+        this.persistPlanningFailureDiagnosis({
+          runId,
+          originalError: error,
+          runtimeError,
+          category: planningFailureCategory(error, runtimeError),
+          retryAfterMs: planningRetryAfterMs(error, this.now()),
+          ...(checkpointId ? { checkpointId } : {}),
+          terminal: true,
+        });
+      }
       throw runtimeError;
     }
   }
 
-  private async safeStopPlanning(runId: string, lease: RunLeaseToken, error: CommandRuntimeError): Promise<void> {
-    try {
-      const current = this.coordinator.getRun(runId);
-      if (isTerminalRunState(current.run.state) || current.run.state === "blocked") return;
-      const transition = this.coordinator.transitionRun({
-        lease,
-        to: "blocked",
-        reason: error.options.humanMessage ?? error.message,
-      });
-      this.repository.events.append({
-        missionId: transition.run.run.missionId,
-        runId,
-        journey: transition.run.run.journey,
-        eventType: transition.run.run.journey === "autonomous"
-          ? "run.autonomous_safe_stopped"
-          : "run.guided_blocked",
-        actorType: "system",
-        summary: error.options.humanMessage ?? error.message,
-        payload: {
-          code: error.code,
-          category: error.options.category ?? "runtime",
-          ...(error.code === "invalid_plan" && error.options.details
-            && typeof error.options.details === "object" && !Array.isArray(error.options.details)
-            && typeof error.options.details.validationField === "string"
-            && typeof error.options.details.validationRule === "string"
-            ? {
-                validationField: error.options.details.validationField,
-                validationRule: error.options.details.validationRule,
-              }
+  private persistPlanningFailureDiagnosis(input: {
+    readonly runId: string;
+    readonly originalError: unknown;
+    readonly runtimeError: CommandRuntimeError;
+    readonly category: FailureCategory;
+    readonly retryAfterMs?: number;
+    readonly checkpointId?: string;
+    readonly boundaryEventId?: string;
+    readonly exactProviderTurnId?: string;
+    readonly latestTurnOnly?: boolean;
+    readonly retryScheduled?: {
+      readonly continuationId: string;
+      readonly notBefore: string;
+      readonly retryCount: number;
+    };
+    readonly terminal: boolean;
+  }): boolean {
+    const run = this.coordinator.getRun(input.runId);
+    const providerTurns = this.database.prepare(`
+      SELECT id, provider, model, status, error_category, latency_ms, started_at, ended_at
+      FROM provider_turns
+      WHERE run_id = ? AND status IN ('failed', 'cancelled')
+      ORDER BY started_at, id
+    `).all(input.runId) as Array<{
+      id: string;
+      provider: string;
+      model: string | null;
+      status: string;
+      error_category: string | null;
+      latency_ms: number | null;
+      started_at: string;
+      ended_at: string | null;
+    }>;
+    const selectedTurns = input.exactProviderTurnId
+      ? providerTurns.filter((turn) => turn.id === input.exactProviderTurnId)
+      : providerTurns;
+    const latestTurn = selectedTurns.at(-1);
+    if (input.exactProviderTurnId && !latestTurn) return false;
+    if (latestTurn) {
+      const existing = this.database.prepare(`
+        SELECT fd.id
+        FROM failure_diagnoses fd, json_each(fd.retry_history_json) attempt
+        WHERE fd.run_id = ? AND fd.subject_type = 'run'
+          AND fd.originating_component = 'command-runtime.planning-provider'
+          AND json_extract(attempt.value, '$.providerTurnId') = ?
+        LIMIT 1
+      `).get(input.runId, latestTurn.id) as { id: string } | undefined;
+      if (existing) return false;
+    }
+
+    const httpStatus = planningHttpStatus(input.originalError);
+    const operationalCategory = operationalFailureCategory(input.category, "provider_turn");
+    const retryable = isRetryableCategory(input.category)
+      && input.runtimeError.options.retryable !== false
+      && !input.terminal;
+    const lastSuccess = this.database.prepare(`
+      SELECT id FROM events
+      WHERE run_id = ? AND event_type IN (
+        'mission.created', 'run.autonomous_planning_started',
+        'run.guided_planning_started', 'run.planning_retry_started'
+      )
+      ORDER BY sequence DESC LIMIT 1
+    `).get(input.runId) as { id: string } | undefined;
+    const historyTurns = input.latestTurnOnly && latestTurn ? [latestTurn] : selectedTurns;
+    const retryHistory = historyTurns.length > 0
+      ? historyTurns.map((turn, index) => ({
+          attempt: index + 1,
+          providerTurnId: turn.id,
+          provider: turn.provider,
+          model: turn.model,
+          providerTurnStatus: turn.status,
+          errorCategory: turn.error_category,
+          latencyMs: turn.latency_ms,
+          startedAt: turn.started_at,
+          endedAt: turn.ended_at,
+          ...(turn.id === latestTurn?.id && httpStatus !== undefined ? { httpStatus } : {}),
+          ...(turn.id === latestTurn?.id && input.retryAfterMs !== undefined
+            ? { retryAfterMs: input.retryAfterMs }
             : {}),
-        },
+        }))
+      : [{
+          attempt: run.control.retryCount + 1,
+          providerTurnId: null,
+          provider: null,
+          model: null,
+          providerTurnStatus: "failed",
+          errorCategory: input.category,
+          ...(httpStatus === undefined ? {} : { httpStatus }),
+          ...(input.retryAfterMs === undefined ? {} : { retryAfterMs: input.retryAfterMs }),
+        }];
+    const automaticRecovery = input.retryScheduled
+      ? {
+          directive: "retry",
+          scheduled: true,
+          continuationId: input.retryScheduled.continuationId,
+          notBefore: input.retryScheduled.notBefore,
+          retryCount: input.retryScheduled.retryCount,
+          retryAfterMs: input.retryAfterMs ?? null,
+        }
+      : {
+          directive: "safe_stop",
+          scheduled: false,
+          retriesUsed: run.control.retryCount,
+          retryAfterMs: input.retryAfterMs ?? null,
+        };
+    try {
+      new FailureDiagnosisService(this.database, { clock: this.now }).create({
+        missionId: run.run.missionId,
+        runId: input.runId,
+        subjectType: "run",
+        subjectId: input.runId,
+        humanReason: input.runtimeError.options.humanMessage ?? input.runtimeError.message,
+        category: operationalCategory,
+        code: input.runtimeError.code,
+        originatingComponent: "command-runtime.planning-provider",
+        ...(lastSuccess ? { lastSuccessEventId: lastSuccess.id } : {}),
+        failedComponentRef: latestTurn
+          ? `${latestTurn.provider}/${latestTurn.model}`
+          : "configured planning provider",
+        targetSummary: "Mission planning failed before any target, MCP tool, or represented action was contacted.",
+        policyOrDependency: `The provider failure remained inside the signed ${run.run.journey} mission boundary.`,
+        retryHistory,
+        progressBeforeFailure: run.control.progress,
+        preservedReferences: [
+          ...(input.boundaryEventId ? [{
+            kind: "event" as const,
+            id: input.boundaryEventId,
+            meaning: "Exact canonical event whose state transition is represented by this diagnosis",
+          }] : []),
+          ...(input.checkpointId ? [{
+            kind: "checkpoint" as const,
+            id: input.checkpointId,
+            meaning: input.retryScheduled
+              ? "Durable checkpoint that owns the exact delayed planning retry"
+              : "Verified zero-in-flight safe-stop checkpoint",
+          }] : []),
+        ],
+        retryable,
+        automaticRecovery,
+        remediation: input.retryScheduled
+          ? `Wait until ${input.retryScheduled.notBefore}; the runtime will consume only the exact persisted retry continuation.`
+          : input.runtimeError.options.remediation
+            ?? "Verify provider health, then resume only through the server-declared bounded recovery control.",
+        operatorActions: failureOperatorActions(operationalCategory, retryable),
+        objectiveImpact: "No plan or target-side evidence was committed by this failed provider turn; the mission objective remains unchanged.",
+        terminal: input.terminal,
+        actor: { id: this.workerId, type: "worker" },
+      });
+      return true;
+    } catch (error) {
+      this.database.prepare(`
+        INSERT INTO structured_logs (
+          id, mission_id, run_id, severity, domain, message,
+          attributes_json, sensitivity, occurred_at
+        ) VALUES (?, ?, ?, 'error', 'command-runtime.failure-diagnosis', ?, ?, 'internal', ?)
+      `).run(
+        `log_${randomUUID()}`,
+        run.run.missionId,
+        input.runId,
+        "Planning failure was committed but its structured diagnosis could not be persisted",
+        JSON.stringify({
+          code: "planning_failure_diagnosis_persistence_failed",
+          category: input.category,
+          providerTurnId: latestTurn?.id ?? null,
+          errorType: error instanceof Error ? error.name : "unknown",
+          rawErrorPersisted: false,
+        }),
+        this.timestamp(),
+      );
+      return false;
+    }
+  }
+
+  /**
+   * Rebuild missing explanatory state after a process dies between the
+   * canonical retry/safe-stop checkpoint and FailureDiagnosis persistence.
+   * Eligibility is deliberately narrow: one V2-owned pre-plan run, the exact
+   * latest checkpoint/event, zero execution work, and the latest failed
+   * provider turn from the current planning boundary must all agree.
+   *
+   * This method never acquires a lease, changes run state, enqueues work, or
+   * authorizes resume. A mismatch is ignored and remains operator-reviewable.
+   */
+  reconcilePlanningFailureDiagnoses(): number {
+    const candidates = this.database.prepare(`
+      SELECT r.id
+      FROM runs r
+      JOIN missions m ON m.id = r.mission_id
+      WHERE r.control_plane = 'command_os_v2'
+        AND m.control_plane = 'command_os_v2'
+        AND r.status IN ('planning', 'blocked')
+        AND r.current_plan_id IS NULL AND r.current_step_id IS NULL
+        AND NOT EXISTS (SELECT 1 FROM plans p WHERE p.run_id = r.id)
+        AND EXISTS (
+          SELECT 1 FROM provider_turns pt
+          WHERE pt.run_id = r.id AND pt.status IN ('failed', 'cancelled')
+        )
+      ORDER BY r.updated_at, r.id
+    `).all() as Array<{ id: string }>;
+    let created = 0;
+    for (const candidate of candidates) {
+      try {
+        const reconciled = inImmediateTransaction(this.database, () => {
+          const run = this.database.prepare(`
+            SELECT r.id, r.mission_id, r.journey, r.status, r.status_reason,
+              r.version, r.started_at, r.current_plan_id, r.current_step_id,
+              r.current_owner_id, r.lease_owner
+            FROM runs r
+            JOIN missions m ON m.id = r.mission_id
+            WHERE r.id = ?
+              AND r.control_plane = 'command_os_v2'
+              AND m.control_plane = 'command_os_v2'
+          `).get(candidate.id) as {
+            id: string;
+            mission_id: string;
+            journey: "autonomous" | "guided";
+            status: "planning" | "blocked";
+            status_reason: string | null;
+            version: number;
+            started_at: string;
+            current_plan_id: string | null;
+            current_step_id: string | null;
+            current_owner_id: string | null;
+            lease_owner: string | null;
+          } | undefined;
+          if (
+            !run || !run.status_reason || run.current_plan_id || run.current_step_id ||
+            run.current_owner_id || run.lease_owner
+          ) return false;
+
+          const checkpoint = this.coordinator.getLatestCheckpoint(run.id);
+          if (
+            !checkpoint || checkpoint.state.run.id !== run.id ||
+            checkpoint.state.run.missionId !== run.mission_id ||
+            checkpoint.state.run.journey !== run.journey ||
+            checkpoint.state.run.state !== run.status ||
+            checkpoint.state.run.stateVersion !== run.version ||
+            checkpoint.state.run.reason !== run.status_reason ||
+            checkpoint.state.run.leaseOwner !== null ||
+            checkpoint.state.lastEventSequence !== checkpoint.eventSequence ||
+            checkpoint.state.completedActionIds.length !== 0 ||
+            checkpoint.state.inFlightActions.length !== 0
+          ) return false;
+
+          const counts = this.database.prepare(`
+            SELECT
+              (SELECT COUNT(*) FROM plans WHERE run_id = ?) AS plans,
+              (SELECT COUNT(*) FROM plan_steps WHERE run_id = ?) AS steps,
+              (SELECT COUNT(*) FROM assignments WHERE run_id = ?) AS assignments,
+              (SELECT COUNT(*) FROM actions WHERE run_id = ?) AS actions,
+              (SELECT COUNT(*) FROM provider_turns WHERE run_id = ? AND status = 'started') AS started_turns
+          `).get(run.id, run.id, run.id, run.id, run.id) as {
+            plans: number;
+            steps: number;
+            assignments: number;
+            actions: number;
+            started_turns: number;
+          };
+          if (Object.values(counts).some((count) => count !== 0)) return false;
+
+          const checkpointEvent = this.database.prepare(`
+            SELECT e.id, e.sequence, e.event_type, e.occurred_at, e.summary, e.payload_json,
+              e.mission_id, e.journey,
+              (SELECT MAX(sequence) FROM events WHERE run_id = e.run_id) AS max_sequence
+            FROM events e
+            WHERE e.run_id = ? AND e.sequence = ?
+          `).get(run.id, checkpoint.eventSequence) as {
+            id: string;
+            sequence: number;
+            event_type: string;
+            occurred_at: string;
+            summary: string;
+            payload_json: string;
+            mission_id: string | null;
+            journey: string;
+            max_sequence: number;
+          } | undefined;
+          if (
+            !checkpointEvent || checkpointEvent.sequence !== checkpoint.eventSequence ||
+            checkpointEvent.mission_id !== run.mission_id || checkpointEvent.journey !== run.journey
+          ) return false;
+
+          const parsePayload = (value: string): Record<string, unknown> | undefined => {
+            try {
+              const parsed = JSON.parse(value) as unknown;
+              if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
+              return parsed as Record<string, unknown>;
+            } catch {
+              return undefined;
+            }
+          };
+          const checkpointPayload = parsePayload(checkpointEvent.payload_json);
+          if (!checkpointPayload) return false;
+
+          let boundaryEvent = checkpointEvent;
+          let payload = checkpointPayload;
+          let exactLegacySafeStopTail = false;
+          if (run.status === "planning") {
+            if (
+              checkpointEvent.max_sequence !== checkpoint.eventSequence ||
+              checkpointEvent.summary !== run.status_reason
+            ) return false;
+          } else {
+            const safeStopType = run.journey === "autonomous"
+              ? "run.autonomous_safe_stopped"
+              : "run.guided_blocked";
+            if (checkpointEvent.event_type === safeStopType) {
+              if (
+                checkpointEvent.max_sequence !== checkpoint.eventSequence ||
+                checkpointEvent.summary !== run.status_reason
+              ) return false;
+            } else {
+              // Older pre-plan safe stops committed the verified transition
+              // checkpoint first, then appended exactly one semantic stop event.
+              // Accept only that adjacent, terminal tail; it remains explanatory
+              // state and never authorizes replay or resume.
+              if (
+                checkpointEvent.event_type !== "run.state_changed" ||
+                checkpointEvent.max_sequence !== checkpoint.eventSequence + 1 ||
+                checkpointPayload.from !== "planning" || checkpointPayload.to !== "blocked" ||
+                checkpointPayload.stateVersion !== run.version
+              ) return false;
+              const tail = this.database.prepare(`
+                SELECT id, sequence, event_type, occurred_at, summary, payload_json,
+                  mission_id, journey, sequence AS max_sequence
+                FROM events WHERE run_id = ? AND sequence = ?
+              `).get(run.id, checkpoint.eventSequence + 1) as typeof checkpointEvent;
+              if (
+                !tail || tail.event_type !== safeStopType ||
+                tail.mission_id !== run.mission_id || tail.journey !== run.journey
+              ) return false;
+              const tailPayload = parsePayload(tail.payload_json);
+              if (!tailPayload) return false;
+              boundaryEvent = tail;
+              payload = tailPayload;
+              exactLegacySafeStopTail = true;
+            }
+          }
+
+          /* payload was parsed above from the exact checkpoint or adjacent tail. */
+          /* istanbul ignore next -- retained as an explicit type narrowing guard. */
+          if (!payload) return false;
+
+          const planningStart = this.database.prepare(`
+            SELECT id, sequence, occurred_at
+            FROM events
+            WHERE run_id = ? AND sequence < ? AND event_type IN (
+              'run.autonomous_planning_started',
+              'run.guided_planning_started',
+              'run.planning_retry_started'
+            )
+            ORDER BY sequence DESC LIMIT 1
+          `).get(run.id, boundaryEvent.sequence) as {
+            id: string;
+            sequence: number;
+            occurred_at: string;
+          } | undefined;
+          if (!planningStart && !(exactLegacySafeStopTail && checkpoint.eventSequence === 1)) return false;
+
+          const latestTurn = this.database.prepare(`
+            SELECT id, provider, model, status, error_category, started_at, ended_at
+            FROM provider_turns
+            WHERE run_id = ?
+            ORDER BY COALESCE(ended_at, started_at) DESC, started_at DESC, rowid DESC
+            LIMIT 1
+          `).get(run.id) as {
+            id: string;
+            provider: string;
+            model: string | null;
+            status: string;
+            error_category: string | null;
+            started_at: string;
+            ended_at: string | null;
+          } | undefined;
+          const planningBoundaryAt = Date.parse(planningStart?.occurred_at ?? run.started_at);
+          const providerStartedAt = Date.parse(latestTurn?.started_at ?? "");
+          const providerEndedAt = Date.parse(latestTurn?.ended_at ?? "");
+          const eventOccurredAt = Date.parse(boundaryEvent.occurred_at);
+          if (
+            !latestTurn || (latestTurn.status !== "failed" && latestTurn.status !== "cancelled") ||
+            !latestTurn.error_category || !latestTurn.ended_at ||
+            !FAILURE_CATEGORIES.includes(latestTurn.error_category as FailureCategory) ||
+            ![planningBoundaryAt, providerStartedAt, providerEndedAt, eventOccurredAt].every(Number.isFinite) ||
+            providerStartedAt < planningBoundaryAt || providerEndedAt < providerStartedAt ||
+            providerEndedAt > eventOccurredAt
+          ) return false;
+
+          const openContinuations = this.database.prepare(`
+            SELECT id, kind, status, available_at
+            FROM runtime_continuations
+            WHERE run_id = ? AND status IN ('pending', 'processing')
+            ORDER BY created_at, id
+          `).all(run.id) as Array<{
+            id: string;
+            kind: string;
+            status: string;
+            available_at: string;
+          }>;
+          const category = latestTurn.error_category as FailureCategory;
+          const code = typeof payload.code === "string" && payload.code.trim()
+            ? payload.code.trim()
+            : typeof payload.errorCode === "string" && payload.errorCode.trim()
+              ? payload.errorCode.trim()
+              : undefined;
+          if (!code) return false;
+
+          let retryScheduled: {
+            continuationId: string;
+            notBefore: string;
+            retryCount: number;
+          } | undefined;
+          let retryAfterMs: number | undefined;
+          if (run.status === "planning") {
+            if (run.journey !== "autonomous" || boundaryEvent.event_type !== "run.planning_retry_scheduled") return false;
+            const retry = checkpoint.state.control.planningRetry;
+            if (!retry || typeof retry !== "object" || Array.isArray(retry)) return false;
+            const item = retry as Record<string, unknown>;
+            if (
+              typeof item.continuationId !== "string" ||
+              typeof item.notBefore !== "string" ||
+              typeof item.retryCount !== "number" || !Number.isSafeInteger(item.retryCount) ||
+              item.failureCategory !== category || item.errorCode !== code ||
+              payload.continuationId !== item.continuationId ||
+              payload.failureCategory !== category || payload.retryCount !== item.retryCount ||
+              payload.nextEligibility !== item.notBefore ||
+              openContinuations.length !== 1 ||
+              openContinuations[0]?.id !== item.continuationId ||
+              openContinuations[0]?.kind !== "planning_retry_to_dispatch" ||
+              openContinuations[0]?.status !== "pending" ||
+              openContinuations[0]?.available_at !== item.notBefore
+            ) return false;
+            retryScheduled = {
+              continuationId: item.continuationId,
+              notBefore: item.notBefore,
+              retryCount: item.retryCount,
+            };
+            retryAfterMs = typeof payload.retryAfterMs === "number" &&
+              Number.isFinite(payload.retryAfterMs) && payload.retryAfterMs >= 0
+              ? payload.retryAfterMs
+              : undefined;
+          } else {
+            if (
+              (run.journey === "autonomous" && boundaryEvent.event_type !== "run.autonomous_safe_stopped") ||
+              (run.journey === "guided" && boundaryEvent.event_type !== "run.guided_blocked") ||
+              payload.category !== category || openContinuations.length !== 0
+            ) return false;
+            const classification = this.database.prepare(
+              "SELECT in_flight_classification FROM checkpoints WHERE id = ?",
+            ).get(checkpoint.id) as { in_flight_classification: string | null } | undefined;
+            if (classification?.in_flight_classification !== "safe_no_in_flight_action") return false;
+          }
+
+          const runtimeError = new CommandRuntimeError(
+            category === "rate_limit" ? 429 : category === "timeout" ? 504 : 503,
+            code,
+            "Canonical planning provider failure",
+            {
+              humanMessage: boundaryEvent.summary,
+              retryable: Boolean(retryScheduled),
+              category,
+              remediation: retryScheduled
+                ? `Wait until ${retryScheduled.notBefore}; the exact persisted retry remains the only scheduled work.`
+                : "Test the provider, then start a new run. This failed run remains preserved and cannot be resumed from historical events.",
+            },
+          );
+          return this.persistPlanningFailureDiagnosis({
+            runId: run.id,
+            originalError: runtimeError,
+            runtimeError,
+            category,
+            ...(retryAfterMs === undefined ? {} : { retryAfterMs }),
+            checkpointId: checkpoint.id,
+            boundaryEventId: boundaryEvent.id,
+            exactProviderTurnId: latestTurn.id,
+            latestTurnOnly: true,
+            ...(retryScheduled ? { retryScheduled } : {}),
+            terminal: run.status === "blocked",
+          });
+        });
+        if (reconciled) created += 1;
+      } catch {
+        // Corrupt, stale, or concurrently changed boundaries remain untouched.
+      }
+    }
+    return created;
+  }
+
+  private async safeStopPlanning(
+    runId: string,
+    lease: RunLeaseToken,
+    error: CommandRuntimeError,
+  ): Promise<string | undefined> {
+    try {
+      return inImmediateTransaction(this.database, () => {
+        const current = this.coordinator.getRun(runId);
+        if (isTerminalRunState(current.run.state)) return undefined;
+        if (current.run.state === "blocked") {
+          return new CheckpointRepository(this.database, new ActionRepository(this.database)).latest(runId)?.id;
+        }
+        const transition = this.coordinator.transitionRun({
+          lease,
+          to: "blocked",
+          reason: error.options.humanMessage ?? error.message,
+        });
+        const event = this.repository.events.append({
+          missionId: transition.run.run.missionId,
+          runId,
+          journey: transition.run.run.journey,
+          eventType: transition.run.run.journey === "autonomous"
+            ? "run.autonomous_safe_stopped"
+            : "run.guided_blocked",
+          actorType: "system",
+          summary: error.options.humanMessage ?? error.message,
+          payload: {
+            code: error.code,
+            category: error.options.category ?? "runtime",
+            ...(error.code === "invalid_plan" && error.options.details
+              && typeof error.options.details === "object" && !Array.isArray(error.options.details)
+              && typeof error.options.details.validationField === "string"
+              && typeof error.options.details.validationRule === "string"
+              ? {
+                  validationField: error.options.details.validationField,
+                  validationRule: error.options.details.validationRule,
+                }
+              : {}),
+          },
+        });
+        const actions = new ActionRepository(this.database);
+        const checkpoint = new CheckpointRepository(this.database, actions).create({
+          run: transition.run,
+          eventSequence: event.sequence,
+          now: this.timestamp(),
+          inFlightClassification: actions.inFlight(runId).length === 0
+            ? "safe_no_in_flight_action"
+            : "review_required",
+        });
+        return checkpoint.id;
       });
     } catch {
       // A newer fenced owner won the race; never overwrite it with stale planning output.
+      return undefined;
     }
   }
 
@@ -1528,6 +2357,135 @@ export class MissionRuntimeEngine implements ExecutionResultSink {
     }
   }
 
+  private persistExecutionFailureDiagnosis(
+    result: ExecutionResult,
+    completed: CompleteActionResult,
+  ): void {
+    if (result.success) return;
+    const existing = this.database.prepare(`
+      SELECT id FROM failure_diagnoses WHERE action_id = ? ORDER BY created_at, id LIMIT 1
+    `).get(result.actionId) as { id: string } | undefined;
+    if (existing) return;
+
+    const actionRow = this.database.prepare(`
+      SELECT assignment_id, normalized_arguments_json FROM actions WHERE id = ?
+    `).get(result.actionId) as {
+      assignment_id: string | null;
+      normalized_arguments_json: string;
+    } | undefined;
+    const operationalCategory = operationalFailureCategory(result.failureCategory, completed.action.kind);
+    const retryable = Boolean(
+      result.failureCategory
+      && isRetryableCategory(result.failureCategory)
+      && completed.directive === "retry",
+    );
+    const code = (result.failure?.code || `action_${result.failureCategory ?? "unknown"}`)
+      .replace(/[^A-Za-z0-9._:@/-]+/gu, "-")
+      .slice(0, 240) || "action_failure";
+    const retries = this.database.prepare(`
+      SELECT id, status, error_category, retry_count, ended_at
+      FROM actions WHERE run_id = ? AND fingerprint = ?
+        AND status IN ('failed', 'timed_out', 'denied')
+      ORDER BY created_at, id
+    `).all(result.runId, completed.action.fingerprint) as Array<{
+      id: string;
+      status: string;
+      error_category: string | null;
+      retry_count: number;
+      ended_at: string | null;
+    }>;
+    const canonicalInput = (() => {
+      try { return JSON.parse(actionRow?.normalized_arguments_json ?? "{}") as Record<string, unknown>; }
+      catch { return {}; }
+    })();
+    const mcpServer = typeof canonicalInput.input === "object" && canonicalInput.input
+      && !Array.isArray(canonicalInput.input)
+      && typeof (canonicalInput.input as Record<string, unknown>).mcpServer === "string"
+      ? (canonicalInput.input as Record<string, unknown>).mcpServer as string
+      : undefined;
+    const toolName = typeof canonicalInput.input === "object" && canonicalInput.input
+      && !Array.isArray(canonicalInput.input)
+      && typeof (canonicalInput.input as Record<string, unknown>).toolName === "string"
+      ? (canonicalInput.input as Record<string, unknown>).toolName as string
+      : undefined;
+    const failedComponentRef = mcpServer && toolName
+      ? `${mcpServer}.${toolName}`.slice(0, 1_000)
+      : completed.action.kind === "tool" ? "reviewed MCP execution boundary" : "enforced provider execution boundary";
+
+    try {
+      new FailureDiagnosisService(this.database, { clock: this.now }).create({
+        missionId: completed.action.missionId,
+        runId: completed.action.runId,
+        stepId: completed.action.stepId,
+        ...(actionRow?.assignment_id ? { assignmentId: actionRow.assignment_id } : {}),
+        actionId: completed.action.id,
+        subjectType: "action",
+        subjectId: completed.action.id,
+        humanReason: result.failureCategory === "invalid_input"
+          ? "The action stopped before MCP execution because its persisted arguments did not satisfy the fresh reviewed tool input schema."
+          : `The represented ${completed.action.kind.replaceAll("_", " ")} action failed and did not advance the current objective.`,
+        category: operationalCategory,
+        code,
+        originatingComponent: completed.action.kind === "tool"
+          ? "command-runtime.mcp-boundary"
+          : "command-runtime.provider-boundary",
+        failedComponentRef,
+        targetSummary: `The exact target remains on canonical action ${completed.action.id}; no broader target was inferred.`,
+        policyOrDependency: result.failureCategory === "invalid_input"
+          ? "Fresh tools/list input schema and concrete canonical arguments are required before dispatch."
+          : `Recovery remains constrained by the signed ${completed.run.run.journey} mission boundary.`,
+        retryHistory: retries.map((retry) => ({
+          actionId: retry.id,
+          status: retry.status,
+          category: retry.error_category,
+          retryCount: retry.retry_count,
+          endedAt: retry.ended_at,
+        })),
+        progressBeforeFailure: JSON.parse(JSON.stringify(result.progress)) as unknown,
+        preservedReferences: [{
+          kind: "checkpoint",
+          id: completed.checkpointId,
+          meaning: "Durable checkpoint created with the terminal action result",
+        }],
+        retryable,
+        automaticRecovery: {
+          directive: completed.directive,
+          reason: completed.reason,
+          loopKinds: completed.loopKinds,
+        },
+        remediation: result.failureCategory === "invalid_input"
+          ? "Create a new versioned plan step with a concrete value and exact schema-defined argument names; do not repeat this action unchanged."
+          : retryable
+            ? "Test the dependency, then use only the declared bounded retry after its backoff and remaining budget are verified."
+            : "Review the preserved failure, amend the plan with materially different valid parameters, or start a new run.",
+        operatorActions: failureOperatorActions(operationalCategory, retryable),
+        objectiveImpact: "This action produced no verified objective progress. Remaining success criteria are unresolved until a valid replacement succeeds or the mission closes inconclusively.",
+        terminal: completed.directive === "blocked" || completed.directive === "failed",
+        actor: { id: this.workerId, type: "worker" },
+      });
+    } catch (error) {
+      this.database.prepare(`
+        INSERT INTO structured_logs (
+          id, mission_id, run_id, step_id, action_id, severity, domain,
+          message, attributes_json, sensitivity, occurred_at
+        ) VALUES (?, ?, ?, ?, ?, 'error', 'command-runtime.failure-diagnosis', ?, ?, 'internal', ?)
+      `).run(
+        `log_${randomUUID()}`,
+        completed.action.missionId,
+        completed.action.runId,
+        completed.action.stepId,
+        completed.action.id,
+        "Canonical action failure was committed but its structured diagnosis could not be persisted",
+        JSON.stringify({
+          code: "failure_diagnosis_persistence_failed",
+          errorType: error instanceof Error ? error.name : "unknown",
+          rawErrorPersisted: false,
+        }),
+        this.timestamp(),
+      );
+    }
+  }
+
   async acceptExecutionResult(result: ExecutionResult): Promise<ExecutionResultReceipt> {
     const summary = validateExecutionResultSummary(result.summary);
     const row = this.database.prepare(`
@@ -1542,6 +2500,10 @@ export class MissionRuntimeEngine implements ExecutionResultSink {
         category: "conflict",
       });
     }
+    // An imported or transferred action result cannot be acknowledged even as
+    // a duplicate. Ownership is re-read after correlation and before any
+    // duplicate receipt or canonical mutation is produced.
+    this.assertV2ControlPlaneOwnership(result.runId);
     if (row.status !== "running") {
       const run = this.repository.getRunProjection(result.runId);
       return {
@@ -1613,14 +2575,18 @@ export class MissionRuntimeEngine implements ExecutionResultSink {
       });
       completionCommitted = true;
       this.actionContexts.delete(result.actionId);
+      this.persistExecutionFailureDiagnosis(result, completed);
       if (result.success && completed.directive === "continue") {
         this.crashAfterCommit("action_result_to_advance", result.runId, result.actionId);
       } else if (!result.success && completed.directive === "recover") {
         this.crashAfterCommit("guided_failure_to_recover", result.runId, result.actionId);
+      } else if (!result.success && completed.directive === "replan") {
+        this.crashAfterCommit("resume_recovery_pending", result.runId, result.actionId);
       }
       if (
         (result.success && completed.directive === "continue") ||
         completed.directive === "recover" ||
+        completed.directive === "replan" ||
         completed.run.run.state === "failed"
       ) {
         await this.replayContinuations(result.runId);
@@ -1728,6 +2694,7 @@ export class MissionRuntimeEngine implements ExecutionResultSink {
 
   async approveGuidedDecision(decisionId: string, actorId: string, reason?: string): Promise<DurableAction> {
     const existingDecision = this.repository.getDecision(decisionId);
+    this.assertV2ControlPlaneOwnership(existingDecision.runId);
     if (existingDecision.status !== "pending") {
       const existing = this.database.prepare(`
         SELECT id FROM actions WHERE guided_decision_id = ? ORDER BY created_at LIMIT 1
@@ -1750,11 +2717,18 @@ export class MissionRuntimeEngine implements ExecutionResultSink {
         },
       );
     }
+    this.ensureControlPlaneAuthority(decision.runId);
     if (Date.parse(decision.expiresAt) <= Date.parse(now)) {
-      this.database.prepare("UPDATE guided_decisions SET status = 'expired' WHERE id = ? AND status = 'pending'").run(decisionId);
+      inImmediateTransaction(this.database, () => {
+        this.assertCurrentControlPlaneAuthority(decision.runId);
+        this.database.prepare(
+          "UPDATE guided_decisions SET status = 'expired' WHERE id = ? AND status = 'pending'",
+        ).run(decisionId);
+      });
       throw new CommandRuntimeError(409, "guided_decision_expired", "The Guided decision expired");
     }
     inImmediateTransaction(this.database, () => {
+      this.assertCurrentControlPlaneAuthority(decision.runId);
       // Repeat the complete boundary under the write reservation so a plan,
       // step, or current-decision change cannot race the status mutation.
       this.repository.requireCurrentPendingDecision(decisionId);
@@ -1809,6 +2783,7 @@ export class MissionRuntimeEngine implements ExecutionResultSink {
   ): Promise<GuidedDecisionSkipResult> {
     const normalizedReason = validateReason(reason);
     const decision = this.repository.getDecision(decisionId);
+    this.assertV2ControlPlaneOwnership(decision.runId);
     const skipped = this.database.prepare(`
       SELECT ps.status AS step_status,
         EXISTS(
@@ -1870,9 +2845,11 @@ export class MissionRuntimeEngine implements ExecutionResultSink {
       });
     }
 
+    this.ensureControlPlaneAuthority(decision.runId);
     const lease = this.controlLease(decision.runId);
     const now = this.timestamp();
     const committed = inImmediateTransaction(this.database, () => {
+      this.assertCurrentControlPlaneAuthority(decision.runId);
       const runs = new RunRepository(this.database);
       const current = runs.get(decision.runId);
       runs.assertLease(current, lease, now);
@@ -1980,11 +2957,14 @@ export class MissionRuntimeEngine implements ExecutionResultSink {
   async rejectGuidedDecision(decisionId: string, actorId: string, reason: string): Promise<void> {
     const normalizedReason = validateReason(reason);
     const existingDecision = this.repository.getDecision(decisionId);
+    this.assertV2ControlPlaneOwnership(existingDecision.runId);
     if (existingDecision.status === "rejected") return;
     if (existingDecision.status !== "pending") throw new CommandRuntimeError(409, "guided_decision_not_pending", "Only a pending decision can be rejected");
     const decision = this.repository.requireCurrentPendingDecision(decisionId);
+    this.ensureControlPlaneAuthority(decision.runId);
     const lease = this.controlLease(decision.runId);
     inImmediateTransaction(this.database, () => {
+      this.assertCurrentControlPlaneAuthority(decision.runId);
       this.repository.requireCurrentPendingDecision(decisionId);
       const updated = this.database.prepare(`
         UPDATE guided_decisions SET status = 'rejected', decision_actor = ?, decision_reason = ?, decided_at = ?
@@ -2025,6 +3005,8 @@ export class MissionRuntimeEngine implements ExecutionResultSink {
   ): Promise<ExecutionResultReceipt> {
     const normalized = validateExecutionResultSummary(summary);
     const decision = this.repository.getDecision(decisionId);
+    this.assertV2ControlPlaneOwnership(decision.runId);
+    this.ensureControlPlaneAuthority(decision.runId);
     if (decision.status === "manual") {
       const existing = this.database.prepare(`
         SELECT id, result_summary FROM actions
@@ -2043,7 +3025,9 @@ export class MissionRuntimeEngine implements ExecutionResultSink {
       `).get(existing.id) as { id: string } | undefined;
       const evidence = linked
         ? { id: linked.id }
-        : this.repository.transaction(() => interpretedEvidenceId
+        : this.repository.transaction(() => {
+          this.assertCurrentControlPlaneAuthority(decision.runId);
+          return interpretedEvidenceId
           ? this.repository.promoteInterpretedGuidedEvidence({
               decision,
               actionId: existing.id,
@@ -2057,7 +3041,8 @@ export class MissionRuntimeEngine implements ExecutionResultSink {
               actorId,
               content: existing.result_summary!,
               now: this.timestamp(),
-            }));
+            });
+        });
       const projection = this.repository.getRunProjection(decision.runId);
       return {
         accepted: true,
@@ -2073,6 +3058,7 @@ export class MissionRuntimeEngine implements ExecutionResultSink {
     const lease = this.controlLease(decision.runId);
     const now = this.timestamp();
     const { accepted, runningLease } = inImmediateTransaction(this.database, () => {
+      this.assertCurrentControlPlaneAuthority(decision.runId);
       const runs = new RunRepository(this.database);
       const current = runs.get(decision.runId);
       runs.assertLease(current, lease, now);
@@ -2200,20 +3186,191 @@ export class MissionRuntimeEngine implements ExecutionResultSink {
     };
   }
 
-  pauseRun(runId: string, actorId: string, reason: string): void {
-    const normalized = validateReason(reason);
-    const inFlight = this.database.prepare(`
-      SELECT id FROM actions WHERE run_id = ? AND status IN ('queued', 'running') LIMIT 1
-    `).get(runId) as { id: string } | undefined;
-    if (inFlight) {
-      throw new CommandRuntimeError(409, "pause_requires_safe_checkpoint", "An in-flight action cannot be safely paused", {
-        humanMessage: "Pause is available at a durable checkpoint; cancel if active child work must stop now.",
+  private assertNoExecutionWork(runId: string, operation: "pause" | "resume"): void {
+    const active = this.database.prepare(`
+      SELECT kind, id FROM (
+        SELECT 'action' AS kind, id FROM actions
+          WHERE run_id = ? AND status IN ('queued', 'running')
+        UNION ALL
+        SELECT 'tool_call' AS kind, tc.id FROM tool_calls tc
+          JOIN actions a ON a.id = tc.action_id
+          WHERE a.run_id = ? AND tc.status IN ('queued', 'running')
+        UNION ALL
+        SELECT 'assignment' AS kind, id FROM assignments
+          WHERE run_id = ? AND (status = 'active' OR lease_owner IS NOT NULL)
+        UNION ALL
+        SELECT 'provider_turn' AS kind, id FROM provider_turns
+          WHERE run_id = ? AND status = 'started'
+        UNION ALL
+        SELECT 'runtime_continuation' AS kind, id FROM runtime_continuations
+          WHERE run_id = ? AND status IN ('pending', 'processing')
+      ) LIMIT 1
+    `).get(runId, runId, runId, runId, runId) as { kind: string; id: string } | undefined;
+    if (!active) return;
+    throw new CommandRuntimeError(
+      409,
+      operation === "pause" ? "pause_requires_safe_checkpoint" : "resume_has_in_flight_work",
+      `${operation === "pause" ? "Pause" : "Resume"} requires a zero-in-flight durable boundary`,
+      {
+        humanMessage: operation === "pause"
+          ? "Pause is available only after actions, provider turns, assignments, and durable continuations have stopped."
+          : "The inspected checkpoint no longer has a zero-in-flight runtime boundary.",
         category: "conflict",
+        details: { blockingWorkKind: active.kind, blockingWorkId: active.id },
+        remediation: operation === "pause"
+          ? "Wait for the named work item to stop, or cancel the run if active child work must be terminated."
+          : "Keep the run stopped, reconcile the named work item, then refresh the Recovery Panel.",
+      },
+    );
+  }
+
+  private assertExactResumeBoundary(
+    runId: string,
+    boundary: ResumeRunBoundary,
+    currentVersion: number,
+    lease?: RunLeaseToken,
+  ) {
+    let checkpoint: ReturnType<DurableRunCoordinator["getLatestCheckpoint"]>;
+    try {
+      checkpoint = this.coordinator.getLatestCheckpoint(runId);
+    } catch {
+      throw new CommandRuntimeError(409, "resume_checkpoint_integrity_failed", "Resume checkpoint integrity verification failed", {
+        humanMessage: "The latest durable checkpoint failed integrity verification and cannot be resumed.",
+        category: "data_integrity",
+        remediation: "Keep the run stopped and reconcile its immutable checkpoint and event history.",
       });
     }
-    const lease = this.controlLease(runId);
+    if (!checkpoint) {
+      throw new CommandRuntimeError(409, "resume_checkpoint_missing", "Resume requires a durable checkpoint", {
+        humanMessage: "No verified durable checkpoint is available for this run.",
+        category: "conflict",
+        remediation: "Keep the run stopped and restore or reconcile its checkpoint before retrying.",
+      });
+    }
     const current = this.coordinator.getRun(runId);
-    if (current.run.state === "blocked") {
+    const latestSequence = this.database.prepare(`
+      SELECT max(
+        coalesce((SELECT last_sequence FROM run_event_sequences WHERE run_id = ?), 0),
+        coalesce((SELECT max(sequence) FROM events WHERE run_id = ?), 0)
+      ) AS sequence
+    `).get(runId, runId) as { sequence: number };
+    const checkpointMetadata = this.database.prepare(`
+      SELECT in_flight_classification FROM checkpoints WHERE id = ? AND run_id = ?
+    `).get(checkpoint.id, runId) as { in_flight_classification: string | null } | undefined;
+    const legacyZeroInFlightCheckpoint = checkpointMetadata?.in_flight_classification === null
+      && checkpoint.state.inFlightActions.length === 0;
+    const checkpointClassificationSafe = checkpointMetadata?.in_flight_classification === "safe_no_in_flight_action"
+      || checkpointMetadata?.in_flight_classification === "resume_idempotently"
+      || legacyZeroInFlightCheckpoint;
+    const latestProviderTurn = this.database.prepare(`
+      SELECT status, error_category FROM provider_turns
+      WHERE run_id = ? ORDER BY started_at DESC, id DESC LIMIT 1
+    `).get(runId) as { status: string; error_category: string | null } | undefined;
+    const planningBoundary = this.database.prepare(`
+      SELECT current_plan_id, current_step_id FROM runs WHERE id = ?
+    `).get(runId) as { current_plan_id: string | null; current_step_id: string | null };
+    const exactCurrentPlanningRateLimit = current.run.journey === "autonomous"
+      && current.run.state === "blocked"
+      && current.run.stateVersion === boundary.expectedRunVersion
+      && planningBoundary.current_plan_id === null
+      && planningBoundary.current_step_id === null
+      && latestProviderTurn?.status === "failed"
+      && latestProviderTurn.error_category === "rate_limit"
+      && checkpoint.id === boundary.expectedCheckpointId
+      && checkpoint.stateHash === boundary.expectedCheckpointStateHash
+      && checkpoint.eventSequence === boundary.expectedCheckpointEventSequence
+      && checkpoint.state.run.id === runId
+      && checkpoint.state.run.missionId === current.run.missionId
+      && checkpoint.state.run.state === "blocked"
+      && checkpoint.state.run.stateVersion === boundary.expectedRunVersion
+      && checkpoint.state.inFlightActions.length === 0;
+    if (exactCurrentPlanningRateLimit) {
+      this.assertNoExecutionWork(runId, "resume");
+      throw new CommandRuntimeError(409, "resume_requires_new_run_after_planning_failure", "Planning failure cannot be resumed in place", {
+        humanMessage: "This run stopped before a plan existed. To avoid replaying stale provider work, keep it preserved and start a new run after provider health recovers.",
+        category: "policy_denied",
+        remediation: "Test the planning provider, then create a new run from this mission. The failed run remains available for diagnosis.",
+      });
+    }
+    const stale =
+      boundary.expectedRunStatus !== "blocked" ||
+      current.run.state !== boundary.expectedRunStatus ||
+      current.run.stateVersion !== currentVersion ||
+      checkpoint.id !== boundary.expectedCheckpointId ||
+      checkpoint.stateHash !== boundary.expectedCheckpointStateHash ||
+      checkpoint.eventSequence !== boundary.expectedCheckpointEventSequence ||
+      checkpoint.state.run.id !== runId ||
+      checkpoint.state.run.missionId !== current.run.missionId ||
+      checkpoint.state.run.journey !== current.run.journey ||
+      checkpoint.state.run.state !== boundary.expectedRunStatus ||
+      checkpoint.state.run.stateVersion !== boundary.expectedRunVersion ||
+      checkpoint.state.run.leaseOwner !== null ||
+      checkpoint.state.run.leaseExpiresAt !== null ||
+      checkpoint.state.lastEventSequence !== boundary.expectedCheckpointEventSequence ||
+      latestSequence.sequence !== boundary.expectedCheckpointEventSequence ||
+      !checkpointClassificationSafe ||
+      (lease
+        ? current.lease?.ownerId !== lease.ownerId ||
+          current.lease.fence !== lease.fence ||
+          current.lease.expiresAt !== lease.expiresAt ||
+          lease.fence !== boundary.expectedRunVersion + 1
+        : current.lease !== null);
+    if (stale) {
+      throw new CommandRuntimeError(409, "resume_checkpoint_stale", "Resume boundary no longer matches canonical state", {
+        humanMessage: "The run or durable checkpoint changed after this resume control was loaded.",
+        category: "conflict",
+        details: {
+          expectedRunVersion: boundary.expectedRunVersion,
+          currentRunVersion: current.run.stateVersion,
+          expectedCheckpointId: boundary.expectedCheckpointId,
+          currentCheckpointId: checkpoint.id,
+        },
+        remediation: "Refresh the Recovery Panel and resume only the newly verified zero-in-flight checkpoint.",
+      });
+    }
+    if (checkpoint.state.inFlightActions.length > 0) {
+      throw new CommandRuntimeError(409, "resume_checkpoint_has_in_flight_actions", "Resume checkpoint contains in-flight actions", {
+        humanMessage: "The latest durable checkpoint records work that may still have side effects.",
+        category: "conflict",
+        remediation: "Keep the run stopped and reconcile every recorded action before resuming.",
+      });
+    }
+    this.assertNoExecutionWork(runId, "resume");
+
+    const pauseReceipt = this.database.prepare(`
+      SELECT id FROM audit_records
+      WHERE run_id = ? AND action = 'run.paused'
+        AND json_extract(details_json, '$.committedRunVersion') = ?
+        AND json_extract(details_json, '$.checkpointId') = ?
+        AND json_extract(details_json, '$.checkpointEventSequence') = ?
+      ORDER BY occurred_at DESC, id DESC LIMIT 1
+    `).get(
+      runId,
+      boundary.expectedRunVersion,
+      boundary.expectedCheckpointId,
+      boundary.expectedCheckpointEventSequence,
+    ) as { id: string } | undefined;
+    const recovery = checkpoint.state.control.recovery;
+    const recoveryKind = recovery && typeof recovery === "object" && !Array.isArray(recovery)
+      ? (recovery as Record<string, unknown>).kind
+      : undefined;
+    const operatorPaused = /^Paused by operator:/iu.test(current.run.stateReason) && Boolean(pauseReceipt);
+    if (!operatorPaused && recoveryKind !== "retry" && recoveryKind !== "replan") {
+      throw new CommandRuntimeError(409, "resume_not_permitted_for_blocked_state", "Blocked run has no current resumable boundary", {
+        humanMessage: "This blocked state is neither the exact operator pause nor a current, checkpoint-bound recovery directive.",
+        category: "policy_denied",
+        remediation: "Use the server-declared Recovery Panel action or start a new run; historical events cannot authorize resume.",
+      });
+    }
+    return current;
+  }
+
+  pauseRun(runId: string, actorId: string, reason: string): void {
+    const normalized = validateReason(reason);
+    this.assertV2ControlPlaneOwnership(runId);
+    this.assertNoExecutionWork(runId, "pause");
+    const beforeAuthority = this.coordinator.getRun(runId);
+    if (beforeAuthority.run.state === "blocked") {
       const paused = this.database.prepare(`
         SELECT id FROM audit_records
         WHERE run_id = ? AND action = 'run.paused'
@@ -2222,134 +3379,303 @@ export class MissionRuntimeEngine implements ExecutionResultSink {
       if (paused) return;
       throw new CommandRuntimeError(409, "run_blocked_not_paused", "Blocked run requires recovery rather than pause");
     }
-    const now = this.timestamp();
-    inImmediateTransaction(this.database, () => {
-      const result = this.coordinator.transitionRun({
-        lease,
-        to: "blocked",
-        reason: `Paused by operator: ${normalized}`,
+    this.ensureControlPlaneAuthority(runId);
+    try {
+      const now = this.timestamp();
+      inImmediateTransaction(this.database, () => {
+        this.assertCurrentControlPlaneAuthority(runId);
+        const lease = this.controlLease(runId);
+        const current = this.coordinator.getRun(runId);
+        if (current.run.state === "blocked") {
+          throw new CommandRuntimeError(409, "run_pause_raced", "Run changed while pause authority was acquired");
+        }
+        this.assertNoExecutionWork(runId, "pause");
+        const result = this.coordinator.transitionRun({
+          lease,
+          to: "blocked",
+          reason: `Paused by operator: ${normalized}`,
+        });
+        this.database.prepare("UPDATE missions SET status = 'paused', updated_at = ? WHERE id = ?")
+          .run(now, result.run.run.missionId);
+        this.repository.appendAudit({
+          missionId: result.run.run.missionId, runId, actorId, action: "run.paused",
+          resourceType: "run", resourceId: runId, reason: normalized,
+          details: {
+            committedRunVersion: result.run.run.stateVersion,
+            checkpointId: result.checkpointId,
+            checkpointEventSequence: result.eventSequence,
+          },
+          now,
+        });
       });
-      this.database.prepare("UPDATE missions SET status = 'paused', updated_at = ? WHERE id = ?")
-        .run(now, result.run.run.missionId);
-      this.repository.appendAudit({
-        missionId: result.run.run.missionId, runId, actorId, action: "run.paused",
-        resourceType: "run", resourceId: runId, reason: normalized, now,
-      });
-    });
-    this.crashAfterCommit("pause_projection_committed", runId);
+      this.crashAfterCommit("pause_projection_committed", runId);
+    } finally {
+      this.releaseControlPlaneAuthority(runId);
+    }
   }
 
-  resumeRun(runId: string, actorId: string, reason: string): void {
+  resumeRun(runId: string, actorId: string, reason: string, boundary: ResumeRunBoundary): void {
     const normalized = validateReason(reason);
-    const successor = this.database.prepare(`
-      SELECT rb.run_id, r.status
-      FROM run_branches rb
-      JOIN runs r ON r.id = rb.run_id
-      WHERE rb.source_run_id = ?
-      ORDER BY rb.created_at DESC, rb.id DESC LIMIT 1
-    `).get(runId) as { run_id: string; status: string } | undefined;
-    if (successor) {
-      throw new CommandRuntimeError(409, "run_superseded_by_branch", "A branched source run cannot resume", {
-        humanMessage: "This paused run was superseded by an explicit new execution attempt and cannot run alongside it.",
-        category: "conflict",
-        details: { successorRunId: successor.run_id, successorStatus: successor.status },
-      });
-    }
-    const current = this.coordinator.getRun(runId);
-    if (current.run.state !== "blocked") throw new CommandRuntimeError(409, "run_not_paused", "Only a blocked run can resume");
-    const recoveryRetry = current.run.journey === "autonomous" && current.control.recovery?.kind === "retry"
-      ? this.database.prepare(`
-          SELECT a.id AS action_id, a.step_id
-          FROM actions a JOIN runs r ON r.id = a.run_id
-          WHERE a.id = ? AND a.run_id = ? AND a.status IN ('failed', 'timed_out')
-            AND r.current_step_id = a.step_id
-        `).get(current.control.recovery.failedActionId, runId) as {
-          action_id: string;
-          step_id: string;
-        } | undefined
-      : undefined;
-    if (current.control.recovery?.kind === "retry" && current.run.journey === "autonomous" && !recoveryRetry) {
-      throw new CommandRuntimeError(409, "recovery_retry_predecessor_stale", "The exact recovery predecessor is no longer current", {
-        humanMessage: "Refresh recovery state; the failed predecessor no longer matches the current step.",
-        category: "conflict",
-      });
-    }
-    const lease = this.controlLease(runId);
     let target: RunState = "recovering";
     let continuationKind: RuntimeContinuationKind = "resume_recovery_pending";
+    let keepAuthorityForRecovery = false;
     const now = this.timestamp();
-    inImmediateTransaction(this.database, () => {
-      const pending = this.database.prepare(`
-        SELECT id FROM guided_decisions WHERE run_id = ? AND status = 'pending' ORDER BY created_at DESC LIMIT 1
-      `).get(runId) as { id: string } | undefined;
-      target = current.run.journey === "guided" && pending ? "waiting_guided_decision" : "recovering";
-      const transitioned = this.coordinator.transitionRun({
-        lease,
-        to: target,
-        reason: `Resumed by operator: ${normalized}`,
-        ...(pending ? { guidedDecisionId: pending.id } : {}),
-      });
-      this.database.prepare("UPDATE missions SET status = 'active', updated_at = ? WHERE id = ?")
-        .run(now, current.run.missionId);
-      this.repository.appendAudit({
-        missionId: current.run.missionId, runId, actorId, action: "run.resumed",
-        resourceType: "run", resourceId: runId, reason: normalized, now,
-      });
-      if (target === "recovering") {
-        if (recoveryRetry) {
-          continuationKind = "autonomous_retry_to_dispatch";
-          this.continuations.enqueue({
-            runId,
-            kind: continuationKind,
-            sourceId: recoveryRetry.action_id,
-            payload: { actionId: recoveryRetry.action_id, stepId: recoveryRetry.step_id },
-            now,
-          });
-        } else {
-          this.continuations.enqueue({
-            runId,
-            kind: continuationKind,
-            sourceId: String(transitioned.run.run.stateVersion),
-            now,
+    this.assertV2ControlPlaneOwnership(runId);
+    this.assertExactResumeBoundary(runId, boundary, boundary.expectedRunVersion);
+    this.ensureControlPlaneAuthority(runId);
+    try {
+      inImmediateTransaction(this.database, () => {
+        this.assertCurrentControlPlaneAuthority(runId);
+        // Acquire the durable run fence inside the same IMMEDIATE transaction
+        // as every repeated boundary check. Any failed check rolls the lease
+        // version back instead of stranding a blocked run behind a stale fence.
+        const lease = this.controlLease(runId);
+        const current = this.assertExactResumeBoundary(
+          runId,
+          boundary,
+          boundary.expectedRunVersion + 1,
+          lease,
+        );
+        const successor = this.database.prepare(`
+          SELECT rb.run_id, r.status
+          FROM run_branches rb
+          JOIN runs r ON r.id = rb.run_id
+          WHERE rb.source_run_id = ?
+          ORDER BY rb.created_at DESC, rb.id DESC LIMIT 1
+        `).get(runId) as { run_id: string; status: string } | undefined;
+        if (successor) {
+          throw new CommandRuntimeError(409, "run_superseded_by_branch", "A branched source run cannot resume", {
+            humanMessage: "This paused run was superseded by an explicit new execution attempt and cannot run alongside it.",
+            category: "conflict",
+            details: { successorRunId: successor.run_id, successorStatus: successor.status },
           });
         }
-      }
-    });
-    this.crashAfterCommit("resume_projection_committed", runId);
-    if (target === "recovering") void this.replayContinuations(runId, [continuationKind]);
+        const planBoundary = this.database.prepare(`
+          SELECT current_plan_id, current_step_id
+          FROM runs WHERE id = ?
+        `).get(runId) as {
+          current_plan_id: string | null;
+          current_step_id: string | null;
+        };
+        const recoveryRetry = current.run.journey === "autonomous" && current.control.recovery?.kind === "retry"
+          ? this.database.prepare(`
+              SELECT a.id AS action_id, a.step_id
+              FROM actions a JOIN runs r ON r.id = a.run_id
+              WHERE a.id = ? AND a.run_id = ? AND a.status IN ('failed', 'timed_out')
+                AND r.current_step_id = a.step_id
+            `).get(current.control.recovery.failedActionId, runId) as {
+              action_id: string;
+              step_id: string;
+            } | undefined
+          : undefined;
+        if (current.control.recovery?.kind === "retry" && current.run.journey === "autonomous" && !recoveryRetry) {
+          throw new CommandRuntimeError(409, "recovery_retry_predecessor_stale", "The exact recovery predecessor is no longer current", {
+            humanMessage: "Refresh recovery state; the failed predecessor no longer matches the current step.",
+            category: "conflict",
+          });
+        }
+        if (current.run.journey === "autonomous" && planBoundary.current_plan_id && !recoveryRetry) {
+          throw new CommandRuntimeError(
+            409,
+            "autonomous_resume_plan_boundary_unverifiable",
+            "Paused Autonomous plan continuation is not cryptographically bound to this checkpoint",
+            {
+              humanMessage: "This Autonomous run has an existing plan, but the saved checkpoint cannot yet prove the exact plan and step continuation. The run remains safely stopped and was not replanned.",
+              category: "data_integrity",
+              details: {
+                planId: planBoundary.current_plan_id,
+                currentStepId: planBoundary.current_step_id,
+              },
+              remediation: "Start a new run from this mission so planning and execution receive a new signed, fully checkpointed boundary.",
+            },
+          );
+        }
+        const currentStepBoundary = this.database.prepare(
+          "SELECT current_step_id FROM runs WHERE id = ?",
+        ).get(runId) as { current_step_id: string | null };
+        const pending = currentStepBoundary.current_step_id
+          ? this.database.prepare(`
+              SELECT id FROM guided_decisions
+              WHERE run_id = ? AND step_id = ? AND status = 'pending' AND expires_at > ?
+              ORDER BY created_at DESC, id DESC LIMIT 1
+            `).get(runId, currentStepBoundary.current_step_id, now) as { id: string } | undefined
+          : undefined;
+        target = current.run.journey === "guided" && pending ? "waiting_guided_decision" : "recovering";
+        const transitioned = this.coordinator.transitionRun({
+          lease,
+          to: target,
+          reason: `Resumed by operator: ${normalized}`,
+          ...(pending ? { guidedDecisionId: pending.id } : {}),
+        });
+        this.database.prepare("UPDATE missions SET status = 'active', updated_at = ? WHERE id = ?")
+          .run(now, current.run.missionId);
+        this.repository.appendAudit({
+          missionId: current.run.missionId, runId, actorId, action: "run.resumed",
+          resourceType: "run", resourceId: runId, reason: normalized,
+          details: {
+            committedRunVersion: transitioned.run.run.stateVersion,
+            checkpointId: transitioned.checkpointId,
+            checkpointEventSequence: transitioned.eventSequence,
+            consumedCheckpointId: boundary.expectedCheckpointId,
+            consumedCheckpointStateHash: boundary.expectedCheckpointStateHash,
+            consumedRunVersion: boundary.expectedRunVersion,
+          },
+          now,
+        });
+        if (target === "recovering") {
+          if (recoveryRetry) {
+            continuationKind = "autonomous_retry_to_dispatch";
+            this.continuations.enqueue({
+              runId,
+              kind: continuationKind,
+              sourceId: recoveryRetry.action_id,
+              payload: { actionId: recoveryRetry.action_id, stepId: recoveryRetry.step_id },
+              now,
+            });
+          } else {
+            this.continuations.enqueue({
+              runId,
+              kind: continuationKind,
+              sourceId: String(transitioned.run.run.stateVersion),
+              now,
+            });
+          }
+        }
+      });
+      this.crashAfterCommit("resume_projection_committed", runId);
+      keepAuthorityForRecovery = target === "recovering";
+      if (target === "recovering") void this.replayContinuations(runId, [continuationKind]);
+    } finally {
+      if (!keepAuthorityForRecovery) this.releaseControlPlaneAuthority(runId);
+    }
   }
 
-  async cancelRun(runId: string, actorId: string, reason: string): Promise<void> {
+  async cancelRun(
+    runId: string,
+    actorId: string,
+    reason: string,
+    context?: GuidedStopCancellationContext,
+  ): Promise<void> {
     const normalized = validateReason(reason);
+    this.assertV2ControlPlaneOwnership(runId);
+    this.ensureControlPlaneAuthority(runId);
     const current = this.coordinator.getRun(runId);
     if (isTerminalRunState(current.run.state)) {
       if (current.run.state === "cancelled") {
-        this.learning.recordTerminalEvaluation({
-          runId,
-          terminalStatus: "cancelled",
-          createdBy: "run-supervisor",
+        inImmediateTransaction(this.database, () => {
+          this.assertCurrentControlPlaneAuthority(runId);
+          this.learning.recordTerminalEvaluation({
+            runId,
+            terminalStatus: "cancelled",
+            createdBy: "run-supervisor",
+          });
         });
         await this.replayContinuations(runId, ["evaluation_pending"]);
       }
       return;
     }
-    const result = await this.coordinator.cancelRun({ lease: this.controlLease(runId), reason: normalized });
-    inImmediateTransaction(this.database, () => {
-      const now = this.timestamp();
-      this.repository.cancelOpenWork(runId, actorId, normalized, now);
-      this.database.prepare("UPDATE missions SET status = 'cancelled', updated_at = ? WHERE id = ?")
-        .run(now, result.run.run.missionId);
-      this.repository.appendAudit({
-        missionId: result.run.run.missionId, runId, actorId, action: "run.cancelled",
-        resourceType: "run", resourceId: runId, reason: normalized, now,
+    this.assertCurrentControlPlaneAuthority(runId);
+    let authorityStopped = false;
+    let authorityFailure: unknown;
+    let authorityChain = Promise.resolve();
+    const renewAuthority = () => {
+      if (authorityStopped) return;
+      authorityChain = authorityChain.then(() => {
+        if (!authorityStopped) this.ensureControlPlaneAuthority(runId);
+      }).catch((error: unknown) => {
+        authorityFailure = authorityFailure ?? error;
+        authorityStopped = true;
       });
-      this.learning.recordTerminalEvaluation({
-        runId,
-        terminalStatus: "cancelled",
-        createdBy: "run-supervisor",
+    };
+    const authorityTimer = setInterval(
+      renewAuthority,
+      Math.max(250, Math.floor(this.leaseTtlMs / 3)),
+    );
+    try {
+      const result = await this.coordinator.cancelRun({ lease: this.controlLease(runId), reason: normalized });
+      await authorityChain;
+      if (authorityFailure) throw authorityFailure;
+      inImmediateTransaction(this.database, () => {
+        this.assertCurrentControlPlaneAuthority(runId);
+        const now = this.timestamp();
+        if (context) {
+          const decision = this.repository.getDecision(context.decisionId);
+          if (
+            context.kind !== "guided_stop" ||
+            result.run.run.journey !== "guided" ||
+            result.run.run.missionId !== context.missionId ||
+            decision.missionId !== context.missionId ||
+            decision.runId !== runId ||
+            decision.stepId !== context.stepId ||
+            decision.status !== "cancelled" ||
+            decision.actionFingerprint !== context.actionFingerprint ||
+            hashCanonical(decision.requestedParameters) !== context.parameterHash
+          ) {
+            throw new CommandRuntimeError(
+              409,
+              "guided_stop_context_stale",
+              "Guided stop context no longer matches the cancelled exact step",
+              {
+                humanMessage: "The represented Guided step changed while cancellation was being finalized.",
+                category: "conflict",
+                remediation: "Refresh the mission and inspect its canonical cancellation record.",
+              },
+            );
+          }
+        }
+        this.repository.cancelOpenWork(runId, actorId, normalized, now);
+        this.database.prepare("UPDATE missions SET status = 'cancelled', updated_at = ? WHERE id = ?")
+          .run(now, result.run.run.missionId);
+        this.repository.appendAudit({
+          missionId: result.run.run.missionId, runId, actorId, action: "run.cancelled",
+          resourceType: "run", resourceId: runId, reason: normalized, now,
+        });
+        if (context) {
+          this.repository.events.append({
+            missionId: context.missionId,
+            runId,
+            journey: "guided",
+            eventType: "guided.mission_stopped",
+            actorType: "operator",
+            actorId,
+            summary: "Operator stopped the mission from the exact represented Guided step",
+            payload: {
+              decisionId: context.decisionId,
+              stepId: context.stepId,
+              actionFingerprint: context.actionFingerprint,
+              parameterHash: context.parameterHash,
+              reason: normalized,
+            },
+            sensitivity: "private",
+          });
+          this.repository.appendAudit({
+            missionId: context.missionId,
+            runId,
+            actorId,
+            action: "guided.mission_stopped",
+            resourceType: "guided_decision",
+            resourceId: context.decisionId,
+            reason: normalized,
+            details: {
+              stepId: context.stepId,
+              actionFingerprint: context.actionFingerprint,
+              parameterHash: context.parameterHash,
+            },
+            now,
+          });
+        }
+        this.learning.recordTerminalEvaluation({
+          runId,
+          terminalStatus: "cancelled",
+          createdBy: "run-supervisor",
+        });
       });
-    });
-    await this.replayContinuations(runId, ["evaluation_pending"]);
+      await this.replayContinuations(runId, ["evaluation_pending"]);
+    } finally {
+      authorityStopped = true;
+      clearInterval(authorityTimer);
+      await authorityChain;
+    }
   }
 }
 

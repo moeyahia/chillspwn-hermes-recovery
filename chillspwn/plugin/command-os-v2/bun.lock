@@ -12,7 +12,6 @@
         "zod": "4.4.3",
       },
       "devDependencies": {
-        "@axe-core/playwright": "4.12.1",
         "@playwright/test": "1.61.1",
         "@tailwindcss/vite": "4.3.2",
         "@types/better-sqlite3": "7.6.13",
@@ -22,6 +21,7 @@
         "@types/react": "19.2.15",
         "@types/react-dom": "19.2.3",
         "@vitejs/plugin-react": "4.7.0",
+        "axe-core": "4.12.1",
         "tailwindcss": "4.3.2",
         "typescript": "5.6.3",
         "vite": "6.4.3",
@@ -29,8 +29,6 @@
     },
   },
   "packages": {
-    "@axe-core/playwright": ["@axe-core/playwright@4.12.1", "", { "dependencies": { "axe-core": "~4.12.1" }, "peerDependencies": { "playwright-core": ">= 1.0.0" } }, "sha512-rMd7xriptqKpP+w5265i4Hdkv2X5kbu6uiBi/B2I7uf3hieRBM3qDCfaKPtxfiYb2mKXfF+yLODJwIx+Jv1GDw=="],
-
     "@babel/code-frame": ["@babel/code-frame@7.29.7", "", { "dependencies": { "@babel/helper-validator-identifier": "^7.29.7", "js-tokens": "^4.0.0", "picocolors": "^1.1.1" } }, "sha512-Aup7aUOfpbAUg2ROOJN6Iw5f9DMBlzu0mIkm/malLQFN/YQgO48wCj0Kxa3sEHJvPVFg7siR+qRInwXd2qhQKw=="],
 
     "@babel/compat-data": ["@babel/compat-data@7.29.7", "", {}, "sha512-locTkQyKvwIEgBzVrn8693ebc97F2U8ZHjbXwDXJ5Fn2TCpNwTlKcaKLkdHop5c/icOFE7qt7Q9JC5hnKNa6Gg=="],

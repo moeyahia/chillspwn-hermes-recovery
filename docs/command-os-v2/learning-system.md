@@ -47,3 +47,19 @@ The fixed benchmark families, disposable environment manager, local metric
 engine, signed integrity/provider-exposure receipts, hidden holdout, shadow and
 canary runners, rollback exercise, and comparative performance report remain
 unimplemented. Research therefore cannot execute or claim improvement yet.
+
+## Legacy public-model reviewer containment
+
+The historical `chillspwn_learn.py` path is disabled at process entry. It could
+resume a public-model session with complete native tool context or submit an
+unbounded engagement transcript, but it cannot produce a typed sanitized
+`LearningCandidateBrief` or a `ProviderExposureReceipt`. Command OS V2 therefore
+does not fall back to that path. Candidate learning remains local and
+evidence-linked until the bounded Research/Learning workflow performs disclosure
+classification, sanitization, receipt creation, benchmark evaluation, and human
+promotion.
+
+The associated 30-minute legacy scheduler is paused in `cron-jobs.json`, and
+the retained scheduler script also exits cleanly before inspecting transcripts
+or spawning the reviewer. This prevents a blocked reviewer from being relaunched
+on a retry loop while keeping the local reusable-content validators importable.

@@ -3,6 +3,16 @@
 Status: **current-source archived static gates and focused implementation checkpoints — not release complete**
 Evidence date: `2026-07-17` UTC.
 
+## Current critical Chromium candidate gate — 2026-07-18
+
+Run `critical-chromium-20260718T041319Z` completed 129/129 tests with 0
+failures, 0 skips, and 0 flaky results on one worker. It included accessibility,
+Brain/Vault lifecycle and conflict handling, registry-driven intake,
+operational truth, recovery, interaction-manifest coverage, and the complete
+internal route/href crawl. It ran on isolated ports 43470/43471 and did not use
+live 3131/3132. The remaining browser projects and viewports below remain
+release gates; this result is not represented as the complete matrix.
+
 The Playwright configuration declares 13 retry-free projects. Current archived
 gates now cover the rendered static/initial manifest state and the complete
 static-route/generated-href contract in every configured project. A separate
@@ -10,40 +20,46 @@ bounded accessibility gate covers Chromium, Firefox, and WebKit. These are
 current-source checkpoints, but the exact final source has not yet passed one
 complete all-spec 13-project release run.
 
-## Latest archived cross-project gates
+## Latest current and archived cross-project gates
 
-| Gate | Projects and result | Duration | Archived report |
+| Gate | Projects and result | Duration | Report |
 |---|---|---:|---|
 | Rendered manifest/static initial state | **13/13** configured projects; 0 unexpected, skipped, or flaky; retries 0 | **119,691.24 ms** | `test-results/results/manifest-current-authority-brain-static-restart-20260717.json` (SHA-256 `0ce34a6fc091d29a5f12ce0f70d69295a729964e835c5ddb998ed233b3d3b21e`) |
 | Static routes and generated internal hrefs | **390/390** tests: 30 per project across all 13 projects; 0 unexpected, skipped, or flaky; retries 0 | **406,441.99 ms** | `test-results/results/route-href-crawl-current-20260717.json` (SHA-256 `7f80e40eecdcc4679f5cdffa5f5832fb3c67630dc9370dd0f6bf744b0e1c5493`) |
-| Bounded automated accessibility | **81/81** tests across Chromium, Firefox, and WebKit; **84 axe scans**, 0 automated A/AA violations, 0 unexpected, skipped, or flaky; retries 0 | **115,689.921 ms** | `test-results/results/axe-expanded-all3-20260717-r1.json` (SHA-256 `aec4b7adbf9a3ac73dae22bcfb6b86c33954a789c65e182b8dca68c7059cbf22`) |
+| Current direct-preload accessibility | **84/84** tests across Chromium, Firefox, and WebKit; **87 axe scans**, 0 automated A/AA violations, 0 unexpected, skipped, or flaky; retries 0 | **195,950.758 ms** | `test-results/results/accessibility-direct-all3-20260717-r1.json` (SHA-256 `646380edb1001873e027203b308f2f2565305f4c66404b2817bcee493e96d223`) |
+| Archived pre-direct-transport accessibility | **81/81** tests across Chromium, Firefox, and WebKit; **84 axe scans**, 0 automated A/AA violations, 0 unexpected, skipped, or flaky; retries 0 | **115,689.921 ms** | `test-results/results/axe-expanded-all3-20260717-r1.json` (SHA-256 `aec4b7adbf9a3ac73dae22bcfb6b86c33954a789c65e182b8dca68c7059cbf22`) |
 
 The manifest report proves rendered-control accounting only in the crawler's
 bounded initial state. The route report proves the 29 static/alias route cases
 and one generated-href crawl in each project. Neither opens every material
 dialog, drawer, menu, degraded/error/recovery state, or activates every grouped
-option. The accessibility report covers 12 primary initial states and 16
-bounded material states on the three desktop engines; it retains 84 gradient
-contrast and 15 ARIA-support determinations for manual review. It is not mobile,
-native-zoom, screen-reader, or manual assistive-technology certification.
+option. The current accessibility implementation covers 12 primary initial
+states and 16 bounded material states. It directly preloads pinned `axe-core`
+4.12.1 and passes only a compact version-checked scan function through
+`page.evaluate`; the transport canary enforces a 64 KiB ceiling. The current
+three-engine artifact has 28 tests and 29 scans per project. The archived
+three-engine artifact used the prior 27-test/28-scan transport and retains 84
+gradient-contrast and 15 ARIA-support determinations for manual review. Neither
+artifact is mobile, native-zoom, screen-reader, or manual assistive-technology
+certification.
 
 ## Project matrix
 
 | Project | Engine/profile | Viewport | Executed evidence | Current disposition |
 |---|---|---:|---|---|
-| `chromium-1440` | Playwright Chromium | 1440×900 | Current manifest 1/1; route/href 30/30; bounded accessibility 27/27 | All three current gates pass; complete all-spec release run remains open. |
-| `firefox-1440` | Playwright Firefox | 1440×900 | Current manifest 1/1; route/href 30/30; bounded accessibility 27/27 | Firefox is installed and directly runnable; complete all-spec release run remains open. |
-| `webkit-1440` | Playwright WebKit | 1440×900 | Current manifest 1/1; route/href 30/30; bounded accessibility 27/27 | Host WebKit uses environment-only compatibility libraries; complete all-spec release run remains open. |
-| `chromium-enterprise-1440` | Chromium enterprise emulation | 1440×900 | Current manifest 1/1; route/href 30/30 | Current static gates pass; this is not an actual Microsoft Edge binary/profile. |
-| `android-chromium-390` | Chromium mobile/touch emulation | 390×844 | Current manifest 1/1; route/href 30/30 | Current static gates pass; bounded accessibility did not include this project and physical Android remains untested. |
-| `iphone-webkit-390` | WebKit mobile/touch emulation | 390×844 | Current manifest 1/1; route/href 30/30 | Current static gates pass; bounded accessibility did not include this project and physical iPhone remains untested. |
-| `tablet-chromium-768` | Chromium mobile/touch emulation | 768×1024 | Current manifest 1/1; route/href 30/30 | Current static gates pass; complete material-state and accessibility execution remains open. |
-| `chromium-360` | Chromium compact/touch emulation | 360×800 | Current manifest 1/1; route/href 30/30 | Current static gates pass; complete material-state and accessibility execution remains open. |
-| `chromium-1024` | Chromium desktop | 1024×768 | Current manifest 1/1; route/href 30/30 | Current static gates pass; complete material-state execution remains open. |
-| `chromium-1280` | Chromium desktop | 1280×800 | Current manifest 1/1; route/href 30/30 | Current static gates pass; complete material-state execution remains open. |
-| `chromium-1920` | Chromium desktop | 1920×1080 | Current manifest 1/1; route/href 30/30 | Current static gates pass; complete material-state execution remains open. |
-| `chromium-2560` | Chromium desktop | 2560×1440 | Current manifest 1/1; route/href 30/30 | Current static gates pass; complete material-state execution remains open. |
-| `chromium-200-percent-zoom` | Chromium geometry emulation | 720×450 CSS at DPR 2 | Current manifest 1/1; route/href 30/30 | Current static gates pass; this models reflow and is not native browser-chrome zoom. |
+| `chromium-1440` | Playwright Chromium | 1440×900 | Archived 479-group manifest 1/1; route/href 30/30; current direct-preload accessibility 28/28 | Current bounded accessibility passes; current 489-group crawl and complete all-spec release run remain open. |
+| `firefox-1440` | Playwright Firefox | 1440×900 | Archived 479-group manifest 1/1; route/href 30/30; current direct-preload accessibility 28/28 | Firefox is installed and directly runnable; current 489-group crawl and complete all-spec release run remain open. |
+| `webkit-1440` | Playwright WebKit | 1440×900 | Archived 479-group manifest 1/1; route/href 30/30; current direct-preload accessibility 28/28 | Current bounded accessibility passes; current 489-group crawl and complete all-spec release run remain open. Host WebKit uses environment-only compatibility libraries. |
+| `chromium-enterprise-1440` | Chromium enterprise emulation | 1440×900 | Archived 479-group manifest 1/1; route/href 30/30 | Current 489-group crawl remains open; this is not an actual Microsoft Edge binary/profile. |
+| `android-chromium-390` | Chromium mobile/touch emulation | 390×844 | Archived 479-group manifest 1/1; route/href 30/30 | Current 489-group crawl remains open; bounded accessibility did not include this project and physical Android remains untested. |
+| `iphone-webkit-390` | WebKit mobile/touch emulation | 390×844 | Archived 479-group manifest 1/1; route/href 30/30 | Current 489-group crawl remains open; bounded accessibility did not include this project and physical iPhone remains untested. |
+| `tablet-chromium-768` | Chromium mobile/touch emulation | 768×1024 | Archived 479-group manifest 1/1; route/href 30/30 | Current 489-group crawl, material-state, and accessibility execution remain open. |
+| `chromium-360` | Chromium compact/touch emulation | 360×800 | Archived 479-group manifest 1/1; route/href 30/30 | Current 489-group crawl, material-state, and accessibility execution remain open. |
+| `chromium-1024` | Chromium desktop | 1024×768 | Archived 479-group manifest 1/1; route/href 30/30 | Current 489-group crawl and complete material-state execution remain open. |
+| `chromium-1280` | Chromium desktop | 1280×800 | Archived 479-group manifest 1/1; route/href 30/30 | Current 489-group crawl and complete material-state execution remain open. |
+| `chromium-1920` | Chromium desktop | 1920×1080 | Archived 479-group manifest 1/1; route/href 30/30 | Current 489-group crawl and complete material-state execution remain open. |
+| `chromium-2560` | Chromium desktop | 2560×1440 | Archived 479-group manifest 1/1; route/href 30/30 | Current 489-group crawl and complete material-state execution remain open. |
+| `chromium-200-percent-zoom` | Chromium geometry emulation | 720×450 CSS at DPR 2 | Archived 479-group manifest 1/1; route/href 30/30 | Current 489-group crawl remains open; this models reflow and is not native browser-chrome zoom. |
 
 Full-run reports:
 
@@ -56,6 +72,9 @@ Full-run reports:
 
 Current-source repair reports:
 
+- the served `/missions/new/autonomous` route is now wired to
+  `RegistryMissionIntakePage` instead of its stale free-form contract page;
+  focused browser acceptance of that current route remains open;
 - compact direct-plan controls: all three direct-plan tests passed within
   `repaired-compact-focused-mouse-20260716T142159Z.json`;
 - compact route generation: `repaired-route-generation-20260716T142645Z.json`,
@@ -67,6 +86,13 @@ Additional focused exact-source slices, all retry-free, passed Brain, Decisions,
 and Intelligence **168/168**, Brain-node lifecycle **12/12**, and verified
 artifact delivery **12/12** across Chromium, Firefox, WebKit, Android Chromium,
 iPhone WebKit, and tablet Chromium.
+
+The current route-readiness and command-palette settlement boundaries passed a
+repeat-five Firefox stress slice **150/150** in 235,569.658 ms, with zero
+unexpected, skipped, or flaky results and retries disabled. Each repeat covered
+the 29 static route cases and the canonical record-family palette journey.
+Artifact: `test-results/results/firefox-route-palette-stress-r1.json` (SHA-256
+`ca21a8c12e8a5121afee2eac87e3d7ba510326d5386aa4e4eeb7238b0f4207d2`).
 
 The final exact-source run intervention/recovery matrix passed **30/30** across
 those same six projects. Each project exercised control-plane rejection, exact
@@ -137,12 +163,12 @@ teardown exceptions from broad URL or timing patterns. It requires:
 - exact pre-navigation request identities for document teardown, and exact
   page/URL lifecycle receipts for EventSource close and page close.
 
-Positive and self-failing negative canaries pass **18/18** across Chromium,
-Firefox, and WebKit. Impacted verified artifact downloads, generated mission
-exports, CVE source popups, and System contract popups pass **12/12** across the
-same engines. Unit policy/ledger/AST checks pass **18/18 with 134 assertions**;
-the static boundary follows aliases, assignments, destructuring, and same-file
-helper parameters. Evidence:
+The prior canary and impacted-path artifacts below are retained as historical
+checkpoints. The current suite adds a cross-document receipt-isolation negative
+canary and its replacement all-engine result is not yet verified, so no current
+aggregate canary count is claimed here. The static boundary follows aliases,
+assignments, destructuring, and same-file helper parameters. Historical
+evidence:
 `browser-audit-p1-canaries-r3-chromium-20260716.json`,
 `browser-audit-p1-canaries-r3-crossbrowser-20260716.json`, and
 `browser-audit-p1-impacted-r2-20260716.json`.
@@ -268,18 +294,21 @@ every-option, or complete all-spec release execution.
 
 ## Interaction coverage
 
-The current source inventory reports:
+The current source inventory contains **489** groups: **381** fixture-required
+groups with dedicated source test-ID ownership and **108** static/non-fixture
+groups. The latest complete all-project rendered-control crawl predates the
+ten-entry expansion and is retained as an archived 479-group snapshot:
 
 | Measure | Value |
 |---|---:|
-| Manifest groups | 479 |
-| Fixture-required groups | 371 |
-| Dedicated source test-ID assignments | 371 |
+| Manifest groups at archived crawl revision | 479 |
+| Fixture-required groups at archived crawl revision | 371 |
+| Dedicated source test-ID assignments at archived crawl revision | 371 |
 | Fixture-required groups still owned only by generic audit | 0 |
 | Static/non-fixture groups | 108 |
-| Latest complete enforced rendered-control crawl | Current 479-group inventory: 13/13 projects; persistent 478 applicable and 868/868 controls; compact/reflow 479 applicable and 582/582 controls; 0 missing, 0 unresolved, 0 stale |
+| Latest complete enforced rendered-control crawl | Archived 479-group revision: 13/13 projects; persistent 478 applicable and 868/868 controls; compact/reflow 479 applicable and 582/582 controls; 0 missing, 0 unresolved, 0 stale |
 
-The latest complete report covers the current 479-group inventory:
+The latest complete report covers that archived 479-group revision:
 `test-results/results/manifest-current-authority-brain-static-restart-20260717.json`
 (SHA-256
 `0ce34a6fc091d29a5f12ce0f70d69295a729964e835c5ddb998ed233b3d3b21e`):
@@ -295,7 +324,7 @@ This artifact proves only the bounded rendered initial state exercised by the
 manifest crawler. It is not material-state or every-option execution proof: it
 does not open every dialog/drawer or traverse every hidden, degraded, error,
 connected-Vault, and fixture-only operational state. The visual registry maps
-only 15/479 manifest groups to 11 Chromium-1440/Linux baselines; 464 remain
+only 30/489 manifest groups to 13 Chromium-1440/Linux baselines; 459 remain
 unmapped, cross-browser and mobile visual approval is incomplete, and human
 release approval remains false.
 
@@ -346,12 +375,14 @@ Before release candidacy:
 
 1. freeze the exact source/build and run all 13 projects without retries;
 2. enable strict required-network and interaction-manifest enforcement;
-3. expand the green current 479-entry initial-state crawl and close every
-   material-state and assertion-level option-receipt gap;
+3. rerun the current 489-entry inventory across all projects, then expand the
+   archived green 479-entry initial-state proof and close every material-state
+   and assertion-level option-receipt gap;
 4. add actual Edge proof if retained as a support target;
-5. extend the green 81/81 bounded desktop-engine accessibility gate to mobile
+5. extend the current green 84/84 direct-preload desktop-engine gate to mobile
    material states, native 200% zoom, focus-order and screen-reader assertions,
-   manual incomplete-item resolution, and assistive-technology review;
+   manual incomplete-item resolution, and assistive-technology review; the
+   archived 81/81 artifact remains historical evidence;
 6. approve success-path visual baselines across all required states/viewports;
 7. crawl imported, archived, blocked, missing, quarantined, offline,
    reconnecting, and expired-session states;

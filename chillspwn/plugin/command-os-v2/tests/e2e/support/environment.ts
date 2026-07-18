@@ -16,7 +16,10 @@ export const E2E_OPERATOR_TOKEN = process.env.COMMAND_OS_V2_E2E_OPERATOR_TOKEN
   ?? "command-os-v2-e2e-local-operator-token-2026";
 export const E2E_API_URL = process.env.COMMAND_OS_V2_E2E_API_URL ?? "http://127.0.0.1:43141";
 export const E2E_AUTH_STATE = process.env.COMMAND_OS_V2_E2E_AUTH_STATE
-  ?? resolve("/tmp/chillspwn-command-os-v2-e2e-auth-state.json");
+  ?? resolve(
+    "/tmp/chillspwn-command-os-v2-e2e-data",
+    `auth-state-${E2E_RUN_ID}.json`,
+  );
 export const E2E_DATABASE_PATH = process.env.COMMAND_OS_V2_E2E_DATABASE_PATH;
 export const E2E_VAULT_ROOT = process.env.COMMAND_OS_V2_E2E_VAULT_ROOT ?? resolve(
   "/tmp/chillspwn-command-os-v2-e2e-data",

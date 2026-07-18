@@ -1,10 +1,14 @@
 #!/usr/bin/env bun
+import { existsSync, lstatSync } from "node:fs";
 import { resolve } from "node:path";
 import {
   checkDatabaseIntegrity,
   createDatabaseConnection,
   createTimestampedBackup,
 } from "../db";
+import { MemoryRepository } from "../memory";
+import { ObsidianVaultBridge, VaultPathPolicy } from "../vault";
+import { ApprovedLegacyVaultProjectionService } from "./ApprovedLegacyVaultProjectionService";
 import { LegacyMigrationService, restoreMigrationBackup } from "./LegacyMigrationService";
 import { redactLegacyText } from "./SecretSafety";
 
@@ -39,6 +43,12 @@ function required(args: ParsedArguments, key: string): string {
   return resolve(value);
 }
 
+function requiredValue(args: ParsedArguments, key: string): string {
+  const value = args.values.get(key)?.at(-1)?.trim();
+  if (!value) throw new Error(`--${key} is required`);
+  return value;
+}
+
 function help(): string {
   return `ChillsPwn Command OS legacy migration
 
@@ -47,11 +57,15 @@ Usage:
   bun run server/migration/cli.ts verify --db PATH
   bun run server/migration/cli.ts backup --db PATH --output DIR
   bun run server/migration/cli.ts reconcile --db PATH --migration-id ID
+  bun run server/migration/cli.ts project-vault --db PATH --vault-root ROOT --migration-id ID --reconciliation-hash HASH --connection ID --dry-run
+  bun run server/migration/cli.ts project-vault --db PATH --vault-root ROOT --migration-id ID --reconciliation-hash HASH --projection-hash HASH --connection ID --approved-by ACTOR --approve-projection
   bun run server/migration/cli.ts restore --db PATH --backup PATH --sha256 HASH --service-stopped
 
 Safety:
   migrate creates a verified database backup and protected source backup before import.
   --dry-run performs discovery/hashing only and never changes the database.
+  project-vault --dry-run is read-only and returns the exact projection hash.
+  Vault writes require that hash plus --approve-projection and a fresh filesystem round-trip.
   restore refuses to run without --service-stopped.
 `;
 }
@@ -61,6 +75,78 @@ async function main(argv = process.argv.slice(2)): Promise<number> {
   if (args.command === "help" || args.flags.has("help")) {
     process.stdout.write(help());
     return 0;
+  }
+  if (args.command === "project-vault") {
+    const dryRun = args.flags.has("dry-run");
+    if (!dryRun && !args.flags.has("approve-projection")) {
+      throw new Error("Vault projection requires --approve-projection after reviewing a dry-run preview");
+    }
+    const databasePath = required(args, "db");
+    if (!existsSync(databasePath)) throw new Error("Canonical database does not exist; run db:migrate first");
+    const vaultRoot = required(args, "vault-root");
+    if (!existsSync(vaultRoot) || !lstatSync(vaultRoot).isDirectory()) {
+      throw new Error("--vault-root must be an existing directory; projection never creates an operator sandbox root");
+    }
+    const database = createDatabaseConnection({
+      filename: databasePath,
+      readonly: dryRun,
+      fileMustExist: true,
+    });
+    try {
+      const bridge = new ObsidianVaultBridge(
+        database,
+        new MemoryRepository(database),
+        new VaultPathPolicy(vaultRoot),
+      );
+      const service = new ApprovedLegacyVaultProjectionService(database, bridge);
+      const previewInput = {
+        migrationId: requiredValue(args, "migration-id"),
+        expectedReconciliationHash: requiredValue(args, "reconciliation-hash"),
+        connectionId: requiredValue(args, "connection"),
+      };
+      const preview = service.preview(previewInput);
+      if (dryRun) {
+        process.stdout.write(`${JSON.stringify({
+          status: preview.eligibleNodeCount > 0 ? "ready_for_approval" : "no_eligible_nodes",
+          dryRun: true,
+          migrationId: preview.migrationId,
+          reconciliationHash: preview.reconciliationHash,
+          projectionHash: preview.projectionHash,
+          connection: {
+            id: preview.connectionId,
+            displayName: preview.connectionDisplayName,
+          },
+          counts: {
+            mapped: preview.mappedNodeCount,
+            eligible: preview.eligibleNodeCount,
+            excludedByPolicyOrConnectionScope: preview.excludedNodeCount,
+          },
+        }, null, 2)}\n`);
+        return preview.eligibleNodeCount > 0 ? 0 : 2;
+      }
+      const result = await service.project({
+        ...previewInput,
+        expectedProjectionHash: requiredValue(args, "projection-hash"),
+        approvedBy: requiredValue(args, "approved-by"),
+      });
+      const attentionRequired = result.export.counts.conflicts > 0
+        || result.export.counts.vaultAhead > 0
+        || result.export.counts.quarantined > 0;
+      const failed = result.export.counts.failed > 0;
+      process.stdout.write(`${JSON.stringify({
+        status: failed ? "failed" : attentionRequired ? "attention_required" : "completed",
+        dryRun: false,
+        approvalId: result.approvalId,
+        migrationId: preview.migrationId,
+        reconciliationHash: preview.reconciliationHash,
+        projectionHash: result.projectionHash,
+        projectedNodes: result.projectedNodeIds.length,
+        export: result.export,
+      }, null, 2)}\n`);
+      return failed ? 1 : attentionRequired ? 2 : 0;
+    } finally {
+      database.close();
+    }
   }
   if (args.command === "migrate") {
     const roots = args.values.get("source") ?? [];

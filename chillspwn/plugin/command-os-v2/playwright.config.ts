@@ -11,6 +11,16 @@ const baseURL = e2eProfile.baseURL;
 const apiURL = e2eProfile.apiURL;
 const externalServers = e2eProfile.externalServers;
 const releaseProfile = e2eProfile.profile === "release";
+const localUiServerUrl = new URL(baseURL);
+const localApiServerUrl = new URL(apiURL);
+const localUiBind = localUiServerUrl.hostname.replace(/^\[|\]$/gu, "") === "localhost"
+  ? "127.0.0.1"
+  : localUiServerUrl.hostname.replace(/^\[|\]$/gu, "");
+const localApiBind = localApiServerUrl.hostname.replace(/^\[|\]$/gu, "") === "localhost"
+  ? "127.0.0.1"
+  : localApiServerUrl.hostname.replace(/^\[|\]$/gu, "");
+const localUiPort = localUiServerUrl.port || (localUiServerUrl.protocol === "http:" ? "80" : "443");
+const localApiPort = localApiServerUrl.port || (localApiServerUrl.protocol === "http:" ? "80" : "443");
 const releaseServerUrl = new URL(baseURL);
 const releaseBind = releaseServerUrl.hostname.replace(/^\[|\]$/gu, "") === "localhost"
   ? "127.0.0.1"
@@ -77,7 +87,7 @@ export default defineConfig({
     storageState: E2E_AUTH_STATE,
     locale: "en-US",
     timezoneId: "UTC",
-    colorScheme: "dark",
+    colorScheme: "light",
     contextOptions: { reducedMotion: "no-preference" },
     screenshot: "only-on-failure",
     trace: "retain-on-failure",
@@ -120,10 +130,16 @@ export default defineConfig({
       command: "bun run server/index.ts",
       url: `${apiURL}/api/v2/health`,
       timeout: 120_000,
-      reuseExistingServer: !process.env.CI,
+      // Every invocation owns a unique database, operator fixture, Vault root,
+      // and evidence namespace. Reusing an orphaned local server can bind the
+      // browser to a prior run's database while fixture helpers write to the
+      // current one, producing hangs and false route/recovery results. Fail on
+      // an occupied port instead of silently crossing that isolation boundary.
+      reuseExistingServer: false,
       env: {
         ...process.env,
-        COMMAND_OS_V2_PORT: "43141",
+        COMMAND_OS_V2_BIND: localApiBind,
+        COMMAND_OS_V2_PORT: localApiPort,
         COMMAND_OS_V2_SERVE_STATIC: "false",
         COMMAND_OS_V2_DATABASE_PATH: E2E_DATABASE_PATH,
         COMMAND_OS_V2_OPERATOR_TOKEN: E2E_OPERATOR_TOKEN,
@@ -145,10 +161,14 @@ export default defineConfig({
       },
     }] : []),
     {
-      command: "CHOKIDAR_USEPOLLING=true CHOKIDAR_INTERVAL=1000 bun run client:dev",
+      command: `CHOKIDAR_USEPOLLING=true CHOKIDAR_INTERVAL=1000 bunx vite --host ${localUiBind} --port ${localUiPort}`,
       url: baseURL,
       timeout: 120_000,
-      reuseExistingServer: !process.env.CI,
+      reuseExistingServer: false,
+      env: {
+        ...process.env,
+        COMMAND_OS_V2_API_ORIGIN: localApiServerUrl.origin,
+      },
     },
   ],
   projects: [

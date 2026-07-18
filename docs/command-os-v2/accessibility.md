@@ -19,8 +19,10 @@ complete, so cutover remains closed.
 - responsive drawer/sheet behavior rather than retaining a desktop window
   metaphor on mobile;
 - locale and UTC-controlled browser fixtures;
-- a pinned `@axe-core/playwright` 4.12.1 gate that runs `wcag2a`, `wcag2aa`,
-  `wcag21a`, `wcag21aa`, and `wcag22aa` without disabling or excluding rules;
+- a pinned direct `axe-core` 4.12.1 gate that preloads `axe.min.js` at document
+  initialization, then evaluates only a compact, version-checked scan function
+  for `wcag2a`, `wcag2aa`, `wcag21a`, `wcag21aa`, and `wcag22aa`, without
+  disabling or excluding rules;
 - `tests/accessibility-state-inventory.json`, which makes the audited route,
   surface, state kind, and canonical fixture source machine-readable.
 
@@ -29,7 +31,11 @@ disabled/loading/error behavior, viewports, and test ownership. A static audit
 detects rendered controls missing from the manifest and stale manifest entries.
 The accessibility policy test additionally requires the inventory's 12 primary
 routes to remain exactly aligned with `PRIMARY_NAVIGATION`, requires the bounded
-material-state set, and rejects axe `.disableRules()` or `.exclude()` use.
+material-state set, rejects axe `.disableRules()` or `.exclude()` use, and
+rejects the previous oversized runtime-source transport. A browser canary pins
+the loaded engine version and limits the evaluated scan function to 64 KiB;
+the current function is approximately 0.6 KiB, while the 1.3 MB minified engine
+is loaded once through `page.addInitScript({ path })` before each document.
 
 ## Expanded automated A/AA gate
 
@@ -68,23 +74,28 @@ It also covers **16 bounded material states**:
 16. System Settings status.
 
 The suite is serial inside each browser project and uses the audited Playwright
-harness plus canonical disposable SQLite/filesystem fixtures. It contains **27
-tests per project** and produces **28 axe scans per project** because one Brain
-test audits both the graph canvas and accessible-table states.
+harness plus canonical disposable SQLite/filesystem fixtures. It contains **28
+tests per project** and produces **29 axe scans per project**: the transport
+canary scans Overview once, and one Brain test audits both the graph canvas and
+accessible-table states.
 
-The Chromium-first defect-finding pass completed **27/27** with zero failed,
-skipped, or retried tests. JSON:
-`/root/chillspwn-command-os-v24/chillspwn/plugin/command-os-v2/test-results/results/axe-expanded-chromium-20260717-r4.json`
+The current direct-preload implementation completed **84/84 tests** across
+`chromium-1440`, `firefox-1440`, and `webkit-1440` in 195,950.758 ms, with
+**87 scans**, zero automated A/AA violations, zero unexpected, skipped, or
+flaky results, and retries disabled. JSON:
+`test-results/results/accessibility-direct-all3-20260717-r1.json`
 (SHA-256
-`1de0b7f18ce916aadf33982037c6eb55073c860633fb2d063c49ee17b99ac76e`).
+`646380edb1001873e027203b308f2f2565305f4c66404b2817bcee493e96d223`).
 HTML:
-`/root/chillspwn-command-os-v24/chillspwn/plugin/command-os-v2/test-results/html/axe-expanded-chromium-20260717-r4/index.html`
+`test-results/html/accessibility-direct-all3-20260717-r1/index.html`
 (SHA-256
-`e818aa096dd0d0364c024362cbfc5850de77b43208ae4afc09d69daef3277db3`).
+`7abec0c4b83b4c2326f629ac68225a83df6a5d8cf940f3ca4930552ff5bb7599`).
 
-The final `chromium-1440`, `firefox-1440`, and `webkit-1440` matrix completed
-**81/81 tests in 115,689.921 ms**, with **0 failed, 0 skipped, and 0 retries**.
-Its **84 state scans recorded 0 automated WCAG A/AA violations**. JSON:
+The most recent complete three-engine result is retained as **archived
+pre-direct-transport evidence**. That `chromium-1440`, `firefox-1440`, and
+`webkit-1440` matrix completed **81/81 tests in 115,689.921 ms**, with **0
+failed, 0 skipped, and 0 retries**. Its **84 state scans recorded 0 automated
+WCAG A/AA violations**. JSON:
 `/root/chillspwn-command-os-v24/chillspwn/plugin/command-os-v2/test-results/results/axe-expanded-all3-20260717-r1.json`
 (864,988 bytes; SHA-256
 `aec4b7adbf9a3ac73dae22bcfb6b86c33954a789c65e182b8dca68c7059cbf22`).
@@ -92,10 +103,12 @@ HTML:
 `/root/chillspwn-command-os-v24/chillspwn/plugin/command-os-v2/test-results/html/axe-expanded-all3-20260717-r1/index.html`
 (637,858 bytes; SHA-256
 `f050dfdf24fb9d95bc77794d5b7007e82343b2ae9563ecee7f20aa2d7b44429a`).
-The JSON report embeds all 84 axe state receipts and all 81 BrowserAudit
-receipts.
+The archived JSON report embeds all 84 axe state receipts and all 81
+BrowserAudit receipts. It remains useful historical evidence, but the 84/84
+current artifact above is the transport-authoritative three-engine result.
 
-Axe also retained **99 non-failing incomplete/manual-review determinations**:
+The archived three-engine axe artifact also retained **99 non-failing
+incomplete/manual-review determinations**:
 **84 color-contrast determinations** where a background gradient prevented an
 authoritative automated ratio and **15 ARIA-support determinations** where axe
 could not conclusively evaluate support for a labeled roleless container. They
@@ -144,7 +157,7 @@ it does not apply or prove native browser-chrome 200% zoom.
 - automated and manual accessibility review for material states beyond the 16
   bounded states, including every grouped option, dialog, drawer, degraded,
   offline, reconnecting, permission, and destructive-confirmation state;
-- Chromium, Firefox, and WebKit keyboard traversal of every one of the 479
+- Chromium, Firefox, and WebKit keyboard traversal of every one of the 489
   current manifest groups and every material option/state;
 - screen-reader role/name/value and critical live-region assertions;
 - focus-order review during live event updates and reconnect;
@@ -159,5 +172,5 @@ it does not apply or prove native browser-chrome 200% zoom.
 
 The expanded desktop automated gate materially improves route and high-risk
 state coverage, but it is not full mobile/zoom/manual-AT certification or a
-whole-product WCAG conformance claim. Legacy remains the default and cutover is
-not authorized.
+whole-product WCAG conformance claim. The operator-authorized live promotion
+does not convert this receipt into formal accessibility or cutover approval.

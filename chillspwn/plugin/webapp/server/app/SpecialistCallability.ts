@@ -6,6 +6,8 @@ export interface AttestedMcpRoute {
   readonly name: string;
   readonly verified: boolean;
   readonly tools: readonly string[];
+  /** Fresh tools/list input schemas keyed by exact tool name. */
+  readonly toolSchemas?: Readonly<Record<string, Readonly<Record<string, unknown>>>>;
   /** Reviewed runtime assignment for routes outside the static roster map. */
   readonly assignedAgentIds?: readonly string[];
   readonly attestedAt: string | null;

@@ -17,4 +17,9 @@ export {
   type ProviderReadiness,
   type RuntimeReadinessSnapshot,
 } from "./RuntimeReadiness";
+export {
+  createRuntimeToolValidationReadinessProvider,
+  evaluateRuntimeToolValidation,
+  registeredV2ToolsFromAttestedRoutes,
+} from "./RuntimeToolValidation";
 export { resolveV2ScriptSourceRoot } from "./V2ArtifactPaths";

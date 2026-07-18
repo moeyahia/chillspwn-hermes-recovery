@@ -90,6 +90,7 @@ import {
   readHermesCredentialProviderNames,
 } from "./runtime/HermesCredentialReadiness";
 import { resolveEngagementWorkingDirectory } from "./runtime/EngagementScope";
+import { createTargetNetworkReadinessProvider } from "./app/TargetNetworkReadiness";
 import {
   readOsintArtifact,
   readOsintLogChunk,
@@ -136,7 +137,12 @@ import { classifySessionKind, structuredSessionName, filterSessionsForList, type
 import { registerMcpRoutes } from "./routes/mcpRoutes";
 import { registerAssetRoutes } from "./routes/assetRoutes";
 import { McpArsenalBridge } from "./mcp/McpArsenalBridge";
+import {
+  attestReviewedMcpToolSchemas,
+  reconcileMcpToolSurface,
+} from "./mcp/McpToolDispositionRegistry";
 import { verifyAndConsumeGuidedExactStepAttestation } from "./mcp/CommandOsGuidedApproval";
+import { verifyAndConsumeAutonomousFullTcpAttestation } from "./mcp/CommandOsAutonomousFullTcpAttestation";
 import {
   acpNotification,
   buildGrokAgentArgs,
@@ -188,9 +194,12 @@ import {
   assessGrokSubscriptionAttestation,
   classifyGrokSubscriptionRpcError,
 } from "./providers/GrokReadinessAttestation";
+import { grokAcpRpcError } from "./providers/GrokAcpRpcError";
 import {
   createCommandOsApplication,
   createRuntimeReadinessProviders,
+  createRuntimeToolValidationReadinessProvider,
+  evaluateRuntimeToolValidation,
   type CommandOsApplication,
   type McpServerProjection,
   type ProviderReadiness,
@@ -1568,7 +1577,7 @@ function buildGrokAcpBootstrap(persisted: PersistedSession, prompt: string): str
 
 interface GrokLiveReadinessValue {
   readonly authenticated: true;
-  readonly boundaryVersion: string;
+  readonly boundaryVersion: number;
 }
 
 /**
@@ -1977,7 +1986,10 @@ function callGrokAcpOAuthTurn(
           if (isAcpClientRequest(msg)) {
             if (msg.method === "session/request_permission") {
               const decision = evaluateGrokAcpTool("planner", msg.params, true);
-              const option = selectPermissionOption(msg.params?.options || [], decision.action === "allow");
+              const permissionOptions = (msg.params as {
+                options?: Parameters<typeof selectPermissionOption>[0];
+              } | undefined)?.options;
+              const option = selectPermissionOption(permissionOptions || [], decision.action === "allow");
               write(option
                 ? permissionSelectedResponse(msg.id, option.optionId)
                 : permissionCancelledResponse(msg.id));
@@ -2032,7 +2044,7 @@ function callGrokAcpOAuthTurn(
           if (!method) continue;
           pending.delete(msg.id);
           if (msg.error) {
-            finish(new Error(msg.error.message || "Grok ACP request failed"));
+            finish(grokAcpRpcError(method, msg.error));
           } else if (method === "initialize") {
             if (!supportsGrokPreToolDeny(msg.result)) {
               finish(new Error("Grok ACP does not advertise blocking pre_tool_use deny hooks; refusing to start planning without its execution boundary"));
@@ -2547,7 +2559,7 @@ function spawnGrokAcp(
     (session as any).grokDrainTimer = null;
     (session as any).grokLastActivity = Date.now();
     const content = bootstrap ? buildGrokAcpBootstrap(session.persisted, text) : text;
-    rawLlmLog(engagementCwd, "xai-grok", "oauth (Grok Build cached CLI session; XAI_API_KEY removed)", persisted.model,
+    rawLlmLog(engagementCwd, "xai-grok", "oauth (Grok Build cached CLI session; XAI_API_KEY removed)", persisted.model!,
       "request", { protocol: "ACP JSON-RPC", method: "session/prompt", bootstrap, turn_prompt: text }, { sessionId, kind: bootstrap ? "context_bootstrap" : "followup" });
     try {
       rpc("session/prompt", { sessionId: (session as any).grokAcpSessionId, prompt: [{ type: "text", text: content }] });
@@ -2761,7 +2773,7 @@ function spawnGrokAcp(
         hooksAttested: (session as any).grokBoundaryHooksAttested === true,
         mcpsAttested: (session as any).grokBoundaryMcpsAttested === true,
         failed: (session as any).grokFailed === true,
-        closing: session.closing === true,
+        closing: Boolean(session.closing),
         activated: (session as any).grokSessionActivated === true,
       })) return;
       (session as any).grokBoundaryReady = true;
@@ -2818,7 +2830,7 @@ function spawnGrokAcp(
         if ((session as any).grokFailed || session.closing) continue;
         const noisyMaintenance = isNoisyGrokMaintenanceMessage(data);
         if (!noisyMaintenance) {
-          rawLlmLog(engagementCwd, "xai-grok", "oauth (Grok Build cached CLI session; XAI_API_KEY removed)", persisted.model, "response", line, { sessionId, kind: "acp" });
+          rawLlmLog(engagementCwd, "xai-grok", "oauth (Grok Build cached CLI session; XAI_API_KEY removed)", persisted.model!, "response", line, { sessionId, kind: "acp" });
         }
         if (!noisyMaintenance && isMeaningfulGrokAcpActivity(data, (session as any).grokPending)) {
           (session as any).grokLastActivity = Date.now();
@@ -2880,7 +2892,14 @@ function spawnGrokAcp(
           (session as any).grokPending.delete(data.id);
           if (data.error) {
             if (method === "session/load") {
-              log("warn", "Grok ACP session/load failed; rebuilding from durable transcript", { sessionId, acpSessionId: (session as any).grokResumeRequested, error: data.error.message });
+              const failure = grokAcpRpcError(method, data.error);
+              log("warn", "Grok ACP session/load failed; rebuilding from durable transcript", {
+                sessionId,
+                acpSessionId: (session as any).grokResumeRequested,
+                code: failure.code,
+                ...(failure.status === undefined ? {} : { httpStatus: failure.status }),
+                ...(failure.retryAfterMs === undefined ? {} : { retryAfterMs: failure.retryAfterMs }),
+              });
               (session as any).grokResumeRequested = undefined;
               (session as any).grokFallbackBootstrap = hadHistory;
               (session as any).grokAcpSessionId = undefined;
@@ -2897,7 +2916,7 @@ function spawnGrokAcp(
               });
               continue;
             }
-            throw new Error(data.error.message || "Grok ACP request failed");
+            throw grokAcpRpcError(method, data.error);
           }
           if (method === "initialize") {
             if (commanderBoundary && !supportsGrokPreToolDeny(data.result)) {
@@ -4999,7 +5018,20 @@ function dispatchPendingCards(): void {
   } catch {}
 }
 
-const kanbanJobs = new Map<string, { id: string; title: string; status: string; pid?: number; proc?: ChildProcess; output: string; startedAt: string; completedAt?: string; model: string }>();
+interface KanbanJob {
+  id: string;
+  title: string;
+  status: string;
+  pid?: number;
+  proc?: ChildProcess;
+  output: string;
+  startedAt: string;
+  completedAt?: string;
+  model: string;
+  sessionId?: string;
+}
+
+const kanbanJobs = new Map<string, KanbanJob>();
 
 app.post("/api/kanban", (req, res) => {
   const { title, body, assignee: requestedAssignee, provider, model, engagement, sessionId: contextSessionId, targetSessionId } = req.body;
@@ -5121,7 +5153,7 @@ app.post("/api/kanban", (req, res) => {
   proc.stdin?.write(taskPrompt);
   proc.stdin?.end();
 
-  const job = {
+  const job: KanbanJob = {
     id,
     title,
     status: "running",
@@ -5498,7 +5530,13 @@ function getMcpBridge(): McpArsenalBridge | null {
           return agentRuntime.verifyAndConsumeMcpApprovalAttestation(request);
         }
         if (!commandOsApplication) {
-          return { approved: false, reason: "the canonical Guided approval store is unavailable" };
+          return { approved: false, reason: "the canonical Command OS approval store is unavailable" };
+        }
+        if (request.attestation.kind === "autonomous_full_tcp") {
+          return verifyAndConsumeAutonomousFullTcpAttestation(
+            commandOsApplication.database,
+            request,
+          );
         }
         return verifyAndConsumeGuidedExactStepAttestation(
           commandOsApplication.database,
@@ -5533,6 +5571,7 @@ const reviewedSelftestAttestation = (() => {
 
 interface LiveMcpRouteValue {
   readonly tools: readonly string[];
+  readonly toolSchemas: Readonly<Record<string, Readonly<Record<string, unknown>>>>;
 }
 
 const mcpRouteAttestations = new LiveAttestationCache<string, LiveMcpRouteValue>({
@@ -5546,18 +5585,29 @@ const mcpRouteAttestations = new LiveAttestationCache<string, LiveMcpRouteValue>
       return { ok: false, retryable: false, reason: "MCP route prerequisites are unavailable" };
     }
     const result = await bridge.probeTools(serverName, signal);
-    if (!result.ok || !Array.isArray(result.tools)) {
+    if (!result.ok || !Array.isArray(result.tools) || !result.toolSchemas) {
       return { ok: false, retryable: true, reason: "MCP live tools/list attestation failed" };
     }
-    const expected = [...new Set(record.spec.toolNames)].sort();
-    const actual = [...new Set(result.tools)].sort();
-    if (expected.length !== actual.length || expected.some((tool, index) => tool !== actual[index])) {
-      return { ok: false, retryable: false, reason: "MCP live tool surface differs from the reviewed route declaration" };
+    const reconciliation = reconcileMcpToolSurface(
+      serverName,
+      record.spec.toolNames,
+      result.tools,
+    );
+    if (!reconciliation.accepted) {
+      return { ok: false, retryable: false, reason: reconciliation.reason };
     }
+    const schemaAttestation = attestReviewedMcpToolSchemas(serverName, result.toolSchemas);
+    if (!schemaAttestation.accepted) {
+      return { ok: false, retryable: false, reason: schemaAttestation.reason };
+    }
+    const toolSchemas = Object.fromEntries(reconciliation.exposedTools.map((toolName) => [
+      toolName,
+      result.toolSchemas?.[toolName],
+    ]).filter((entry): entry is [string, Readonly<Record<string, unknown>>] => Boolean(entry[1])));
     return {
       ok: true,
-      value: { tools: actual },
-      reason: "Live MCP tools/list surface attested",
+      value: { tools: reconciliation.exposedTools, toolSchemas },
+      reason: `${reconciliation.reason}; ${schemaAttestation.reason}`,
     };
   },
   successTtlMs: 2 * 60_000,
@@ -5603,7 +5653,7 @@ let obsidianVaultWatcher: ObsidianVaultWatcher | null = null;
  * inventory; it never receives a shell or an MCP connection of its own.
  */
 function commandOsToolInventory(
-  currentAttestedRoutes = commandOsAttestedMcpRoutes(),
+  currentAttestedRoutes: readonly AttestedMcpRoute[] = commandOsAttestedMcpRoutes(),
 ): CommandOsToolInventory[] {
   const planningOnlySpecialists = AGENT_ROSTER.map((agent) => ({
     agentId: agent.agentId,
@@ -5623,6 +5673,7 @@ function commandOsToolInventory(
         description: recon.description,
         mcpServer: route.name,
         toolNames: route.tools.filter((tool) => recon.allowedTools.includes(tool)),
+        toolInputSchemas: route.toolSchemas,
         // The opt-in no-network E2E fixture is the only inventory projection
         // with a reviewed deterministic empty-input template. Live/general
         // MCP inventory remains ineligible for analysis-to-tool compilation.
@@ -5658,6 +5709,7 @@ function commandOsToolInventory(
         const toolNames = autonomousSpecialistTools(
           agent.agentId,
           route.tools.filter((toolName) => agent.allowedTools.includes(toolName) && spec.toolNames.includes(toolName)),
+          spec.name,
         );
         if (toolNames.length === 0) continue;
         const deterministicProjection = reviewedSelftestDeterministicProjection(
@@ -5670,6 +5722,10 @@ function commandOsToolInventory(
           description: agent.description,
           mcpServer: spec.name,
           toolNames,
+          toolInputSchemas: Object.fromEntries(toolNames.map((toolName) => [
+            toolName,
+            route.toolSchemas?.[toolName],
+          ]).filter((entry): entry is [string, Readonly<Record<string, unknown>>] => Boolean(entry[1]))),
           ...(deterministicProjection ?? {}),
           safetyBoundaries: agent.safetyBoundaries,
         });
@@ -5835,6 +5891,7 @@ function commandOsAttestedMcpRoutes(): AttestedMcpRoute[] {
       name: spec.name,
       verified: snapshot.verified,
       tools: snapshot.verified ? snapshot.value?.tools ?? [] : [],
+      toolSchemas: snapshot.verified ? snapshot.value?.toolSchemas ?? {} : {},
       assignedAgentIds: spec.assignedAgents,
       attestedAt: snapshot.attestedAt,
       expiresAt: snapshot.expiresAt,
@@ -6003,10 +6060,16 @@ function commandOsRuntimeProjection(): RuntimeProjectionInput {
 const commandOsDatabasePath = resolve(
   process.env.COMMAND_OS_DB_PATH || join(RUNTIME_DATA_DIR, "command-os-v2.sqlite"),
 );
+const commandOsToolValidation = () => evaluateRuntimeToolValidation(commandOsAttestedMcpRoutes());
 commandOsApplication = createCommandOsApplication({
   databasePath: commandOsDatabasePath,
-  readinessProviders: () => createRuntimeReadinessProviders(commandOsRuntimeSnapshot),
+  readinessProviders: () => [
+    ...createRuntimeReadinessProviders(commandOsRuntimeSnapshot),
+    createRuntimeToolValidationReadinessProvider(commandOsToolValidation),
+    createTargetNetworkReadinessProvider(),
+  ],
   runtimeProjection: commandOsRuntimeProjection,
+  runtimeToolValidation: commandOsToolValidation,
   resolveActor: () => "operator:local",
   resolveEventSensitivity: () => "restricted",
   // This closure is registered before runtime construction but is only called
@@ -7311,7 +7374,7 @@ app.all("/proxy/anthropic/*", async (req, res) => {
   });
 
   // Forward to upstream
-  let upstream: Response;
+  let upstream: globalThis.Response;
   try {
     upstream = await fetch(upstreamUrl, {
       method: req.method,
@@ -8033,7 +8096,16 @@ function discoverSafeReportFiles(engagementPath: string): {
 }
 
 // Track report generation jobs
-const reportJobs = new Map<string, { status: string; output: string; startedAt: string; completedAt?: string; reportPath?: string }>();
+const reportJobs = new Map<string, {
+  status: string;
+  output: string;
+  startedAt: string;
+  completedAt?: string;
+  reportPath?: string;
+  stage?: string;
+  progress?: number;
+  _readCount?: number;
+}>();
 
 // Process history — tracks shells/agents that have completed or disappeared
 // so they show up in the Completed/Failed columns instead of vanishing
@@ -9276,7 +9348,7 @@ app.post("/api/reports/generate-missing", async (_, res) => {
         headers: { "Content-Type": "application/json" },
         body: "{}",
       });
-      const data = await r.json().catch(() => ({} as any));
+      const data = await r.json().catch(() => ({})) as { jobId?: string; error?: string };
       if (r.ok && data.jobId) {
         jobs.push({ name: m.name, jobId: data.jobId });
       } else {
@@ -9663,7 +9735,7 @@ function buildOsintPrompt(target: string, targetType: string, scope: string, out
     person: ["sherlock <username>", "Google dorking site-specific patterns (linkedin, twitter, github)", "image reverse search guidance", "username variants enum"],
     company: ["whois (all known domains)", "amass + subfinder", "theHarvester -b all", "linkedin enumeration via Google dorks", "crunchbase / opencorporates via curl"],
   };
-  const targetSpecific = ((tools as any)[targetType] || tools.domain)
+  const targetSpecific: string[] = ((tools as Record<string, string[]>)[targetType] || tools.domain)
     .map((entry: string) => entry.replaceAll("<target>", quotedTarget));
 
   return `You are conducting a comprehensive OSINT investigation. Be thorough and methodical.

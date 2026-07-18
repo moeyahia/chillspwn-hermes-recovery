@@ -6,7 +6,6 @@ import { Button, ButtonLink, Card, ErrorPanel, LoadingPanel, PageHeader, StatusP
 import { useModalFocus } from "../../design-system/hooks/useModalFocus";
 import { MEMORY_SENSITIVITIES, type MemorySensitivity } from "../../domain/types/brain";
 import { BrainNav, formatBrainDate, scopeLabel } from "./BrainNav";
-import { BROWSER_STORAGE_KEYS } from "../../lib/browserNamespaces";
 import { ContextPackPanel } from "./ContextPackPanel";
 
 export default function BrainNodePage({ nodeId }: { nodeId: string }) {
@@ -41,7 +40,7 @@ export default function BrainNodePage({ nodeId }: { nodeId: string }) {
 
   return (
     <div className="os-page brain-page brain-node-page">
-      <PageHeader eyebrow="Canonical memory record" title={detail.data?.node.title ?? "Memory node"} description="Provenance, lifecycle, scope, usage, corrections, and relationships remain visible and operator-controlled." actions={<Button variant="secondary" onClick={() => { sessionStorage.setItem(BROWSER_STORAGE_KEYS.brainGraphRoot, nodeId); navigation.navigate("/brain/graph"); }}>Show in graph</Button>} />
+      <PageHeader eyebrow="Canonical memory record" title={detail.data?.node.title ?? "Memory node"} description="Provenance, lifecycle, scope, usage, corrections, and relationships remain visible and operator-controlled." actions={<Button variant="secondary" onClick={() => navigation.navigate(`/brain/graph?view=local&root=${encodeURIComponent(nodeId)}&selected=${encodeURIComponent(nodeId)}`)}>Show in graph</Button>} />
       <BrainNav />
       {detail.isLoading && <LoadingPanel label="Loading complete memory record" />}
       {detail.error && !detail.data && <ErrorPanel error={detail.error} onRetry={detail.refresh} />}

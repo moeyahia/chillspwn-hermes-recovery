@@ -102,6 +102,7 @@ export interface BrainSummary {
   schemaVersion: "2.4";
   counts: {
     confirmed: number;
+    verified: number;
     candidates: number;
     stale: number;
     disputed: number;
@@ -127,6 +128,8 @@ export interface MemoryGraph {
   rootNodeId?: string;
   nodes: MemoryNodeSummary[];
   edges: MemoryEdgeSummary[];
+  /** Full access-controlled result count before the bounded render limit. */
+  availableNodeCount: number;
   truncated: boolean;
 }
 

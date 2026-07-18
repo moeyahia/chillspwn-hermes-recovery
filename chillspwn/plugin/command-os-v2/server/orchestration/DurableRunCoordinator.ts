@@ -57,7 +57,11 @@ export type PlanningRetryScheduleResult =
     }
   | {
       readonly scheduled: false;
-      readonly reason: "non_retryable" | "retry_budget_exhausted" | "signed_budget_exhausted";
+      readonly reason:
+        | "non_retryable"
+        | "retry_budget_exhausted"
+        | "provider_retry_after_exceeds_bound"
+        | "signed_budget_exhausted";
       readonly exhausted: readonly string[];
     };
 
@@ -296,7 +300,9 @@ export class DurableRunCoordinator {
           scheduled: false,
           reason: decision.reason === "retry_budget_exhausted"
             ? "retry_budget_exhausted"
-            : "non_retryable",
+            : decision.reason === "provider_retry_after_exceeds_bound"
+              ? "provider_retry_after_exceeds_bound"
+              : "non_retryable",
           exhausted: [],
         };
       }

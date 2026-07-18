@@ -463,19 +463,19 @@ export function buildActionClassRegistry(
       if (input.journey === "autonomous" && resolved.policyState === "pre_authorized") {
         const executable = capability.availability === "supported" && capability.enforcementReady;
         if (!executable && resolved.policySource !== "operator_override") {
-          // Recommended defaults are capability-adaptive. They never grant an
-          // unavailable class and they do not make otherwise safe defaults
-          // impossible merely because an optional specialist is offline.
+          // Recommended defaults adapt to the attested runtime. An unavailable
+          // optional capability is never granted and does not make a safe
+          // minimal mission impossible to launch.
           resolved = { policyState: "prohibited", policySource: "platform_default" };
         } else if (!executable) {
           if (capability.availability !== "supported") {
             launchBlockingReasons.push(
-              `Explicitly pre-authorized class is ${capability.availability}; no ready runtime path is available.`,
+              `${definition.label} was explicitly allowed, but the runtime reports it as ${capability.availability}. Connect a supported specialist and tool, or change this class to Guided only or Prohibited.`,
             );
           }
           if (!capability.enforcementReady) {
             launchBlockingReasons.push(
-              "Explicitly pre-authorized class has no locally enforced compatible executor path.",
+              `${definition.label} was explicitly allowed, but no locally enforced executor can perform it autonomously. Select an enforcing provider and tool path, or change this class to Guided only or Prohibited.`,
             );
           }
         }
@@ -503,7 +503,7 @@ export function buildActionClassRegistry(
   }
 
   const launchBlockingReasons = ACTION_CLASS_IDS.flatMap((id) =>
-    classes[id].launchBlockingReasons.map((reason) => `${id}: ${reason}`),
+    classes[id].launchBlockingReasons,
   );
   if (
     input.journey === "autonomous"

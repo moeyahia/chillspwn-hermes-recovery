@@ -5,7 +5,7 @@ import type { JsonValue } from "../events";
 import { EventRepository } from "../events";
 import { evaluateDestructiveAuthorization } from "../domain";
 import { redactSensitiveText } from "../guided-commander/validation";
-import type { DurableActionIntent, RunLeaseToken } from "../orchestration";
+import type { DurableAction, DurableActionIntent, RunLeaseToken } from "../orchestration";
 import {
   fingerprintAction,
   progressSignature,
@@ -103,9 +103,45 @@ interface DecisionRow {
   readonly created_at: string;
 }
 
-interface StoredIdempotency {
-  readonly requestHash: string;
-  readonly response: JsonValue;
+export type RuntimeIdempotencyReservation =
+  | {
+      readonly status: "reserved";
+      readonly ownerToken: string;
+      /** An expired owner was fenced; canonical reconciliation is mandatory before work may run. */
+      readonly recoveryRequired?: true;
+    }
+  | { readonly status: "replay"; readonly response: JsonValue }
+  | { readonly status: "failure"; readonly error: RuntimeIdempotencyFailure };
+
+export interface RuntimeIdempotencyFailure {
+  readonly status: number;
+  readonly code: string;
+  readonly message: string;
+  readonly humanMessage: string;
+  readonly retryable: boolean;
+  readonly category: string;
+  readonly details?: JsonValue;
+  readonly remediation?: string;
+}
+
+export type RuntimeIdempotencyReconciliation =
+  | { readonly status: "committed"; readonly auditDetails: JsonValue }
+  | { readonly status: "not_committed" }
+  | { readonly status: "indeterminate" };
+
+interface RuntimeMutationReceiptRow {
+  readonly receipt_key: string;
+  readonly request_hash: string;
+  readonly actor_id: string;
+  readonly state: "in_progress" | "succeeded" | "failed";
+  readonly owner_token: string | null;
+  readonly lease_expires_at: string | null;
+  readonly boundary_json: string | null;
+  readonly response_json: string | null;
+  readonly error_json: string | null;
+  readonly started_at: string;
+  readonly completed_at: string | null;
+  readonly updated_at: string;
 }
 
 export interface PersistedPlanResult {
@@ -131,6 +167,7 @@ export interface RuntimeRunProjection {
   readonly missionName: string;
   readonly objective: string;
   readonly journey: Journey;
+  readonly controlPlane: "legacy" | "command_os_v2";
   readonly status: RunState;
   readonly statusReason: string | null;
   readonly progress: number;
@@ -294,6 +331,7 @@ function mapRunProjection(row: Record<string, unknown>): RuntimeRunProjection {
     missionName: String(row.mission_name),
     objective: String(row.objective),
     journey: row.journey as Journey,
+    controlPlane: row.control_plane as "legacy" | "command_os_v2",
     status: row.status as RunState,
     statusReason: typeof row.status_reason === "string" ? row.status_reason : null,
     progress: typeof row.progress === "number" ? row.progress : 0,
@@ -314,6 +352,62 @@ function mapRunProjection(row: Record<string, unknown>): RuntimeRunProjection {
 function idempotencyKey(scope: string, key: string): string {
   const digest = createHash("sha256").update(key, "utf8").digest("hex");
   return `idempotency.runtime.${scope}.${digest}`;
+}
+
+const DEFAULT_IDEMPOTENCY_LEASE_MS = 120_000;
+const MIN_IDEMPOTENCY_LEASE_MS = 1_000;
+const MAX_IDEMPOTENCY_LEASE_MS = 15 * 60_000;
+
+function idempotencyLeaseExpiry(now: string, leaseTtlMs: number): string {
+  if (
+    !Number.isSafeInteger(leaseTtlMs)
+    || leaseTtlMs < MIN_IDEMPOTENCY_LEASE_MS
+    || leaseTtlMs > MAX_IDEMPOTENCY_LEASE_MS
+  ) {
+    throw new RangeError(
+      `Idempotency lease must be ${MIN_IDEMPOTENCY_LEASE_MS} through ${MAX_IDEMPOTENCY_LEASE_MS} milliseconds`,
+    );
+  }
+  const timestamp = Date.parse(now);
+  if (!Number.isFinite(timestamp)) throw new RangeError("Idempotency lease time is invalid");
+  return new Date(timestamp + leaseTtlMs).toISOString();
+}
+
+function recordValue(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {};
+}
+
+function parseIdempotencyFailure(value: string): RuntimeIdempotencyFailure {
+  const parsed = recordValue(JSON.parse(value) as unknown);
+  const status = Number(parsed.status);
+  if (
+    !Number.isSafeInteger(status)
+    || status < 400
+    || status > 599
+    || typeof parsed.code !== "string"
+    || typeof parsed.message !== "string"
+    || typeof parsed.humanMessage !== "string"
+    || typeof parsed.retryable !== "boolean"
+    || typeof parsed.category !== "string"
+  ) {
+    throw new CommandRuntimeError(500, "idempotency_failure_receipt_corrupt", "Stored command failure receipt is corrupt", {
+      humanMessage: "The saved command result failed its integrity checks and was not replayed.",
+      category: "data_integrity",
+      remediation: "Inspect and reconcile the mutation receipt before taking another action.",
+    });
+  }
+  return {
+    status,
+    code: parsed.code,
+    message: parsed.message,
+    humanMessage: parsed.humanMessage,
+    retryable: parsed.retryable,
+    category: parsed.category,
+    ...(parsed.details === undefined ? {} : { details: jsonValue(parsed.details) }),
+    ...(typeof parsed.remediation === "string" ? { remediation: parsed.remediation } : {}),
+  };
 }
 
 export class RuntimeRepository {
@@ -388,8 +482,21 @@ export class RuntimeRepository {
   listRunnableRuns(now: string, limit = 20): string[] {
     return (this.database.prepare(`
       SELECT id FROM runs
-      WHERE status IN ('planning', 'recovering')
+      WHERE control_plane = 'command_os_v2'
+        AND EXISTS (
+          SELECT 1 FROM missions m
+          WHERE m.id = runs.mission_id AND m.control_plane = 'command_os_v2'
+        )
+        -- Ambient scheduling is only allowed for planning. Recovery requires
+        -- an exact durable continuation or a typed supervisor directive; a
+        -- broad recovering-state scan could otherwise race a resumed action and
+        -- silently replace its existing plan.
+        AND status = 'planning'
         AND (lease_expires_at IS NULL OR lease_expires_at <= ?)
+        AND NOT EXISTS (
+          SELECT 1 FROM actions active
+          WHERE active.run_id = runs.id AND active.status IN ('queued', 'running')
+        )
         AND NOT EXISTS (
           SELECT 1 FROM runtime_continuations continuation
           WHERE continuation.run_id = runs.id
@@ -2218,28 +2325,500 @@ export class RuntimeRepository {
     return { mission, runs: ids.map((row) => this.getRunProjection(row.id)) };
   }
 
+  private captureIdempotencyBoundary(scope: string, request: unknown): JsonValue | null {
+    const envelope = recordValue(request);
+    const params = recordValue(envelope.params);
+    if (scope.startsWith("decision.")) {
+      const decisionId = typeof params.decisionId === "string" ? params.decisionId : "";
+      if (!decisionId) return null;
+      const row = this.database.prepare(`
+        SELECT gd.id AS decision_id, gd.status AS decision_status,
+          gd.decision_actor, gd.decision_reason, gd.step_id,
+          r.id AS run_id, r.status AS run_status, r.version AS run_version,
+          r.current_plan_id, r.current_step_id, r.control_plane AS run_control_plane,
+          m.control_plane AS mission_control_plane
+        FROM guided_decisions gd
+        JOIN runs r ON r.id = gd.run_id
+        JOIN missions m ON m.id = gd.mission_id
+        WHERE gd.id = ?
+      `).get(decisionId) as Record<string, unknown> | undefined;
+      return row ? jsonValue(row) : null;
+    }
+    if (scope.startsWith("run.")) {
+      const runId = typeof params.runId === "string" ? params.runId : "";
+      if (!runId) return null;
+      const row = this.database.prepare(`
+        SELECT r.id AS run_id, r.status AS run_status, r.version AS run_version,
+          r.current_plan_id, r.current_step_id, r.control_plane AS run_control_plane,
+          m.control_plane AS mission_control_plane,
+          checkpoint.id AS checkpoint_id,
+          checkpoint.event_sequence AS checkpoint_event_sequence,
+          checkpoint.state_hash AS checkpoint_state_hash
+        FROM runs r
+        JOIN missions m ON m.id = r.mission_id
+        LEFT JOIN checkpoints checkpoint ON checkpoint.id = (
+          SELECT latest.id FROM checkpoints latest
+          WHERE latest.run_id = r.id
+          ORDER BY latest.created_at DESC, latest.id DESC LIMIT 1
+        )
+        WHERE r.id = ?
+      `).get(runId) as Record<string, unknown> | undefined;
+      return row ? jsonValue(row) : null;
+    }
+    return null;
+  }
+
+  private idempotencyAuditDescriptor(scope: string, request: unknown): {
+    readonly action: string;
+    readonly resourceType: "guided_decision" | "run";
+    readonly resourceId: string;
+    readonly reason: string;
+    readonly resumeBoundary?: Readonly<Record<string, unknown>>;
+  } | null {
+    const envelope = recordValue(request);
+    const params = recordValue(envelope.params);
+    const body = recordValue(envelope.body);
+    const suppliedReason = typeof body.reason === "string"
+      ? body.reason.trim().normalize("NFKC")
+      : undefined;
+    const decisionId = typeof params.decisionId === "string" ? params.decisionId : "";
+    const runId = typeof params.runId === "string" ? params.runId : "";
+    if (scope === "decision.approve" && decisionId) {
+      return {
+        action: "guided.decision_approved",
+        resourceType: "guided_decision",
+        resourceId: decisionId,
+        reason: suppliedReason || "Approved exact represented step",
+      };
+    }
+    if (scope === "decision.manual" && decisionId) {
+      return {
+        action: "guided.manual_result_recorded",
+        resourceType: "guided_decision",
+        resourceId: decisionId,
+        reason: "Operator supplied exact-step result",
+      };
+    }
+    const decisionActions = {
+      "decision.reject": "guided.decision_rejected",
+      "decision.skip": "guided.decision_skipped",
+      "decision.stop": "guided.mission_stopped",
+    } as const;
+    if (scope in decisionActions && decisionId && suppliedReason) {
+      return {
+        action: decisionActions[scope as keyof typeof decisionActions],
+        resourceType: "guided_decision",
+        resourceId: decisionId,
+        reason: suppliedReason,
+      };
+    }
+    const runActions = {
+      "run.pause": "run.paused",
+      "run.resume": "run.resumed",
+      "run.cancel": "run.cancelled",
+    } as const;
+    if (scope in runActions && runId && suppliedReason) {
+      return {
+        action: runActions[scope as keyof typeof runActions],
+        resourceType: "run",
+        resourceId: runId,
+        reason: suppliedReason,
+        ...(scope === "run.resume" ? { resumeBoundary: body } : {}),
+      };
+    }
+    return null;
+  }
+
+  private mutationReceipt(receiptKey: string): RuntimeMutationReceiptRow | undefined {
+    return this.database.prepare(`
+      SELECT receipt_key, request_hash, actor_id, state, owner_token,
+        lease_expires_at, boundary_json, response_json, error_json,
+        started_at, completed_at, updated_at
+      FROM runtime_mutation_receipts WHERE receipt_key = ?
+    `).get(receiptKey) as RuntimeMutationReceiptRow | undefined;
+  }
+
+  private classifyIdempotencyRecovery(
+    scope: string,
+    request: unknown,
+    actorId: string,
+    row: RuntimeMutationReceiptRow,
+  ): RuntimeIdempotencyReconciliation {
+    const descriptor = this.idempotencyAuditDescriptor(scope, request);
+    if (descriptor) {
+      const audit = this.database.prepare(`
+        SELECT details_json FROM audit_records
+        WHERE action = ? AND resource_type = ? AND resource_id = ?
+          AND actor_id = ? AND reason = ? AND occurred_at >= ?
+        ORDER BY occurred_at DESC, id DESC LIMIT 1
+      `).get(
+        descriptor.action,
+        descriptor.resourceType,
+        descriptor.resourceId,
+        actorId,
+        descriptor.reason,
+        row.started_at,
+      ) as { details_json: string } | undefined;
+      if (audit) {
+        const details = JSON.parse(audit.details_json) as JsonValue;
+        if (scope === "run.resume") {
+          const stored = recordValue(details);
+          const expected = descriptor.resumeBoundary ?? {};
+          if (
+            stored.consumedRunVersion !== expected.expectedRunVersion
+            || stored.consumedCheckpointId !== expected.expectedCheckpointId
+            || stored.consumedCheckpointStateHash !== expected.expectedCheckpointStateHash
+            || stored.checkpointEventSequence === undefined
+          ) {
+            return { status: "indeterminate" };
+          }
+        }
+        return { status: "committed", auditDetails: details };
+      }
+    }
+    if (!row.boundary_json) return { status: "indeterminate" };
+    const currentBoundary = this.captureIdempotencyBoundary(scope, request);
+    if (currentBoundary === null) return { status: "indeterminate" };
+    return canonicalJson(currentBoundary) === canonicalJson(JSON.parse(row.boundary_json) as JsonValue)
+      ? { status: "not_committed" }
+      : { status: "indeterminate" };
+  }
+
+  private assertIdempotencyOwner(
+    row: RuntimeMutationReceiptRow | undefined,
+    requestHash: string,
+    actorId: string,
+    ownerToken: string,
+    now: string,
+  ): RuntimeMutationReceiptRow {
+    if (
+      !row
+      || row.state !== "in_progress"
+      || row.request_hash !== requestHash
+      || row.actor_id !== actorId
+      || row.owner_token !== ownerToken
+    ) {
+      throw new CommandRuntimeError(409, "idempotency_reservation_changed", "The command reservation changed before completion", {
+        humanMessage: "The action may have completed, but another command state replaced its response reservation.",
+        category: "data_integrity",
+        remediation: "Refresh the affected run or decision and inspect its current state before taking another action.",
+      });
+    }
+    if (!row.lease_expires_at || Date.parse(row.lease_expires_at) <= Date.parse(now)) {
+      throw new CommandRuntimeError(409, "idempotency_reservation_expired", "The command reservation expired before completion", {
+        humanMessage: "The command outlived its durable receipt lease and was not allowed to publish a stale result.",
+        category: "data_integrity",
+        remediation: "Retry with the same key so the runtime can reconcile the canonical mutation before doing any more work.",
+      });
+    }
+    return row;
+  }
+
   findIdempotent(scope: string, key: string, request: unknown): JsonValue | undefined {
-    const row = this.database.prepare("SELECT value_json FROM settings WHERE key = ?")
-      .get(idempotencyKey(scope, key)) as { value_json: string } | undefined;
+    const row = this.mutationReceipt(idempotencyKey(scope, key));
     if (!row) return undefined;
-    const stored = JSON.parse(row.value_json) as StoredIdempotency;
-    if (stored.requestHash !== hashJson(request)) {
+    if (row.request_hash !== hashJson(request)) {
       throw new CommandRuntimeError(409, "idempotency_key_conflict", "Idempotency key was reused with a different request", {
         humanMessage: "This command key already belongs to another mutation.",
         category: "conflict",
       });
     }
-    return stored.response;
+    if (row.state === "succeeded" && row.response_json) {
+      return JSON.parse(row.response_json) as JsonValue;
+    }
+    if (row.state === "failed" && row.error_json) {
+      const failure = parseIdempotencyFailure(row.error_json);
+      throw new CommandRuntimeError(failure.status, failure.code, failure.message, {
+        humanMessage: failure.humanMessage,
+        retryable: failure.retryable,
+        category: failure.category,
+        ...(failure.details === undefined ? {} : { details: failure.details }),
+        ...(failure.remediation ? { remediation: failure.remediation } : {}),
+      });
+    }
+    throw new CommandRuntimeError(409, "idempotency_request_in_progress", "An earlier command with this key has no final response", {
+      humanMessage: "This command is still owned by an active worker or is waiting for canonical reconciliation.",
+      retryable: true,
+      category: "conflict",
+      remediation: "Retry with the same key after the bounded receipt lease expires; do not create a second command key.",
+    });
+  }
+
+  reserveIdempotent(
+    scope: string,
+    key: string,
+    request: unknown,
+    actorId: string,
+    now: string,
+    leaseTtlMs = DEFAULT_IDEMPOTENCY_LEASE_MS,
+  ): RuntimeIdempotencyReservation {
+    return inImmediateTransaction(this.database, () => {
+      const receiptKey = idempotencyKey(scope, key);
+      const requestHash = hashJson(request);
+      const leaseExpiresAt = idempotencyLeaseExpiry(now, leaseTtlMs);
+      const row = this.mutationReceipt(receiptKey);
+      if (row) {
+        if (row.request_hash !== requestHash || row.actor_id !== actorId) {
+          throw new CommandRuntimeError(409, "idempotency_key_conflict", "Idempotency key was reused with a different request or actor", {
+            humanMessage: "This command key already belongs to another operator action.",
+            category: "conflict",
+          });
+        }
+        if (row.state === "succeeded" && row.response_json) {
+          return { status: "replay", response: JSON.parse(row.response_json) as JsonValue };
+        }
+        if (row.state === "failed" && row.error_json) {
+          // A handler exception is terminal and replayable unless the immutable
+          // domain audit proves that the handler committed before it failed.
+          // In that one case, fence the failed receipt and reconstruct success
+          // rather than replaying the handler or its side effects.
+          const reconciliation = this.classifyIdempotencyRecovery(scope, request, actorId, row);
+          if (reconciliation.status !== "committed") {
+            return { status: "failure", error: parseIdempotencyFailure(row.error_json) };
+          }
+          const ownerToken = id("idempotency-owner");
+          const recovered = this.database.prepare(`
+            UPDATE runtime_mutation_receipts
+            SET state = 'in_progress', owner_token = ?, lease_expires_at = ?,
+              error_json = NULL, completed_at = NULL, updated_at = ?
+            WHERE receipt_key = ? AND state = 'failed'
+              AND request_hash = ? AND actor_id = ? AND error_json = ?
+          `).run(
+            ownerToken,
+            leaseExpiresAt,
+            now,
+            receiptKey,
+            requestHash,
+            actorId,
+            row.error_json,
+          );
+          if (recovered.changes !== 1) {
+            throw new CommandRuntimeError(409, "idempotency_reservation_changed", "Command failure receipt changed during recovery", {
+              retryable: true,
+              category: "conflict",
+            });
+          }
+          return { status: "reserved", ownerToken, recoveryRequired: true };
+        }
+        const currentExpiry = row.lease_expires_at ? Date.parse(row.lease_expires_at) : Number.NaN;
+        if (!Number.isFinite(currentExpiry)) {
+          throw new CommandRuntimeError(500, "idempotency_receipt_corrupt", "Command receipt lease is corrupt", {
+            humanMessage: "The saved command reservation failed its integrity checks.",
+            category: "data_integrity",
+            remediation: "Reconcile the receipt record before taking another action.",
+          });
+        }
+        if (currentExpiry > Date.parse(now)) {
+          throw new CommandRuntimeError(409, "idempotency_request_in_progress", "An earlier command with this key has no final response", {
+            humanMessage: "This command is already being handled by an active fenced worker.",
+            retryable: true,
+            category: "conflict",
+            remediation: "Retry with the same key after the bounded receipt lease; do not submit a second command.",
+          });
+        }
+        const ownerToken = id("idempotency-owner");
+        const recovered = this.database.prepare(`
+          UPDATE runtime_mutation_receipts
+          SET owner_token = ?, lease_expires_at = ?, updated_at = ?
+          WHERE receipt_key = ? AND state = 'in_progress'
+            AND request_hash = ? AND actor_id = ?
+            AND owner_token = ? AND lease_expires_at = ?
+        `).run(
+          ownerToken,
+          leaseExpiresAt,
+          now,
+          receiptKey,
+          requestHash,
+          actorId,
+          row.owner_token,
+          row.lease_expires_at,
+        );
+        if (recovered.changes !== 1) {
+          throw new CommandRuntimeError(409, "idempotency_reservation_changed", "Command reservation changed during recovery", {
+            retryable: true,
+            category: "conflict",
+          });
+        }
+        return { status: "reserved", ownerToken, recoveryRequired: true };
+      }
+      const ownerToken = id("idempotency-owner");
+      const boundary = this.captureIdempotencyBoundary(scope, request);
+      this.database.prepare(`
+        INSERT INTO runtime_mutation_receipts (
+          receipt_key, request_hash, actor_id, state, owner_token,
+          lease_expires_at, boundary_json, response_json, error_json,
+          started_at, completed_at, updated_at
+        ) VALUES (?, ?, ?, 'in_progress', ?, ?, ?, NULL, NULL, ?, NULL, ?)
+      `).run(
+        receiptKey,
+        requestHash,
+        actorId,
+        ownerToken,
+        leaseExpiresAt,
+        boundary === null ? null : canonicalJson(boundary),
+        now,
+        now,
+      );
+      return { status: "reserved", ownerToken };
+    });
+  }
+
+  heartbeatIdempotent(
+    scope: string,
+    key: string,
+    request: unknown,
+    ownerToken: string,
+    actorId: string,
+    now: string,
+    leaseTtlMs = DEFAULT_IDEMPOTENCY_LEASE_MS,
+  ): void {
+    const receiptKey = idempotencyKey(scope, key);
+    const requestHash = hashJson(request);
+    const leaseExpiresAt = idempotencyLeaseExpiry(now, leaseTtlMs);
+    const updated = this.database.prepare(`
+      UPDATE runtime_mutation_receipts
+      SET lease_expires_at = ?, updated_at = ?
+      WHERE receipt_key = ? AND state = 'in_progress'
+        AND request_hash = ? AND actor_id = ? AND owner_token = ?
+        AND lease_expires_at > ?
+    `).run(leaseExpiresAt, now, receiptKey, requestHash, actorId, ownerToken, now);
+    if (updated.changes !== 1) {
+      throw new CommandRuntimeError(409, "idempotency_reservation_changed", "Command receipt heartbeat lost its owner fence", {
+        retryable: true,
+        category: "data_integrity",
+      });
+    }
+  }
+
+  reconcileIdempotentReservation(
+    scope: string,
+    key: string,
+    request: unknown,
+    ownerToken: string,
+    actorId: string,
+    now: string,
+  ): RuntimeIdempotencyReconciliation {
+    return inImmediateTransaction(this.database, () => {
+      const row = this.assertIdempotencyOwner(
+        this.mutationReceipt(idempotencyKey(scope, key)),
+        hashJson(request),
+        actorId,
+        ownerToken,
+        now,
+      );
+      return this.classifyIdempotencyRecovery(scope, request, actorId, row);
+    });
+  }
+
+  completeIdempotent(
+    scope: string,
+    key: string,
+    request: unknown,
+    ownerToken: string,
+    response: JsonValue,
+    actorId: string,
+    now: string,
+  ): void {
+    inImmediateTransaction(this.database, () => {
+      const receiptKey = idempotencyKey(scope, key);
+      this.assertIdempotencyOwner(
+        this.mutationReceipt(receiptKey),
+        hashJson(request),
+        actorId,
+        ownerToken,
+        now,
+      );
+      const updated = this.database.prepare(`
+        UPDATE runtime_mutation_receipts
+        SET state = 'succeeded', owner_token = NULL, lease_expires_at = NULL,
+          response_json = ?, completed_at = ?, updated_at = ?
+        WHERE receipt_key = ? AND state = 'in_progress'
+          AND request_hash = ? AND actor_id = ? AND owner_token = ?
+          AND lease_expires_at > ?
+      `).run(
+        canonicalJson(response),
+        now,
+        now,
+        receiptKey,
+        hashJson(request),
+        actorId,
+        ownerToken,
+        now,
+      );
+      if (updated.changes !== 1) {
+        throw new CommandRuntimeError(409, "idempotency_reservation_changed", "The command reservation changed before completion", {
+          category: "data_integrity",
+        });
+      }
+    });
+  }
+
+  failIdempotent(
+    scope: string,
+    key: string,
+    request: unknown,
+    ownerToken: string,
+    failure: RuntimeIdempotencyFailure,
+    actorId: string,
+    now: string,
+  ): void {
+    const serialized = canonicalJson(failure);
+    parseIdempotencyFailure(serialized);
+    inImmediateTransaction(this.database, () => {
+      const receiptKey = idempotencyKey(scope, key);
+      this.assertIdempotencyOwner(
+        this.mutationReceipt(receiptKey),
+        hashJson(request),
+        actorId,
+        ownerToken,
+        now,
+      );
+      const updated = this.database.prepare(`
+        UPDATE runtime_mutation_receipts
+        SET state = 'failed', owner_token = NULL, lease_expires_at = NULL,
+          error_json = ?, completed_at = ?, updated_at = ?
+        WHERE receipt_key = ? AND state = 'in_progress'
+          AND request_hash = ? AND actor_id = ? AND owner_token = ?
+          AND lease_expires_at > ?
+      `).run(
+        serialized,
+        now,
+        now,
+        receiptKey,
+        hashJson(request),
+        actorId,
+        ownerToken,
+        now,
+      );
+      if (updated.changes !== 1) {
+        throw new CommandRuntimeError(409, "idempotency_reservation_changed", "The command reservation changed before failure receipt was stored", {
+          category: "data_integrity",
+        });
+      }
+    });
+  }
+
+  getGuidedDecisionAction(decisionId: string): DurableAction | null {
+    const row = this.database.prepare(`
+      SELECT id FROM actions WHERE guided_decision_id = ? ORDER BY created_at, id LIMIT 1
+    `).get(decisionId) as { id: string } | undefined;
+    return row ? new ActionRepository(this.database).get(row.id) : null;
   }
 
   storeIdempotent(scope: string, key: string, request: unknown, response: JsonValue, actorId: string, now: string): void {
     this.database.prepare(`
-      INSERT INTO settings (key, value_json, sensitivity, version, updated_by, updated_at)
-      VALUES (?, ?, 'private', 1, ?, ?)
+      INSERT INTO runtime_mutation_receipts (
+        receipt_key, request_hash, actor_id, state, owner_token,
+        lease_expires_at, boundary_json, response_json, error_json,
+        started_at, completed_at, updated_at
+      ) VALUES (?, ?, ?, 'succeeded', NULL, NULL, NULL, ?, NULL, ?, ?, ?)
     `).run(
       idempotencyKey(scope, key),
-      canonicalJson({ requestHash: hashJson(request), response }),
+      hashJson(request),
       actorId,
+      canonicalJson(response),
+      now,
+      now,
       now,
     );
   }

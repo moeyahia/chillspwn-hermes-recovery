@@ -168,6 +168,18 @@ export class FailureDiagnosisRepository {
     return this.get(id);
   }
 
+  supersede(id: string, supersededAt: string): FailureDiagnosis {
+    const result = this.database.prepare(`
+      UPDATE failure_diagnoses SET state = 'superseded', resolved_at = ?
+      WHERE id = ? AND state = 'active'
+    `).run(supersededAt, id);
+    if (result.changes !== 1) {
+      const row = this.row(id);
+      throw stateConflict(`Failure diagnosis in state ${row.state} cannot be superseded`);
+    }
+    return this.get(id);
+  }
+
   assertMissionRun(missionId: string, runId?: string): void {
     if (!this.database.prepare("SELECT 1 FROM missions WHERE id = ?").get(missionId)) throw missing("mission");
     if (runId) {

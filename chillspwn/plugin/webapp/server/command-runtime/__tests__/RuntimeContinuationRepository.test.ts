@@ -24,6 +24,113 @@ function fixture() {
 }
 
 describe("RuntimeContinuationRepository", () => {
+  test("post-claim writes fail closed when either run or mission ownership transfers", () => {
+    for (const ownership of ["run", "mission"] as const) {
+      for (const operation of ["heartbeat", "complete", "retry", "fail"] as const) {
+        const { database, repository, now } = fixture();
+        try {
+          const pending = repository.enqueue({
+            runId: "run-continuation",
+            kind: "evaluation_pending",
+            sourceId: `plan-${ownership}-${operation}`,
+            now,
+          });
+          const claimed = repository.claimNext({
+            runId: pending.runId,
+            workerId: "worker-before-transfer",
+            now,
+            leaseTtlMs: 1_000,
+          })!;
+          database.prepare(`UPDATE ${ownership === "run" ? "runs" : "missions"}
+            SET control_plane = 'legacy' WHERE id = ?`)
+            .run(ownership === "run" ? pending.runId : "mission-continuation");
+
+          const invoke = () => {
+            if (operation === "heartbeat") {
+              return repository.heartbeat(
+                pending.id,
+                claimed.leaseOwner!,
+                "2026-07-15T00:00:00.100Z",
+                1_000,
+              );
+            }
+            if (operation === "complete") {
+              return repository.complete(
+                pending.id,
+                claimed.leaseOwner!,
+                "2026-07-15T00:00:00.100Z",
+              );
+            }
+            if (operation === "retry") {
+              return repository.retry({
+                id: pending.id,
+                ownerToken: claimed.leaseOwner!,
+                now: "2026-07-15T00:00:00.100Z",
+                availableAt: "2026-07-15T00:00:02.000Z",
+                error: "retry only while V2 owns the run",
+              });
+            }
+            return repository.fail({
+              id: pending.id,
+              ownerToken: claimed.leaseOwner!,
+              now: "2026-07-15T00:00:00.100Z",
+              error: "fail only while V2 owns the run",
+            });
+          };
+
+          const fenceLabel = operation === "complete"
+            ? "completion"
+            : operation === "fail"
+              ? "failure"
+              : operation;
+          expect(invoke).toThrow(`${fenceLabel} fence lost`);
+          expect(repository.get(pending.id)).toMatchObject({
+            status: "processing",
+            leaseOwner: claimed.leaseOwner,
+            leaseExpiresAt: claimed.leaseExpiresAt,
+            completedAt: null,
+            lastError: null,
+          });
+        } finally {
+          database.close();
+        }
+      }
+
+      const { database, repository, now } = fixture();
+      try {
+        const pending = repository.enqueue({
+          runId: "run-continuation",
+          kind: "evaluation_pending",
+          sourceId: `plan-${ownership}-cancel`,
+          now,
+        });
+        const claimed = repository.claimNext({
+          runId: pending.runId,
+          workerId: "worker-before-transfer",
+          now,
+          leaseTtlMs: 1_000,
+        })!;
+        database.prepare(`UPDATE ${ownership === "run" ? "runs" : "missions"}
+          SET control_plane = 'legacy' WHERE id = ?`)
+          .run(ownership === "run" ? pending.runId : "mission-continuation");
+
+        expect(repository.cancelOpen(
+          pending.runId,
+          "2026-07-15T00:00:00.100Z",
+          "terminal state observed after transfer",
+        )).toBe(0);
+        expect(repository.get(pending.id)).toMatchObject({
+          status: "processing",
+          leaseOwner: claimed.leaseOwner,
+          leaseExpiresAt: claimed.leaseExpiresAt,
+          lastError: null,
+        });
+      } finally {
+        database.close();
+      }
+    }
+  });
+
   test("deduplicates source transitions and owner-fences an expired processing claim", () => {
     const { database, repository, now } = fixture();
     try {

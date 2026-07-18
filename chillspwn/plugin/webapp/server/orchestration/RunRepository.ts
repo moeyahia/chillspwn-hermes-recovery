@@ -21,6 +21,11 @@ import {
   type RunLeaseToken,
 } from "./types";
 import { canonicalJson, parseObject } from "./serialization";
+import {
+  resolvedMcpToolExecutionDecision,
+  type McpToolExecutionDecision,
+} from "../mcp/McpToolDispositionRegistry";
+import { validatePentestReconActionBinding } from "../mcp/PentestReconToolPolicy";
 
 interface RunRow {
   readonly id: string;
@@ -46,6 +51,7 @@ interface RunRow {
   readonly created_at: string;
   readonly updated_at: string;
   readonly version: number;
+  readonly control_plane: "legacy" | "command_os_v2";
 }
 
 interface ContractRow {
@@ -127,6 +133,10 @@ const BUDGET_KEYS: readonly BudgetKey[] = [
   "evidenceBytes",
   "artifactBytes",
 ];
+
+function nestedToolArguments(actionArguments: Readonly<Record<string, unknown>>): unknown {
+  return actionArguments.arguments ?? actionArguments.input ?? {};
+}
 
 function isoMs(value: string | null): number {
   const parsed = value ? Date.parse(value) : Number.NaN;
@@ -231,7 +241,12 @@ export class RunRepository {
   listExpiredNonterminal(now: string): DurableRun[] {
     const rows = this.database
       .prepare(`${RUN_SELECT}
-        WHERE r.status NOT IN ('completed', 'failed', 'cancelled')
+        WHERE r.control_plane = 'command_os_v2'
+          AND EXISTS (
+            SELECT 1 FROM missions m
+            WHERE m.id = r.mission_id AND m.control_plane = 'command_os_v2'
+          )
+          AND r.status NOT IN ('completed', 'failed', 'cancelled')
           AND r.lease_expires_at IS NOT NULL
           AND r.lease_expires_at <= ?
         ORDER BY r.lease_expires_at ASC, r.id ASC
@@ -286,7 +301,11 @@ export class RunRepository {
         UPDATE runs SET
           lease_owner = ?, lease_acquired_at = ?, last_heartbeat_at = ?,
           lease_expires_at = ?, version = version + 1, updated_at = ?
-        WHERE id = ? AND version = ?
+        WHERE id = ? AND version = ? AND control_plane = 'command_os_v2'
+          AND EXISTS (
+            SELECT 1 FROM missions m
+            WHERE m.id = runs.mission_id AND m.control_plane = 'command_os_v2'
+          )
       `)
       .run(ownerId, now, now, expiresAt, now, runId, current.run.stateVersion);
     if (result.changes !== 1) throw new DurableOrchestrationError("lease_conflict", "Run changed while acquiring lease");
@@ -319,6 +338,11 @@ export class RunRepository {
         UPDATE runs SET last_heartbeat_at = ?, lease_expires_at = ?,
           version = version + 1, updated_at = ?
         WHERE id = ? AND lease_owner = ? AND version = ?
+          AND control_plane = 'command_os_v2'
+          AND EXISTS (
+            SELECT 1 FROM missions m
+            WHERE m.id = runs.mission_id AND m.control_plane = 'command_os_v2'
+          )
       `)
       .run(now, expiresAt, now, token.runId, token.ownerId, token.fence);
     if (result.changes !== 1) throw new DurableOrchestrationError("stale_lease", "Heartbeat fencing token is stale");
@@ -357,6 +381,11 @@ export class RunRepository {
           started_at = CASE WHEN ? IS NULL THEN started_at ELSE COALESCE(started_at, ?) END,
           ended_at = ?, updated_at = ?, version = ?
         WHERE id = ? AND version = ?
+          AND control_plane = 'command_os_v2'
+          AND EXISTS (
+            SELECT 1 FROM missions m
+            WHERE m.id = runs.mission_id AND m.control_plane = 'command_os_v2'
+          )
       `)
       .run(
         input.nextRun.state,
@@ -565,7 +594,16 @@ export class RunRepository {
       ) {
         return deny("autonomous_tool_binding_invalid", "The tool action lacks an exact MCP server and tool binding.");
       }
-      if (!this.specialistToolAllowed(assignment.agent_id, mcpServer, toolName)) {
+      const bindingError = validatePentestReconActionBinding(
+        mcpServer,
+        toolName,
+        intent,
+        nestedToolArguments(intent.arguments),
+      );
+      if (bindingError) {
+        return deny("autonomous_tool_binding_mismatch", bindingError);
+      }
+      if (!this.specialistToolAllowed(assignment.agent_id, mcpServer, toolName, "autonomous")) {
         return deny("autonomous_tool_policy_denied", "The current specialist policy does not allow this exact MCP tool binding.");
       }
     }
@@ -613,6 +651,28 @@ export class RunRepository {
     ) {
       return { allowed: false, code: "guided_assignment_not_authorized", humanMessage: "The exact current plan, step, and specialist assignment is no longer executable." };
     }
+    if (intent.kind === "tool") {
+      const mcpServer = intent.arguments.mcpServer;
+      const toolName = intent.arguments.toolName;
+      if (
+        typeof mcpServer !== "string" || !mcpServer.trim() || mcpServer !== mcpServer.trim()
+        || typeof toolName !== "string" || !toolName.trim() || toolName !== toolName.trim()
+      ) {
+        return { allowed: false, code: "guided_tool_binding_invalid", humanMessage: "The Guided tool action lacks an exact MCP server and tool binding." };
+      }
+      const bindingError = validatePentestReconActionBinding(
+        mcpServer,
+        toolName,
+        intent,
+        nestedToolArguments(intent.arguments),
+      );
+      if (bindingError) {
+        return { allowed: false, code: "guided_tool_binding_mismatch", humanMessage: bindingError };
+      }
+      if (!this.specialistToolAllowed(assignment.agent_id, mcpServer, toolName, "guided")) {
+        return { allowed: false, code: "guided_tool_policy_denied", humanMessage: "The current specialist policy does not permit this exact represented MCP tool binding." };
+      }
+    }
     return { allowed: true };
   }
 
@@ -655,6 +715,28 @@ export class RunRepository {
       decision.step_id !== action.stepId || decision.requested_action_fingerprint !== action.fingerprint
     ) {
       return { allowed: false, code: "guided_decision_no_longer_authorized", humanMessage: "The reserved action no longer matches the approved exact Guided decision." };
+    }
+    if (action.kind === "tool") {
+      const mcpServer = action.arguments.mcpServer;
+      const toolName = action.arguments.toolName;
+      if (
+        typeof mcpServer !== "string" || !mcpServer.trim() || mcpServer !== mcpServer.trim()
+        || typeof toolName !== "string" || !toolName.trim() || toolName !== toolName.trim()
+      ) {
+        return { allowed: false, code: "guided_tool_binding_invalid", humanMessage: "The reserved Guided action has no exact MCP server and tool binding." };
+      }
+      const bindingError = validatePentestReconActionBinding(
+        mcpServer,
+        toolName,
+        action,
+        nestedToolArguments(action.arguments),
+      );
+      if (bindingError) {
+        return { allowed: false, code: "guided_tool_binding_mismatch", humanMessage: bindingError };
+      }
+      if (!this.specialistToolAllowed(assignment.agent_id!, mcpServer, toolName, "guided")) {
+        return { allowed: false, code: "guided_tool_policy_denied", humanMessage: "The reserved Guided MCP binding is no longer permitted for its specialist." };
+      }
     }
     return { allowed: true };
   }
@@ -767,7 +849,13 @@ export class RunRepository {
       typeof mcpServer !== "string" || !mcpServer.trim() || mcpServer !== mcpServer.trim() ||
       typeof toolName !== "string" || !toolName.trim() || toolName !== toolName.trim()
     ) return false;
-    return this.specialistToolAllowed(currentAssignment.agent_id, mcpServer, toolName);
+    if (validatePentestReconActionBinding(
+      mcpServer,
+      toolName,
+      action,
+      nestedToolArguments(action.arguments),
+    )) return false;
+    return this.specialistToolAllowed(currentAssignment.agent_id, mcpServer, toolName, "autonomous");
   }
 
   /**
@@ -776,7 +864,12 @@ export class RunRepository {
    * fail closed. This replaces the legacy in-process roster import and keeps
    * the parallel server independent from legacy agent and MCP modules.
    */
-  private specialistToolAllowed(agentId: string, mcpServer: string, toolName: string): boolean {
+  private specialistToolAllowed(
+    agentId: string,
+    mcpServer: string,
+    toolName: string,
+    journey: Journey,
+  ): boolean {
     const agent = this.database.prepare(`
       SELECT status, tool_policy_json FROM agents WHERE id = ?
     `).get(agentId) as { status: string; tool_policy_json: string } | undefined;
@@ -788,7 +881,11 @@ export class RunRepository {
     const allowed = new Set(strings(toolPolicy.allowedTools));
     const denied = new Set(strings(toolPolicy.deniedTools));
     const approvalRequired = new Set(strings(toolPolicy.approvalRequiredTools));
-    if (!allowed.has(toolName) || denied.has(toolName) || approvalRequired.has(toolName)) return false;
+    const fallback: McpToolExecutionDecision = denied.has(toolName) || !allowed.has(toolName)
+      ? "deny"
+      : approvalRequired.has(toolName)
+        ? "require_approval"
+        : "allow";
 
     const capability = this.database.prepare(`
       SELECT 1 AS present FROM agent_capabilities
@@ -811,10 +908,20 @@ export class RunRepository {
     const serverPolicy = parseObject(server.policy_json);
     const capabilities = new Set(strings(parseObject(`{\"items\":${server.capabilities_json}}`).items));
     const assignedAgents = new Set(strings(serverPolicy.assignedAgents));
-    return serverPolicy.enabled === true
+    const bindingReady = serverPolicy.enabled === true
       && serverPolicy.startPermitted === true
       && assignedAgents.has(agentId)
       && capabilities.has(toolName);
+    if (!bindingReady) return false;
+    const decision = resolvedMcpToolExecutionDecision(
+      mcpServer,
+      toolName,
+      agentId,
+      fallback,
+    );
+    return journey === "autonomous"
+      ? decision === "allow"
+      : decision === "allow" || decision === "require_approval";
   }
 
   private currentPersistedActionAssignment(action: DurableAction): ActionAssignmentRow | undefined {

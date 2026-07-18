@@ -1,5 +1,6 @@
-import AxeBuilder from "@axe-core/playwright";
+import type { AxeResults } from "axe-core";
 import { readFileSync } from "node:fs";
+import { createRequire } from "node:module";
 import { expect, test, type Page, type TestInfo } from "./support/playwright";
 import { createBrainGraphFixture } from "./support/brainGraphFixture";
 import { createBrainHomeInboxFixture } from "./support/brainHomeInboxFixture";
@@ -42,6 +43,49 @@ const accessibilityInventory = JSON.parse(readFileSync(
   "utf8",
 )) as AccessibilityInventory;
 const WCAG_TAGS = accessibilityInventory.wcagTags;
+const AXE_VERSION = "4.12.1";
+const AXE_MIN_PATH = createRequire(import.meta.url).resolve("axe-core/axe.min.js");
+const MAX_RUNTIME_EVALUATION_SOURCE_BYTES = 64 * 1024;
+
+interface AxeRunInput {
+  readonly expectedVersion: string;
+  readonly tags: readonly string[];
+}
+
+interface BrowserAxeRuntime {
+  readonly version: string;
+  run(
+    context: Document,
+    options: {
+      readonly iframes: boolean;
+      readonly runOnly: {
+        readonly type: "tag";
+        readonly values: readonly string[];
+      };
+    },
+  ): Promise<AxeResults>;
+}
+
+async function runAxeInBrowser(input: AxeRunInput): Promise<AxeResults> {
+  const runtime = (window as unknown as { readonly axe?: BrowserAxeRuntime }).axe;
+  if (!runtime || typeof runtime.run !== "function") {
+    throw new Error("The preloaded axe-core runtime is unavailable in the tested document");
+  }
+  if (runtime.version !== input.expectedVersion) {
+    throw new Error(
+      `The tested document loaded axe-core ${runtime.version}; expected ${input.expectedVersion}`,
+    );
+  }
+  return runtime.run(document, {
+    iframes: true,
+    runOnly: { type: "tag", values: input.tags },
+  });
+}
+
+const AXE_RUNTIME_EVALUATION_SOURCE_BYTES = Buffer.byteLength(
+  runAxeInBrowser.toString(),
+  "utf8",
+);
 
 interface AxeFinding {
   readonly id: string;
@@ -101,9 +145,16 @@ async function waitForLoadedSurface(page: Page): Promise<void> {
 
 async function assertWcagAa(page: Page, testInfo: TestInfo, state: string): Promise<void> {
   const inventory = inventoryState(state);
-  const results = await new AxeBuilder({ page })
-    .withTags(WCAG_TAGS)
-    .analyze();
+  if (AXE_RUNTIME_EVALUATION_SOURCE_BYTES > MAX_RUNTIME_EVALUATION_SOURCE_BYTES) {
+    throw new Error(
+      `The axe runtime evaluation source is ${AXE_RUNTIME_EVALUATION_SOURCE_BYTES} bytes; ` +
+      `the audited transport limit is ${MAX_RUNTIME_EVALUATION_SOURCE_BYTES} bytes`,
+    );
+  }
+  const results = await page.evaluate(runAxeInBrowser, {
+    expectedVersion: AXE_VERSION,
+    tags: [...WCAG_TAGS],
+  });
   const violations = compactFindings(results.violations);
   const incomplete = compactFindings(results.incomplete);
   await testInfo.attach(`axe-${state}.json`, {
@@ -112,6 +163,8 @@ async function assertWcagAa(page: Page, testInfo: TestInfo, state: string): Prom
       inventory,
       actualUrl: page.url(),
       tags: WCAG_TAGS,
+      axeVersion: results.testEngine.version,
+      runtimeEvaluationSourceBytes: AXE_RUNTIME_EVALUATION_SOURCE_BYTES,
       testedAt: results.timestamp,
       passes: results.passes.length,
       inapplicable: results.inapplicable.length,
@@ -225,6 +278,21 @@ test.describe("automated WCAG 2.2 AA primary-route and material-state gate", () 
       "pause_resume",
       canonicalFixtureNamespace(testInfo, "axe-guided-waiting"),
     );
+  });
+
+  test.beforeEach(async ({ page }) => {
+    // Preload the minified engine at document initialization. This avoids
+    // transporting and compiling axe-core's 1.3 MB source through a runtime
+    // page.evaluate call, which can intermittently stall Firefox before a scan.
+    await page.addInitScript({ path: AXE_MIN_PATH });
+  });
+
+  test("preloaded axe transport remains bounded and version-pinned", async ({ page }, testInfo) => {
+    await page.goto("/", { waitUntil: "domcontentloaded" });
+    await expect(page.getByRole("heading", { level: 2, name: "Active operations", exact: true })).toBeVisible();
+    await waitForLoadedSurface(page);
+    expect(AXE_RUNTIME_EVALUATION_SOURCE_BYTES).toBeLessThanOrEqual(MAX_RUNTIME_EVALUATION_SOURCE_BYTES);
+    await assertWcagAa(page, testInfo, "overview");
   });
 
   for (const route of PRIMARY_ROUTES) {

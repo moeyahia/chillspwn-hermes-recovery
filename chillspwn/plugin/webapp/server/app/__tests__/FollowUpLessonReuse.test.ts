@@ -176,6 +176,9 @@ function plannerInventory() {
     description: "Collects bounded service evidence",
     mcpServer: "local-selftest",
     toolNames: ["observe"],
+    toolInputSchemas: {
+      observe: { type: "object", additionalProperties: false },
+    },
     safetyBoundaries: ["Read-only fixture target"],
   }] as const;
 }

@@ -12,6 +12,7 @@ import {
   type TestInfo,
   type WebError,
 } from "@playwright/test";
+import { randomUUID } from "node:crypto";
 import {
   classifyHistoryTraversalReceipt,
   correlatableEventStreamConsoleUrl,
@@ -141,11 +142,13 @@ interface AuditedApiRequestInFlight {
 }
 
 interface EventStreamRequestBoundary {
+  readonly request: PlaywrightRequest;
   readonly page: Page;
+  readonly frame: Frame;
   readonly url: string;
-  readonly documentNavigationCount: number;
   readonly instanceOrdinal: number;
-  explicitCloseReceipt?: PageBoundIntentionalEventStreamClose;
+  createdReceipt?: PageBoundEventStreamCreatedReceipt;
+  explicitCloseReceipt?: PageBoundEventStreamClosedReceipt;
 }
 
 interface EventStreamCancellationReceipt {
@@ -206,19 +209,103 @@ interface PendingEventStreamFailure {
   readonly observedAt: number;
 }
 
-interface IntentionalEventStreamClose {
+interface EventStreamLifecycleIdentity {
   readonly url: string;
-  readonly closedAt: number;
+  readonly documentId: string;
+  readonly instanceId: string;
   readonly instanceOrdinal: number;
+  readonly documentStartedAt: number;
+  readonly createdAt: number;
 }
 
-interface PageBoundIntentionalEventStreamClose extends IntentionalEventStreamClose {
-  readonly page: Page;
+interface EventStreamCreatedReceipt extends EventStreamLifecycleIdentity {
+  readonly kind: "created";
+}
+
+interface EventStreamClosedReceipt extends EventStreamLifecycleIdentity {
+  readonly kind: "closed";
+  readonly closedAt: number;
+}
+
+type EventStreamLifecycleReceipt = EventStreamCreatedReceipt | EventStreamClosedReceipt;
+type AuthenticatedEventStreamLifecycleReceipt = EventStreamLifecycleReceipt & { readonly auditToken: string };
+type PageBoundEventStreamCreatedReceipt = EventStreamCreatedReceipt & { readonly page: Page; readonly frame: Frame };
+type PageBoundEventStreamClosedReceipt = EventStreamClosedReceipt & { readonly page: Page; readonly frame: Frame };
+type PageBoundEventStreamLifecycleReceipt =
+  | PageBoundEventStreamCreatedReceipt
+  | PageBoundEventStreamClosedReceipt;
+
+interface PageBoundEventStreamLifecyclePair {
+  readonly created: PageBoundEventStreamCreatedReceipt;
+  readonly closed: PageBoundEventStreamClosedReceipt;
 }
 
 const EVENT_STREAM_CLOSE_RECEIPTS = "__chillspwnV2EventStreamCloseReceipts";
+const EVENT_STREAM_LIFECYCLE_BINDING = "__chillspwnV2ReportEventStreamLifecycle";
 
 const sessions = new WeakMap<BrowserContext, BrowserAuditSession>();
+const pendingEventStreamLifecycleReceipts = new WeakMap<
+  BrowserContext,
+  PageBoundEventStreamLifecycleReceipt[]
+>();
+const instrumentedContexts = new WeakSet<BrowserContext>();
+
+function isEventStreamLifecycleReceipt(value: unknown): value is AuthenticatedEventStreamLifecycleReceipt {
+  if (typeof value !== "object" || value === null) return false;
+  const candidate = value as Partial<EventStreamLifecycleReceipt>;
+  const commonValid = (candidate.kind === "created" || candidate.kind === "closed")
+    && typeof (candidate as Partial<AuthenticatedEventStreamLifecycleReceipt>).auditToken === "string"
+    && ((candidate as Partial<AuthenticatedEventStreamLifecycleReceipt>).auditToken?.length ?? 0) > 0
+    && typeof candidate.url === "string"
+    && candidate.url.length > 0
+    && typeof candidate.documentId === "string"
+    && candidate.documentId.length > 0
+    && typeof candidate.instanceId === "string"
+    && candidate.instanceId.length > 0
+    && Number.isSafeInteger(candidate.instanceOrdinal)
+    && (candidate.instanceOrdinal ?? 0) > 0
+    && typeof candidate.documentStartedAt === "number"
+    && Number.isFinite(candidate.documentStartedAt)
+    && typeof candidate.createdAt === "number"
+    && Number.isFinite(candidate.createdAt)
+    && candidate.documentStartedAt <= candidate.createdAt;
+  if (!commonValid) return false;
+  return candidate.kind === "created" || (
+    typeof (candidate as Partial<EventStreamClosedReceipt>).closedAt === "number"
+    && Number.isFinite((candidate as Partial<EventStreamClosedReceipt>).closedAt)
+    && ((candidate as Partial<EventStreamClosedReceipt>).closedAt ?? -1) >= candidate.createdAt!
+  );
+}
+
+function deliverEventStreamLifecycleReceipt(
+  context: BrowserContext,
+  receipt: PageBoundEventStreamLifecycleReceipt,
+): void {
+  const session = sessions.get(context);
+  if (session) {
+    session.recordEventStreamLifecycleReceipt(receipt);
+    return;
+  }
+  const pending = pendingEventStreamLifecycleReceipts.get(context) ?? [];
+  pending.push(receipt);
+  pendingEventStreamLifecycleReceipts.set(context, pending);
+}
+
+export function eventStreamLifecyclePairCausallyMatchesRequest(input: {
+  readonly receiptUrl: string;
+  readonly receiptOrdinal: number;
+  readonly documentStartedAt: number;
+  readonly closedAt: number;
+  readonly requestUrl: string;
+  readonly requestOrdinal: number;
+  readonly requestStartedAt: number;
+}): boolean {
+  return input.receiptUrl === input.requestUrl
+    && input.receiptOrdinal === input.requestOrdinal
+    && Number.isFinite(input.requestStartedAt)
+    && input.requestStartedAt >= input.documentStartedAt
+    && input.requestStartedAt <= input.closedAt;
+}
 
 export function e2eAuditProfile(environment: NodeJS.ProcessEnv = process.env): E2EAuditProfile {
   const profile = environment.COMMAND_OS_V2_E2E_PROFILE?.trim() || "development";
@@ -274,34 +361,97 @@ const CHROMIUM_HTTP_CONSOLE = /^Failed to load resource: the server responded wi
  * stream request.
  */
 export async function installBrowserAuditRuntimeInstrumentation(context: BrowserContext): Promise<void> {
-  await context.addInitScript((receiptKey) => {
+  if (instrumentedContexts.has(context)) return;
+  const lifecycleToken = randomUUID();
+  await context.exposeBinding(EVENT_STREAM_LIFECYCLE_BINDING, ({ page, frame }, value: unknown) => {
+    if (!isEventStreamLifecycleReceipt(value) || value.auditToken !== lifecycleToken) {
+      sessions.get(context)?.recordRuntimeInstrumentationDefect(
+        page,
+        "Browser audit received an unauthenticated or malformed EventSource lifecycle receipt",
+      );
+      return false;
+    }
+    const { auditToken: _, ...receipt } = value;
+    deliverEventStreamLifecycleReceipt(context, { ...receipt, page, frame });
+    return true;
+  });
+  await context.addInitScript(({ receiptKey, bindingName, lifecycleToken: privateLifecycleToken }) => {
     type RuntimeWindow = Window & Record<string, unknown>;
+    type PrivateEventStreamIdentity = {
+      readonly url: string;
+      readonly documentId: string;
+      readonly instanceId: string;
+      readonly instanceOrdinal: number;
+      readonly documentStartedAt: number;
+      readonly createdAt: number;
+      closedAt?: number;
+    };
     const runtimeWindow = window as unknown as RuntimeWindow;
     runtimeWindow[receiptKey] = [];
+    const reportLifecycle = runtimeWindow[bindingName] as undefined | (
+      (receipt: AuthenticatedEventStreamLifecycleReceipt) => Promise<unknown>
+    );
     const NativeEventSource = window.EventSource;
+    const browserClock = (): number => performance.timeOrigin + performance.now();
+    const documentStartedAt = performance.timeOrigin;
+    const privateId = (): string => {
+      if (typeof crypto.randomUUID === "function") return crypto.randomUUID();
+      const bytes = new Uint32Array(4);
+      crypto.getRandomValues(bytes);
+      return [...bytes].map((part) => part.toString(16).padStart(8, "0")).join("");
+    };
+    const documentId = privateId();
     const instanceOrdinals = new Map<string, number>();
+    const privateInstances = new WeakMap<EventSource, PrivateEventStreamIdentity>();
+    const sendLifecycle = (receipt: EventStreamLifecycleReceipt): void => {
+      if (typeof reportLifecycle === "function") {
+        void reportLifecycle({ ...receipt, auditToken: privateLifecycleToken }).catch(() => undefined);
+      }
+    };
     class AuditedEventSource extends NativeEventSource {
-      readonly auditInstanceOrdinal: number;
-
       constructor(url: string | URL, eventSourceInitDict?: EventSourceInit) {
         super(url, eventSourceInitDict);
         const nextOrdinal = (instanceOrdinals.get(this.url) ?? 0) + 1;
         instanceOrdinals.set(this.url, nextOrdinal);
-        this.auditInstanceOrdinal = nextOrdinal;
+        const identity: PrivateEventStreamIdentity = {
+          url: this.url,
+          documentId,
+          instanceId: privateId(),
+          instanceOrdinal: nextOrdinal,
+          documentStartedAt,
+          createdAt: browserClock(),
+        };
+        privateInstances.set(this, identity);
+        sendLifecycle({ kind: "created", ...identity });
       }
 
       override close(): void {
-        const receipts = runtimeWindow[receiptKey] as IntentionalEventStreamClose[];
-        receipts.push({
-          url: this.url,
-          closedAt: Date.now(),
-          instanceOrdinal: this.auditInstanceOrdinal,
-        });
+        const identity = privateInstances.get(this);
+        if (identity && identity.closedAt === undefined) {
+          const closedAt = browserClock();
+          identity.closedAt = closedAt;
+          const receipts = runtimeWindow[receiptKey] as Array<{
+            readonly url: string;
+            readonly closedAt: number;
+            readonly instanceOrdinal: number;
+          }>;
+          receipts.push({
+            url: identity.url,
+            closedAt,
+            instanceOrdinal: identity.instanceOrdinal,
+          });
+          sendLifecycle({ kind: "closed", ...identity, closedAt });
+        }
         super.close();
       }
     }
     window.EventSource = AuditedEventSource;
-  }, EVENT_STREAM_CLOSE_RECEIPTS);
+  }, {
+    receiptKey: EVENT_STREAM_CLOSE_RECEIPTS,
+    bindingName: EVENT_STREAM_LIFECYCLE_BINDING,
+    lifecycleToken,
+  });
+  instrumentedContexts.add(context);
 }
 
 export class BrowserAuditSession {
@@ -358,11 +508,13 @@ export class BrowserAuditSession {
     readonly observedUrl: string;
   }> = [];
   private readonly eventStreamRequests = new Map<PlaywrightRequest, EventStreamRequestBoundary>();
-  private readonly eventStreamRequestOrdinals = new Map<Page, Map<string, number>>();
+  private readonly eventStreamRequestOrdinals = new Map<Frame, Map<string, number>>();
   private readonly eventStreamCancellations: EventStreamCancellationReceipt[] = [];
   private readonly pageCloseEventStreamReceipts: PageCloseEventStreamReceipt[] = [];
   private readonly pendingEventStreamFailures: PendingEventStreamFailure[] = [];
-  private readonly intentionalEventStreamCloseReceipts: PageBoundIntentionalEventStreamClose[] = [];
+  private readonly pendingEventStreamCreatedReceipts: PageBoundEventStreamCreatedReceipt[] = [];
+  private readonly pendingEventStreamClosedReceipts: PageBoundEventStreamClosedReceipt[] = [];
+  private readonly pendingEventStreamLifecyclePairs: PageBoundEventStreamLifecyclePair[] = [];
   private readonly pendingEventStreamConsoles: Array<{ readonly page: Page | undefined; readonly issue: BrowserIssue }> = [];
   private readonly seenRequests = new WeakSet<PlaywrightRequest>();
   private readonly seenRequestFailures = new WeakSet<PlaywrightRequest>();
@@ -436,7 +588,139 @@ export class BrowserAuditSession {
     const created = new BrowserAuditSession(context, options);
     sessions.set(context, created);
     for (const page of context.pages()) created.attach(page);
+    for (const receipt of pendingEventStreamLifecycleReceipts.get(context) ?? []) {
+      created.recordEventStreamLifecycleReceipt(receipt);
+    }
+    pendingEventStreamLifecycleReceipts.delete(context);
     return created;
+  }
+
+  /**
+   * Receives browser-side EventSource creation and close lifecycle receipts
+   * through Playwright's context binding. This path deliberately avoids
+   * evaluating the page: a wedged or replacing document must never block
+   * navigation or audit finalization.
+   */
+  recordEventStreamLifecycleReceipt(receipt: PageBoundEventStreamLifecycleReceipt): void {
+    if (receipt.page.context() !== this.context) {
+      this.unexpected.push({
+        kind: "pageerror",
+        message: "Browser audit received an EventSource lifecycle receipt from another context",
+        url: receipt.url,
+      });
+      return;
+    }
+    this.attach(receipt.page);
+    if (receipt.kind === "created") {
+      const matchingCloseIndexes = this.pendingEventStreamClosedReceipts
+        .map((closed, index) => this.eventStreamCreatedReceiptMatchesClosed(receipt, closed) ? index : -1)
+        .filter((index) => index >= 0);
+      if (matchingCloseIndexes.length > 1) {
+        this.recordRuntimeInstrumentationDefect(
+          receipt.page,
+          "Browser audit found ambiguous close receipts for one private EventSource creation",
+        );
+      } else if (matchingCloseIndexes.length === 1) {
+        const [closed] = this.pendingEventStreamClosedReceipts.splice(matchingCloseIndexes[0]!, 1);
+        this.bindOrQueueEventStreamLifecyclePair({ created: receipt, closed });
+      } else {
+        this.pendingEventStreamCreatedReceipts.push(receipt);
+      }
+    } else {
+      const matchingCreatedIndexes = this.pendingEventStreamCreatedReceipts
+        .map((created, index) => this.eventStreamCreatedReceiptMatchesClosed(created, receipt) ? index : -1)
+        .filter((index) => index >= 0);
+      if (matchingCreatedIndexes.length > 1) {
+        this.recordRuntimeInstrumentationDefect(
+          receipt.page,
+          "Browser audit found ambiguous creation receipts for one private EventSource close",
+        );
+      } else if (matchingCreatedIndexes.length === 1) {
+        const [created] = this.pendingEventStreamCreatedReceipts.splice(matchingCreatedIndexes[0]!, 1);
+        this.bindOrQueueEventStreamLifecyclePair({ created, closed: receipt });
+      } else {
+        // A close is never authoritative by URL or ordinal alone. It remains
+        // pending until its exact private instanceId has a creation receipt.
+        this.pendingEventStreamClosedReceipts.push(receipt);
+      }
+    }
+    this.consumePendingIntentionalEventStreamFailures();
+  }
+
+  private eventStreamCreatedReceiptMatchesClosed(
+    created: PageBoundEventStreamCreatedReceipt,
+    closed: PageBoundEventStreamClosedReceipt,
+  ): boolean {
+    return created.page === closed.page
+      && created.frame === closed.frame
+      && created.documentId === closed.documentId
+      && created.instanceId === closed.instanceId
+      && created.url === closed.url
+      && created.instanceOrdinal === closed.instanceOrdinal
+      && created.documentStartedAt === closed.documentStartedAt
+      && created.createdAt === closed.createdAt;
+  }
+
+  private eventStreamLifecyclePairMatchesBoundary(
+    pair: PageBoundEventStreamLifecyclePair,
+    boundary: EventStreamRequestBoundary,
+  ): boolean {
+    return boundary.page === pair.created.page
+      && boundary.frame === pair.created.frame
+      && eventStreamLifecyclePairCausallyMatchesRequest({
+        receiptUrl: pair.created.url,
+        receiptOrdinal: pair.created.instanceOrdinal,
+        documentStartedAt: pair.created.documentStartedAt,
+        closedAt: pair.closed.closedAt,
+        requestUrl: boundary.url,
+        requestOrdinal: boundary.instanceOrdinal,
+        requestStartedAt: boundary.request.timing().startTime,
+      });
+  }
+
+  private bindOrQueueEventStreamLifecyclePair(pair: PageBoundEventStreamLifecyclePair): void {
+    const candidates = [...this.eventStreamRequests.values()].filter((boundary) => (
+      boundary.createdReceipt === undefined
+      && boundary.explicitCloseReceipt === undefined
+      && this.eventStreamLifecyclePairMatchesBoundary(pair, boundary)
+    ));
+    if (candidates.length > 1) {
+      this.recordRuntimeInstrumentationDefect(
+        pair.created.page,
+        "Browser audit found ambiguous requests for one private EventSource lifecycle pair",
+      );
+      return;
+    }
+    if (candidates.length === 0) {
+      this.pendingEventStreamLifecyclePairs.push(pair);
+      return;
+    }
+    candidates[0]!.createdReceipt = pair.created;
+    candidates[0]!.explicitCloseReceipt = pair.closed;
+  }
+
+  private bindPendingEventStreamLifecyclePair(boundary: EventStreamRequestBoundary): void {
+    if (boundary.createdReceipt !== undefined || boundary.explicitCloseReceipt !== undefined) return;
+    const matchingIndexes = this.pendingEventStreamLifecyclePairs
+      .map((pair, index) => this.eventStreamLifecyclePairMatchesBoundary(pair, boundary) ? index : -1)
+      .filter((index) => index >= 0);
+    if (matchingIndexes.length === 0) return;
+    if (matchingIndexes.length > 1) {
+      this.recordRuntimeInstrumentationDefect(
+        boundary.page,
+        `Browser audit found ambiguous private EventSource lifecycle pairs for ${boundary.url}`,
+      );
+      return;
+    }
+    const index = matchingIndexes[0]!;
+    const [pair] = this.pendingEventStreamLifecyclePairs.splice(index, 1);
+    boundary.createdReceipt = pair.created;
+    boundary.explicitCloseReceipt = pair.closed;
+  }
+
+  recordRuntimeInstrumentationDefect(page: Page, message: string): void {
+    this.attach(page);
+    this.unexpected.push({ kind: "pageerror", message, url: page.url() });
   }
 
   configure(options: BrowserAuditOptions): void {
@@ -461,7 +745,7 @@ export class BrowserAuditSession {
     this.pageStates.set(page, {
       mainFrameNavigationCount: 0,
     });
-    this.eventStreamRequestOrdinals.set(page, new Map());
+    this.eventStreamRequestOrdinals.set(page.mainFrame(), new Map());
     const popupListener = (popup: Page) => this.handlePopup(page, popup);
     const downloadListener = (download: Download) => this.handleDownload(page, download);
     page.on("popup", popupListener);
@@ -703,18 +987,23 @@ export class BrowserAuditSession {
     };
     this.activeRequests.set(request, active);
     const state = this.pageStates.get(page)!;
+    const requestFrame = request.frame();
     const activeNavigationBoundary = this.activeDocumentNavigationTeardown.get(page);
     if (activeNavigationBoundary) {
       this.bindOptionalImageNavigationRequest(activeNavigationBoundary, request, active);
     }
     const exactDeclaredDownloadRequest = this.bindVerifiedDownloadRequest(page, request);
+    if (request.isNavigationRequest() && !exactDeclaredDownloadRequest) {
+      // The runtime wrapper resets its ordinal map for every new frame
+      // document. Mirror that identity boundary for main frames and iframes.
+      this.eventStreamRequestOrdinals.set(requestFrame, new Map());
+    }
     if (
       request.isNavigationRequest()
-      && request.frame() === page.mainFrame()
+      && requestFrame === page.mainFrame()
       && !exactDeclaredDownloadRequest
     ) {
       state.mainFrameNavigationCount += 1;
-      this.eventStreamRequestOrdinals.set(page, new Map());
       const popupExpectation = this.popupExpectations.find((entry) => entry.popup === page);
       if (popupExpectation) this.observePopupUrl(popupExpectation, request.url());
       const boundary = this.activeDocumentNavigationTeardown.get(page);
@@ -740,16 +1029,20 @@ export class BrowserAuditSession {
         && url.origin === this.expectedOrigin
         && url.pathname === "/api/v2/events/stream"
       ) {
-        const ordinals = this.eventStreamRequestOrdinals.get(page) ?? new Map<string, number>();
+        const ordinals = this.eventStreamRequestOrdinals.get(requestFrame) ?? new Map<string, number>();
         const instanceOrdinal = (ordinals.get(url.href) ?? 0) + 1;
         ordinals.set(url.href, instanceOrdinal);
-        this.eventStreamRequestOrdinals.set(page, ordinals);
-        this.eventStreamRequests.set(request, {
+        this.eventStreamRequestOrdinals.set(requestFrame, ordinals);
+        const boundary: EventStreamRequestBoundary = {
+          request,
           page,
+          frame: requestFrame,
           url: url.href,
-          documentNavigationCount: state.mainFrameNavigationCount,
           instanceOrdinal,
-        });
+        };
+        this.eventStreamRequests.set(request, boundary);
+        this.bindPendingEventStreamLifecyclePair(boundary);
+        this.consumePendingIntentionalEventStreamFailures();
       }
     } catch {
       // Unparseable request URLs remain visible if they later fail.
@@ -810,6 +1103,7 @@ export class BrowserAuditSession {
       method: request.method(),
     };
     const streamBoundary = this.eventStreamRequests.get(request);
+    if (streamBoundary) this.bindPendingEventStreamLifecyclePair(streamBoundary);
     const navigationBoundary = this.navigationRequestBoundaries.get(request);
     const boundedPage = streamBoundary?.page ?? page;
     const activeHistoryBoundary = boundedPage === undefined
@@ -941,9 +1235,9 @@ export class BrowserAuditSession {
       throw new Error("A navigation boundary is already active for this page");
     }
     this.attach(page);
-    // Explicit EventSource.close() receipts live in the current document. Drain
-    // and bind them to their exact request identities before navigation replaces
-    // that document and its receipt queue.
+    // Reconcile context-bound EventSource.close() receipts before the exact
+    // pre-navigation request snapshot. This never evaluates the page being
+    // replaced, so a browser-world stall cannot block the navigation boundary.
     await this.reconcileIntentionalEventStreamClosuresForPage(page);
     const state = this.pageStates.get(page)!;
     const startingDocumentUrl = page.url();
@@ -1143,10 +1437,8 @@ export class BrowserAuditSession {
 
   async closeAuditedPage(page: Page): Promise<void> {
     if (page.isClosed()) return;
-    // Drain explicit EventSource.close() receipts while the owning document
-    // is still evaluable. The automatic page fixture closes before the audit
-    // fixture finalizes, so waiting until finalize would lose this exact
-    // browser-side lifecycle evidence.
+    // Reconcile context-bound EventSource.close() receipts before taking the
+    // exact page-close stream snapshot. No page-world command is required.
     await this.reconcileIntentionalEventStreamClosuresForPage(page);
     const exactOpenStreams = [...this.activeRequests.entries()]
       .filter(([request, active]) => active.page === page && this.eventStreamRequests.get(request)?.page === page)
@@ -1234,40 +1526,15 @@ export class BrowserAuditSession {
 
   private async reconcileIntentionalEventStreamClosuresForPage(page: Page): Promise<void> {
     if (page.isClosed()) return;
-    let receipts: IntentionalEventStreamClose[] = [];
-    try {
-      receipts = await page.evaluate((receiptKey) => {
-        const runtime = window as unknown as Window & Record<string, unknown>;
-        const observed = Array.isArray(runtime[receiptKey])
-          ? [...runtime[receiptKey] as IntentionalEventStreamClose[]]
-          : [];
-        runtime[receiptKey] = [];
-        return observed;
-      }, EVENT_STREAM_CLOSE_RECEIPTS);
-    } catch (error) {
-      this.unexpected.push({
-        kind: "pageerror",
-        message: `Could not reconcile intentional EventSource closures: ${error instanceof Error ? error.message : String(error)}`,
-        url: page.url(),
-      });
-      return;
-    }
-    const currentDocumentNavigationCount = this.pageStates.get(page)?.mainFrameNavigationCount;
-    for (const receipt of receipts) {
-      const boundReceipt = { ...receipt, page };
-      const candidates = [...this.eventStreamRequests.entries()].filter(([, boundary]) => (
-        boundary.page === page
-        && boundary.url === receipt.url
-        && boundary.documentNavigationCount === currentDocumentNavigationCount
-        && boundary.instanceOrdinal === receipt.instanceOrdinal
-        && boundary.explicitCloseReceipt === undefined
-      ));
-      if (candidates.length === 1) {
-        candidates[0]![1].explicitCloseReceipt = boundReceipt;
-      } else {
-        this.intentionalEventStreamCloseReceipts.push(boundReceipt);
-      }
-    }
+    // Browser-side close receipts arrive through the context binding. Yield
+    // once so a receipt sent by the preceding browser operation can be
+    // delivered, without issuing a command into a page that may be wedged or
+    // about to navigate.
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    this.consumePendingIntentionalEventStreamFailures();
+  }
+
+  private consumePendingIntentionalEventStreamFailures(): void {
     for (let index = this.pendingEventStreamFailures.length - 1; index >= 0; index -= 1) {
       const failure = this.pendingEventStreamFailures[index];
       if (!failure || !this.consumeIntentionalEventStreamClose(failure)) continue;
@@ -1687,7 +1954,6 @@ export class BrowserAuditSession {
     this.popupListeners.clear();
     this.downloadListeners.clear();
     this.eventStreamRequestOrdinals.clear();
-    this.eventStreamRequests.clear();
     this.pageStates.clear();
     this.activeRequests.clear();
   }
@@ -1808,11 +2074,33 @@ export class BrowserAuditSession {
         requestBound: entry.request !== undefined,
         cancellationObserved: entry.cancellationObserved,
       })),
-      unmatchedIntentionalEventStreamCloseReceipts: this.intentionalEventStreamCloseReceipts.map((entry) => ({
+      unmatchedEventStreamCreatedReceipts: this.pendingEventStreamCreatedReceipts.map((entry) => ({
+        url: entry.url,
+        instanceOrdinal: entry.instanceOrdinal,
+        documentStartedAt: entry.documentStartedAt,
+        createdAt: entry.createdAt,
+      })),
+      unmatchedIntentionalEventStreamCloseReceipts: this.pendingEventStreamClosedReceipts.map((entry) => ({
         url: entry.url,
         closedAt: entry.closedAt,
         instanceOrdinal: entry.instanceOrdinal,
+        documentStartedAt: entry.documentStartedAt,
+        createdAt: entry.createdAt,
       })),
+      unmatchedEventStreamLifecyclePairs: this.pendingEventStreamLifecyclePairs.map((entry) => ({
+        url: entry.created.url,
+        instanceOrdinal: entry.created.instanceOrdinal,
+        documentStartedAt: entry.created.documentStartedAt,
+        createdAt: entry.created.createdAt,
+        closedAt: entry.closed.closedAt,
+      })),
+      unboundEventStreamRequests: [...this.eventStreamRequests.values()]
+        .filter((entry) => entry.createdReceipt === undefined || entry.explicitCloseReceipt === undefined)
+        .map((entry) => ({
+          url: entry.url,
+          instanceOrdinal: entry.instanceOrdinal,
+          requestStartedAt: entry.request.timing().startTime,
+        })),
       popupAuthorizations: this.popupExpectations.map((entry) => ({
         id: entry.id,
         exactUrl: entry.exactUrl,

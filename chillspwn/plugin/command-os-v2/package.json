@@ -42,6 +42,7 @@
     "db:reconcile": "bun run server/migration/cli.ts reconcile",
     "brain:import-obsidian": "bun run server/vault/cli.ts import",
     "brain:export-obsidian": "bun run server/vault/cli.ts export",
+    "brain:project-legacy": "bun run server/migration/cli.ts project-vault",
     "brain:sync-verify": "bun run server/vault/cli.ts sync-verify",
     "legacy:test:regression": "cd ../webapp && bun run check",
     "check": "bun run logo:verify && bun run isolation:verify && bun run typecheck && bun run typecheck:e2e && bun run test && bun run build"
@@ -54,7 +55,6 @@
     "zod": "4.4.3"
   },
   "devDependencies": {
-    "@axe-core/playwright": "4.12.1",
     "@playwright/test": "1.61.1",
     "@tailwindcss/vite": "4.3.2",
     "@types/better-sqlite3": "7.6.13",
@@ -64,6 +64,7 @@
     "@types/react": "19.2.15",
     "@types/react-dom": "19.2.3",
     "@vitejs/plugin-react": "4.7.0",
+    "axe-core": "4.12.1",
     "tailwindcss": "4.3.2",
     "typescript": "5.6.3",
     "vite": "6.4.3"

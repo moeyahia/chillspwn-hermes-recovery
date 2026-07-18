@@ -11,6 +11,7 @@ import {
   CommandOsBoundedExecutionPort,
   createGrokMissionPlanner,
   createGrokOutcomeEvaluator,
+  journeySpecialistToolDecision,
   type CommandOsToolInventory,
 } from "../CommandOsRuntimeAdapters";
 
@@ -163,6 +164,9 @@ const inventory: readonly CommandOsToolInventory[] = [{
   description: "Maps services",
   mcpServer: "recon-mcp",
   toolNames: ["quick_scan"],
+  toolInputSchemas: {
+    quick_scan: { type: "object", additionalProperties: true },
+  },
   deterministicToolInputs: { quick_scan: {} },
   deterministicToolInputAttestations: {
     quick_scan: {
@@ -179,7 +183,33 @@ const unattestedInventory: readonly CommandOsToolInventory[] = [{
   description: "Maps services",
   mcpServer: "recon-mcp",
   toolNames: ["quick_scan"],
+  toolInputSchemas: {
+    quick_scan: { type: "object", additionalProperties: true },
+  },
   safetyBoundaries: ["authorized targets only"],
+}];
+
+const executionInventory: readonly CommandOsToolInventory[] = [{
+  ...inventory[0]!,
+  mcpServer: "sechub-reconnaissance",
+  toolNames: ["quick_scan", "nmapScan"],
+  toolInputSchemas: {
+    quick_scan: { type: "object", additionalProperties: true },
+    nmapScan: { type: "object", additionalProperties: true },
+  },
+}];
+
+const strictExecutionInventory: readonly CommandOsToolInventory[] = [{
+  ...executionInventory[0]!,
+  toolNames: ["quick_scan"],
+  toolInputSchemas: {
+    quick_scan: {
+      type: "object",
+      required: ["target"],
+      properties: { target: { type: "string" } },
+      additionalProperties: false,
+    },
+  },
 }];
 
 const ambiguousInventory: readonly CommandOsToolInventory[] = [{
@@ -187,10 +217,29 @@ const ambiguousInventory: readonly CommandOsToolInventory[] = [{
   toolNames: ["quick_scan", "port_scan"],
 }];
 
+const cveInventory: readonly CommandOsToolInventory[] = [{
+  agentId: "VulnIntel",
+  role: "vulnerability intelligence",
+  description: "Validates CVE applicability",
+  mcpServer: "vulnintel-nvd",
+  toolNames: ["get_cve_details"],
+  toolInputSchemas: {
+    get_cve_details: {
+      type: "object",
+      properties: {
+        cve_id: { type: "string", pattern: "^CVE-\\d{4}-\\d{4,}$" },
+      },
+      required: ["cve_id"],
+      additionalProperties: false,
+    },
+  },
+  safetyBoundaries: ["authoritative public vulnerability metadata only"],
+}];
+
 function planJson() {
   return JSON.stringify({
     strategySummary: "Run one bounded scan",
-    rationaleSummary: "The exact MCP tool produces the required record",
+    rationaleSummary: "A read-only service check provides the required record",
     steps: [{
       phase: "reconnaissance",
       title: "Map service",
@@ -233,6 +282,18 @@ function invalidBindingPlanJson(canary?: string) {
   return JSON.stringify(plan);
 }
 
+function cvePlanJson(value: string, propertyName = "cveId") {
+  const plan = JSON.parse(planJson()) as Record<string, any>;
+  plan.strategySummary = "Validate one concrete CVE candidate";
+  plan.steps[0].assignedAgentId = "VulnIntel";
+  plan.steps[0].action.arguments = {
+    mcpServer: "vulnintel-nvd",
+    toolName: "get_cve_details",
+    arguments: { [propertyName]: value },
+  };
+  return JSON.stringify(plan);
+}
+
 function seedVerifiedEvidence(db: SqliteDatabase, id = "evidence-verified-1"): string {
   db.prepare(`
     INSERT INTO evidence (
@@ -250,6 +311,197 @@ describe("Command OS production runtime adapters", () => {
   test("projects only approval-free specialist tools into the Autonomous planner inventory", () => {
     expect(autonomousSpecialistTools("ReconScout", ["quick_scan", "nmapScan", "hashcat"]))
       .toEqual(["quick_scan"]);
+    expect(autonomousSpecialistTools(
+      "ReconScout",
+      ["quick_scan", "nmapScan", "gobuster", "subfinderEnum"],
+      "pentest-mcp-recon",
+    )).toEqual(["nmapScan"]);
+    expect(autonomousSpecialistTools(
+      "WebBreaker",
+      ["ffufScan", "nucleiScan", "extractionSweep"],
+      "pentest-mcp-recon",
+    )).toEqual([]);
+    expect(journeySpecialistToolDecision(
+      "autonomous",
+      "pentest-mcp-recon",
+      "ReconScout",
+      "nmapScan",
+    )).toBe("allow");
+    expect(journeySpecialistToolDecision(
+      "guided",
+      "pentest-mcp-recon",
+      "ReconScout",
+      "nmapScan",
+    )).toBe("require_approval");
+    expect(journeySpecialistToolDecision(
+      "guided",
+      "pentest-mcp-recon",
+      "ReconScout",
+      "httpxProbe",
+    )).toBe("deny");
+    expect(journeySpecialistToolDecision(
+      "guided",
+      "pentest-mcp-recon",
+      "WebBreaker",
+      "nucleiScan",
+    )).toBe("deny");
+  });
+
+  test("normalizes a unique live-schema MCP argument alias before the plan becomes durable", async () => {
+    const db = database();
+    try {
+      const state = seed(db, "autonomous", {
+        actionPolicy: {
+          allowedActionClasses: ["reconnaissance", "network"],
+          prohibitedActionClasses: [],
+          specialistAgentIds: ["VulnIntel"],
+          contextNodeIds: ["eng-memory"],
+        },
+      });
+      const prompts: string[] = [];
+      const planner = createGrokMissionPlanner({
+        database: db,
+        inventory: () => cveInventory,
+        callGrok: async (prompt) => {
+          prompts.push(prompt);
+          return cvePlanJson("CVE-2025-13583");
+        },
+      });
+
+      const plan = await planner.plan(state, new AbortController().signal);
+      expect(plan.steps[0]!.action.arguments).toEqual({
+        mcpServer: "vulnintel-nvd",
+        toolName: "get_cve_details",
+        arguments: { cve_id: "CVE-2025-13583" },
+      });
+      expect(prompts).toHaveLength(1);
+      expect(prompts[0]).toContain("TOOL_INPUT_CONTRACTS=");
+      expect(prompts[0]).toContain('"name":"cve_id","type":"string"');
+      expect(prompts[0]).not.toContain("根据CVE ID");
+    } finally {
+      db.close();
+    }
+  });
+
+  test("rejects an unresolved CVE placeholder through the bounded repair path without MCP execution", async () => {
+    const db = database();
+    try {
+      const state = seed(db, "autonomous", {
+        actionPolicy: {
+          allowedActionClasses: ["reconnaissance", "network"],
+          prohibitedActionClasses: [],
+          specialistAgentIds: ["VulnIntel"],
+          contextNodeIds: ["eng-memory"],
+        },
+      });
+      let providerCalls = 0;
+      const planner = createGrokMissionPlanner({
+        database: db,
+        inventory: () => cveInventory,
+        callGrok: async () => {
+          providerCalls += 1;
+          return cvePlanJson("OPAQUE_TOP_CVE_ID_FROM_STEP_0");
+        },
+      });
+
+      await expect(planner.plan(state, new AbortController().signal)).rejects.toMatchObject({
+        code: "invalid_plan",
+        options: {
+          category: "invalid_input",
+          details: { validationRule: "mcp_tool_input_placeholder" },
+        },
+      });
+      expect(providerCalls).toBe(3);
+      expect(db.prepare("SELECT COUNT(*) AS count FROM tool_calls").get()).toEqual({ count: 0 });
+      expect(db.prepare(`
+        SELECT COUNT(*) AS count FROM structured_logs
+        WHERE domain = 'command-runtime.planner'
+          AND json_extract(attributes_json, '$.validationRule') = 'mcp_tool_input_placeholder'
+      `).get()).toEqual({ count: 2 });
+    } finally {
+      db.close();
+    }
+  });
+
+  test("repairs unreadable operator prose while retaining exact CVE tool details only in action arguments", async () => {
+    const db = database();
+    try {
+      const state = seed(db, "autonomous", {
+        actionPolicy: {
+          allowedActionClasses: ["reconnaissance", "network"],
+          prohibitedActionClasses: [],
+          specialistAgentIds: ["VulnIntel"],
+          contextNodeIds: ["eng-memory"],
+        },
+      });
+      const badPriorityText = "Fetch public NVD detail for the top CVE candidate to sharpen prioritization toward user and root flag capture without target interaction.";
+      const badBindingText = "Dispatch VulnIntel via the exact reviewed vulnintel-nvd get_cve_details binding using an opaque reference to the top-ranked CVE from step 1, remaining strictly read-only.";
+      const goodObjective = "Check the highest-ranked CVE against its public NVD record to confirm the affected software versions and decide whether it is relevant. This reads public vulnerability data and does not contact the target.";
+      const goodExplanation = "Ask the vulnerability specialist to retrieve the public NVD record for CVE-2025-13583 so the team can assess applicability. This does not contact or change the target.";
+      const candidate = (objective: string, explanation: string) => {
+        const plan = JSON.parse(cvePlanJson("CVE-2025-13583", "cve_id")) as Record<string, any>;
+        plan.strategySummary = "Validate the leading vulnerability candidate using authoritative public data.";
+        plan.rationaleSummary = "NVD and vendor records can clarify affected versions without contacting the target.";
+        plan.steps[0].title = "Check the leading CVE against NVD";
+        plan.steps[0].objective = objective;
+        plan.steps[0].explanation = explanation;
+        plan.steps[0].rationale = "The version range will show whether target-side validation is justified.";
+        plan.steps[0].action.intentSummary = "Retrieve the authoritative public record for the confirmed CVE ID.";
+        return JSON.stringify(plan);
+      };
+      const prompts: string[] = [];
+      const responses = [
+        candidate(badPriorityText, goodExplanation),
+        candidate(goodObjective, badBindingText),
+        candidate(goodObjective, goodExplanation),
+      ];
+      const planner = createGrokMissionPlanner({
+        database: db,
+        inventory: () => cveInventory,
+        callGrok: async (prompt) => {
+          prompts.push(prompt);
+          return responses[prompts.length - 1]!;
+        },
+      });
+
+      const plan = await planner.plan(state, new AbortController().signal);
+
+      expect(prompts).toHaveLength(3);
+      expect(prompts[0]).toContain("technically literate operator");
+      expect(prompts[0]).toContain("Terms such as CVE, NVD, provider, protocol, TLS, HTTP, and SMB are allowed");
+      expect(prompts[0]).toContain("Keep those implementation details only in action.arguments");
+      expect(prompts[1]).toContain("REJECTED_FIELD=steps[0].objective");
+      expect(prompts[1]).toContain("REJECTED_RULE=operator_language_indirect_priority");
+      expect(prompts[1]).not.toContain(badPriorityText);
+      expect(prompts[2]).toContain("REJECTED_FIELD=steps[0].explanation");
+      expect(prompts[2]).toContain("REJECTED_RULE=operator_language_internal_binding");
+      expect(prompts[2]).not.toContain(badBindingText);
+      expect(plan.steps[0]).toMatchObject({
+        objective: goodObjective,
+        explanation: goodExplanation,
+        action: {
+          arguments: {
+            mcpServer: "vulnintel-nvd",
+            toolName: "get_cve_details",
+            arguments: { cve_id: "CVE-2025-13583" },
+          },
+        },
+      });
+      expect(db.prepare("SELECT COUNT(*) AS count FROM tool_calls").get()).toEqual({ count: 0 });
+      const repairRules = (db.prepare(`
+        SELECT attributes_json FROM structured_logs
+        WHERE domain = 'command-runtime.planner'
+        ORDER BY occurred_at, id
+      `).all() as Array<{ attributes_json: string }>).map((row) => (
+        JSON.parse(row.attributes_json).validationRule
+      ));
+      expect(repairRules.sort()).toEqual([
+        "operator_language_indirect_priority",
+        "operator_language_internal_binding",
+      ].sort());
+    } finally {
+      db.close();
+    }
   });
 
   test("fails before a provider turn when no runtime specialist matches the signed Autonomous pool", async () => {
@@ -773,9 +1025,7 @@ describe("Command OS production runtime adapters", () => {
         toolName: "quick_scan",
         arguments: {},
       });
-      expect(plan.steps[0]?.action.arguments).toMatchObject({
-        analysisScope: "authorized mission context",
-      });
+      expect(plan.steps[0]?.action.arguments).not.toHaveProperty("analysisScope");
       expect(prompts).toHaveLength(1);
       expect(prompts[0]).toContain("CANONICAL_VERIFIED_EVIDENCE_AVAILABLE=false");
       expect(prompts[0]).toContain("AUTONOMOUS_TOOL_EVIDENCE_PATH_REQUIRED=true");
@@ -1434,7 +1684,7 @@ describe("Command OS production runtime adapters", () => {
       const received = new Promise((resolve) => { resolveResult = resolve; });
       const port = new CommandOsBoundedExecutionPort({
         database: db,
-        inventory: () => inventory,
+        inventory: () => executionInventory,
         callGrok: async () => "unused",
         executeMcp: async (input) => {
           invocation = input;
@@ -1462,6 +1712,86 @@ describe("Command OS production runtime adapters", () => {
       expect(db.prepare("SELECT verification_state, source FROM evidence").get())
         .toEqual({ verification_state: "verified", source: "mcp:sechub-reconnaissance.quick_scan" });
       expect(() => db.prepare("UPDATE evidence SET summary = 'changed'").run()).toThrow("immutable");
+    } finally {
+      db.close();
+    }
+  });
+
+  test("the execution boundary rejects a persisted placeholder against the fresh MCP schema before dispatch", async () => {
+    const db = database();
+    try {
+      seed(db);
+      db.prepare(`
+        INSERT INTO plans (id, run_id, version, status, strategy_summary, plan_hash, created_by, created_at, activated_at)
+        VALUES ('plan-placeholder', 'run-1', 1, 'active', 'Reject unresolved input', ?, 'planner', ?, ?)
+      `).run("9".repeat(64), NOW, NOW);
+      db.prepare(`
+        INSERT INTO plan_steps (
+          id, plan_id, run_id, ordinal, phase, title, objective, status,
+          assigned_agent_id, created_at, updated_at
+        ) VALUES ('step-placeholder', 'plan-placeholder', 'run-1', 0, 'recon',
+          'Bounded scan', 'Reject unresolved target', 'running', 'ReconScout', ?, ?)
+      `).run(NOW, NOW);
+      db.prepare(`
+        INSERT INTO assignments (id, run_id, step_id, agent_id, status, created_at, updated_at)
+        VALUES ('assignment-placeholder', 'run-1', 'step-placeholder', 'ReconScout', 'active', ?, ?)
+      `).run(NOW, NOW);
+      db.prepare(`
+        UPDATE runs SET status = 'running', current_plan_id = 'plan-placeholder',
+          current_step_id = 'step-placeholder' WHERE id = 'run-1'
+      `).run();
+      const action = new ActionRepository(db).create({
+        intent: {
+          missionId: "mission-1", runId: "run-1", stepId: "step-placeholder", planVersion: 1,
+          assignmentId: "assignment-placeholder", actionType: "reconnaissance", actionClass: "network",
+          target: "lab.internal", intentSummary: "Run the persisted bounded scan", kind: "tool",
+          idempotent: true, destructive: false,
+          arguments: {
+            mcpServer: "sechub-reconnaissance",
+            toolName: "quick_scan",
+            arguments: { target: "OPAQUE_TARGET_FROM_STEP_0" },
+          },
+        },
+        fingerprint: "fingerprint-placeholder",
+        contractId: "contract-1",
+        now: NOW,
+      });
+      let mcpCalls = 0;
+      let resolveResult!: (value: unknown) => void;
+      const received = new Promise((resolve) => { resolveResult = resolve; });
+      const port = new CommandOsBoundedExecutionPort({
+        database: db,
+        inventory: () => strictExecutionInventory,
+        callGrok: async () => "unused",
+        executeMcp: async () => {
+          mcpCalls += 1;
+          throw new Error("MCP dispatch must not occur");
+        },
+      });
+      port.bindResultSink({
+        async acceptExecutionResult(result) {
+          resolveResult(result);
+          return {
+            accepted: true, duplicate: false, actionId: result.actionId,
+            runId: result.runId, runState: "blocked", nextAction: null,
+          };
+        },
+      });
+
+      await port.dispatch(action, new AbortController().signal);
+      const result = await received as {
+        success: boolean;
+        failureCategory?: string;
+        failure?: { code: string };
+      };
+      expect(result).toMatchObject({
+        success: false,
+        failureCategory: "invalid_input",
+        failure: { code: "mcp_tool_input_placeholder" },
+      });
+      expect(mcpCalls).toBe(0);
+      expect(db.prepare("SELECT COUNT(*) AS count FROM tool_calls").get()).toEqual({ count: 0 });
+      expect(db.prepare("SELECT COUNT(*) AS count FROM evidence").get()).toEqual({ count: 0 });
     } finally {
       db.close();
     }
@@ -1509,6 +1839,7 @@ describe("Command OS production runtime adapters", () => {
       });
       const results: Array<{
         success: boolean;
+        failureCategory?: string;
         progress: { evidenceIds?: string[] };
         usage: { evidenceBytes?: number };
       }> = [];
@@ -1516,7 +1847,7 @@ describe("Command OS production runtime adapters", () => {
       const completed = new Promise<void>((resolve) => { release = resolve; });
       const port = new CommandOsBoundedExecutionPort({
         database: db,
-        inventory: () => inventory,
+        inventory: () => executionInventory,
         callGrok: async () => "unused",
         executeMcp: async (input) => ({
           success: false,
@@ -1551,6 +1882,14 @@ describe("Command OS production runtime adapters", () => {
 
       expect(results).toHaveLength(2);
       expect(results.every((result) => result.success === false)).toBe(true);
+      expect(results.map(({ failureCategory }) => failureCategory)).toEqual([
+        "deterministic_tool_error",
+        "deterministic_tool_error",
+      ]);
+      expect(db.prepare("SELECT error_category FROM tool_calls ORDER BY created_at, id").all()).toEqual([
+        { error_category: "deterministic_tool_error" },
+        { error_category: "deterministic_tool_error" },
+      ]);
       expect(db.prepare("SELECT COUNT(*) AS count FROM evidence").get()).toEqual({ count: 1 });
       expect(db.prepare(`
         SELECT event_type, COUNT(*) AS count FROM evidence_chain_events GROUP BY event_type ORDER BY event_type
@@ -1612,7 +1951,7 @@ describe("Command OS production runtime adapters", () => {
       const received = new Promise<void>((resolve) => { resolveResults = resolve; });
       const port = new CommandOsBoundedExecutionPort({
         database: db,
-        inventory: () => inventory,
+        inventory: () => executionInventory,
         callGrok: async () => "unused",
         executeMcp: async (input) => {
           mcpCalls += 1;
@@ -1695,7 +2034,7 @@ describe("Command OS production runtime adapters", () => {
       const received = new Promise((resolve) => { resolveResult = resolve; });
       const port = new CommandOsBoundedExecutionPort({
         database: db,
-        inventory: () => inventory,
+        inventory: () => executionInventory,
         callGrok: async () => "unused",
         executeMcp: async (input) => {
           mcpCalls += 1;
@@ -1783,7 +2122,7 @@ describe("Command OS production runtime adapters", () => {
       const received = new Promise((resolve) => { resolveResult = resolve; });
       const port = new CommandOsBoundedExecutionPort({
         database: db,
-        inventory: () => inventory,
+        inventory: () => executionInventory,
         callGrok: async () => "unused",
         executeMcp: async (input) => {
           mcpCalls += 1;
@@ -1933,7 +2272,7 @@ describe("Command OS production runtime adapters", () => {
         const received = new Promise((resolve) => { resolveResult = resolve; });
         const port = new CommandOsBoundedExecutionPort({
           database: db,
-          inventory: () => inventory,
+          inventory: () => executionInventory,
           callGrok: async () => {
             providerCalls += 1;
             return "must not execute";
@@ -2056,7 +2395,7 @@ describe("Command OS production runtime adapters", () => {
         const received = new Promise((resolve) => { resolveResult = resolve; });
         const port = new CommandOsBoundedExecutionPort({
           database: db,
-          inventory: () => inventory,
+          inventory: () => executionInventory,
           now: () => new Date(NOW),
           callGrok: async (prompt) => {
             providerCalls += 1;
@@ -2116,6 +2455,22 @@ describe("Command OS production runtime adapters", () => {
     try {
       seed(db, "guided");
       db.prepare("UPDATE runs SET status = 'running' WHERE id = 'run-1'").run();
+      // The final RunRepository recheck intentionally consults canonical DB
+      // policy rather than trusting only the adapter inventory. Represent the
+      // exact approval-required binding in all three durable registries.
+      db.prepare(`
+        UPDATE agents SET tool_policy_json =
+          '{"allowedTools":["quick_scan","nmapScan"],"deniedTools":[],"approvalRequiredTools":["nmapScan"]}'
+        WHERE id = 'ReconScout'
+      `).run();
+      db.prepare(`
+        INSERT INTO agent_capabilities (agent_id, capability, source, enabled, metadata_json)
+        VALUES ('ReconScout', 'nmapScan', 'runtime-adapter-guided-test-attestation', 1, '{}')
+      `).run();
+      db.prepare(`
+        UPDATE mcp_servers SET capabilities_json = '["quick_scan","nmapScan"]'
+        WHERE id = 'sechub-reconnaissance'
+      `).run();
       db.prepare(`
         INSERT INTO plans (id, run_id, version, status, strategy_summary, plan_hash, created_by, created_at, activated_at)
         VALUES ('plan-guided-tool', 'run-1', 1, 'active', 'Exact Guided tool', ?, 'planner', ?, ?)
@@ -2166,7 +2521,7 @@ describe("Command OS production runtime adapters", () => {
       const received = new Promise<void>((resolve) => { resolveResult = resolve; });
       const port = new CommandOsBoundedExecutionPort({
         database: db,
-        inventory: () => inventory,
+        inventory: () => executionInventory,
         callGrok: async () => "unused",
         now: () => new Date("2026-07-15T12:01:00.000Z"),
         executeMcp: async (input) => {

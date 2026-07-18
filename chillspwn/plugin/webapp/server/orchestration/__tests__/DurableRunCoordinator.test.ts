@@ -24,6 +24,7 @@ class RecordingExecutionPort implements ExecutionPort {
   failDispatch = false;
   failResume = false;
   failCancel = false;
+  cancelGate?: Promise<void>;
   beforeDispatch?: (action: DurableAction) => void;
 
   async dispatch(action: DurableAction, signal: AbortSignal): Promise<void> {
@@ -41,6 +42,7 @@ class RecordingExecutionPort implements ExecutionPort {
 
   async cancelRun(runId: string): Promise<void> {
     this.cancelled.push(runId);
+    await this.cancelGate;
     if (this.failCancel) throw new Error("cleanup unavailable");
   }
 }
@@ -185,6 +187,56 @@ function intent(fixture: { missionId: string; stepId: string; assignmentId: stri
     destructive: false,
     ...overrides,
   };
+}
+
+function enableReviewedNmap(database: Database): void {
+  database.prepare(`
+    UPDATE agents SET tool_policy_json = ? WHERE id = 'ReconScout'
+  `).run(JSON.stringify({
+    allowedTools: ["quick_scan", "nmapScan"],
+    deniedTools: [],
+    // The legacy/global profile remains approval-gated. Only the exact
+    // reviewed server disposition may resolve it for Autonomous execution.
+    approvalRequiredTools: ["nmapScan"],
+  }));
+  database.prepare(`
+    INSERT OR REPLACE INTO agent_capabilities (
+      agent_id, capability, source, enabled, metadata_json
+    ) VALUES ('ReconScout', 'nmapScan', 'reviewed-pentest-binding-test', 1, '{}')
+  `).run();
+  database.prepare(`
+    INSERT OR REPLACE INTO mcp_servers (
+      id, name, transport, endpoint_redacted, status, capabilities_json,
+      policy_json, last_checked_at, created_at, updated_at
+    ) VALUES (
+      'pentest-mcp-recon', 'pentest-mcp-recon', 'stdio', 'local reviewed fixture',
+      'healthy', '["nmapScan"]',
+      '{"enabled":true,"assignedAgents":["ReconScout"],"startPermitted":true}',
+      '2026-07-14T23:59:00.000Z', '2026-07-14T23:59:00.000Z', '2026-07-14T23:59:00.000Z'
+    )
+  `).run();
+}
+
+function reviewedNmapIntent(
+  fixture: { missionId: string; stepId: string; assignmentId: string },
+  runId: string,
+  overrides: Partial<DurableActionIntent> = {},
+): DurableActionIntent {
+  return intent(fixture, runId, {
+    actionType: "port_service_enumeration",
+    actionClass: "port_service_enumeration",
+    arguments: {
+      mcpServer: "pentest-mcp-recon",
+      toolName: "nmapScan",
+      arguments: {
+        target: "target-1",
+        scanTechnique: "Connect",
+        ports: "80,443",
+        timingTemplate: "T3",
+      },
+    },
+    ...overrides,
+  });
 }
 
 function setup() {
@@ -386,6 +438,113 @@ describe("DurableRunCoordinator", () => {
         .toEqual({ count: 1 });
     } finally {
       database.close();
+    }
+  });
+
+  test("dispatches exact reviewed Nmap for Autonomous while retaining one exact Guided decision", async () => {
+    {
+      const { database, coordinator, port } = setup();
+      try {
+        const fixture = seedRun(database, {
+          runId: "run-reviewed-nmap-autonomous",
+          journey: "autonomous",
+          allowedActions: ["port_service_enumeration"],
+        });
+        enableReviewedNmap(database);
+        const lease = coordinator.acquireRunLease("run-reviewed-nmap-autonomous", "worker-nmap-auto");
+        const started = await coordinator.startAction({
+          lease,
+          intent: reviewedNmapIntent(fixture, "run-reviewed-nmap-autonomous"),
+        });
+        expect(started.action.arguments).toMatchObject({
+          mcpServer: "pentest-mcp-recon",
+          toolName: "nmapScan",
+        });
+        expect(port.dispatched).toHaveLength(1);
+      } finally {
+        database.close();
+      }
+    }
+
+    {
+      const { database, coordinator, port } = setup();
+      try {
+        const fixture = seedRun(database, {
+          runId: "run-reviewed-nmap-guided",
+          journey: "guided",
+          status: "waiting_guided_decision",
+        });
+        enableReviewedNmap(database);
+        const represented = reviewedNmapIntent(fixture, "run-reviewed-nmap-guided");
+        database.prepare(`
+          INSERT INTO guided_decisions (
+            id, mission_id, run_id, step_id, requested_action_fingerprint,
+            requested_parameters_json, rationale, risk_class, reversibility,
+            status, decision_actor, decided_at, expires_at, created_at
+          ) VALUES ('decision-reviewed-nmap', ?, 'run-reviewed-nmap-guided', ?, ?, ?,
+            'Run this exact represented Connect scan', 'moderate', 'Read-only',
+            'approved', 'operator', '2026-07-14T23:59:30.000Z',
+            '2026-07-15T01:00:00.000Z', '2026-07-14T23:59:00.000Z')
+        `).run(
+          fixture.missionId,
+          fixture.stepId,
+          fingerprintAction(represented).hash,
+          JSON.stringify(represented.arguments),
+        );
+        const lease = coordinator.acquireRunLease("run-reviewed-nmap-guided", "worker-nmap-guided");
+        await coordinator.startAction({
+          lease,
+          intent: represented,
+          guidedDecisionId: "decision-reviewed-nmap",
+        });
+        expect(port.dispatched).toHaveLength(1);
+        expect(database.prepare(`
+          SELECT COUNT(*) AS count FROM actions
+          WHERE guided_decision_id = 'decision-reviewed-nmap'
+        `).get()).toEqual({ count: 1 });
+      } finally {
+        database.close();
+      }
+    }
+  });
+
+  test("rejects reviewed Nmap target and action-class laundering before persistence", async () => {
+    for (const testCase of [
+      {
+        name: "target mismatch",
+        override: {
+          arguments: {
+            mcpServer: "pentest-mcp-recon",
+            toolName: "nmapScan",
+            arguments: { target: "other-target", scanTechnique: "Connect", ports: "443" },
+          },
+        },
+      },
+      {
+        name: "action class mismatch",
+        override: { actionClass: "exploit_validation" },
+      },
+    ] as const) {
+      const { database, coordinator, port } = setup();
+      try {
+        const runId = `run-reviewed-nmap-${testCase.name.replaceAll(" ", "-")}`;
+        const fixture = seedRun(database, {
+          runId,
+          journey: "autonomous",
+          allowedActions: ["port_service_enumeration", "exploit_validation"],
+        });
+        enableReviewedNmap(database);
+        const lease = coordinator.acquireRunLease(runId, "worker-nmap-deny");
+        await expect(coordinator.startAction({
+          lease,
+          intent: reviewedNmapIntent(fixture, runId, testCase.override),
+        })).rejects.toBeInstanceOf(DurableOrchestrationError);
+        expect(port.dispatched).toHaveLength(0);
+        expect(database.prepare("SELECT COUNT(*) AS count FROM actions WHERE run_id = ?").get(runId))
+          .toEqual({ count: 0 });
+      } finally {
+        database.close();
+      }
     }
   });
 
@@ -947,6 +1106,35 @@ describe("DurableRunCoordinator", () => {
     }
   });
 
+  test("schema-invalid input cannot turn an error transcript into replan authority", async () => {
+    const { database, coordinator } = setup();
+    try {
+      const fixture = seedRun(database, { runId: "run-invalid-input", journey: "autonomous" });
+      const lease = coordinator.acquireRunLease("run-invalid-input", "worker-1");
+      const started = await coordinator.startAction({ lease, intent: intent(fixture, "run-invalid-input") });
+      const failed = await coordinator.completeAction({
+        lease: started.lease,
+        actionId: started.action.id,
+        success: false,
+        resultSummary: "An old adapter retained the schema error as an evidence-like record",
+        before: { evidenceIds: [] },
+        after: { evidenceIds: ["schema-error-transcript"] },
+        failureCategory: "invalid_input",
+      });
+      expect(failed).toMatchObject({
+        directive: "failed",
+        run: { run: { state: "failed" }, control: { replanCount: 0 } },
+      });
+      expect(failed.run.control.recovery).toBeUndefined();
+      expect(database.prepare(`
+        SELECT COUNT(*) AS count FROM runtime_continuations
+        WHERE run_id = 'run-invalid-input' AND kind = 'replan_pending'
+      `).get()).toEqual({ count: 0 });
+    } finally {
+      database.close();
+    }
+  });
+
   test("cooperatively cancels child work, writes terminal checkpoint, and clears every active lease", async () => {
     const { database, coordinator, port } = setup();
     try {
@@ -972,4 +1160,40 @@ describe("DurableRunCoordinator", () => {
       database.close();
     }
   });
+
+  test("heartbeats the run and continuation while cooperative cancellation cleanup is slow", async () => {
+    const { database, coordinator, port, clock } = setup();
+    let releaseCleanup!: () => void;
+    port.cancelGate = new Promise<void>((resolve) => { releaseCleanup = resolve; });
+    try {
+      const fixture = seedRun(database, { runId: "run-slow-cancel", journey: "autonomous" });
+      const lease = coordinator.acquireRunLease("run-slow-cancel", "worker-1");
+      const started = await coordinator.startAction({ lease, intent: intent(fixture, "run-slow-cancel") });
+      const cancellation = coordinator.cancelRun({
+        lease: started.lease,
+        reason: "Operator requested a safe stop",
+      });
+      await Promise.resolve();
+
+      clock.advance(750);
+      await Bun.sleep(375);
+      clock.advance(750);
+      await Bun.sleep(375);
+      releaseCleanup();
+
+      const cancelled = await cancellation;
+      expect(cancelled.run.run.state).toBe("cancelled");
+      expect(database.prepare(`
+        SELECT status, lease_owner, lease_expires_at
+        FROM runtime_continuations
+        WHERE run_id = 'run-slow-cancel' AND kind = 'cancellation_finalize_pending'
+      `).get()).toEqual({ status: "completed", lease_owner: null, lease_expires_at: null });
+      expect(database.prepare(`
+        SELECT status, lease_owner, lease_expires_at FROM runs WHERE id = 'run-slow-cancel'
+      `).get()).toEqual({ status: "cancelled", lease_owner: null, lease_expires_at: null });
+    } finally {
+      releaseCleanup?.();
+      database.close();
+    }
+  }, 10_000);
 });

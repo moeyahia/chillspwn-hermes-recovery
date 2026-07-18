@@ -42,7 +42,14 @@ function write(path: string, content: string | Uint8Array): void {
 
 function createEngagement(root: string): { engagement: string; secret: string } {
   const engagement = join(root, "customer-portal");
-  write(join(engagement, "scans/service.nmap"), "443/tcp open https nginx 1.24\n");
+  write(join(engagement, "scans/service.nmap"), [
+    "Nmap scan report for portal.example.test (192.0.2.45)",
+    "Host is up (0.0040s latency).",
+    "PORT    STATE SERVICE VERSION",
+    "443/tcp open  https   nginx 1.24",
+    "Running: Linux 5.X",
+    "",
+  ].join("\n"));
   write(join(engagement, "report/report.md"), "# Historical report\nReview required.\n");
   write(join(engagement, "loot/public.txt"), "non-secret historical username: analyst\n");
   write(join(engagement, "notes/overview.md"), "Authorized-history note with no inferred current authorization.\n");
@@ -157,8 +164,8 @@ describe("historical engagement import and approved Vault projection", () => {
       expect(count(database, "engagement_log_records")).toBe(1);
       expect(count(database, "evidence_candidates")).toBe(2);
       expect(count(database, "evidence")).toBe(0);
-      expect(count(database, "memory_nodes")).toBe(14);
-      expect(count(database, "memory_edges")).toBe(13);
+      expect(count(database, "memory_nodes")).toBe(16);
+      expect(count(database, "memory_edges")).toBe(17);
       expect(count(database, "legacy_engagement_manifests")).toBe(1);
       expect(count(database, "legacy_migration_quarantine")).toBe(3);
       expect((database.prepare("SELECT authorization_status FROM missions").get() as { authorization_status: string }).authorization_status).toBe("unverified");
@@ -167,7 +174,24 @@ describe("historical engagement import and approved Vault projection", () => {
       expect((database.prepare("SELECT control_plane FROM runs").get() as { control_plane: string }).control_plane).toBe("legacy");
       expect((database.prepare("SELECT technical_payload_json FROM engagement_log_records").get() as { technical_payload_json: string }).technical_payload_json)
         .toContain('"rawOutputIsEvidence":false');
-      expect((database.prepare("SELECT COUNT(*) AS count FROM memory_edges WHERE lifecycle_status='verified'").get() as { count: number }).count).toBe(11);
+      expect((database.prepare("SELECT COUNT(*) AS count FROM memory_edges WHERE lifecycle_status='verified'").get() as { count: number }).count).toBe(15);
+      const assetObservation = database.prepare(`
+        SELECT title, summary, body FROM memory_nodes WHERE node_type = 'asset'
+      `).get() as { title: string; summary: string; body: string };
+      expect(assetObservation.title).toContain("192.0.2.45");
+      expect(assetObservation.summary).toContain("current reachability is unverified");
+      expect(assetObservation.body).toContain("portal.example.test");
+      const serviceObservation = database.prepare(`
+        SELECT title, summary, body FROM memory_nodes WHERE node_type = 'entity'
+      `).get() as { title: string; summary: string; body: string };
+      expect(serviceObservation.title).toContain("192.0.2.45:443/tcp");
+      expect(serviceObservation.body).toContain("nginx 1.24");
+      expect((database.prepare(`
+        SELECT COUNT(*) AS count FROM memory_edges
+        WHERE edge_type = 'belongs_to'
+          AND source_node_id = (SELECT id FROM memory_nodes WHERE node_type = 'entity')
+          AND target_node_id = (SELECT id FROM memory_nodes WHERE node_type = 'asset')
+      `).get() as { count: number }).count).toBe(1);
       const verifiedNodes = (database.prepare("SELECT id FROM memory_nodes WHERE lifecycle_status='verified'").all() as Array<{ id: string }>).map((row) => row.id);
       const visibleEdgeNodes = new Set((database.prepare(`
         SELECT source_node_id AS id FROM memory_edges WHERE lifecycle_status='verified'
@@ -197,8 +221,8 @@ describe("historical engagement import and approved Vault projection", () => {
       expect(count(afterSecond, "missions")).toBe(1);
       expect(count(afterSecond, "runs")).toBe(1);
       expect(count(afterSecond, "artifacts")).toBe(9);
-      expect(count(afterSecond, "memory_nodes")).toBe(14);
-      expect(count(afterSecond, "memory_edges")).toBe(13);
+      expect(count(afterSecond, "memory_nodes")).toBe(16);
+      expect(count(afterSecond, "memory_edges")).toBe(17);
     } finally {
       afterSecond.close();
     }
@@ -218,10 +242,18 @@ describe("historical engagement import and approved Vault projection", () => {
         permissionGranted: true,
       });
       const approval = new ApprovedLegacyVaultProjectionService(writable, bridge);
+      const preview = approval.preview({
+        migrationId: first.migrationId,
+        expectedReconciliationHash: reconciliationHash!,
+        connectionId: connection.id,
+      });
+      expect(preview.eligibleNodeCount).toBe(14);
+      expect(preview.projectionHash).toMatch(/^[a-f0-9]{64}$/u);
       expect(markdownFiles(connection.vaultPath)).toHaveLength(0);
       await expect(approval.project({
         migrationId: first.migrationId,
         expectedReconciliationHash: "0".repeat(64),
+        expectedProjectionHash: preview.projectionHash,
         connectionId: connection.id,
         approvedBy: "operator-test",
       })).rejects.toThrow("does not match");
@@ -231,6 +263,7 @@ describe("historical engagement import and approved Vault projection", () => {
       await expect(approval.project({
         migrationId: first.migrationId,
         expectedReconciliationHash: reconciliationHash!,
+        expectedProjectionHash: preview.projectionHash,
         connectionId: connection.id,
         approvedBy: "operator-test",
       })).rejects.toThrow("active connected");
@@ -240,14 +273,15 @@ describe("historical engagement import and approved Vault projection", () => {
       const projected = await approval.project({
         migrationId: first.migrationId,
         expectedReconciliationHash: reconciliationHash!,
+        expectedProjectionHash: preview.projectionHash,
         connectionId: connection.id,
         approvedBy: "operator-test",
       });
-      expect(projected.projectedNodeIds).toHaveLength(12);
-      expect(projected.export).toMatchObject({ total: 12, processed: 12 });
-      expect(projected.export.counts).toMatchObject({ synced: 12, failed: 0, conflicts: 0 });
+      expect(projected.projectedNodeIds).toHaveLength(14);
+      expect(projected.export).toMatchObject({ total: 14, processed: 14 });
+      expect(projected.export.counts).toMatchObject({ synced: 14, failed: 0, conflicts: 0 });
       const notes = markdownFiles(connection.vaultPath);
-      expect(notes).toHaveLength(12);
+      expect(notes).toHaveLength(14);
       const parsed = notes.map((path) => ({ path, note: parseObsidianNote(readFileSync(path, "utf8")) }));
       expect(parsed.every((item) => item.note.aliases.includes(item.note.id))).toBe(true);
       const run = parsed.find((item) => item.note.nodeType === "run");
@@ -256,6 +290,8 @@ describe("historical engagement import and approved Vault projection", () => {
       expect(run!.note.edges[0]).toMatchObject({ edgeType: "belongs_to" });
       const artifacts = parsed.filter((item) => item.note.nodeType === "artifact");
       expect(artifacts).toHaveLength(9);
+      expect(parsed.filter((item) => item.note.nodeType === "asset")).toHaveLength(1);
+      expect(parsed.filter((item) => item.note.nodeType === "entity")).toHaveLength(1);
       for (const artifact of artifacts) {
         expect(readFileSync(artifact.path, "utf8"))
           .toContain(`<!-- chillspwn-backlink:produced:${run!.note.id} -->`);

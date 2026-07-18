@@ -1,4 +1,4 @@
-import { expect, test, type Locator, type Page, type Response } from "./support/playwright";
+import { expect, test, type Locator, type Page, type Response, type TestInfo } from "./support/playwright";
 import { readFileSync } from "node:fs";
 import { validateInteractionManifest } from "../interaction-manifest/schema";
 import { BrowserAudit } from "./support/browserAudit";
@@ -18,6 +18,11 @@ const STAGES_TEST_ID = "e2e.operational-truth.stages-and-pagination";
 const RETRY_TEST_ID = "e2e.operational-truth.retry";
 const REJECT_TEST_ID = "e2e.operational-truth.reject";
 const VERIFY_TEST_ID = "e2e.operational-truth.verify-demote";
+const VISUAL_PROJECT = "chromium-1440";
+const EVIDENCE_VERIFICATION_VISUAL = {
+  id: "visual.operational-truth.evidence-verification.chromium-1440",
+  snapshot: "operational-truth-evidence-verification.png",
+} as const;
 
 const OPERATIONAL_TRUTH_MANIFEST_IDS = [
   "operational-truth.stage-tabs",
@@ -86,6 +91,25 @@ function nativeDisclosure(page: Page, label: string | RegExp): Locator {
   // rather than a button. Target the real keyboard-operable summary while the
   // interaction manifest keeps its cross-control disclosure normalization.
   return page.locator("summary").filter({ hasText: label });
+}
+
+async function expectEvidenceVerificationVisual(form: Locator, testInfo: TestInfo): Promise<void> {
+  if (testInfo.project.name !== VISUAL_PROJECT) return;
+  await form.page().evaluate(async () => { await document.fonts.ready; });
+  const topbar = form.page().locator(".os-topbar");
+  if (await topbar.count() === 1) {
+    await topbar.evaluate((node) => { (node as HTMLElement).style.visibility = "hidden"; });
+  }
+  const sourceIds = form.locator(".os-compact-list small");
+  await expect(sourceIds).toHaveCount(2);
+  await sourceIds.nth(0).evaluate((node) => { node.textContent = "obs_visual_fixture"; });
+  await sourceIds.nth(1).evaluate((node) => { node.textContent = "log_visual_fixture"; });
+  await expect(form).toHaveScreenshot(EVIDENCE_VERIFICATION_VISUAL.snapshot, {
+    animations: "disabled",
+    caret: "hide",
+    maxDiffPixels: 0,
+    threshold: 0.15,
+  });
 }
 
 async function assertManifestControl(page: Page, id: typeof OPERATIONAL_TRUTH_MANIFEST_IDS[number]): Promise<void> {
@@ -419,6 +443,10 @@ test(`${VERIFY_TEST_ID} validates, independently verifies, inspects, and demotes
   await page.keyboard.press("Space");
   await expect(attestation).toBeChecked();
   await expect(verifySubmit).toBeEnabled();
+  const verificationForm = page.locator("form.os-review-form").filter({
+    has: page.getByRole("heading", { name: "Verify as evidence", exact: true }),
+  });
+  await expectEvidenceVerificationVisual(verificationForm, testInfo);
 
   const verifyRequest = page.waitForRequest((request) =>
     request.url().endsWith(`/evidence-candidates/${fixture.mainCandidateId}/verify`)

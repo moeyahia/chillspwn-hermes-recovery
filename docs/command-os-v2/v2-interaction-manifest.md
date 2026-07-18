@@ -29,8 +29,8 @@ Brain-node, Vault-lifecycle, journey-row, agent-row, trace-row, and report-row
 additions. This closes generic source ownership, not execution or
 assertion-level option coverage.
 
-The latest complete enforced initial-state crawl covers the current 479-group
-inventory and is archived at
+The latest complete enforced initial-state crawl covers the archived 479-group
+revision that preceded the current 489-group inventory and is stored at
 `test-results/results/manifest-current-479-all13-enforced-20260717-r2.json`
 (SHA-256
 `840616394a5b875c1791315bd6f38eb2ed37099c7c7e3330a1ea1241c73524a7`):
@@ -45,7 +45,7 @@ inventory and is archived at
 | Stale static manifest groups | 0 |
 | Browser-audit/API degradation | 0 unexpected; 0 degraded API responses |
 
-The current 479-group crawl used the development E2E profile with strict
+That archived 479-group crawl used the development E2E profile with strict
 manifest enforcement and required-API mode, with BrowserAudit active before
 the first navigation. It validates
 the visible initial state of the static routes plus both
@@ -88,16 +88,19 @@ appears somewhere in E2E source; it does not prove assertion-level ownership of
 every option. The 381 dedicated assignments therefore remain an inventory
 checkpoint, not a mathematical proof that every option and state was exercised.
 
-A checked-in visual registry now maps **18/489** manifest groups to **12**
+A checked-in visual registry now maps **30/489** manifest groups to **13**
 deterministic Chromium 1440/Linux baselines. Six cover the connected-Vault
 lifecycle; six additional material screenshots cover minimal Autonomous
 intake, structured blocked recovery, Guided waiting decision, Second Brain
 canvas/table modes, and targeted node projection with a sanitized native
-Obsidian deep link after reload. The remaining **471** groups are unmapped, cross-browser
+Obsidian deep link after reload. A thirteenth baseline covers the independent
+evidence-verification gate before mutation. The remaining **459** groups are unmapped, cross-browser
 baselines are not complete, and `humanReleaseApproval` remains `false`.
 
-The earlier five-screenshot focused visual replay passed **3/3** in 27,940.205 ms, and registry reverse
-mapping plus file-integrity tests passed **21/21 with 3,486 assertions**. JSON:
+The current 13-baseline registry reverse mapping and file-integrity suite passed
+**21/21 with 3,554 assertions**. The earlier five-screenshot focused visual
+replay passed **3/3** in 27,940.205 ms, and its archived registry revision passed
+**21/21 with 3,486 assertions**. JSON for that archived run:
 `test-results/results/59786-1784264454738.json` (SHA-256
 `fc72e41f27b524cb3591825ccc29339bc3f9e95bd394ed764f40fc9a8371ef6c`).
 The targeted node projection baseline separately passed a strict no-update
@@ -118,12 +121,27 @@ Policies/Settings.
 
 The policy test requires the 12 primary route paths to match
 `PRIMARY_NAVIGATION`, requires all 16 named material states, and forbids axe
-rule disabling/exclusion. Each browser project runs 27 serial tests and emits
-28 state receipts. The Chromium-first pass completed 27/27; the final Chromium,
-Firefox, and WebKit matrix completed **81/81 in 115,689.921 ms**, with **84
-scans, 0 A/AA violations, 0 failed, 0 skipped, and 0 retries**. JSON:
+rule disabling/exclusion. The current implementation directly preloads pinned
+`axe-core` 4.12.1 before document initialization and evaluates only a compact,
+version-checked scan function. Its transport canary enforces a 64 KiB maximum
+evaluated source and rejects the previous oversized source transport. Each
+browser project now runs **28 serial tests** and emits **29 state receipts**.
+
+The current direct-preload implementation completed **84/84** across Chromium,
+Firefox, and WebKit in 195,950.758 ms, with **87 scans**, zero unexpected,
+skipped, or flaky results, zero automated A/AA violations, and retries disabled.
+JSON:
+`test-results/results/accessibility-direct-all3-20260717-r1.json`
+(SHA-256
+`646380edb1001873e027203b308f2f2565305f4c66404b2817bcee493e96d223`).
+
+The most recent complete three-engine result is archived pre-direct-transport
+evidence: Chromium, Firefox, and WebKit completed **81/81 in 115,689.921 ms**,
+with **84 scans, 0 A/AA violations, 0 failed, 0 skipped, and 0 retries**. JSON:
 `test-results/results/axe-expanded-all3-20260717-r1.json` (SHA-256
 `aec4b7adbf9a3ac73dae22bcfb6b86c33954a789c65e182b8dca68c7059cbf22`).
+The archived result remains historical and is not relabeled as proof of the new
+transport; the current 84/84 artifact above is authoritative for that boundary.
 
 The embedded receipts retain 84 gradient color-contrast and 15 ARIA-support
 incomplete determinations for manual review. The run closed two frontend
@@ -153,8 +171,9 @@ release matrix.
 
 Source assignment is no longer the primary gap. Release evidence still needs:
 
-1. extend the green current 479-group initial-state crawl and bounded 16-state
-   accessibility matrix into every material hidden, dynamic, degraded, error,
+1. rerun the current 489-group inventory across all projects, then extend the
+   archived green 479-group initial-state proof and bounded accessibility
+   matrix into every material hidden, dynamic, degraded, error,
    dialog, drawer, and connected-Vault state;
 2. assertion-level ownership of every option and material state;
 3. complete browser/viewport, keyboard, mobile, error, refresh/reconnect, and
@@ -163,7 +182,7 @@ Source assignment is no longer the primary gap. Release evidence still needs:
    finding/admin/lesson
    review, live in-flight plan amendment, plan comparison/rollback, provider
    recovery, and Research Lab promotion;
-5. the remaining 471 screenshot mappings, cross-browser and human visual
-   approval, accessibility coverage beyond the bounded 81/81 three-engine axe
-   matrix, and a retry-free full 13-project complete-product release matrix
-   beyond the bounded manifest crawl.
+5. the remaining 459 screenshot mappings, cross-browser and human visual
+   approval, accessibility coverage beyond the current bounded 84/84 desktop-
+   engine gate, and a retry-free full 13-project complete-product release
+   matrix beyond the bounded manifest crawl.

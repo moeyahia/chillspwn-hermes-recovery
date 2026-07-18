@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "application": "CHILLSPWN // COMMAND OS",
   "namespace": "chillspwn.command-os-v2",
-  "scope": "Local authentication, shell navigation, two journey-entry surfaces, both registry-driven four-step mission-intake journeys, the complete currently rendered initial static-route inventory, and the currently mounted fixture-backed operational controls. All 381 fixture-required groups map to dedicated canonical fixture source coverage; the additional 108 shell, intake, and static-route groups map to bounded source tests. Current-run assertion receipts, remaining hidden and material state traversal, visual approval, and the full browser matrix remain release work.",
+  "scope": "Local authentication, shell navigation, two journey-entry surfaces, the six-step Autonomous and four-step Guided registry-driven mission-intake journeys, the complete currently rendered initial static-route inventory, and the currently mounted fixture-backed operational controls. All 383 fixture-required groups map to dedicated canonical fixture source coverage; the additional shell, intake, and static-route groups map to bounded source tests. Current-run assertion receipts, remaining hidden and material state traversal, visual approval, and the full browser matrix remain release work.",
   "entries": [
     {
       "id": "shell.home",
@@ -542,7 +542,7 @@
       "controlId": "autonomous-intake-navigation-stepper",
       "accessible": {
         "role": "button",
-        "name": "^[1-4](Scope|Outcome|Contract|Review)$",
+        "name": "^[1-6](Scope|Outcome|Contract|Team|Context|Review)$",
         "match": "regex"
       },
       "controlType": "wizard-step-collection",
@@ -550,6 +550,8 @@
         "Scope",
         "Outcome",
         "Contract",
+        "Team",
+        "Context",
         "Review"
       ],
       "keyboardAction": "Reach with Tab and activate or edit using the native keyboard interaction",
@@ -995,7 +997,7 @@
     {
       "id": "autonomous-intake.navigation.continue",
       "route": "/missions/new/autonomous",
-      "surface": "Autonomous mission intake — Scope, Outcome, and Contract",
+      "surface": "Autonomous mission intake — Scope, Outcome, Contract, Team, and Context",
       "requiredState": "Autonomous registry-driven scope, outcome, and contract step rendered from the live V2 intake contract",
       "controlId": "autonomous-intake-navigation-continue",
       "accessible": {
@@ -1007,12 +1009,14 @@
       "options": [
         "Scope → Outcome",
         "Outcome → Contract",
-        "Contract → Review"
+        "Contract → Team",
+        "Team → Context",
+        "Context → Review"
       ],
       "keyboardAction": "Reach with Tab and activate or edit using the native keyboard interaction",
       "pointerAction": "Activate or edit the represented control with a pointer",
       "expectedStateTransition": "Resolve the current structured request and advance one step only",
-      "expectedApiOrEventSideEffect": "POST /api/v2/registries/intake/resolve; Autonomous Contract → Review also POSTs /api/v2/missions/autonomous/preflight",
+      "expectedApiOrEventSideEffect": "POST /api/v2/registries/intake/resolve; Autonomous Contract → Team, Team → Context, and Context → Review also POST /api/v2/missions/autonomous/preflight",
       "states": {
         "loading": "The named runtime-registry loading state remains visible until controls resolve",
         "disabled": "Future wizard steps and fail-closed launch controls expose a native disabled state",
@@ -1047,7 +1051,7 @@
     {
       "id": "autonomous-intake.navigation.back-button",
       "route": "/missions/new/autonomous",
-      "surface": "Autonomous mission intake — Outcome, Contract, and Review",
+      "surface": "Autonomous mission intake — Outcome, Contract, Team, Context, and Review",
       "requiredState": "Autonomous registry-driven outcome, contract, and review step rendered from the live V2 intake contract",
       "controlId": "autonomous-intake-navigation-back-button",
       "accessible": {
@@ -1059,7 +1063,9 @@
       "options": [
         "Outcome → Scope",
         "Contract → Outcome",
-        "Review → Contract"
+        "Team → Contract",
+        "Context → Team",
+        "Review → Context"
       ],
       "keyboardAction": "Reach with Tab and activate or edit using the native keyboard interaction",
       "pointerAction": "Activate or edit the represented control with a pointer",
@@ -1933,6 +1939,258 @@
         "loading": "The named runtime-registry loading state remains visible until controls resolve",
         "disabled": "Future wizard steps and fail-closed launch controls expose a native disabled state",
         "error": "A specific validation or server remediation message is shown without losing entered scope"
+      },
+      "classification": "reversible",
+      "screenshotsRequired": [],
+      "browsers": [
+        "chromium",
+        "firefox",
+        "webkit",
+        "chromium-enterprise",
+        "android-chromium",
+        "iphone-webkit",
+        "tablet-chromium"
+      ],
+      "viewports": [
+        "360x800",
+        "390x844",
+        "768x1024",
+        "1024x768",
+        "1280x800",
+        "1440x900",
+        "1920x1080",
+        "2560x1440",
+        "200%"
+      ],
+      "testIds": [
+        "e2e.mission-intake.autonomous-minimal"
+      ]
+    },
+    {
+      "id": "autonomous-intake.team.recommended",
+      "route": "/missions/new/autonomous",
+      "surface": "Autonomous mission intake — Team",
+      "requiredState": "Autonomous preflight returned at least one compatible recommended specialist",
+      "controlId": "autonomous-intake-team-recommended",
+      "accessible": {
+        "role": "button",
+        "name": "Use recommended team",
+        "match": "exact"
+      },
+      "controlType": "registry-team-default",
+      "options": [
+        "Select the current runtime-recommended compatible specialists"
+      ],
+      "keyboardAction": "Reach with Tab and press Enter or Space",
+      "pointerAction": "Activate Use recommended team",
+      "expectedStateTransition": "Replace the draft specialist selection with the current preflight recommendation and mark readiness for revalidation",
+      "expectedApiOrEventSideEffect": "The next Continue POSTs the selected specialist IDs to /api/v2/missions/autonomous/preflight",
+      "states": {
+        "loading": "The readiness panel names that specialist and provider readiness is being checked",
+        "disabled": "Unavailable specialists remain disabled and cannot be selected by the recommendation",
+        "error": "A specific preflight remediation is retained without losing the draft contract"
+      },
+      "classification": "reversible",
+      "screenshotsRequired": [],
+      "browsers": [
+        "chromium",
+        "firefox",
+        "webkit",
+        "chromium-enterprise",
+        "android-chromium",
+        "iphone-webkit",
+        "tablet-chromium"
+      ],
+      "viewports": [
+        "360x800",
+        "390x844",
+        "768x1024",
+        "1024x768",
+        "1280x800",
+        "1440x900",
+        "1920x1080",
+        "2560x1440",
+        "200%"
+      ],
+      "testIds": [
+        "e2e.mission-intake.autonomous-minimal"
+      ]
+    },
+    {
+      "id": "autonomous-intake.team.specialists",
+      "route": "/missions/new/autonomous",
+      "surface": "Autonomous mission intake — Team",
+      "requiredState": "Fixture required: Autonomous preflight returned live specialist candidates with compatibility and provider readiness",
+      "controlId": "autonomous-intake-team-specialists",
+      "accessible": {
+        "role": "checkbox",
+        "name": "^.+reviewed tools.+MCP servers.+provider",
+        "match": "regex"
+      },
+      "controlType": "runtime-specialist-checkbox-collection",
+      "options": [
+        "Every live compatible specialist candidate returned by preflight"
+      ],
+      "keyboardAction": "Reach each compatible candidate with Tab and toggle with Space",
+      "pointerAction": "Toggle an individual compatible specialist",
+      "expectedStateTransition": "Change only the represented specialist assignment set; incompatible candidates remain unavailable",
+      "expectedApiOrEventSideEffect": "The next Continue POSTs the exact specialist selection to /api/v2/missions/autonomous/preflight",
+      "states": {
+        "loading": "The readiness panel names that specialist and provider readiness is being checked",
+        "disabled": "A specialist with no compatible execution path has a native disabled checkbox and reasons",
+        "error": "A specific capability or provider remediation is shown beside the affected specialist"
+      },
+      "classification": "reversible",
+      "screenshotsRequired": [],
+      "browsers": [
+        "chromium",
+        "firefox",
+        "webkit",
+        "chromium-enterprise",
+        "android-chromium",
+        "iphone-webkit",
+        "tablet-chromium"
+      ],
+      "viewports": [
+        "360x800",
+        "390x844",
+        "768x1024",
+        "1024x768",
+        "1280x800",
+        "1440x900",
+        "1920x1080",
+        "2560x1440",
+        "200%"
+      ],
+      "testIds": [
+        "e2e.mission-intake.autonomous-minimal"
+      ]
+    },
+    {
+      "id": "autonomous-intake.context.scopes",
+      "route": "/missions/new/autonomous",
+      "surface": "Autonomous mission intake — Context",
+      "requiredState": "Autonomous preflight resolved the default memory-scope policy",
+      "controlId": "autonomous-intake-context-scopes",
+      "accessible": {
+        "role": "checkbox",
+        "name": "^(?:Confirmed operator preferences|Verified operational lessons|Engagement-isolated knowledge)",
+        "match": "regex"
+      },
+      "controlType": "memory-scope-checkbox-collection",
+      "options": [
+        "Confirmed operator preferences",
+        "Verified operational lessons",
+        "Engagement-isolated knowledge"
+      ],
+      "keyboardAction": "Reach each memory scope with Tab and toggle an available scope with Space",
+      "pointerAction": "Toggle an available memory scope",
+      "expectedStateTransition": "Change which confirmed memory domains preflight may search without changing authorization or disclosure policy",
+      "expectedApiOrEventSideEffect": "The next Continue POSTs exact allowed memory scopes to /api/v2/missions/autonomous/preflight",
+      "states": {
+        "loading": "The panel names that scope-safe Second Brain context is loading",
+        "disabled": "Engagement-isolated knowledge stays disabled until an explicit engagement ID is supplied",
+        "error": "An invalid or unavailable scope is identified and Autonomous launch remains blocked"
+      },
+      "classification": "reversible",
+      "screenshotsRequired": [],
+      "browsers": [
+        "chromium",
+        "firefox",
+        "webkit",
+        "chromium-enterprise",
+        "android-chromium",
+        "iphone-webkit",
+        "tablet-chromium"
+      ],
+      "viewports": [
+        "360x800",
+        "390x844",
+        "768x1024",
+        "1024x768",
+        "1280x800",
+        "1440x900",
+        "1920x1080",
+        "2560x1440",
+        "200%"
+      ],
+      "testIds": [
+        "e2e.mission-intake.autonomous-minimal"
+      ]
+    },
+    {
+      "id": "autonomous-intake.context.clear",
+      "route": "/missions/new/autonomous",
+      "surface": "Autonomous mission intake — Context",
+      "requiredState": "Autonomous preflight returned the scope-safe Second Brain context result",
+      "controlId": "autonomous-intake-context-clear",
+      "accessible": {
+        "role": "button",
+        "name": "Use no retained context",
+        "match": "exact"
+      },
+      "controlType": "context-selection-clear",
+      "options": [
+        "Create an empty Context Pack when the contract permits degraded memory use"
+      ],
+      "keyboardAction": "Reach with Tab and press Enter or Space",
+      "pointerAction": "Activate Use no retained context",
+      "expectedStateTransition": "Clear all optional retained-memory selections without changing authorization, scope, or immutable mission facts",
+      "expectedApiOrEventSideEffect": "The next Continue POSTs an empty selected memory-node list to /api/v2/missions/autonomous/preflight",
+      "states": {
+        "loading": "The panel names that scope-safe Second Brain context is loading",
+        "disabled": "Launch remains disabled when the signed contract requires Brain availability",
+        "error": "Unavailable or excluded memories are named without exposing their content to an incompatible provider"
+      },
+      "classification": "reversible",
+      "screenshotsRequired": [],
+      "browsers": [
+        "chromium",
+        "firefox",
+        "webkit",
+        "chromium-enterprise",
+        "android-chromium",
+        "iphone-webkit",
+        "tablet-chromium"
+      ],
+      "viewports": [
+        "360x800",
+        "390x844",
+        "768x1024",
+        "1024x768",
+        "1280x800",
+        "1440x900",
+        "1920x1080",
+        "2560x1440",
+        "200%"
+      ],
+      "testIds": [
+        "e2e.mission-intake.autonomous-minimal"
+      ]
+    },
+    {
+      "id": "autonomous-intake.context.memories",
+      "route": "/missions/new/autonomous",
+      "surface": "Autonomous mission intake — Context",
+      "requiredState": "Fixture required: Autonomous preflight returned at least one permitted confirmed memory or verified lesson",
+      "controlId": "autonomous-intake-context-memories",
+      "accessible": {
+        "role": "checkbox",
+        "name": "^.+(?:confirmed|verified).+confidence",
+        "match": "regex"
+      },
+      "controlType": "scope-safe-memory-checkbox-collection",
+      "options": [
+        "Every eligible confirmed preference or verified lesson returned by preflight"
+      ],
+      "keyboardAction": "Reach each memory with Tab and toggle with Space",
+      "pointerAction": "Toggle an individual permitted memory",
+      "expectedStateTransition": "Change the smallest inspectable Context Pack candidate set while preserving scope, sensitivity, lifecycle, and provenance",
+      "expectedApiOrEventSideEffect": "The next Continue POSTs exact selected memory-node IDs to /api/v2/missions/autonomous/preflight",
+      "states": {
+        "loading": "The panel names that scope-safe Second Brain context is loading",
+        "disabled": "A memory excluded by scope or disclosure policy is not selectable",
+        "error": "Excluded memory IDs and a safe remediation are shown without silently substituting another memory"
       },
       "classification": "reversible",
       "screenshotsRequired": [],
@@ -3769,40 +4027,40 @@
       "id": "operational-truth.demote-evidence", "route": "/missions/:missionId/runs/:runId?tab=evidence", "surface": "Mission Evidence — promoted evidence review", "requiredState": "Fixture required: the selected candidate is promoted and has a sufficient audited reason", "controlId": "operational-truth-demote-evidence", "accessible": { "role": "button", "name": "Demote evidence", "match": "exact" }, "controlType": "verified-evidence-demotion", "options": ["Demote evidence while preserving dependent policy checks"], "keyboardAction": "Focus with Tab and press Enter or Space", "pointerAction": "Click Demote evidence", "expectedStateTransition": "Demote the evidence under server-enforced dependency rules and preserve its audit trail", "expectedApiOrEventSideEffect": "POST /api/v2/operational-truth/missions/:missionId/evidence-candidates/:candidateId/demote with idempotency key", "states": { "loading": "Button reads Recording… while pending", "disabled": "Disabled for insufficient reason, pending mutation, or invalid candidate state", "error": "Dependency or policy denial is explained and evidence remains unchanged" }, "classification": "destructive", "screenshotsRequired": [], "browsers": ["chromium", "firefox", "webkit", "chromium-enterprise", "android-chromium", "iphone-webkit", "tablet-chromium"], "viewports": ["360x800", "390x844", "768x1024", "1024x768", "1280x800", "1440x900", "1920x1080", "2560x1440", "200%"], "testIds": ["e2e.operational-truth.verify-demote"]
     },
     {
-      "id": "operational-truth.verify.reason", "route": "/missions/:missionId/runs/:runId?tab=evidence", "surface": "Mission Evidence — independent evidence verification", "requiredState": "Fixture required: a validating candidate has resolved canonical provenance", "controlId": "operational-truth-verify-reason", "accessible": { "role": "textbox", "name": "Independent review reason", "match": "exact" }, "controlType": "verification-textarea", "options": ["At least 12 non-whitespace characters"], "keyboardAction": "Focus with Tab and enter the independent review reason", "pointerAction": "Click and enter the independent review reason", "expectedStateTransition": "Update the local verification proposal; no evidence is created before submit", "expectedApiOrEventSideEffect": null, "states": { "loading": "Canonical observation sources resolve before the form renders", "disabled": "Editable when the form renders", "error": "Canonical provenance failure prevents the form from rendering" }, "classification": "reversible", "screenshotsRequired": [], "browsers": ["chromium", "firefox", "webkit", "chromium-enterprise", "android-chromium", "iphone-webkit", "tablet-chromium"], "viewports": ["360x800", "390x844", "768x1024", "1024x768", "1280x800", "1440x900", "1920x1080", "2560x1440", "200%"], "testIds": ["e2e.operational-truth.verify-demote"]
+      "id": "operational-truth.verify.reason", "route": "/missions/:missionId/runs/:runId?tab=evidence", "surface": "Mission Evidence — independent evidence verification", "requiredState": "Fixture required: a validating candidate has resolved canonical provenance", "controlId": "operational-truth-verify-reason", "accessible": { "role": "textbox", "name": "Independent review reason", "match": "exact" }, "controlType": "verification-textarea", "options": ["At least 12 non-whitespace characters"], "keyboardAction": "Focus with Tab and enter the independent review reason", "pointerAction": "Click and enter the independent review reason", "expectedStateTransition": "Update the local verification proposal; no evidence is created before submit", "expectedApiOrEventSideEffect": null, "states": { "loading": "Canonical observation sources resolve before the form renders", "disabled": "Editable when the form renders", "error": "Canonical provenance failure prevents the form from rendering" }, "classification": "reversible", "screenshotsRequired": ["visual.operational-truth.evidence-verification.chromium-1440"], "browsers": ["chromium", "firefox", "webkit", "chromium-enterprise", "android-chromium", "iphone-webkit", "tablet-chromium"], "viewports": ["360x800", "390x844", "768x1024", "1024x768", "1280x800", "1440x900", "1920x1080", "2560x1440", "200%"], "testIds": ["e2e.operational-truth.verify-demote"]
     },
     {
-      "id": "operational-truth.verify.source", "route": "/missions/:missionId/runs/:runId?tab=evidence", "surface": "Mission Evidence — independent evidence verification", "requiredState": "Fixture required: a validating candidate has resolved canonical provenance", "controlId": "operational-truth-verify-source", "accessible": { "role": "textbox", "name": "Source description", "match": "exact" }, "controlType": "verification-text-input", "options": ["Canonical source description"], "keyboardAction": "Focus with Tab and edit the source description", "pointerAction": "Click and edit the source description", "expectedStateTransition": "Update the local verification proposal without changing bound source IDs", "expectedApiOrEventSideEffect": null, "states": { "loading": "Canonical sources resolve before the field renders", "disabled": "Editable when the form renders", "error": "Canonical provenance failure prevents the form from rendering" }, "classification": "reversible", "screenshotsRequired": [], "browsers": ["chromium", "firefox", "webkit", "chromium-enterprise", "android-chromium", "iphone-webkit", "tablet-chromium"], "viewports": ["360x800", "390x844", "768x1024", "1024x768", "1280x800", "1440x900", "1920x1080", "2560x1440", "200%"], "testIds": ["e2e.operational-truth.verify-demote"]
+      "id": "operational-truth.verify.source", "route": "/missions/:missionId/runs/:runId?tab=evidence", "surface": "Mission Evidence — independent evidence verification", "requiredState": "Fixture required: a validating candidate has resolved canonical provenance", "controlId": "operational-truth-verify-source", "accessible": { "role": "textbox", "name": "Source description", "match": "exact" }, "controlType": "verification-text-input", "options": ["Canonical source description"], "keyboardAction": "Focus with Tab and edit the source description", "pointerAction": "Click and edit the source description", "expectedStateTransition": "Update the local verification proposal without changing bound source IDs", "expectedApiOrEventSideEffect": null, "states": { "loading": "Canonical sources resolve before the field renders", "disabled": "Editable when the form renders", "error": "Canonical provenance failure prevents the form from rendering" }, "classification": "reversible", "screenshotsRequired": ["visual.operational-truth.evidence-verification.chromium-1440"], "browsers": ["chromium", "firefox", "webkit", "chromium-enterprise", "android-chromium", "iphone-webkit", "tablet-chromium"], "viewports": ["360x800", "390x844", "768x1024", "1024x768", "1280x800", "1440x900", "1920x1080", "2560x1440", "200%"], "testIds": ["e2e.operational-truth.verify-demote"]
     },
     {
-      "id": "operational-truth.verify.target", "route": "/missions/:missionId/runs/:runId?tab=evidence", "surface": "Mission Evidence — independent evidence verification", "requiredState": "Fixture required: a validating candidate has resolved canonical provenance", "controlId": "operational-truth-verify-target", "accessible": { "role": "textbox", "name": "Normalized target", "match": "exact" }, "controlType": "verification-text-input", "options": ["Exact authorized asset, service, endpoint, or identity"], "keyboardAction": "Focus with Tab and enter the normalized target", "pointerAction": "Click and enter the normalized target", "expectedStateTransition": "Update the local target proposal; scope is revalidated on submit", "expectedApiOrEventSideEffect": null, "states": { "loading": "Canonical sources resolve before the field renders", "disabled": "Editable when the form renders", "error": "Invalid target prevents submission and receives specific remediation" }, "classification": "reversible", "screenshotsRequired": [], "browsers": ["chromium", "firefox", "webkit", "chromium-enterprise", "android-chromium", "iphone-webkit", "tablet-chromium"], "viewports": ["360x800", "390x844", "768x1024", "1024x768", "1280x800", "1440x900", "1920x1080", "2560x1440", "200%"], "testIds": ["e2e.operational-truth.verify-demote"]
+      "id": "operational-truth.verify.target", "route": "/missions/:missionId/runs/:runId?tab=evidence", "surface": "Mission Evidence — independent evidence verification", "requiredState": "Fixture required: a validating candidate has resolved canonical provenance", "controlId": "operational-truth-verify-target", "accessible": { "role": "textbox", "name": "Normalized target", "match": "exact" }, "controlType": "verification-text-input", "options": ["Exact authorized asset, service, endpoint, or identity"], "keyboardAction": "Focus with Tab and enter the normalized target", "pointerAction": "Click and enter the normalized target", "expectedStateTransition": "Update the local target proposal; scope is revalidated on submit", "expectedApiOrEventSideEffect": null, "states": { "loading": "Canonical sources resolve before the field renders", "disabled": "Editable when the form renders", "error": "Invalid target prevents submission and receives specific remediation" }, "classification": "reversible", "screenshotsRequired": ["visual.operational-truth.evidence-verification.chromium-1440"], "browsers": ["chromium", "firefox", "webkit", "chromium-enterprise", "android-chromium", "iphone-webkit", "tablet-chromium"], "viewports": ["360x800", "390x844", "768x1024", "1024x768", "1280x800", "1440x900", "1920x1080", "2560x1440", "200%"], "testIds": ["e2e.operational-truth.verify-demote"]
     },
     {
-      "id": "operational-truth.verify.acquired-at", "route": "/missions/:missionId/runs/:runId?tab=evidence", "surface": "Mission Evidence — independent evidence verification", "requiredState": "Fixture required: a validating candidate has resolved canonical provenance", "controlId": "operational-truth-verify-acquired-at", "accessible": { "locator": "native-date-input", "name": "Acquired at", "match": "exact" }, "controlType": "verification-datetime-input", "options": ["Valid acquisition date and time"], "keyboardAction": "Focus with Tab and edit using the native date-time control", "pointerAction": "Click and edit using the native date-time control", "expectedStateTransition": "Update the proposed acquisition time and constrain custody chronology", "expectedApiOrEventSideEffect": null, "states": { "loading": "The field is initialized from the canonical observation or candidate time", "disabled": "Editable when the form renders", "error": "Invalid acquisition time prevents submission" }, "classification": "reversible", "screenshotsRequired": [], "browsers": ["chromium", "firefox", "webkit", "chromium-enterprise", "android-chromium", "iphone-webkit", "tablet-chromium"], "viewports": ["360x800", "390x844", "768x1024", "1024x768", "1280x800", "1440x900", "1920x1080", "2560x1440", "200%"], "testIds": ["e2e.operational-truth.verify-demote"]
+      "id": "operational-truth.verify.acquired-at", "route": "/missions/:missionId/runs/:runId?tab=evidence", "surface": "Mission Evidence — independent evidence verification", "requiredState": "Fixture required: a validating candidate has resolved canonical provenance", "controlId": "operational-truth-verify-acquired-at", "accessible": { "locator": "native-date-input", "name": "Acquired at", "match": "exact" }, "controlType": "verification-datetime-input", "options": ["Valid acquisition date and time"], "keyboardAction": "Focus with Tab and edit using the native date-time control", "pointerAction": "Click and edit using the native date-time control", "expectedStateTransition": "Update the proposed acquisition time and constrain custody chronology", "expectedApiOrEventSideEffect": null, "states": { "loading": "The field is initialized from the canonical observation or candidate time", "disabled": "Editable when the form renders", "error": "Invalid acquisition time prevents submission" }, "classification": "reversible", "screenshotsRequired": ["visual.operational-truth.evidence-verification.chromium-1440"], "browsers": ["chromium", "firefox", "webkit", "chromium-enterprise", "android-chromium", "iphone-webkit", "tablet-chromium"], "viewports": ["360x800", "390x844", "768x1024", "1024x768", "1280x800", "1440x900", "1920x1080", "2560x1440", "200%"], "testIds": ["e2e.operational-truth.verify-demote"]
     },
     {
-      "id": "operational-truth.verify.confidence", "route": "/missions/:missionId/runs/:runId?tab=evidence", "surface": "Mission Evidence — independent evidence verification", "requiredState": "Fixture required: a validating candidate has resolved canonical provenance", "controlId": "operational-truth-verify-confidence", "accessible": { "role": "slider", "name": "^Confidence \\([0-9]+%\\)$", "match": "regex" }, "controlType": "verification-confidence-slider", "options": ["0.00 through 1.00 in 0.05 increments"], "keyboardAction": "Focus with Tab and use arrow, Home, or End keys", "pointerAction": "Drag or click the confidence range", "expectedStateTransition": "Update the proposed evidence confidence and visible percentage", "expectedApiOrEventSideEffect": null, "states": { "loading": "Initialized from the source observation or the conservative default", "disabled": "Editable when the form renders", "error": "Out-of-range confidence is rejected before mutation" }, "classification": "reversible", "screenshotsRequired": [], "browsers": ["chromium", "firefox", "webkit", "chromium-enterprise", "android-chromium", "iphone-webkit", "tablet-chromium"], "viewports": ["360x800", "390x844", "768x1024", "1024x768", "1280x800", "1440x900", "1920x1080", "2560x1440", "200%"], "testIds": ["e2e.operational-truth.verify-demote"]
+      "id": "operational-truth.verify.confidence", "route": "/missions/:missionId/runs/:runId?tab=evidence", "surface": "Mission Evidence — independent evidence verification", "requiredState": "Fixture required: a validating candidate has resolved canonical provenance", "controlId": "operational-truth-verify-confidence", "accessible": { "role": "slider", "name": "^Confidence \\([0-9]+%\\)$", "match": "regex" }, "controlType": "verification-confidence-slider", "options": ["0.00 through 1.00 in 0.05 increments"], "keyboardAction": "Focus with Tab and use arrow, Home, or End keys", "pointerAction": "Drag or click the confidence range", "expectedStateTransition": "Update the proposed evidence confidence and visible percentage", "expectedApiOrEventSideEffect": null, "states": { "loading": "Initialized from the source observation or the conservative default", "disabled": "Editable when the form renders", "error": "Out-of-range confidence is rejected before mutation" }, "classification": "reversible", "screenshotsRequired": ["visual.operational-truth.evidence-verification.chromium-1440"], "browsers": ["chromium", "firefox", "webkit", "chromium-enterprise", "android-chromium", "iphone-webkit", "tablet-chromium"], "viewports": ["360x800", "390x844", "768x1024", "1024x768", "1280x800", "1440x900", "1920x1080", "2560x1440", "200%"], "testIds": ["e2e.operational-truth.verify-demote"]
     },
     {
-      "id": "operational-truth.verify.method", "route": "/missions/:missionId/runs/:runId?tab=evidence", "surface": "Mission Evidence — independent evidence verification", "requiredState": "Fixture required: a validating candidate has resolved canonical provenance", "controlId": "operational-truth-verify-method", "accessible": { "role": "textbox", "name": "Provenance method", "match": "exact" }, "controlType": "verification-text-input", "options": ["Attributable validation method"], "keyboardAction": "Focus with Tab and edit the provenance method", "pointerAction": "Click and edit the provenance method", "expectedStateTransition": "Update the local provenance proposal without changing canonical source IDs", "expectedApiOrEventSideEffect": null, "states": { "loading": "Initialized from observation or artifact provenance type", "disabled": "Editable when the form renders", "error": "Insufficient method detail prevents submission" }, "classification": "reversible", "screenshotsRequired": [], "browsers": ["chromium", "firefox", "webkit", "chromium-enterprise", "android-chromium", "iphone-webkit", "tablet-chromium"], "viewports": ["360x800", "390x844", "768x1024", "1024x768", "1280x800", "1440x900", "1920x1080", "2560x1440", "200%"], "testIds": ["e2e.operational-truth.verify-demote"]
+      "id": "operational-truth.verify.method", "route": "/missions/:missionId/runs/:runId?tab=evidence", "surface": "Mission Evidence — independent evidence verification", "requiredState": "Fixture required: a validating candidate has resolved canonical provenance", "controlId": "operational-truth-verify-method", "accessible": { "role": "textbox", "name": "Provenance method", "match": "exact" }, "controlType": "verification-text-input", "options": ["Attributable validation method"], "keyboardAction": "Focus with Tab and edit the provenance method", "pointerAction": "Click and edit the provenance method", "expectedStateTransition": "Update the local provenance proposal without changing canonical source IDs", "expectedApiOrEventSideEffect": null, "states": { "loading": "Initialized from observation or artifact provenance type", "disabled": "Editable when the form renders", "error": "Insufficient method detail prevents submission" }, "classification": "reversible", "screenshotsRequired": ["visual.operational-truth.evidence-verification.chromium-1440"], "browsers": ["chromium", "firefox", "webkit", "chromium-enterprise", "android-chromium", "iphone-webkit", "tablet-chromium"], "viewports": ["360x800", "390x844", "768x1024", "1024x768", "1280x800", "1440x900", "1920x1080", "2560x1440", "200%"], "testIds": ["e2e.operational-truth.verify-demote"]
     },
     {
-      "id": "operational-truth.verify.explanation", "route": "/missions/:missionId/runs/:runId?tab=evidence", "surface": "Mission Evidence — independent evidence verification", "requiredState": "Fixture required: a validating candidate has resolved canonical provenance", "controlId": "operational-truth-verify-explanation", "accessible": { "role": "textbox", "name": "Provenance explanation", "match": "exact" }, "controlType": "verification-textarea", "options": ["At least 12 non-whitespace characters"], "keyboardAction": "Focus with Tab and enter the provenance explanation", "pointerAction": "Click and enter the provenance explanation", "expectedStateTransition": "Update the local explanation of how canonical sources support the evidence", "expectedApiOrEventSideEffect": null, "states": { "loading": "Canonical sources resolve before the field renders", "disabled": "Editable when the form renders", "error": "Insufficient explanation prevents submission" }, "classification": "reversible", "screenshotsRequired": [], "browsers": ["chromium", "firefox", "webkit", "chromium-enterprise", "android-chromium", "iphone-webkit", "tablet-chromium"], "viewports": ["360x800", "390x844", "768x1024", "1024x768", "1280x800", "1440x900", "1920x1080", "2560x1440", "200%"], "testIds": ["e2e.operational-truth.verify-demote"]
+      "id": "operational-truth.verify.explanation", "route": "/missions/:missionId/runs/:runId?tab=evidence", "surface": "Mission Evidence — independent evidence verification", "requiredState": "Fixture required: a validating candidate has resolved canonical provenance", "controlId": "operational-truth-verify-explanation", "accessible": { "role": "textbox", "name": "Provenance explanation", "match": "exact" }, "controlType": "verification-textarea", "options": ["At least 12 non-whitespace characters"], "keyboardAction": "Focus with Tab and enter the provenance explanation", "pointerAction": "Click and enter the provenance explanation", "expectedStateTransition": "Update the local explanation of how canonical sources support the evidence", "expectedApiOrEventSideEffect": null, "states": { "loading": "Canonical sources resolve before the field renders", "disabled": "Editable when the form renders", "error": "Insufficient explanation prevents submission" }, "classification": "reversible", "screenshotsRequired": ["visual.operational-truth.evidence-verification.chromium-1440"], "browsers": ["chromium", "firefox", "webkit", "chromium-enterprise", "android-chromium", "iphone-webkit", "tablet-chromium"], "viewports": ["360x800", "390x844", "768x1024", "1024x768", "1280x800", "1440x900", "1920x1080", "2560x1440", "200%"], "testIds": ["e2e.operational-truth.verify-demote"]
     },
     {
-      "id": "operational-truth.verify.custody-actor", "route": "/missions/:missionId/runs/:runId?tab=evidence", "surface": "Mission Evidence — independent evidence verification", "requiredState": "Fixture required: a validating candidate has resolved canonical provenance", "controlId": "operational-truth-verify-custody-actor", "accessible": { "role": "textbox", "name": "Acquisition custody actor", "match": "exact" }, "controlType": "verification-text-input", "options": ["Attributable human or agent identity"], "keyboardAction": "Focus with Tab and edit the custody actor", "pointerAction": "Click and edit the custody actor", "expectedStateTransition": "Update the proposed first chain-of-custody actor", "expectedApiOrEventSideEffect": null, "states": { "loading": "Initialized from the candidate proposer", "disabled": "Editable when the form renders", "error": "Insufficient actor attribution prevents submission" }, "classification": "reversible", "screenshotsRequired": [], "browsers": ["chromium", "firefox", "webkit", "chromium-enterprise", "android-chromium", "iphone-webkit", "tablet-chromium"], "viewports": ["360x800", "390x844", "768x1024", "1024x768", "1280x800", "1440x900", "1920x1080", "2560x1440", "200%"], "testIds": ["e2e.operational-truth.verify-demote"]
+      "id": "operational-truth.verify.custody-actor", "route": "/missions/:missionId/runs/:runId?tab=evidence", "surface": "Mission Evidence — independent evidence verification", "requiredState": "Fixture required: a validating candidate has resolved canonical provenance", "controlId": "operational-truth-verify-custody-actor", "accessible": { "role": "textbox", "name": "Acquisition custody actor", "match": "exact" }, "controlType": "verification-text-input", "options": ["Attributable human or agent identity"], "keyboardAction": "Focus with Tab and edit the custody actor", "pointerAction": "Click and edit the custody actor", "expectedStateTransition": "Update the proposed first chain-of-custody actor", "expectedApiOrEventSideEffect": null, "states": { "loading": "Initialized from the candidate proposer", "disabled": "Editable when the form renders", "error": "Insufficient actor attribution prevents submission" }, "classification": "reversible", "screenshotsRequired": ["visual.operational-truth.evidence-verification.chromium-1440"], "browsers": ["chromium", "firefox", "webkit", "chromium-enterprise", "android-chromium", "iphone-webkit", "tablet-chromium"], "viewports": ["360x800", "390x844", "768x1024", "1024x768", "1280x800", "1440x900", "1920x1080", "2560x1440", "200%"], "testIds": ["e2e.operational-truth.verify-demote"]
     },
     {
-      "id": "operational-truth.verify.custody-time", "route": "/missions/:missionId/runs/:runId?tab=evidence", "surface": "Mission Evidence — independent evidence verification", "requiredState": "Fixture required: a validating candidate has resolved canonical provenance", "controlId": "operational-truth-verify-custody-time", "accessible": { "locator": "native-date-input", "name": "Custody event time", "match": "exact" }, "controlType": "verification-datetime-input", "options": ["Valid date and time not earlier than acquisition"], "keyboardAction": "Focus with Tab and edit using the native date-time control", "pointerAction": "Click and edit using the native date-time control", "expectedStateTransition": "Update the proposed custody event time while enforcing chronology", "expectedApiOrEventSideEffect": null, "states": { "loading": "Initialized from the canonical acquisition time", "disabled": "Editable with a minimum equal to acquisition time", "error": "Custody before acquisition is rejected before mutation" }, "classification": "reversible", "screenshotsRequired": [], "browsers": ["chromium", "firefox", "webkit", "chromium-enterprise", "android-chromium", "iphone-webkit", "tablet-chromium"], "viewports": ["360x800", "390x844", "768x1024", "1024x768", "1280x800", "1440x900", "1920x1080", "2560x1440", "200%"], "testIds": ["e2e.operational-truth.verify-demote"]
+      "id": "operational-truth.verify.custody-time", "route": "/missions/:missionId/runs/:runId?tab=evidence", "surface": "Mission Evidence — independent evidence verification", "requiredState": "Fixture required: a validating candidate has resolved canonical provenance", "controlId": "operational-truth-verify-custody-time", "accessible": { "locator": "native-date-input", "name": "Custody event time", "match": "exact" }, "controlType": "verification-datetime-input", "options": ["Valid date and time not earlier than acquisition"], "keyboardAction": "Focus with Tab and edit using the native date-time control", "pointerAction": "Click and edit using the native date-time control", "expectedStateTransition": "Update the proposed custody event time while enforcing chronology", "expectedApiOrEventSideEffect": null, "states": { "loading": "Initialized from the canonical acquisition time", "disabled": "Editable with a minimum equal to acquisition time", "error": "Custody before acquisition is rejected before mutation" }, "classification": "reversible", "screenshotsRequired": ["visual.operational-truth.evidence-verification.chromium-1440"], "browsers": ["chromium", "firefox", "webkit", "chromium-enterprise", "android-chromium", "iphone-webkit", "tablet-chromium"], "viewports": ["360x800", "390x844", "768x1024", "1024x768", "1280x800", "1440x900", "1920x1080", "2560x1440", "200%"], "testIds": ["e2e.operational-truth.verify-demote"]
     },
     {
-      "id": "operational-truth.verify.additional-requirements", "route": "/missions/:missionId/runs/:runId?tab=evidence", "surface": "Mission Evidence — independent evidence verification", "requiredState": "Fixture required: the validating candidate declares second_source_corroborated or another additional requirement", "controlId": "operational-truth-verify-additional-requirements", "accessible": { "role": "checkbox", "name": "^I verified the additional requirement: .+$", "match": "regex" }, "controlType": "verification-requirement-checkbox-collection", "options": ["Every server-declared requirement beyond immutable hash, provenance, target, acquisition time, and custody"], "keyboardAction": "Focus each checkbox with Tab and press Space", "pointerAction": "Click each independently verified additional requirement", "expectedStateTransition": "Record local satisfaction of every additional requirement; verification remains disabled until all are checked", "expectedApiOrEventSideEffect": null, "states": { "loading": "Requirements render from the selected candidate", "disabled": "Checkboxes remain editable; submit is disabled until all are checked", "error": "A server-declared unsatisfied requirement prevents verification" }, "classification": "reversible", "screenshotsRequired": [], "browsers": ["chromium", "firefox", "webkit", "chromium-enterprise", "android-chromium", "iphone-webkit", "tablet-chromium"], "viewports": ["360x800", "390x844", "768x1024", "1024x768", "1280x800", "1440x900", "1920x1080", "2560x1440", "200%"], "testIds": ["e2e.operational-truth.verify-demote"]
+      "id": "operational-truth.verify.additional-requirements", "route": "/missions/:missionId/runs/:runId?tab=evidence", "surface": "Mission Evidence — independent evidence verification", "requiredState": "Fixture required: the validating candidate declares second_source_corroborated or another additional requirement", "controlId": "operational-truth-verify-additional-requirements", "accessible": { "role": "checkbox", "name": "^I verified the additional requirement: .+$", "match": "regex" }, "controlType": "verification-requirement-checkbox-collection", "options": ["Every server-declared requirement beyond immutable hash, provenance, target, acquisition time, and custody"], "keyboardAction": "Focus each checkbox with Tab and press Space", "pointerAction": "Click each independently verified additional requirement", "expectedStateTransition": "Record local satisfaction of every additional requirement; verification remains disabled until all are checked", "expectedApiOrEventSideEffect": null, "states": { "loading": "Requirements render from the selected candidate", "disabled": "Checkboxes remain editable; submit is disabled until all are checked", "error": "A server-declared unsatisfied requirement prevents verification" }, "classification": "reversible", "screenshotsRequired": ["visual.operational-truth.evidence-verification.chromium-1440"], "browsers": ["chromium", "firefox", "webkit", "chromium-enterprise", "android-chromium", "iphone-webkit", "tablet-chromium"], "viewports": ["360x800", "390x844", "768x1024", "1024x768", "1280x800", "1440x900", "1920x1080", "2560x1440", "200%"], "testIds": ["e2e.operational-truth.verify-demote"]
     },
     {
-      "id": "operational-truth.verify.confirmation", "route": "/missions/:missionId/runs/:runId?tab=evidence", "surface": "Mission Evidence — independent evidence verification", "requiredState": "Fixture required: a validating candidate has resolved canonical provenance", "controlId": "operational-truth-verify-confirmation", "accessible": { "role": "checkbox", "name": "^I independently reviewed attribution, scope, hash-bound source, acquisition time, and custody\\.", "match": "regex" }, "controlType": "independent-review-attestation", "options": ["Confirmed", "Not confirmed"], "keyboardAction": "Focus with Tab and press Space", "pointerAction": "Click the independent review attestation", "expectedStateTransition": "Record the explicit human attestation locally; verification remains disabled when unchecked", "expectedApiOrEventSideEffect": null, "states": { "loading": "Form renders only after canonical source resolution", "disabled": "Attestation is editable; submit remains disabled until confirmed", "error": "No verification request is sent without confirmation" }, "classification": "reversible", "screenshotsRequired": [], "browsers": ["chromium", "firefox", "webkit", "chromium-enterprise", "android-chromium", "iphone-webkit", "tablet-chromium"], "viewports": ["360x800", "390x844", "768x1024", "1024x768", "1280x800", "1440x900", "1920x1080", "2560x1440", "200%"], "testIds": ["e2e.operational-truth.verify-demote"]
+      "id": "operational-truth.verify.confirmation", "route": "/missions/:missionId/runs/:runId?tab=evidence", "surface": "Mission Evidence — independent evidence verification", "requiredState": "Fixture required: a validating candidate has resolved canonical provenance", "controlId": "operational-truth-verify-confirmation", "accessible": { "role": "checkbox", "name": "^I independently reviewed attribution, scope, hash-bound source, acquisition time, and custody\\.", "match": "regex" }, "controlType": "independent-review-attestation", "options": ["Confirmed", "Not confirmed"], "keyboardAction": "Focus with Tab and press Space", "pointerAction": "Click the independent review attestation", "expectedStateTransition": "Record the explicit human attestation locally; verification remains disabled when unchecked", "expectedApiOrEventSideEffect": null, "states": { "loading": "Form renders only after canonical source resolution", "disabled": "Attestation is editable; submit remains disabled until confirmed", "error": "No verification request is sent without confirmation" }, "classification": "reversible", "screenshotsRequired": ["visual.operational-truth.evidence-verification.chromium-1440"], "browsers": ["chromium", "firefox", "webkit", "chromium-enterprise", "android-chromium", "iphone-webkit", "tablet-chromium"], "viewports": ["360x800", "390x844", "768x1024", "1024x768", "1280x800", "1440x900", "1920x1080", "2560x1440", "200%"], "testIds": ["e2e.operational-truth.verify-demote"]
     },
     {
-      "id": "operational-truth.verify.submit", "route": "/missions/:missionId/runs/:runId?tab=evidence", "surface": "Mission Evidence — independent evidence verification", "requiredState": "Fixture required: every verification field and attestation is valid for a validating candidate", "controlId": "operational-truth-verify-submit", "accessible": { "role": "button", "name": "Verify evidence", "match": "exact" }, "controlType": "verified-evidence-create", "options": ["Create immutable verified evidence with provenance and acquisition custody"], "keyboardAction": "Focus with Tab and press Enter or Space", "pointerAction": "Click Verify evidence", "expectedStateTransition": "Create immutable evidence, transition the candidate to promoted, and refresh the candidate collection", "expectedApiOrEventSideEffect": "POST /api/v2/operational-truth/missions/:missionId/evidence-candidates/:candidateId/verify with idempotency key", "states": { "loading": "Button reads Verifying… while pending", "disabled": "Disabled until every field, additional requirement, and independent attestation is valid", "error": "Specific verification or policy error leaves the candidate unverified" }, "classification": "destructive", "screenshotsRequired": [], "browsers": ["chromium", "firefox", "webkit", "chromium-enterprise", "android-chromium", "iphone-webkit", "tablet-chromium"], "viewports": ["360x800", "390x844", "768x1024", "1024x768", "1280x800", "1440x900", "1920x1080", "2560x1440", "200%"], "testIds": ["e2e.operational-truth.verify-demote"]
+      "id": "operational-truth.verify.submit", "route": "/missions/:missionId/runs/:runId?tab=evidence", "surface": "Mission Evidence — independent evidence verification", "requiredState": "Fixture required: every verification field and attestation is valid for a validating candidate", "controlId": "operational-truth-verify-submit", "accessible": { "role": "button", "name": "Verify evidence", "match": "exact" }, "controlType": "verified-evidence-create", "options": ["Create immutable verified evidence with provenance and acquisition custody"], "keyboardAction": "Focus with Tab and press Enter or Space", "pointerAction": "Click Verify evidence", "expectedStateTransition": "Create immutable evidence, transition the candidate to promoted, and refresh the candidate collection", "expectedApiOrEventSideEffect": "POST /api/v2/operational-truth/missions/:missionId/evidence-candidates/:candidateId/verify with idempotency key", "states": { "loading": "Button reads Verifying… while pending", "disabled": "Disabled until every field, additional requirement, and independent attestation is valid", "error": "Specific verification or policy error leaves the candidate unverified" }, "classification": "destructive", "screenshotsRequired": ["visual.operational-truth.evidence-verification.chromium-1440"], "browsers": ["chromium", "firefox", "webkit", "chromium-enterprise", "android-chromium", "iphone-webkit", "tablet-chromium"], "viewports": ["360x800", "390x844", "768x1024", "1024x768", "1280x800", "1440x900", "1920x1080", "2560x1440", "200%"], "testIds": ["e2e.operational-truth.verify-demote"]
     },
     {
       "id": "operational-truth.verified-select", "route": "/missions/:missionId/runs/:runId?tab=evidence", "surface": "Mission Evidence — verified evidence master-detail", "requiredState": "Fixture required: the deterministic HTTPS service exposure candidate was independently verified", "controlId": "operational-truth-verified-select", "accessible": { "role": "button", "name": "The authorized target exposed TCP port 443 during the assessment window.", "match": "exact" }, "controlType": "master-detail-row-selector", "options": ["Select verified evidence for provenance and custody inspection"], "keyboardAction": "Focus the evidence summary with Tab and press Enter or Space", "pointerAction": "Click the verified evidence summary", "expectedStateTransition": "Select verified evidence and fetch its immutable provenance and chain of custody", "expectedApiOrEventSideEffect": "GET /api/v2/operational-truth/missions/:missionId/verified-evidence/:evidenceId", "states": { "loading": "Evidence detail names provenance and custody loading", "disabled": "Never disabled for a rendered evidence record", "error": "A detail error exposes precise retry without dropping the selected row" }, "classification": "reversible", "screenshotsRequired": [], "browsers": ["chromium", "firefox", "webkit", "chromium-enterprise", "android-chromium", "iphone-webkit", "tablet-chromium"], "viewports": ["360x800", "390x844", "768x1024", "1024x768", "1280x800", "1440x900", "1920x1080", "2560x1440", "200%"], "testIds": ["e2e.operational-truth.verify-demote"]
@@ -4196,7 +4454,7 @@
       "id": "brain.graph.advanced-disclosure", "route": "/brain/graph", "surface": "Memory Graph — advanced filters", "requiredState": "Fixture required: graph toolbar is mounted", "controlId": "brain-graph-advanced-disclosure", "accessible": { "locator": "native-summary", "name": "Filters, labels, and time range", "match": "exact" }, "controlType": "advanced-filter-disclosure", "options": ["Expand advanced graph controls", "Collapse advanced graph controls"], "keyboardAction": "Focus with Tab and press Enter or Space", "pointerAction": "Click Filters, labels, and time range", "expectedStateTransition": "Toggle visibility of advanced controls without changing graph state", "expectedApiOrEventSideEffect": null, "states": { "loading": "Toolbar is available independently of graph layout completion", "disabled": "Never disabled", "error": "No server mutation occurs" }, "classification": "reversible", "screenshotsRequired": [], "browsers": ["chromium", "firefox", "webkit", "chromium-enterprise", "android-chromium", "iphone-webkit", "tablet-chromium"], "viewports": ["360x800", "390x844", "768x1024", "1024x768", "1280x800", "1440x900", "1920x1080", "2560x1440", "200%"], "testIds": ["e2e.brain-graph.error-empty-retry", "e2e.brain-graph.controls-filters-views"]
     },
     {
-      "id": "brain.graph.reset-view", "route": "/brain/graph", "surface": "Memory Graph — clear bounded view", "requiredState": "Fixture required: one or more URL-backed graph filters are active, including a no-match state", "controlId": "brain-graph-reset-view", "accessible": { "role": "button", "name": "Reset graph view", "match": "exact" }, "controlType": "graph-filter-reset", "options": ["Clear all graph URL filters and view state"], "keyboardAction": "Focus with Tab and press Enter or Space", "pointerAction": "Click Reset graph view", "expectedStateTransition": "Remove every graph-state query key, clear the session root, and reload the canonical global graph", "expectedApiOrEventSideEffect": "GET /api/v2/brain/graph without active filters", "states": { "loading": "The canonical global graph reload is named", "disabled": "Available in advanced controls and filtered empty state", "error": "A failed reset read retains a precise recoverable error" }, "classification": "reversible", "screenshotsRequired": [], "browsers": ["chromium", "firefox", "webkit", "chromium-enterprise", "android-chromium", "iphone-webkit", "tablet-chromium"], "viewports": ["360x800", "390x844", "768x1024", "1024x768", "1280x800", "1440x900", "1920x1080", "2560x1440", "200%"], "testIds": ["e2e.brain-graph.error-empty-retry", "e2e.brain-graph.controls-filters-views"]
+      "id": "brain.graph.reset-view", "route": "/brain/graph", "surface": "Memory Graph — clear bounded view", "requiredState": "Fixture required: one or more URL-backed graph filters are active, including a no-match state", "controlId": "brain-graph-reset-view", "accessible": { "role": "button", "name": "Reset graph view", "match": "exact" }, "controlType": "graph-filter-reset", "options": ["Clear all graph URL filters and view state"], "keyboardAction": "Focus with Tab and press Enter or Space", "pointerAction": "Click Reset graph view", "expectedStateTransition": "Remove every graph-state query key and reload the canonical global graph", "expectedApiOrEventSideEffect": "GET /api/v2/brain/graph without active filters", "states": { "loading": "The canonical global graph reload is named", "disabled": "Available in advanced controls and filtered empty state", "error": "A failed reset read retains a precise recoverable error" }, "classification": "reversible", "screenshotsRequired": [], "browsers": ["chromium", "firefox", "webkit", "chromium-enterprise", "android-chromium", "iphone-webkit", "tablet-chromium"], "viewports": ["360x800", "390x844", "768x1024", "1024x768", "1280x800", "1440x900", "1920x1080", "2560x1440", "200%"], "testIds": ["e2e.brain-graph.error-empty-retry", "e2e.brain-graph.controls-filters-views"]
     },
     {
       "id": "brain.graph.load-more", "route": "/brain/graph", "surface": "Memory Graph — progressive bounded loading", "requiredState": "Fixture required: the initial 250-node graph segment reports truncation", "controlId": "brain-graph-load-more", "accessible": { "role": "button", "name": "Load another bounded segment", "match": "exact" }, "controlType": "bounded-graph-expansion", "options": ["Increase the limit by 250 up to 1000"], "keyboardAction": "Focus with Tab and press Enter or Space", "pointerAction": "Click Load another bounded segment", "expectedStateTransition": "Increase only the bounded query limit and remove the control when the complete fixture graph loads", "expectedApiOrEventSideEffect": "GET /api/v2/brain/graph with increased limit", "states": { "loading": "The expanded bounded neighborhood is named", "disabled": "Disabled at the 1000-node cap and absent when not truncated", "error": "The prior validated segment remains recoverable" }, "classification": "read-only", "screenshotsRequired": [], "browsers": ["chromium", "firefox", "webkit", "chromium-enterprise", "android-chromium", "iphone-webkit", "tablet-chromium"], "viewports": ["360x800", "390x844", "768x1024", "1024x768", "1280x800", "1440x900", "1920x1080", "2560x1440", "200%"], "testIds": ["e2e.brain-graph.controls-filters-views"]
@@ -4268,7 +4526,7 @@
       "id": "brain.graph.saved-view.delete", "route": "/brain/graph", "surface": "Memory Graph — named view deletion", "requiredState": "Fixture required: the browser contains the saved Evidence-first fixture view", "controlId": "brain-graph-saved-view-delete", "accessible": { "role": "button", "name": "^Delete saved view Evidence-first graph .+$", "match": "regex" }, "controlType": "saved-view-delete", "options": ["Delete only the selected browser-local view"], "keyboardAction": "Focus with Tab and press Enter or Space", "pointerAction": "Click the labeled delete control", "expectedStateTransition": "Remove only the named view from namespaced local storage without changing canonical memory or the current URL", "expectedApiOrEventSideEffect": null, "states": { "loading": "No server request", "disabled": "Absent when no saved view exists", "error": "Storage denial is reported without deleting canonical data" }, "classification": "destructive", "screenshotsRequired": [], "browsers": ["chromium", "firefox", "webkit", "chromium-enterprise", "android-chromium", "iphone-webkit", "tablet-chromium"], "viewports": ["360x800", "390x844", "768x1024", "1024x768", "1280x800", "1440x900", "1920x1080", "2560x1440", "200%"], "testIds": ["e2e.brain-graph.controls-filters-views"]
     },
     {
-      "id": "brain.graph.local-filter.clear", "route": "/brain/graph", "surface": "Memory Graph — active local neighborhood", "requiredState": "Fixture required: an explicit local root is active", "controlId": "brain-graph-local-filter-clear", "accessible": { "role": "button", "name": "Clear", "match": "exact" }, "controlType": "local-neighborhood-clear", "options": ["Clear local root, view, and selection"], "keyboardAction": "Focus the Clear control inside Local neighborhood and press Enter or Space", "pointerAction": "Click Clear inside Local neighborhood", "expectedStateTransition": "Remove the session root and local-view URL keys, then restore the canonical global graph", "expectedApiOrEventSideEffect": "GET /api/v2/brain/graph without local nodeId", "states": { "loading": "Global graph reload is named", "disabled": "Absent outside local view", "error": "The prior local graph remains inspectable with remediation" }, "classification": "reversible", "screenshotsRequired": [], "browsers": ["chromium", "firefox", "webkit", "chromium-enterprise", "android-chromium", "iphone-webkit", "tablet-chromium"], "viewports": ["360x800", "390x844", "768x1024", "1024x768", "1280x800", "1440x900", "1920x1080", "2560x1440", "200%"], "testIds": ["e2e.brain-graph.canvas-table-inspector"]
+      "id": "brain.graph.local-filter.clear", "route": "/brain/graph", "surface": "Memory Graph — active local neighborhood", "requiredState": "Fixture required: an explicit local root is active", "controlId": "brain-graph-local-filter-clear", "accessible": { "role": "button", "name": "Clear", "match": "exact" }, "controlType": "local-neighborhood-clear", "options": ["Clear local root, view, and selection"], "keyboardAction": "Focus the Clear control inside Local neighborhood and press Enter or Space", "pointerAction": "Click Clear inside Local neighborhood", "expectedStateTransition": "Remove the local-view URL keys, then restore the canonical global graph", "expectedApiOrEventSideEffect": "GET /api/v2/brain/graph without local nodeId", "states": { "loading": "Global graph reload is named", "disabled": "Absent outside local view", "error": "The prior local graph remains inspectable with remediation" }, "classification": "reversible", "screenshotsRequired": [], "browsers": ["chromium", "firefox", "webkit", "chromium-enterprise", "android-chromium", "iphone-webkit", "tablet-chromium"], "viewports": ["360x800", "390x844", "768x1024", "1024x768", "1280x800", "1440x900", "1920x1080", "2560x1440", "200%"], "testIds": ["e2e.brain-graph.canvas-table-inspector"]
     },
     {
       "id": "brain.graph.path-filter.clear", "route": "/brain/graph", "surface": "Memory Graph — active shortest path", "requiredState": "Fixture required: a path-start node and selected destination are active", "controlId": "brain-graph-path-filter-clear", "accessible": { "role": "button", "name": "Clear", "match": "exact" }, "controlType": "shortest-path-clear", "options": ["Clear only the path-start selection"], "keyboardAction": "Focus the Clear control inside Shortest path from and press Enter or Space", "pointerAction": "Click Clear inside Shortest path from", "expectedStateTransition": "Remove only pathFrom from the URL while preserving selected node and graph view", "expectedApiOrEventSideEffect": null, "states": { "loading": "Path highlighting updates locally", "disabled": "Absent until a path start exists", "error": "No canonical memory mutation occurs" }, "classification": "reversible", "screenshotsRequired": [], "browsers": ["chromium", "firefox", "webkit", "chromium-enterprise", "android-chromium", "iphone-webkit", "tablet-chromium"], "viewports": ["360x800", "390x844", "768x1024", "1024x768", "1280x800", "1440x900", "1920x1080", "2560x1440", "200%"], "testIds": ["e2e.brain-graph.canvas-table-inspector"]
@@ -4310,10 +4568,10 @@
       "id": "brain.graph.inspector.path-start", "route": "/brain/graph", "surface": "Memory Graph — selected node inspector", "requiredState": "Fixture required: a canonical node is selected and shortest-path comparison is available", "controlId": "brain-graph-inspector-path-start", "accessible": { "role": "button", "name": "^(?:Set as path start|Clear path start)$", "match": "regex" }, "controlType": "path-start-toggle", "options": ["Set selected node as path start", "Clear path start"], "keyboardAction": "Focus with Tab and press Enter or Space", "pointerAction": "Click Set as path start or Clear path start", "expectedStateTransition": "Set or remove pathFrom in the URL and highlight the shortest explanatory path to another selection", "expectedApiOrEventSideEffect": null, "states": { "loading": "Path computation is local to the loaded projection", "disabled": "Absent until a node is selected", "error": "No memory record is mutated" }, "classification": "reversible", "screenshotsRequired": [], "browsers": ["chromium", "firefox", "webkit", "chromium-enterprise", "android-chromium", "iphone-webkit", "tablet-chromium"], "viewports": ["360x800", "390x844", "768x1024", "1024x768", "1280x800", "1440x900", "1920x1080", "2560x1440", "200%"], "testIds": ["e2e.brain-graph.canvas-table-inspector"]
     },
     {
-      "id": "brain.graph.inspector.open-local", "route": "/brain/graph", "surface": "Memory Graph — selected node inspector", "requiredState": "Fixture required: one canonical node is selected", "controlId": "brain-graph-inspector-open-local", "accessible": { "role": "button", "name": "Open local graph", "match": "exact" }, "controlType": "selected-node-local-root", "options": ["Use selected node as the local graph root"], "keyboardAction": "Focus with Tab and press Enter or Space", "pointerAction": "Click Open local graph", "expectedStateTransition": "Persist the explicit session root and load a URL-backed local neighborhood centered on the selected node", "expectedApiOrEventSideEffect": "GET /api/v2/brain/graph with view=local and nodeId", "states": { "loading": "Local neighborhood loading is named", "disabled": "Absent until a node is selected", "error": "The prior graph remains available with exact remediation" }, "classification": "reversible", "screenshotsRequired": [], "browsers": ["chromium", "firefox", "webkit", "chromium-enterprise", "android-chromium", "iphone-webkit", "tablet-chromium"], "viewports": ["360x800", "390x844", "768x1024", "1024x768", "1280x800", "1440x900", "1920x1080", "2560x1440", "200%"], "testIds": ["e2e.brain-graph.canvas-table-inspector"]
+      "id": "brain.graph.inspector.open-local", "route": "/brain/graph", "surface": "Memory Graph — selected node inspector", "requiredState": "Fixture required: one canonical node is selected", "controlId": "brain-graph-inspector-open-local", "accessible": { "role": "button", "name": "Open local graph", "match": "exact" }, "controlType": "selected-node-local-root", "options": ["Use selected node as the local graph root"], "keyboardAction": "Focus with Tab and press Enter or Space", "pointerAction": "Click Open local graph", "expectedStateTransition": "Load a URL-backed local neighborhood centered on the selected node", "expectedApiOrEventSideEffect": "GET /api/v2/brain/graph with view=local and nodeId", "states": { "loading": "Local neighborhood loading is named", "disabled": "Absent until a node is selected", "error": "The prior graph remains available with exact remediation" }, "classification": "reversible", "screenshotsRequired": [], "browsers": ["chromium", "firefox", "webkit", "chromium-enterprise", "android-chromium", "iphone-webkit", "tablet-chromium"], "viewports": ["360x800", "390x844", "768x1024", "1024x768", "1280x800", "1440x900", "1920x1080", "2560x1440", "200%"], "testIds": ["e2e.brain-graph.canvas-table-inspector"]
     },
     {
-      "id": "brain.node.show-in-graph", "route": "/brain/nodes/:memoryNodeId", "surface": "Canonical memory node — graph return action", "requiredState": "Fixture required: a canonical memory node opened from the graph is loaded", "controlId": "brain-node-show-in-graph", "accessible": { "role": "button", "name": "Show in graph", "match": "exact" }, "controlType": "node-to-local-graph", "options": ["Open local graph rooted at this exact node"], "keyboardAction": "Focus with Tab and press Enter or Space", "pointerAction": "Click Show in graph", "expectedStateTransition": "Store only the stable node ID as the session root and navigate to its local graph", "expectedApiOrEventSideEffect": "GET /api/v2/brain/graph with view=local and nodeId", "states": { "loading": "Local neighborhood loading is named", "disabled": "Never disabled for a loaded node", "error": "The node detail remains available with exact graph remediation" }, "classification": "read-only", "screenshotsRequired": [], "browsers": ["chromium", "firefox", "webkit", "chromium-enterprise", "android-chromium", "iphone-webkit", "tablet-chromium"], "viewports": ["360x800", "390x844", "768x1024", "1024x768", "1280x800", "1440x900", "1920x1080", "2560x1440", "200%"], "testIds": ["e2e.brain-graph.deep-links-history"]
+      "id": "brain.node.show-in-graph", "route": "/brain/nodes/:memoryNodeId", "surface": "Canonical memory node — graph return action", "requiredState": "Fixture required: a canonical memory node opened from the graph is loaded", "controlId": "brain-node-show-in-graph", "accessible": { "role": "button", "name": "Show in graph", "match": "exact" }, "controlType": "node-to-local-graph", "options": ["Open local graph rooted at this exact node"], "keyboardAction": "Focus with Tab and press Enter or Space", "pointerAction": "Click Show in graph", "expectedStateTransition": "Navigate to an explicit shareable local-graph URL rooted at this stable node ID", "expectedApiOrEventSideEffect": "GET /api/v2/brain/graph with view=local and nodeId", "states": { "loading": "Local neighborhood loading is named", "disabled": "Never disabled for a loaded node", "error": "The node detail remains available with exact graph remediation" }, "classification": "read-only", "screenshotsRequired": [], "browsers": ["chromium", "firefox", "webkit", "chromium-enterprise", "android-chromium", "iphone-webkit", "tablet-chromium"], "viewports": ["360x800", "390x844", "768x1024", "1024x768", "1280x800", "1440x900", "1920x1080", "2560x1440", "200%"], "testIds": ["e2e.brain-graph.deep-links-history"]
     },
     {
       "id": "brain.control.navigation", "route": "/brain/control", "surface": "Memory Control Center — section navigation", "requiredState": "Fixture required: the canonical global memory-control policy is loaded", "controlId": "brain-control-navigation", "accessible": { "role": "link", "name": "^(?:Home|Graph|Memory Inbox|Controls|Obsidian Vault)$", "match": "regex" }, "controlType": "brain-section-navigation", "options": ["Home", "Graph", "Memory Inbox", "Controls", "Obsidian Vault"], "keyboardAction": "Focus a section link with Tab and press Enter", "pointerAction": "Click the selected Brain section", "expectedStateTransition": "Navigate to the canonical Brain surface with browser history and restore the Memory Control Center when returning", "expectedApiOrEventSideEffect": "GET the selected Brain surface's canonical projection; returning GETs /api/v2/brain/control", "states": { "loading": "Each destination names the canonical data being loaded", "disabled": "Never disabled", "error": "The destination shows a precise read failure without changing the memory-control policy" }, "classification": "read-only", "screenshotsRequired": [], "browsers": ["chromium", "firefox", "webkit", "chromium-enterprise", "android-chromium", "iphone-webkit", "tablet-chromium"], "viewports": ["360x800", "390x844", "768x1024", "1024x768", "1280x800", "1440x900", "1920x1080", "2560x1440", "200%"], "testIds": ["e2e.brain-control.all-controls-save-reload"]
@@ -4745,7 +5003,7 @@
       "id": "command-palette.decision-results", "route": "/manual", "surface": "Command palette — canonical Guided decision result", "requiredState": "Fixture required: a searchable pending Guided decision exists", "controlId": "command-palette-decision-results", "accessible": { "role": "option", "name": "^Review palette decision beacon .+pending.+low risk.+step .+$", "match": "regex" }, "controlType": "decision-result-family", "options": ["Open the Decisions inbox at the represented decision family"], "keyboardAction": "Search the unique decision token and press Enter", "pointerAction": "Click the exact decision result", "expectedStateTransition": "Navigate to /decisions", "expectedApiOrEventSideEffect": "GET /api/v2/decisions with server-side query", "states": { "loading": "Remote decision search is named", "disabled": "Inaccessible decisions are omitted", "error": "Decision-domain failure is named without hiding other commands" }, "classification": "read-only", "screenshotsRequired": [], "browsers": ["chromium", "firefox", "webkit", "chromium-enterprise", "android-chromium", "iphone-webkit", "tablet-chromium"], "viewports": ["360x800", "390x844", "768x1024", "1024x768", "1280x800", "1440x900", "1920x1080", "2560x1440", "200%"], "testIds": ["e2e.command-palette.search-record-families"]
     },
     {
-      "id": "command-palette.agent-results", "route": "/manual", "surface": "Command palette — canonical agent result", "requiredState": "Fixture required: a searchable canonical agent exists", "controlId": "command-palette-agent-results", "accessible": { "role": "option", "name": "^Palette agent beacon .+recon-specialist.+available.+queue [0-9]+$", "match": "regex" }, "controlType": "agent-result-family", "options": ["Open the exact agent profile", "Omit the agent when its exact query domain fails"], "keyboardAction": "The shared named result list provides arrow-key selection", "pointerAction": "Click the exact agent result", "expectedStateTransition": "Navigate to /agents/:agentId", "expectedApiOrEventSideEffect": "GET /api/v2/agents with the exact server-side query; a failed query returns no stale agent row", "states": { "loading": "Remote agent search is named", "disabled": "Inaccessible agents are omitted", "error": "Agent-domain failure is named while local commands remain available" }, "classification": "read-only", "screenshotsRequired": [], "browsers": ["chromium", "firefox", "webkit", "chromium-enterprise", "android-chromium", "iphone-webkit", "tablet-chromium"], "viewports": ["360x800", "390x844", "768x1024", "1024x768", "1280x800", "1440x900", "1920x1080", "2560x1440", "200%"], "testIds": ["e2e.command-palette.search-record-families", "e2e.command-palette.partial-data"]
+      "id": "command-palette.agent-results", "route": "/manual", "surface": "Command palette — canonical agent result", "requiredState": "Fixture required: a searchable canonical agent exists; its live health may change at the runtime projection boundary", "controlId": "command-palette-agent-results", "accessible": { "role": "option", "name": "^Palette agent beacon .+recon-specialist.+(?:available|busy|degraded|offline|quarantined).+queue [0-9]+$", "match": "regex" }, "controlType": "agent-result-family", "options": ["Open the exact agent profile", "Reflect the current canonical health and queue depth", "Omit the agent when its exact query domain fails"], "keyboardAction": "The shared named result list provides arrow-key selection", "pointerAction": "Click the exact agent result", "expectedStateTransition": "Navigate to /agents/:agentId", "expectedApiOrEventSideEffect": "GET /api/v2/agents with the exact server-side query; the option mirrors the returned role, health, and queue depth; a failed query returns no stale agent row", "states": { "loading": "Remote agent search is named", "disabled": "Inaccessible agents are omitted", "error": "Agent-domain failure is named while local commands remain available" }, "classification": "read-only", "screenshotsRequired": [], "browsers": ["chromium", "firefox", "webkit", "chromium-enterprise", "android-chromium", "iphone-webkit", "tablet-chromium"], "viewports": ["360x800", "390x844", "768x1024", "1024x768", "1280x800", "1440x900", "1920x1080", "2560x1440", "200%"], "testIds": ["e2e.command-palette.search-record-families", "e2e.command-palette.partial-data"]
     },
     {
       "id": "command-palette.memory-results", "route": "/manual", "surface": "Command palette — permitted Second Brain result", "requiredState": "Fixture required: a searchable confirmed memory node is permitted for the operator", "controlId": "command-palette-memory-results", "accessible": { "role": "option", "name": "^Palette memory beacon .+preference.+confirmed.+Confirmed searchable operator preference .+$", "match": "regex" }, "controlType": "memory-result-family", "options": ["Open the exact permitted memory node", "Omit memory when permitted Brain search fails"], "keyboardAction": "The shared named result list provides arrow-key selection", "pointerAction": "Click the exact memory result", "expectedStateTransition": "Navigate to /brain/nodes/:memoryNodeId", "expectedApiOrEventSideEffect": "GET /api/v2/brain/nodes with the exact access-controlled FTS query; a failed query returns no stale memory row", "states": { "loading": "Permitted Second Brain search is named", "disabled": "Out-of-scope or disallowed memory is omitted", "error": "Brain-domain failure is named and no remembered result is invented" }, "classification": "read-only", "screenshotsRequired": [], "browsers": ["chromium", "firefox", "webkit", "chromium-enterprise", "android-chromium", "iphone-webkit", "tablet-chromium"], "viewports": ["360x800", "390x844", "768x1024", "1024x768", "1280x800", "1440x900", "1920x1080", "2560x1440", "200%"], "testIds": ["e2e.command-palette.search-record-families", "e2e.command-palette.partial-data"]
@@ -4812,13 +5070,13 @@
     }
   ],
   "knownGaps": [
-    "This manifest contains 489 control groups: 381 fixture-required groups and 108 authentication, shell, journey-entry, intake, and initial static-route groups. The enforced initial-state crawl maps the currently rendered initial controls; compact projects additionally render the represented off-canvas navigation toggle. Grouped inventory does not prove that every option was activated, and this is not release-complete interaction coverage.",
-    "All 381 entries whose required state begins with Fixture required now map to dedicated canonical fixture source traversal. The command-palette material-state slice covers both journeys, one Observability navigation result, exact queried Guided mission/run/decision/agent/memory IDs, pointer and keyboard listbox movement, reviewed pause/exact-resume/cancel, both run and Guided editor return paths, all rendered candidate classification choices, candidate-only memory creation, reload persistence, and agent/Brain query-domain degradation without stale fallback. Autonomous mission/run search records, every remaining navigation destination, invalid-resume and injected mutation-rejection editors, and retry-free frozen-source cross-browser execution remain deliberate release gaps.",
+    "This manifest contains 494 control groups: 383 fixture-required groups and 111 authentication, shell, journey-entry, intake, and initial static-route groups. The enforced initial-state crawl maps the currently rendered initial controls; compact projects additionally render the represented off-canvas navigation toggle. Grouped inventory does not prove that every option was activated, and this is not release-complete interaction coverage.",
+    "All 383 entries whose required state begins with Fixture required now map to dedicated canonical fixture source traversal. The command-palette material-state slice covers both journeys, one Observability navigation result, exact queried Guided mission/run/decision/agent/memory IDs, pointer and keyboard listbox movement, reviewed pause/exact-resume/cancel, both run and Guided editor return paths, all rendered candidate classification choices, candidate-only memory creation, reload persistence, and agent/Brain query-domain degradation without stale fallback. Autonomous mission/run search records, every remaining navigation destination, invalid-resume and injected mutation-rejection editors, and retry-free frozen-source cross-browser execution remain deliberate release gaps.",
     "Direct plan-graph add, update, dependency, reorder, remove, exact represented-action proposals, immutable script versions, evidence-backed page-capture metadata, fail-closed Decisions/Intelligence controls, the mounted Brain home, inbox, graph, node lifecycle and privacy erasure, Memory Control Center, Vault candidate-path round trip, verified-connect, connected health recovery, repair/reindex, offline fail-closed recovery, export/import/synchronize, portable archive creation/download, note-state disclosure, deep-link generation, node-level targeted projection, and both conflict resolutions, inventoried System controls, Overview shortcut and Mission Portfolio controls, and V2-owned pause, resume, cancel, bounded replan, reassignment, and graceful termination now have canonical fixtures. Live in-flight amendment checkpoint/cancellation, plan-version comparison and rollback, CVE review mutations, provider-backed Guided and administrative mutations, finding-review submission, an attested callable recovery provider-route change, Vault navigation activation, health-error retry, operation retry, service-process restart persistence, native protocol activation on an installed Obsidian host, System health-metric activation, non-MCP query-retry states, Overview read retry, saved-view and bulk-operation failure paths, and Research Lab mutations remain explicit release gaps even where an initial rendered control is now inventoried.",
     "Autonomous fail-closed readiness is covered against the real unavailable-runtime projection; a passing live-runtime Autonomous launch requires attested provider, MCP, and specialist manifests and is not claimed by this slice.",
     "Guided creation, durable runtime readback, and the read-only transcript projection are covered against mounted V2 APIs. Provider-backed Guided mutations and execution remain deliberately unmounted until their production runtime dependencies are attested; no executable Guided chain is claimed by this slice.",
     "Dynamic ID routes require imported or V2-native canonical records before their links can be traversed without fabricated data; dedicated fixtures now satisfy the source-ownership gate, while release enforcement still requires every fixture spec and generated deep link to pass the full browser matrix. Canonical Intelligence fixtures now cover verified same-mission run, artifact, and evidence relationships; missing-run, cross-mission-run, and unavailable-artifact reconciliation; and the absence of run/export links when only a raw run ID or URL filter is present. The current retry-free full browser matrix remains the release gate rather than an absent fixture state.",
-    "Twelve deterministic Chromium 1440 material-state baselines cover selected intake, Guided decision, recovery, Second Brain, and Obsidian Vault states; they are mapped to eighteen interaction entries and integrity-bound to dedicated browser paths. The remaining 471 entries have no mapped baseline, and no cross-browser or human release approval is claimed by this incremental slice.",
+    "Thirteen deterministic Chromium 1440 material-state baselines cover selected intake, independent evidence verification, Guided decision, recovery, Second Brain, and Obsidian Vault states; they are mapped to thirty interaction entries and integrity-bound to dedicated browser paths. The remaining 464 entries have no mapped baseline, and no cross-browser or human release approval is claimed by this incremental slice.",
     "Browser and API auditing is strict by default in development and release profiles. Only the explicitly selected degraded profile may record API or optional-media degradation without failing, and every intentional non-success response must be declared prospectively in the exact response ledger."
   ]
 }

@@ -42,6 +42,12 @@ export interface DurableRunCoordinatorOptions {
   readonly leaseTtlMs?: number;
   readonly afterActionCommit?: (action: DurableAction) => void;
   readonly afterCancellationCleanup?: (runId: string) => void;
+  /**
+   * Revalidates the active control-plane controller inside the final
+   * cancellation transaction. Cleanup may await an external worker, so the
+   * authority that requested it must not be assumed to still be current.
+   */
+  readonly assertCancellationAuthority?: (runId: string) => void;
 }
 
 export type PlanningRetryScheduleResult =
@@ -57,7 +63,11 @@ export type PlanningRetryScheduleResult =
     }
   | {
       readonly scheduled: false;
-      readonly reason: "non_retryable" | "retry_budget_exhausted" | "signed_budget_exhausted";
+      readonly reason:
+        | "non_retryable"
+        | "retry_budget_exhausted"
+        | "provider_retry_after_exceeds_bound"
+        | "signed_budget_exhausted";
       readonly exhausted: readonly string[];
     };
 
@@ -134,6 +144,7 @@ export class DurableRunCoordinator {
   private readonly leaseTtlMs: number;
   private readonly afterActionCommit?: (action: DurableAction) => void;
   private readonly afterCancellationCleanup?: (runId: string) => void;
+  private readonly assertCancellationAuthority?: (runId: string) => void;
   private readonly controllers = new Map<string, AbortController>();
 
   constructor(
@@ -151,6 +162,7 @@ export class DurableRunCoordinator {
     this.leaseTtlMs = options.leaseTtlMs ?? 30_000;
     this.afterActionCommit = options.afterActionCommit;
     this.afterCancellationCleanup = options.afterCancellationCleanup;
+    this.assertCancellationAuthority = options.assertCancellationAuthority;
     if (!Number.isFinite(this.leaseTtlMs) || this.leaseTtlMs <= 0) {
       throw new Error("leaseTtlMs must be positive");
     }
@@ -296,7 +308,9 @@ export class DurableRunCoordinator {
           scheduled: false,
           reason: decision.reason === "retry_budget_exhausted"
             ? "retry_budget_exhausted"
-            : "non_retryable",
+            : decision.reason === "provider_retry_after_exceeds_bound"
+              ? "provider_retry_after_exceeds_bound"
+              : "non_retryable",
           exhausted: [],
         };
       }
@@ -906,11 +920,18 @@ export class DurableRunCoordinator {
         const inContract = current.run.journey === "autonomous"
           ? this.runs.autonomousActionRemainsInContract(current, pendingAction)
           : true;
-        const materiallyNewReplanAvailable = evaluation.progress.dimensions.includes("evidence_added")
+        // Invalid input is a deterministic defect in the represented action,
+        // not a new environmental fact. Even if an older adapter retained an
+        // error transcript as evidence, it must not authorize an equivalent
+        // automatic replan/repetition. A new plan requires a corrected input
+        // contract, normally through a new run or explicit Guided decision.
+        const materiallyNewReplanAvailable = category !== "invalid_input" && (
+          evaluation.progress.dimensions.includes("evidence_added")
           || evaluation.progress.dimensions.includes("finding_strengthened")
           || evaluation.progress.dimensions.includes("entity_discovered")
           || evaluation.progress.dimensions.includes("dependency_resolved")
-          || evaluation.progress.dimensions.includes("uncertainty_reduced");
+          || evaluation.progress.dimensions.includes("uncertainty_reduced")
+        );
         const recovery = this.supervisor.decideRecovery({
           journey: current.run.journey,
           category: category ?? "unknown",
@@ -1108,6 +1129,22 @@ export class DurableRunCoordinator {
           payload: { actionId: action.id, stepId: action.stepId },
           now,
           availableAt: recoveryState.notBefore,
+        });
+      } else if (
+        !input.success &&
+        directive === "replan" &&
+        recoveryState?.kind === "replan"
+      ) {
+        // The failed action and its exact bounded-replan authority become
+        // durable in this transaction. Reuse the recovery continuation kind,
+        // but bind it to this canonical failed action so a restart never has
+        // to infer planning authority from `status = recovering` alone.
+        this.continuations.enqueue({
+          runId: action.runId,
+          kind: "resume_recovery_pending",
+          sourceId: action.id,
+          payload: { actionId: action.id },
+          now,
         });
       } else if (input.success && directive === "continue") {
         this.continuations.enqueue({
@@ -1414,14 +1451,56 @@ export class DurableRunCoordinator {
       return { lease: persisted.lease, continuation };
     });
 
+    let cancellationLease = reservation.lease;
+    let cancellationContinuation = reservation.continuation;
+    let heartbeatStopped = false;
+    let heartbeatFailure: unknown;
+    let heartbeatChain = Promise.resolve();
+    const renewCancellationLeases = () => {
+      if (heartbeatStopped) return;
+      heartbeatChain = heartbeatChain.then(() => {
+        if (heartbeatStopped) return;
+        cancellationLease = this.heartbeatRunLease(cancellationLease, this.leaseTtlMs);
+        cancellationContinuation = this.continuations.heartbeat(
+          cancellationContinuation.id,
+          cancellationContinuation.leaseOwner!,
+          this.timestamp(),
+          this.leaseTtlMs,
+        );
+      }).catch((error: unknown) => {
+        heartbeatFailure = heartbeatFailure ?? error;
+        heartbeatStopped = true;
+      });
+    };
+    const heartbeatTimer = setInterval(
+      renewCancellationLeases,
+      Math.max(25, Math.floor(this.leaseTtlMs / 3)),
+    );
+    const stopCancellationHeartbeat = async () => {
+      heartbeatStopped = true;
+      clearInterval(heartbeatTimer);
+      await heartbeatChain;
+      if (heartbeatFailure) throw heartbeatFailure;
+    };
+
     this.controllers.get(input.lease.runId)?.abort(input.reason);
+    let cleanupFailure: unknown;
     try {
       await this.execution.cancelRun(input.lease.runId, input.reason);
-    } catch {
+    } catch (error) {
+      cleanupFailure = error;
+    }
+    try {
+      await stopCancellationHeartbeat();
+    } catch (error) {
+      cleanupFailure = cleanupFailure ?? error;
+    }
+    if (cleanupFailure) {
       const failedAt = this.timestamp();
       inImmediateTransaction(this.database, () => {
-        const current = this.load(reservation.lease.runId);
-        this.runs.assertLease(current, reservation.lease, failedAt);
+        this.assertCancellationAuthority?.(cancellationLease.runId);
+        const current = this.load(cancellationLease.runId);
+        this.runs.assertLease(current, cancellationLease, failedAt);
         const target = allowedRunTransitions(current.run.state, current.run.journey).includes("blocked")
           ? "blocked"
           : "failed";
@@ -1443,8 +1522,8 @@ export class DurableRunCoordinator {
           summary: reason,
         });
         this.continuations.fail({
-          id: reservation.continuation.id,
-          ownerToken: reservation.continuation.leaseOwner!,
+          id: cancellationContinuation.id,
+          ownerToken: cancellationContinuation.leaseOwner!,
           now: failedAt,
           error: reason,
         });
@@ -1456,8 +1535,9 @@ export class DurableRunCoordinator {
     this.afterCancellationCleanup?.(input.lease.runId);
     const completedAt = this.timestamp();
     return inImmediateTransaction(this.database, () => {
-      const current = this.load(reservation.lease.runId);
-      this.runs.assertLease(current, reservation.lease, completedAt);
+      this.assertCancellationAuthority?.(cancellationLease.runId);
+      const current = this.load(cancellationLease.runId);
+      this.runs.assertLease(current, cancellationLease, completedAt);
       this.closeAggregateChildren(current.run.id, input.reason, completedAt);
       const transition = this.supervisor.transition(current.run, "cancelled", {
         reason: input.reason,
@@ -1479,8 +1559,8 @@ export class DurableRunCoordinator {
       this.database.prepare("UPDATE missions SET status = 'cancelled', updated_at = ? WHERE id = ?")
         .run(completedAt, persisted.run.missionId);
       this.continuations.complete(
-        reservation.continuation.id,
-        reservation.continuation.leaseOwner!,
+        cancellationContinuation.id,
+        cancellationContinuation.leaseOwner!,
         completedAt,
       );
       this.continuations.cancelOpen(current.run.id, completedAt, "Run reached a terminal cancelled state");

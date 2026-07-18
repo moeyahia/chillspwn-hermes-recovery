@@ -19,7 +19,7 @@ function files(directory: string): string[] {
 describe("Command OS V2 interaction manifest", () => {
   test("is schema-valid, unique, and explicitly incomplete", () => {
     expect(manifest.namespace).toBe(INTERACTION_MANIFEST_NAMESPACE);
-    expect(manifest.entries).toHaveLength(489);
+    expect(manifest.entries).toHaveLength(494);
     expect(new Set(manifest.entries.map((entry) => entry.id)).size).toBe(manifest.entries.length);
     expect(new Set(manifest.entries.map((entry) => entry.controlId)).size).toBe(manifest.entries.length);
     expect(manifest.knownGaps.length).toBeGreaterThan(0);
@@ -78,7 +78,10 @@ describe("Command OS V2 interaction manifest", () => {
   test("accounts for every registry-driven intake step and collection in both journeys", () => {
     for (const journey of ["autonomous", "guided"] as const) {
       const entries = manifest.entries.filter((entry) => entry.route === `/missions/new/${journey}`);
-      for (const step of ["Scope", "Outcome", "Contract", "Review"]) {
+      const steps = journey === "autonomous"
+        ? ["Scope", "Outcome", "Contract", "Team", "Context", "Review"]
+        : ["Scope", "Outcome", "Contract", "Review"];
+      for (const step of steps) {
         expect(entries.some((entry) => entry.surface.includes(step) || entry.requiredState.toLocaleLowerCase("en-US").includes(step.toLocaleLowerCase("en-US")))).toBe(true);
       }
       expect(entries.find((entry) => entry.id === `${journey}-intake.scope.template`)?.options).toHaveLength(7);
@@ -87,6 +90,12 @@ describe("Command OS V2 interaction manifest", () => {
       expect(entries.find((entry) => entry.id === `${journey}-intake.contract.evidence`)?.options).toHaveLength(21);
       expect(entries.find((entry) => entry.id === `${journey}-intake.contract.safe-stops`)?.options).toHaveLength(10);
     }
+    expect(manifest.entries.find((entry) => entry.id === "autonomous-intake.team.specialists")?.controlType)
+      .toBe("runtime-specialist-checkbox-collection");
+    expect(manifest.entries.find((entry) => entry.id === "autonomous-intake.context.memories")?.controlType)
+      .toBe("scope-safe-memory-checkbox-collection");
+    expect(manifest.entries.find((entry) => entry.id === "autonomous-intake.context.scopes")?.options)
+      .toEqual(["Confirmed operator preferences", "Verified operational lessons", "Engagement-isolated knowledge"]);
   });
 
   test("inventories mounted mission truth controls and distinguishes dedicated fixture coverage", () => {
@@ -127,7 +136,7 @@ describe("Command OS V2 interaction manifest", () => {
     expect(dedicated).toHaveLength(126);
     expect(unresolved).toHaveLength(0);
     expect(unresolved.every((entry) => entry.testIds.length === 1)).toBe(true);
-    expect(manifest.knownGaps.some((gap) => gap.includes("All 381 entries") && gap.includes("dedicated canonical fixture source traversal"))).toBe(true);
+    expect(manifest.knownGaps.some((gap) => gap.includes("All 383 entries") && gap.includes("dedicated canonical fixture source traversal"))).toBe(true);
     expect(manifest.knownGaps.some((gap) => gap.includes("full browser matrix"))).toBe(true);
   });
 
@@ -329,7 +338,7 @@ describe("Command OS V2 interaction manifest", () => {
       expect(entry.testIds.every((testId) => allowedTestIds.has(testId)), entry.id).toBe(true);
     }
     expect(new Set(entries.flatMap((entry) => entry.testIds))).toEqual(allowedTestIds);
-    expect(manifest.entries.filter((entry) => entry.requiredState.startsWith("Fixture required:"))).toHaveLength(381);
+    expect(manifest.entries.filter((entry) => entry.requiredState.startsWith("Fixture required:"))).toHaveLength(383);
   });
 
   test("inventories Second Brain home, inbox, graph, and graph-return families against only their dedicated fixture sources", () => {
@@ -383,7 +392,7 @@ describe("Command OS V2 interaction manifest", () => {
     expect(graph.find((entry) => entry.id === "brain.graph.canvas")?.accessible.role).toBe("application");
     expect(home.find((entry) => entry.id === "brain.home.node-links")?.accessible.name)
       .toBe("^Open memory .+ \\([A-Za-z0-9._:-]+\\)$");
-    expect(manifest.entries.filter((entry) => entry.requiredState.startsWith("Fixture required:"))).toHaveLength(381);
+    expect(manifest.entries.filter((entry) => entry.requiredState.startsWith("Fixture required:"))).toHaveLength(383);
   });
 
   test("maps all Brain node controls only to graph, lifecycle, and targeted Vault fixture paths", () => {
@@ -477,7 +486,7 @@ describe("Command OS V2 interaction manifest", () => {
       expect(entry.testIds.every((testId) => allowedTestIds.has(testId)), entry.id).toBe(true);
     }
     expect(new Set(entries.flatMap((entry) => entry.testIds))).toEqual(allowedTestIds);
-    expect(manifest.entries.filter((entry) => entry.requiredState.startsWith("Fixture required:"))).toHaveLength(381);
+    expect(manifest.entries.filter((entry) => entry.requiredState.startsWith("Fixture required:"))).toHaveLength(383);
   });
 
   test("inventories the mounted Vault lifecycle against dedicated isolated fixture sources", () => {
@@ -546,9 +555,9 @@ describe("Command OS V2 interaction manifest", () => {
       "brain.vault.conflict-keep-vault",
     ]);
     expect(new Set(visualEntries.flatMap((entry) => entry.screenshotsRequired)).size).toBe(6);
-    expect(manifest.entries.filter((entry) => entry.screenshotsRequired.length === 0)).toHaveLength(471);
-    expect(manifest.knownGaps.some((gap) => gap.includes("Twelve deterministic Chromium 1440") && gap.includes("remaining 471 entries"))).toBe(true);
-    expect(manifest.entries.filter((entry) => entry.requiredState.startsWith("Fixture required:"))).toHaveLength(381);
+    expect(manifest.entries.filter((entry) => entry.screenshotsRequired.length === 0)).toHaveLength(464);
+    expect(manifest.knownGaps.some((gap) => gap.includes("Thirteen deterministic Chromium 1440") && gap.includes("remaining 464 entries"))).toBe(true);
+    expect(manifest.entries.filter((entry) => entry.requiredState.startsWith("Fixture required:"))).toHaveLength(383);
   });
 
   test("inventories the ten System control families against only existing dedicated System fixture sources", () => {
@@ -602,7 +611,7 @@ describe("Command OS V2 interaction manifest", () => {
       "/system/policies",
       "/system/settings",
     ]));
-    expect(manifest.entries.filter((entry) => entry.requiredState.startsWith("Fixture required:"))).toHaveLength(381);
+    expect(manifest.entries.filter((entry) => entry.requiredState.startsWith("Fixture required:"))).toHaveLength(383);
   });
 
   test("inventories Overview shortcuts and every Mission Portfolio control family against only existing portfolio fixtures", () => {
@@ -681,7 +690,7 @@ describe("Command OS V2 interaction manifest", () => {
     expect(new Set(entries.flatMap((entry) => entry.testIds))).toEqual(allowedTestIds);
     expect(new Set(entries.filter((entry) => entry.id.startsWith("overview.")).map((entry) => entry.route))).toEqual(new Set(["/"]));
     expect(new Set(entries.filter((entry) => entry.id.startsWith("mission-portfolio.")).map((entry) => entry.route))).toEqual(new Set(["/missions"]));
-    expect(manifest.entries.filter((entry) => entry.requiredState.startsWith("Fixture required:"))).toHaveLength(381);
+    expect(manifest.entries.filter((entry) => entry.requiredState.startsWith("Fixture required:"))).toHaveLength(383);
   });
 
   test("assigns every dynamic journey, agent, trace, and report family to a dedicated canonical browser path", () => {

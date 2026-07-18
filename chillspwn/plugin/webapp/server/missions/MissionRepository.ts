@@ -997,6 +997,9 @@ export class MissionRepository {
       const budget = autonomous
         ? {
             timeBudgetMinutes: request.contract.timeBudgetMinutes,
+            ...(request.contract.toolCallBudget === undefined
+              ? {}
+              : { toolCalls: request.contract.toolCallBudget }),
             tokenBudget: request.contract.tokenBudget ?? null,
             costBudget: request.contract.costBudget ?? null,
             retryBudget: request.contract.retryBudget,

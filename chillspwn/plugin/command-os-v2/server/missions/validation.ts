@@ -150,7 +150,11 @@ function targetOverlap(left: readonly string[], right: readonly string[]): strin
   return left.filter((value) => rightSet.has(targetKey(value)));
 }
 
-function parseAutonomous(root: UnknownRecord, issues: string[]): AutonomousMissionRequest {
+function parseAutonomous(
+  root: UnknownRecord,
+  issues: string[],
+  options: { readonly allowEmptyActionClasses: boolean },
+): AutonomousMissionRequest {
   const authorization = isRecord(root.authorization) ? root.authorization : {};
   if (!isRecord(root.authorization)) issues.push("authorization must be an object");
   const contract = isRecord(root.contract) ? root.contract : {};
@@ -175,7 +179,7 @@ function parseAutonomous(root: UnknownRecord, issues: string[]): AutonomousMissi
     contract.allowedActionClasses,
     "contract.allowedActionClasses",
     issues,
-    { required: true },
+    { required: !options.allowEmptyActionClasses },
   );
   const prohibitedActionClasses = stringList(
     contract.prohibitedActionClasses,
@@ -217,6 +221,12 @@ function parseAutonomous(root: UnknownRecord, issues: string[]): AutonomousMissi
     issues,
     { integer: true, minimum: 1, maximum: 525_600 },
   );
+  const toolCallBudget = finiteNumber(contract.toolCallBudget, "contract.toolCallBudget", issues, {
+    integer: true,
+    minimum: 1,
+    maximum: Number.MAX_SAFE_INTEGER,
+    optional: true,
+  });
   const tokenBudget = finiteNumber(contract.tokenBudget, "contract.tokenBudget", issues, {
     integer: true,
     minimum: 1,
@@ -329,6 +339,7 @@ function parseAutonomous(root: UnknownRecord, issues: string[]): AutonomousMissi
         issues,
       ),
       timeBudgetMinutes: timeBudgetMinutes ?? 0,
+      ...(toolCallBudget === undefined ? {} : { toolCallBudget }),
       ...(tokenBudget === undefined ? {} : { tokenBudget }),
       ...(costBudget === undefined ? {} : { costBudget }),
       retryBudget: retryBudget ?? -1,
@@ -428,7 +439,10 @@ function parseGuided(root: UnknownRecord, issues: string[]): GuidedMissionReques
   };
 }
 
-export function validateMissionCreateRequest(value: unknown): MissionCreateRequest {
+function validateMissionRequest(
+  value: unknown,
+  options: { readonly allowEmptyAutonomousActionClasses: boolean },
+): MissionCreateRequest {
   const issues: string[] = [];
   if (!isRecord(value)) throw new MissionValidationError(["request body must be an object"]);
   if (value.launch !== true) issues.push("launch must be true");
@@ -440,10 +454,24 @@ export function validateMissionCreateRequest(value: unknown): MissionCreateReque
 
   const result =
     value.journey === "autonomous"
-      ? parseAutonomous(value, issues)
+      ? parseAutonomous(value, issues, {
+          allowEmptyActionClasses: options.allowEmptyAutonomousActionClasses,
+        })
       : parseGuided(value, issues);
   if (issues.length > 0) throw new MissionValidationError([...new Set(issues)]);
   return result;
+}
+
+export function validateMissionCreateRequest(value: unknown): MissionCreateRequest {
+  return validateMissionRequest(value, { allowEmptyAutonomousActionClasses: false });
+}
+
+/**
+ * Preflight accepts a capability-empty draft so the server can return a
+ * structured blocked review. The actual create boundary remains strict.
+ */
+export function validateMissionPreflightRequest(value: unknown): MissionCreateRequest {
+  return validateMissionRequest(value, { allowEmptyAutonomousActionClasses: true });
 }
 
 export function validateIdempotencyKey(value: unknown): string {

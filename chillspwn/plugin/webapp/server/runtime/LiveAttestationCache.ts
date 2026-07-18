@@ -59,9 +59,10 @@ function safeReason(value: unknown, fallback: string): string {
  *
  * Reading a snapshot never performs I/O. Callers may schedule a refresh from a
  * hot readiness path without awaiting it; duplicate requests coalesce and a
- * small queue bounds concurrent subprocess/network probes. Expired successes
- * immediately lose their verified value, so stale health can never authorize
- * execution while a background refresh is pending.
+ * small queue bounds concurrent subprocess/network probes. Successful evidence
+ * is refreshed before expiry and remains usable only through its original hard
+ * expiry while that refresh is pending. Expired successes immediately lose
+ * their verified value, so a slow refresh never extends stale authority.
  */
 export class LiveAttestationCache<K, T> {
   private readonly probe: LiveAttestationCacheOptions<K, T>["probe"];
@@ -70,6 +71,7 @@ export class LiveAttestationCache<K, T> {
   private readonly failureTtlMs: number;
   private readonly maximumFailureBackoffMs: number;
   private readonly timeoutMs: number;
+  private readonly refreshLeadMs: number;
   private readonly maximumConcurrency: number;
   private readonly describeKey: (key: K) => string;
   private readonly entries = new Map<K, Entry<T>>();
@@ -106,6 +108,11 @@ export class LiveAttestationCache<K, T> {
       250,
       5 * 60_000,
     );
+    // Start a successful attestation's replacement early enough for one normal
+    // bounded probe to finish, while keeping at least half of every TTL free of
+    // refresh traffic. This changes scheduling only: snapshot() still revokes
+    // the old value at expiresAtMs and never grants a grace period.
+    this.refreshLeadMs = Math.min(this.timeoutMs, Math.floor(this.successTtlMs / 2));
     this.maximumConcurrency = boundedInteger(
       options.maximumConcurrency ?? 1,
       "maximumConcurrency",
@@ -199,7 +206,10 @@ export class LiveAttestationCache<K, T> {
     if (entry?.inFlight) return false;
     const nowMs = this.clock().getTime();
     if (!entry?.result) return entry?.nextAttemptAtMs === undefined || nowMs >= entry.nextAttemptAtMs;
-    if (entry.result.ok) return entry.expiresAtMs === undefined || nowMs > entry.expiresAtMs;
+    if (entry.result.ok) {
+      return entry.expiresAtMs === undefined
+        || nowMs >= entry.expiresAtMs - this.refreshLeadMs;
+    }
     return entry.nextAttemptAtMs === undefined || nowMs >= entry.nextAttemptAtMs;
   }
 
@@ -263,7 +273,7 @@ export class LiveAttestationCache<K, T> {
           };
           entry.attestedAtMs = completedAtMs;
           entry.expiresAtMs = completedAtMs + this.successTtlMs;
-          entry.nextAttemptAtMs = entry.expiresAtMs;
+          entry.nextAttemptAtMs = entry.expiresAtMs - this.refreshLeadMs;
           entry.consecutiveFailures = 0;
         } else {
           entry.consecutiveFailures += 1;

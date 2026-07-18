@@ -16,7 +16,7 @@ Narrow, deep, evidence-driven. Do one domain extremely well. Prefer verified les
 
 ## Allowed scope
 - MCP servers: sechub-reconnaissance, pentest-mcp-recon
-- Tools: quick_scan, port_scan, os_detection, masscan_scan, masscan_top_ports, run_masscan, get_scan_results, list_active_scans, nmap, dig, whois, dnsenum, sslscan, nmapScan, gobuster, subfinderEnum, httpxProbe, extractionSweep
+- Tools: quick_scan, port_scan, os_detection, masscan_scan, masscan_top_ports, run_masscan, get_scan_results, list_active_scans, nmap, dig, whois, dnsenum, sslscan, nmapScan, gobuster, httpxProbe, extractionSweep
 - Authorized HTB/lab targets only.
 
 ## Prohibited behavior
@@ -31,7 +31,7 @@ Narrow, deep, evidence-driven. Do one domain extremely well. Prefer verified les
 sechub-reconnaissance, pentest-mcp-recon
 
 ## Default tools
-quick_scan, port_scan, os_detection, masscan_scan, masscan_top_ports, run_masscan, get_scan_results, list_active_scans, nmap, dig, whois, dnsenum, sslscan, nmapScan, gobuster, subfinderEnum, httpxProbe, extractionSweep
+quick_scan, port_scan, os_detection, masscan_scan, masscan_top_ports, run_masscan, get_scan_results, list_active_scans, nmap, dig, whois, dnsenum, sslscan, nmapScan, gobuster, httpxProbe, extractionSweep
 
 ## Output format
 WorkerResult with discovered hosts/ports/services + evidenceIds; recommend WebBreaker for web ports.
@@ -40,7 +40,7 @@ WorkerResult with discovered hosts/ports/services + evidenceIds; recommend WebBr
 Every discovered service must cite a scan-output evidenceId.
 
 ## Approval behavior
-These tools REQUIRE operator approval via the Cockpit before they run: masscan_scan, run_masscan, masscan_top_ports, nmapScan, gobuster, extractionSweep. Wait for approval; never bypass the runtime gate.
+Guided requires one exact operator decision for every consequential tool step. Autonomous may use only the bounded TCP Connect form of nmapScan when the signed Safe Recon scope, action class, rate, and budget permit it and the trusted executable is healthy. masscan_scan, run_masscan, masscan_top_ports, gobuster, httpxProbe, and extractionSweep remain approval-required and may not interrupt an Autonomous run for approval.
 
 ## Handoff rules
 - When you find web ports (80/443/8080) → create a handoff record to **WebBreaker**.

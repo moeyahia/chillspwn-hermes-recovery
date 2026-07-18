@@ -11,6 +11,7 @@ import {
 } from "../../command-runtime";
 import { createDatabaseConnection, migrateDatabase, type SqliteDatabase } from "../../db";
 import type { DurableAction } from "../../orchestration";
+import { hashJson } from "../../orchestration/serialization";
 import { createMissionRunControlV2Router } from "../missionRuntimeV2Routes";
 
 const NOW = "2026-07-16T12:00:00.000Z";
@@ -109,6 +110,78 @@ function seedGuidedRun(database: SqliteDatabase, suffix: string): {
   return { missionId, runId, planId, stepId, assignmentId };
 }
 
+function seedLegacyAutonomousPlanningRateLimit(database: SqliteDatabase, suffix: string): {
+  missionId: string;
+  runId: string;
+} {
+  const missionId = `mission-${suffix}`;
+  const runId = `run-${suffix}`;
+  database.prepare(`
+    INSERT INTO missions (
+      id, name, objective, journey, status, authorization_status,
+      created_by, created_at, updated_at, control_plane
+    ) VALUES (?, 'ReaperTwo', 'Plan the authorized lab assessment',
+      'autonomous', 'active', 'verified', 'operator:test', ?, ?, 'command_os_v2')
+  `).run(missionId, NOW, NOW);
+  database.prepare(`
+    INSERT INTO runs (
+      id, mission_id, journey, status, progress, status_reason,
+      next_action_summary, budget_json, budget_usage_json, retry_count,
+      replan_count, started_at, created_at, updated_at, version, control_plane
+    ) VALUES (?, ?, 'autonomous', 'blocked', 0,
+      'The planning provider is rate-limited and no result was committed.',
+      'Retry the first in-contract plan once the provider is available',
+      '{"retries":2,"replans":2}', '{}', 0, 0, ?, ?, ?, 4, 'command_os_v2')
+  `).run(runId, missionId, NOW, NOW, NOW);
+  const event = database.prepare(`
+    INSERT INTO events (
+      id, mission_id, run_id, sequence, event_type, occurred_at,
+      actor_type, summary, payload_json, journey, sensitivity, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'autonomous', 'internal', ?)
+  `);
+  event.run(`event-${suffix}-created`, missionId, runId, 1, "mission.created", NOW,
+    "operator", "Autonomous mission created", "{}", NOW);
+  event.run(`event-${suffix}-planning`, missionId, runId, 2,
+    "run.autonomous_planning_started", NOW, "system", "Autonomous planning started", "{}", NOW);
+  event.run(`event-${suffix}-blocked`, missionId, runId, 3, "run.state_changed", NOW,
+    "worker", "planning -> blocked: provider rate limit",
+    '{"from":"planning","to":"blocked","stateVersion":4}', NOW);
+  event.run(`event-${suffix}-safe-stop`, missionId, runId, 4,
+    "run.autonomous_safe_stopped", NOW, "system",
+    "The planning provider is rate-limited and no result was committed.",
+    '{"code":"mission_runtime_rate_limit","category":"rate_limit"}', NOW);
+  const state = {
+    schemaVersion: 1 as const,
+    run: {
+      id: runId,
+      missionId,
+      journey: "autonomous" as const,
+      state: "blocked" as const,
+      stateVersion: 4,
+      reason: "The planning provider is rate-limited and no result was committed.",
+      leaseOwner: null,
+      leaseExpiresAt: null,
+    },
+    control: {
+      budget: { limits: { retries: 2, replans: 2 }, usage: {} },
+      retryCount: 0,
+      replanCount: 0,
+      circuits: {},
+      progress: {},
+    },
+    completedActionIds: [],
+    inFlightActions: [],
+    lastEventSequence: 3,
+  };
+  database.prepare(`
+    INSERT INTO checkpoints (
+      id, mission_id, run_id, journey, event_sequence, plan_version,
+      state_json, state_hash, in_flight_classification, created_at
+    ) VALUES (?, ?, ?, 'autonomous', 3, NULL, ?, ?, NULL, ?)
+  `).run(`checkpoint-${suffix}`, missionId, runId, JSON.stringify(state), hashJson(state), NOW);
+  return { missionId, runId };
+}
+
 function runtime(database: SqliteDatabase, workerId: string) {
   return createMissionRuntime({
     database,
@@ -167,6 +240,44 @@ function activeControlLeaseCount(database: SqliteDatabase, runId: string): numbe
 }
 
 describe("mission run-control V2 boundary", () => {
+  test("resume accepts the exact legacy zero-in-flight boundary for an Autonomous planning rate limit", async () => {
+    const database = createDatabaseConnection({ filename: ":memory:" });
+    databases.push(database);
+    migrateDatabase(database);
+    const fixture = seedLegacyAutonomousPlanningRateLimit(database, "planning-rate-limit-resume");
+    const { engine, base } = await startApplication(database, "planning-rate-limit-worker");
+    const boundary = resumeBoundary(engine, fixture.runId);
+
+    const resumed = await mutate(
+      base,
+      fixture.runId,
+      "resume",
+      "planning-rate-limit-resume-command",
+      boundary,
+    );
+    expect(resumed.status).toBe(200);
+    expect(await resumed.json()).toMatchObject({
+      schemaVersion: "2.4",
+      run: { id: fixture.runId, journey: "autonomous", status: "recovering" },
+      latestCheckpoint: {
+        state: {
+          run: { id: fixture.runId, state: "recovering" },
+          inFlightActions: [],
+        },
+      },
+    });
+    expect(database.prepare(`
+      SELECT count(*) AS count FROM audit_records
+      WHERE run_id = ? AND action = 'run.resumed'
+    `).get(fixture.runId)).toEqual({ count: 1 });
+    expect(database.prepare(`
+      SELECT count(*) AS count FROM events
+      WHERE run_id = ? AND event_type = 'run.state_changed'
+        AND json_extract(payload_json, '$.from') = 'blocked'
+        AND json_extract(payload_json, '$.to') = 'recovering'
+    `).get(fixture.runId)).toEqual({ count: 1 });
+  });
+
   test("resume rejects missing, stale, and newly in-flight checkpoint boundaries without reserving execution", async () => {
     const database = createDatabaseConnection({ filename: ":memory:" });
     databases.push(database);

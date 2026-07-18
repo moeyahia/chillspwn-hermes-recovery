@@ -23,6 +23,13 @@ function actionVariant(action: RecoveryActionAvailability): "secondary" | "dange
   return action.kind === "terminate" ? "danger" : "secondary";
 }
 
+const RECOVERY_UNMOUNT_EVENTS = new Set([
+  "run.cancellation_requested",
+  "run.cancelled",
+  "run.completed",
+  "run.evaluation_recorded",
+]);
+
 export function RecoveryPanel({ runId, onChanged }: { runId: string; onChanged: () => void }) {
   const query = useQuery(`run-recovery:${runId}`, (signal) => operationsApi.recovery(runId, signal), { staleTime: 0 });
   const stream = useEventStream();
@@ -33,7 +40,7 @@ export function RecoveryPanel({ runId, onChanged }: { runId: string; onChanged: 
   const [providerId, setProviderId] = useState("");
   const mutation = useActionState();
   useEffect(() => {
-    if (stream.lastEvent?.runId === runId) query.refresh();
+    if (stream.lastEvent?.runId === runId && !RECOVERY_UNMOUNT_EVENTS.has(stream.lastEvent.type)) query.refresh();
   }, [stream.lastEvent?.id, runId]);
 
   if (query.isLoading) return <Card className="os-recovery-panel"><LoadingPanel label="Loading canonical recovery intelligence" /></Card>;
@@ -73,10 +80,10 @@ export function RecoveryPanel({ runId, onChanged }: { runId: string; onChanged: 
     return Boolean(reason.trim());
   };
 
-  const finishMutation = (message: string) => {
+  const finishMutation = (message: string, refreshRecovery = true) => {
     setReason("");
     setStrategyReason("");
-    query.refresh();
+    if (refreshRecovery) query.refresh();
     onChanged();
     return message;
   };
@@ -131,7 +138,7 @@ export function RecoveryPanel({ runId, onChanged }: { runId: string; onChanged: 
       return;
     }
     void mutation.run(
-      () => operation.then(() => { finishMutation(success); }),
+      () => operation.then(() => { finishMutation(success, action.command !== "cancel"); }),
       success,
     );
   };

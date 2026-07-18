@@ -288,6 +288,7 @@ async function application() {
           maximumSensitivity: "restricted", allEngagements: true,
           allowUnscopedSystemData: true, allowGlobalKnowledge: true,
           canReviewFindings: true, canOverrideEvidenceGate: true, canReviewLessons: true,
+          canManageRecovery: true,
         };
       return {
         maximumSensitivity: "private", engagementIds: ["eng-a"], missionIds: ["mission-a"],
@@ -895,6 +896,108 @@ describe("canonical operations HTTP API", () => {
         available: false,
         command: null,
       });
+    } finally { database.close(); }
+  });
+
+  test("preserves a legacy planning rate-limit diagnosis and offers safe zero-in-flight resume", async () => {
+    const { database, url } = await application();
+    try {
+      database.prepare(`
+        INSERT INTO missions (
+          id, name, objective, journey, status, authorization_status,
+          engagement_id, created_by, created_at, updated_at, control_plane
+        ) VALUES (
+          'mission-auto-rate-limit', 'ReaperTwo', 'Plan the authorized lab assessment',
+          'autonomous', 'active', 'verified', 'eng-a', 'operator', ?, ?, 'command_os_v2'
+        )
+      `).run(A, C);
+      database.prepare(`
+        INSERT INTO runs (
+          id, mission_id, journey, status, progress, status_reason,
+          next_action_summary, budget_json, budget_usage_json, retry_count,
+          replan_count, started_at, created_at, updated_at, version, control_plane
+        ) VALUES (
+          'run-auto-rate-limit', 'mission-auto-rate-limit', 'autonomous', 'blocked', 0,
+          'The planning provider is rate-limited and no result was committed.',
+          'Build and version the first in-contract plan',
+          '{"retries":2,"replans":2,"wallClockMs":3600000}', '{}', 0, 0,
+          ?, ?, ?, 4, 'command_os_v2'
+        )
+      `).run(A, A, C);
+      const event = database.prepare(`
+        INSERT INTO events (
+          id, mission_id, run_id, sequence, event_type, occurred_at,
+          actor_type, summary, payload_json, journey, sensitivity, created_at
+        ) VALUES (?, 'mission-auto-rate-limit', 'run-auto-rate-limit', ?, ?, ?, ?, ?, ?,
+          'autonomous', 'internal', ?)
+      `);
+      event.run(
+        'event-auto-rate-limit-created', 1, 'mission.created', A, 'operator',
+        'Autonomous mission created as a durable objective', '{}', A,
+      );
+      event.run(
+        'event-auto-rate-limit-started', 2, 'run.autonomous_planning_started', A, 'system',
+        'Autonomous planning started under the confirmed mission contract', '{}', A,
+      );
+      event.run(
+        'event-auto-rate-limit-blocked', 3, 'run.state_changed', B, 'worker',
+        'planning -> blocked: The planning provider is rate-limited and no result was committed.',
+        '{"from":"planning","to":"blocked","stateVersion":4}', B,
+      );
+      event.run(
+        'event-auto-rate-limit-safe-stop', 4, 'run.autonomous_safe_stopped', B, 'system',
+        'The planning provider is rate-limited and no result was committed.',
+        '{"code":"mission_runtime_rate_limit","category":"rate_limit"}', B,
+      );
+      const state = {
+        schemaVersion: 1,
+        run: {
+          id: 'run-auto-rate-limit', missionId: 'mission-auto-rate-limit', journey: 'autonomous',
+          state: 'blocked', stateVersion: 4,
+          reason: 'The planning provider is rate-limited and no result was committed.',
+          leaseOwner: null, leaseExpiresAt: null,
+        },
+        control: {
+          budget: { limits: { retries: 2, replans: 2, wallClockMs: 3_600_000 }, usage: {} },
+          retryCount: 0, replanCount: 0, circuits: {}, progress: {},
+        },
+        completedActionIds: [],
+        inFlightActions: [],
+        lastEventSequence: 3,
+      };
+      database.prepare(`
+        INSERT INTO checkpoints (
+          id, mission_id, run_id, journey, event_sequence, plan_version,
+          state_json, state_hash, in_flight_classification, created_at
+        ) VALUES (
+          'checkpoint-auto-rate-limit', 'mission-auto-rate-limit', 'run-auto-rate-limit',
+          'autonomous', 3, NULL, ?, ?, NULL, ?
+        )
+      `).run(JSON.stringify(state), hashJson(state), B);
+
+      const response = await fetch(`${url}/api/v2/operations/runs/run-auto-rate-limit/recovery`, {
+        headers: { "X-Test-Access": "all" },
+      });
+      expect(response.status).toBe(200);
+      const recovery = await body(response);
+      expect(recovery).toMatchObject({
+        recoveryRequired: true,
+        run: { journey: "autonomous", status: "blocked" },
+        detection: { category: "rate_limit" },
+        checkpoint: {
+          id: "checkpoint-auto-rate-limit",
+          eventSequence: 3,
+          inFlightClassification: null,
+          inFlightActions: [],
+        },
+        attempts: { retryCount: 0, retryLimit: 2, retriesRemaining: 2 },
+        proposedRecovery: { kind: "operator_resume" },
+      });
+      expect(recovery.actions.find((item: any) => item.kind === "resume")).toMatchObject({
+        available: true,
+        command: "resume",
+      });
+      expect(recovery.proposedRecovery.summary).toContain("bounded planning retry");
     } finally { database.close(); }
   });
 

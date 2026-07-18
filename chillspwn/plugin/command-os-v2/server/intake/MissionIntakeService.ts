@@ -296,6 +296,12 @@ export class MissionIntakeService {
     const successCriteria = input.successCriteria && input.successCriteria.length > 0
       ? unique(input.successCriteria)
       : [...applied.successCriteria];
+    const defaultMemoryScopes = [
+      "confirmed_preferences",
+      "verified_lessons",
+      ...(text(input.engagementId, "Engagement ID", 240) ? ["engagement_memory"] : []),
+    ];
+    const memoryScopes = input.memoryScopes ? unique(input.memoryScopes) : defaultMemoryScopes;
     const inferredFields = [
       ...(input.title ? [] : ["title"]),
       ...(input.objective ? [] : ["objective"]),
@@ -305,6 +311,7 @@ export class MissionIntakeService {
       ...(input.optionalSafeStopIds ? [] : ["optionalSafeStops"]),
       ...(input.budgetPresetId ? [] : ["budget"]),
       ...(input.specialistAgentIds ? [] : ["specialistAgentIds"]),
+      ...(input.journey === "autonomous" && !input.memoryScopes ? ["memoryScopes"] : []),
     ];
     const selectedAgentIds = input.specialistAgentIds
       ? unique(input.specialistAgentIds)
@@ -312,9 +319,14 @@ export class MissionIntakeService {
           policyMatrix.classes[id].policyState === "pre_authorized"
             ? policyMatrix.classes[id].capability.availableAgentIds
             : []));
+    const blockedActionLabels = ACTION_CLASS_IDS
+      .filter((id) => policyMatrix.classes[id].launchBlockingReasons.length > 0)
+      .map((id) => policyMatrix.classes[id].label);
     const limitations = [
       ...(!hasLiveSource(manifests) ? ["No attested runtime capability manifest is connected; operational launch readiness is unavailable."] : []),
-      ...policyMatrix.launchBlockingReasons,
+      ...(blockedActionLabels.length > 0 ? [
+        `Autonomous execution is not ready for ${blockedActionLabels.length} contract action classes: ${blockedActionLabels.join(", ")}. Connect compatible specialists, tools, and locally enforced provider paths, or change those classes to Guided only or Prohibited. Exact class-level reasons remain in the Action-class policy matrix.`,
+      ] : []),
     ];
 
     if (input.journey === "guided") {
@@ -374,6 +386,7 @@ export class MissionIntakeService {
           }),
           evidenceRequirements: evidenceTypeIds,
           timeBudgetMinutes: budget.timeBudgetMinutes,
+          toolCallBudget: budget.toolCallBudget,
           tokenBudget: budget.tokenBudget,
           costBudget: budget.estimatedCostBudget,
           retryBudget: budget.retryBudget,
@@ -388,7 +401,7 @@ export class MissionIntakeService {
           providerPolicy: "automatic_enforcing_only",
           toolPolicy: "contract_allowlist",
           specialistAgentIds: selectedAgentIds.filter((id) => SAFE_ID.test(id)),
-          memoryScopes: input.memoryScopes ? unique(input.memoryScopes) : [],
+          memoryScopes,
           contextNodeIds: input.contextNodeIds ? unique(input.contextNodeIds) : [],
           safeStopConditions: optionalSafeStopIds,
           deliverables: deliverableIds,

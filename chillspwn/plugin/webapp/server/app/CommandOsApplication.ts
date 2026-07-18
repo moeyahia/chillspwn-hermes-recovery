@@ -63,11 +63,18 @@ import {
 } from "../script-artifacts";
 import { BrainContextService } from "../brain-runtime";
 import { MemoryRepository, SecondBrainService } from "../memory";
+import type { V2ToolCoverageReport } from "../mcp/V2ToolCoverageAudit";
+import {
+  createRuntimeToolValidationReadinessProvider,
+  evaluateRuntimeToolValidation,
+} from "./RuntimeToolValidation";
 
 export interface CommandOsApplicationOptions {
   readonly databasePath: string;
   readonly readinessProviders: (database: SqliteDatabase) => readonly ReadinessCheckProvider[];
   readonly runtimeProjection: () => RuntimeProjectionInput;
+  /** Exact per-tool release evidence. Absence fails closed for execution readiness. */
+  readonly runtimeToolValidation?: () => V2ToolCoverageReport;
   readonly resolveActor: (request: Request) => string;
   readonly resolveEventSensitivity?: (request: Request) => EventSensitivity;
   readonly projectionIntervalMs?: number;
@@ -210,9 +217,25 @@ export function createCommandOsApplication(
     intervalMs: options.projectionIntervalMs,
   });
   const router = Router();
+  const configuredReadinessProviders = options.readinessProviders(database);
+  const hasConfiguredToolValidation = configuredReadinessProviders.some(
+    ({ id }) => id === "runtime_tool_validation",
+  );
+  const scopedToolValidationProvider = options.runtimeToolValidation
+    ? createRuntimeToolValidationReadinessProvider(
+        options.runtimeToolValidation,
+        () => options.runtimeProjection().capabilityManifests,
+      )
+    : undefined;
   const readinessProviders = [
     createDatabaseReadinessProvider(database),
-    ...options.readinessProviders(database),
+    ...configuredReadinessProviders.map((provider) =>
+      provider.id === "runtime_tool_validation" && scopedToolValidationProvider
+        ? scopedToolValidationProvider
+        : provider),
+    ...(!hasConfiguredToolValidation && scopedToolValidationProvider
+      ? [scopedToolValidationProvider]
+      : []),
   ];
 
   router.use((request, response, next) => {
@@ -359,6 +382,12 @@ export function createCommandOsApplication(
     const enforcingProviders = callableProviders.filter((provider) =>
       provider.enforcesAutonomousBoundary);
     const guidedProviders = callableProviders.filter((provider) => provider.supportsGuided);
+    let toolValidation: V2ToolCoverageReport;
+    try {
+      toolValidation = options.runtimeToolValidation?.() ?? evaluateRuntimeToolValidation([]);
+    } catch {
+      toolValidation = evaluateRuntimeToolValidation([]);
+    }
     const mcpReady = runtime.mcp.enabled
       && runtime.mcp.executionMode === "enabled"
       && runtime.mcp.startPermitted
@@ -371,7 +400,8 @@ export function createCommandOsApplication(
     const autonomousReady = sharedBoundaryReady
       && runtime.actionBoundaryActive
       && enforcingProviders.length > 0
-      && mcpReady;
+      && mcpReady
+      && toolValidation.releasable;
     const guidedReady = sharedBoundaryReady && guidedProviders.length > 0;
     const dependenciesReady = autonomousReady && guidedReady;
     response.setHeader("Cache-Control", "no-store");
@@ -388,6 +418,7 @@ export function createCommandOsApplication(
       execution: {
         autonomous: autonomousReady ? "ready" : "unavailable",
         guided: guidedReady ? "ready" : "unavailable",
+        guidedToolExecution: toolValidation.releasable ? "ready" : "unavailable",
         actionBoundaryActive: runtime.actionBoundaryActive,
         delegationEnforced: runtime.delegationEnforced,
         noHandsCommanderEnforced: runtime.noHandsCommanderEnforced,
@@ -405,6 +436,22 @@ export function createCommandOsApplication(
           configuredServers: runtime.mcp.configuredServers,
           runnableServers: runtime.mcp.runnableServers,
           executionMode: runtime.mcp.executionMode,
+          validation: {
+            status: toolValidation.releasable ? "ready" : "blocked",
+            registeredTools: toolValidation.registeredTools,
+            fullyCovered: toolValidation.fullyCovered,
+            schemaValidationCovered: toolValidation.schemaValidationCovered,
+            safeSuccessPathCovered: toolValidation.safeSuccessPathCovered,
+            failureClassificationCovered: toolValidation.failureClassificationCovered,
+            humanMessage: toolValidation.releasable
+              ? `All ${toolValidation.registeredTools} exposed tool bindings have complete current validation evidence.`
+              : `Only ${toolValidation.fullyCovered} of ${toolValidation.registeredTools} exposed tool bindings have complete current validation evidence.`,
+            remediation: toolValidation.releasable
+              ? undefined
+              : "Keep unvalidated tool execution unavailable until exact schema, safe success, and failure-path evidence is attached.",
+            blockers: toolValidation.blockers.slice(0, 50),
+            blockerCount: toolValidation.blockers.length,
+          },
         },
         specialists: {
           status: runtime.specialistsConfigured > 0 ? "available" : "unavailable",

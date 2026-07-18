@@ -5,6 +5,7 @@ import type { Server } from "node:http";
 import express from "express";
 import { CommandOsBoundedExecutionPort } from "../../app/CommandOsRuntimeAdapters";
 import { createDatabaseConnection, migrateDatabase, type SqliteDatabase } from "../../db";
+import { ControlPlaneLeaseService } from "../../control-plane";
 import { ActionRepository, type DurableAction } from "../../orchestration";
 import { hashJson } from "../../orchestration/serialization";
 import { createGuidedCommanderRouter } from "../../guided-commander";
@@ -31,6 +32,7 @@ class CallbackPort implements ResultAwareExecutionPort {
   readonly dispatched: DurableAction[] = [];
   readonly cancelled: string[] = [];
   sink?: ExecutionResultSink;
+  cancelGate?: Promise<void>;
 
   bindResultSink(sink: ExecutionResultSink): () => void {
     this.sink = sink;
@@ -47,6 +49,7 @@ class CallbackPort implements ResultAwareExecutionPort {
 
   async cancelRun(runId: string): Promise<void> {
     this.cancelled.push(runId);
+    await this.cancelGate;
   }
 
   async succeed(index = 0): Promise<void> {
@@ -67,7 +70,7 @@ class CallbackPort implements ResultAwareExecutionPort {
 
   async fail(
     index = 0,
-    category: "timeout" | "deterministic_tool_error" = "timeout",
+    category: "timeout" | "deterministic_tool_error" | "invalid_input" = "timeout",
     retryAfterMs?: number,
   ): Promise<void> {
     const action = this.dispatched[index]!;
@@ -79,8 +82,15 @@ class CallbackPort implements ResultAwareExecutionPort {
       success: false,
       summary: category === "timeout"
         ? "The authorized service observation timed out without evidence"
-        : "The represented service observation returned a deterministic error",
+        : category === "invalid_input"
+          ? "The represented tool input contained an unresolved placeholder"
+          : "The represented service observation returned a deterministic error",
       progress: {},
+      failure: {
+        source: "mcp",
+        code: category === "invalid_input" ? "mcp_tool_input_placeholder" : `fixture_${category}`,
+        message: category === "invalid_input" ? "MCP input validation failed before dispatch" : category,
+      },
       failureCategory: category,
       ...(retryAfterMs === undefined ? {} : { retryAfterMs }),
     });
@@ -288,7 +298,38 @@ const guidedRecoveryPlanner: MissionPlannerPort = {
         action: {
           ...step.action,
           actionType: "alternate-reconnaissance",
-          arguments: { service: "http", fallbackAfter: "https-timeout" },
+          arguments: {
+            mcpServer: "sechub-reconnaissance",
+            toolName: "quick_scan",
+            arguments: { service: "http", fallbackAfter: "https-timeout" },
+          },
+          intentSummary: "Inspect the alternate approved service path",
+        },
+      })),
+    };
+  },
+};
+
+const autonomousReplanPlanner: MissionPlannerPort = {
+  async plan(input, signal) {
+    const draft = await planner.plan(input, signal);
+    if (!input.rejectionReason) return draft;
+    return {
+      ...draft,
+      strategySummary: "Use one different read-only protocol observation after the retained new fact",
+      rationaleSummary: `The retained fact supports a changed parameter set: ${input.rejectionReason}`,
+      steps: draft.steps.map((step) => ({
+        ...step,
+        title: "Inspect the alternate approved service path",
+        explanation: "The first probe retained a new banner, so this checks a different read-only service path.",
+        rationale: "Changing the protocol parameter is materially different while staying in the signed reconnaissance class.",
+        action: {
+          ...step.action,
+          arguments: {
+            mcpServer: "sechub-reconnaissance",
+            toolName: "quick_scan",
+            arguments: { service: "http", fallbackAfter: "new-banner" },
+          },
           intentSummary: "Inspect the alternate approved service path",
         },
       })),
@@ -329,6 +370,7 @@ function setup(
   selectedPlanner: MissionPlannerPort = planner,
   selectedEvaluator: MissionOutcomeEvaluatorPort = evaluator,
   crashAfterCommit?: NonNullable<Parameters<typeof createMissionRuntime>[0]["crashAfterCommit"]>,
+  leaseTtlMs = 10_000,
 ) {
   const database = createDatabaseConnection({ filename: ":memory:" });
   migrateDatabase(database);
@@ -341,7 +383,7 @@ function setup(
     outcomeEvaluator: selectedEvaluator,
     execution: port,
     workerId: "runtime-test-worker",
-    leaseTtlMs: 10_000,
+    leaseTtlMs,
     scanIntervalMs: 100,
     ...(crashAfterCommit ? { crashAfterCommit } : {}),
   });
@@ -354,6 +396,7 @@ function restartedRuntime(
   selectedPlanner: MissionPlannerPort = planner,
   selectedEvaluator: MissionOutcomeEvaluatorPort = evaluator,
   workerId = "runtime-test-worker",
+  leaseTtlMs = 10_000,
 ) {
   return createMissionRuntime({
     database,
@@ -361,22 +404,388 @@ function restartedRuntime(
     outcomeEvaluator: selectedEvaluator,
     execution: port,
     workerId,
-    leaseTtlMs: 10_000,
+    leaseTtlMs,
     scanIntervalMs: 100,
   });
 }
 
+function exactResumeBoundary(runtime: ReturnType<typeof createMissionRuntime>, runId: string) {
+  const run = runtime.repository.getRunProjection(runId);
+  const checkpoint = runtime.coordinator.getLatestCheckpoint(runId);
+  if (!checkpoint || run.status !== "blocked") throw new Error("Fixture has no blocked resume boundary");
+  return {
+    expectedRunVersion: run.version,
+    expectedRunStatus: "blocked" as const,
+    expectedCheckpointId: checkpoint.id,
+    expectedCheckpointStateHash: checkpoint.stateHash,
+    expectedCheckpointEventSequence: checkpoint.eventSequence,
+  };
+}
+
 describe("MissionRuntimeEngine", () => {
+  test("execution results reject transferred run or mission ownership before mutation or duplicate receipt", async () => {
+    for (const ownership of ["run", "mission"] as const) {
+      for (const resultState of ["running", "duplicate"] as const) {
+        const { database, runtime, port, runId, missionId } = setup("autonomous");
+        try {
+          await runtime.processRunNow(runId);
+          expect(port.dispatched).toHaveLength(1);
+          if (resultState === "duplicate") {
+            await port.succeed();
+            expect(database.prepare("SELECT status FROM actions WHERE run_id = ?").get(runId))
+              .toEqual({ status: "succeeded" });
+          }
+
+          database.prepare(`UPDATE ${ownership === "run" ? "runs" : "missions"}
+            SET control_plane = 'legacy' WHERE id = ?`)
+            .run(ownership === "run" ? runId : missionId);
+          const before = database.prepare(`
+            SELECT status, result_summary, ended_at, updated_at
+            FROM actions WHERE id = ?
+          `).get(port.dispatched[0]!.id);
+
+          await expect(port.succeed()).rejects.toMatchObject({
+            code: "control_plane_mismatch",
+          });
+          expect(database.prepare(`
+            SELECT status, result_summary, ended_at, updated_at
+            FROM actions WHERE id = ?
+          `).get(port.dispatched[0]!.id)).toEqual(before);
+          expect(database.prepare(`
+            SELECT COUNT(*) AS count FROM events
+            WHERE run_id = ? AND event_type = 'action.completed'
+          `).get(runId)).toEqual({ count: resultState === "duplicate" ? 1 : 0 });
+        } finally {
+          await runtime.stop();
+          database.close();
+        }
+      }
+    }
+  });
+
+  test("execution-semantic operator mutations reject legacy control-plane runs before changing them", async () => {
+    for (const operation of ["approve", "skip", "reject", "manual"] as const) {
+      const { database, runtime, runId } = setup("guided");
+      try {
+        await runtime.processRunNow(runId);
+        const decision = runtime.repository.listDecisions({ runId, status: "pending" })[0]!;
+        database.prepare("UPDATE runs SET control_plane = 'legacy' WHERE id = ?").run(runId);
+        const invoke = operation === "approve"
+          ? runtime.approveGuidedDecision(decision.id, "operator-test", "Approve represented step")
+          : operation === "skip"
+            ? runtime.skipGuidedDecision(decision.id, "operator-test", "Skip represented step")
+            : operation === "reject"
+              ? runtime.rejectGuidedDecision(decision.id, "operator-test", "Use another approach")
+              : runtime.submitManualGuidedResult(
+                  decision.id,
+                  "operator-test",
+                  "The represented check returned one bounded observation.",
+                );
+        await expect(invoke).rejects.toMatchObject({ code: "control_plane_mismatch" });
+        expect(database.prepare("SELECT status FROM guided_decisions WHERE id = ?").get(decision.id))
+          .toEqual({ status: "pending" });
+        expect(database.prepare("SELECT COUNT(*) AS count FROM actions WHERE run_id = ?").get(runId))
+          .toEqual({ count: 0 });
+      } finally {
+        await runtime.stop();
+        database.close();
+      }
+    }
+
+    for (const ownership of ["run", "mission"] as const) {
+      const { database, runtime, runId, missionId } = setup("autonomous");
+      try {
+        database.prepare(`UPDATE ${ownership === "run" ? "runs" : "missions"}
+          SET control_plane = 'legacy' WHERE id = ?`)
+          .run(ownership === "run" ? runId : missionId);
+        await expect(runtime.cancelRun(runId, "operator-test", "Stop the imported run"))
+          .rejects.toMatchObject({ code: "control_plane_mismatch" });
+        expect(database.prepare("SELECT status FROM runs WHERE id = ?").get(runId))
+          .toEqual({ status: "planning" });
+      } finally {
+        await runtime.stop();
+        database.close();
+      }
+    }
+  });
+
+  test("execution-semantic operator mutations reject another active V2 controller fence", async () => {
+    for (const operation of ["approve", "skip", "reject", "manual"] as const) {
+      const { database, runtime, runId } = setup("guided");
+      try {
+        await runtime.processRunNow(runId);
+        const decision = runtime.repository.listDecisions({ runId, status: "pending" })[0]!;
+        new ControlPlaneLeaseService(database).acquire({
+          runId,
+          controlPlane: "command_os_v2",
+          leaseOwner: "other-v2-controller",
+          ttlMs: 10_000,
+        });
+        const invoke = operation === "approve"
+          ? runtime.approveGuidedDecision(decision.id, "operator-test", "Approve represented step")
+          : operation === "skip"
+            ? runtime.skipGuidedDecision(decision.id, "operator-test", "Skip represented step")
+            : operation === "reject"
+              ? runtime.rejectGuidedDecision(decision.id, "operator-test", "Use another approach")
+              : runtime.submitManualGuidedResult(
+                  decision.id,
+                  "operator-test",
+                  "The represented check returned one bounded observation.",
+                );
+        await expect(invoke).rejects.toMatchObject({ code: "lease_conflict" });
+        expect(database.prepare("SELECT status FROM guided_decisions WHERE id = ?").get(decision.id))
+          .toEqual({ status: "pending" });
+        expect(database.prepare("SELECT COUNT(*) AS count FROM actions WHERE run_id = ?").get(runId))
+          .toEqual({ count: 0 });
+      } finally {
+        await runtime.stop();
+        database.close();
+      }
+    }
+
+    const { database, runtime, runId } = setup("autonomous");
+    try {
+      new ControlPlaneLeaseService(database).acquire({
+        runId,
+        controlPlane: "command_os_v2",
+        leaseOwner: "other-v2-controller",
+        ttlMs: 10_000,
+      });
+      await expect(runtime.cancelRun(runId, "operator-test", "Stop this run"))
+        .rejects.toMatchObject({ code: "lease_conflict" });
+      expect(database.prepare("SELECT status FROM runs WHERE id = ?").get(runId))
+        .toEqual({ status: "planning" });
+    } finally {
+      await runtime.stop();
+      database.close();
+    }
+  });
+
+  test("scheduler, continuation replay, and startup recovery ignore legacy-owned work", async () => {
+    let plannerCalls = 0;
+    const countingPlanner: MissionPlannerPort = {
+      async plan(input) {
+        plannerCalls += 1;
+        return planner.plan(input);
+      },
+    };
+    const { database, runtime, runId } = setup("autonomous", countingPlanner);
+    try {
+      const lease = runtime.coordinator.acquireRunLease(runId, "expired-legacy-worker", 10_000);
+      database.prepare(`
+        INSERT INTO runtime_continuations (
+          id, run_id, kind, source_id, status, attempt_count, available_at,
+          created_at, updated_at
+        ) VALUES ('legacy-continuation', ?, 'resume_recovery_pending', 'legacy-source',
+          'pending', 0, '2000-01-01T00:00:00.000Z',
+          '2000-01-01T00:00:00.000Z', '2000-01-01T00:00:00.000Z')
+      `).run(runId);
+      database.prepare(`
+        UPDATE runs SET control_plane = 'legacy', lease_expires_at = '2000-01-01T00:00:00.000Z'
+        WHERE id = ?
+      `).run(runId);
+
+      expect(runtime.repository.listRunnableRuns(new Date().toISOString())).toEqual([]);
+      expect(runtime.continuations.readyRunIds(new Date().toISOString())).toEqual([]);
+      expect(() => runtime.continuations.enqueue({
+        runId,
+        kind: "resume_recovery_pending",
+        sourceId: "legacy-enqueue",
+        now: new Date().toISOString(),
+      })).toThrow("requires Command OS V2 ownership");
+      await expect(runtime.replayContinuations(runId)).rejects.toMatchObject({
+        code: "control_plane_mismatch",
+      });
+      expect(await runtime.scanOnce()).toBe(0);
+      expect(await runtime.recover()).toBe(0);
+      expect(plannerCalls).toBe(0);
+      expect(database.prepare("SELECT status, lease_owner FROM runs WHERE id = ?").get(runId))
+        .toEqual({ status: "planning", lease_owner: lease.ownerId });
+      expect(database.prepare("SELECT status FROM runtime_continuations WHERE id = 'legacy-continuation'").get())
+        .toEqual({ status: "pending" });
+
+      database.prepare("UPDATE runs SET control_plane = 'command_os_v2' WHERE id = ?").run(runId);
+      database.prepare("UPDATE missions SET control_plane = 'legacy' WHERE id = 'mission-autonomous'").run();
+      expect(runtime.repository.listRunnableRuns(new Date().toISOString())).toEqual([]);
+      expect(runtime.continuations.readyRunIds(new Date().toISOString())).toEqual([]);
+      expect(await runtime.scanOnce()).toBe(0);
+      expect(await runtime.recover()).toBe(0);
+      expect(plannerCalls).toBe(0);
+    } finally {
+      await runtime.stop();
+      database.close();
+    }
+  });
+
+  test("startup resumes an exact idempotent action without scheduling a replacement plan", async () => {
+    const initial = setup("autonomous");
+    const { database, runtime, port, runId } = initial;
+    let replacement: ReturnType<typeof createMissionRuntime> | undefined;
+    try {
+      await runtime.processRunNow(runId);
+      expect(port.dispatched).toHaveLength(1);
+      await runtime.stop();
+      database.prepare(`
+        UPDATE runs SET lease_expires_at = '2000-01-01T00:00:00.000Z',
+          last_heartbeat_at = '2000-01-01T00:00:00.000Z'
+        WHERE id = ?
+      `).run(runId);
+
+      let plannerCalls = 0;
+      const countingPlanner: MissionPlannerPort = {
+        async plan(input) {
+          plannerCalls += 1;
+          return planner.plan(input);
+        },
+      };
+      replacement = restartedRuntime(database, port, countingPlanner, evaluator, "restart-action-worker");
+      expect(await replacement.recover()).toBe(1);
+      expect(port.dispatched).toHaveLength(2);
+      expect(replacement.repository.getRunProjection(runId).status).toBe("recovering");
+      expect(replacement.repository.listRunnableRuns(new Date().toISOString())).toEqual([]);
+      await replacement.scanOnce();
+      expect(plannerCalls).toBe(0);
+      expect(database.prepare("SELECT COUNT(*) AS count FROM plans WHERE run_id = ?").get(runId))
+        .toEqual({ count: 1 });
+    } finally {
+      await replacement?.stop();
+      await runtime.stop();
+      database.close();
+    }
+  });
+
+  test("untyped Autonomous recovery with an existing plan safe-stops without replanning", async () => {
+    const initial = setup("autonomous");
+    const { database, runtime, port, runId } = initial;
+    let replacement: ReturnType<typeof createMissionRuntime> | undefined;
+    try {
+      await runtime.processRunNow(runId);
+      expect(port.dispatched).toHaveLength(1);
+      await runtime.stop();
+      const now = "2026-07-15T00:01:00.000Z";
+      database.transaction(() => {
+        database.prepare(`
+          UPDATE actions SET status = 'cancelled', ended_at = ?, updated_at = ?
+          WHERE run_id = ? AND status IN ('queued', 'running')
+        `).run(now, now, runId);
+        database.prepare(`
+          UPDATE assignments SET status = 'cancelled', ended_at = ?, updated_at = ?
+          WHERE run_id = ? AND status IN ('queued', 'active')
+        `).run(now, now, runId);
+        database.prepare(`
+          UPDATE plan_steps SET status = 'blocked', updated_at = ?
+          WHERE run_id = ? AND status = 'running'
+        `).run(now, runId);
+        database.prepare(`
+          UPDATE runs SET status = 'recovering', status_reason = ?,
+            lease_owner = NULL, lease_acquired_at = NULL, last_heartbeat_at = NULL,
+            lease_expires_at = NULL, version = version + 1, updated_at = ?
+          WHERE id = ?
+        `).run("Recovered state without a typed retry or replan directive", now, runId);
+      })();
+
+      let plannerCalls = 0;
+      const countingPlanner: MissionPlannerPort = {
+        async plan(input) {
+          plannerCalls += 1;
+          return planner.plan(input);
+        },
+      };
+      replacement = restartedRuntime(database, new CallbackPort(), countingPlanner, evaluator, "restart-plan-worker");
+      expect(replacement.continuations.reconcileFromCanonicalState(now)).toBe(0);
+      expect(replacement.continuations.listForRun(runId).filter(
+        (item) => item.kind === "resume_recovery_pending" && item.status !== "completed",
+      )).toHaveLength(0);
+      await replacement.processRunNow(runId);
+
+      expect(plannerCalls).toBe(0);
+      expect(replacement.repository.getRunProjection(runId)).toMatchObject({
+        status: "blocked",
+        statusReason: "Safe-stopped: the saved recovery state does not prove which existing plan and step may continue, so ChillsPwn did not create or replace a plan.",
+      });
+      expect(database.prepare("SELECT COUNT(*) AS count FROM plans WHERE run_id = ?").get(runId))
+        .toEqual({ count: 1 });
+      expect(database.prepare(`
+        SELECT COUNT(*) AS count FROM events
+        WHERE run_id = ? AND event_type = 'run.autonomous_safe_stopped'
+          AND json_extract(payload_json, '$.code') = 'autonomous_recovery_authority_missing'
+      `).get(runId)).toEqual({ count: 1 });
+    } finally {
+      await replacement?.stop();
+      await runtime.stop();
+      database.close();
+    }
+  });
+
+  test("paused Autonomous plan fails closed without invoking the planner when exact continuation is unverifiable", async () => {
+    let plannerCalls = 0;
+    const countingPlanner: MissionPlannerPort = {
+      async plan(input) {
+        plannerCalls += 1;
+        return planner.plan(input);
+      },
+    };
+    const { database, runtime, runId } = setup("autonomous", countingPlanner);
+    try {
+      const now = "2026-07-15T00:00:01.000Z";
+      database.prepare(`
+        INSERT INTO plans (
+          id, run_id, version, status, strategy_summary, plan_hash,
+          created_by, created_at, activated_at
+        ) VALUES ('plan-paused-autonomous', ?, 1, 'active',
+          'Continue the checkpointed authorized plan', ?, 'planner-test', ?, ?)
+      `).run(runId, "f".repeat(64), now, now);
+      database.prepare(`
+        INSERT INTO plan_steps (
+          id, plan_id, run_id, ordinal, phase, title, objective, status,
+          assigned_agent_id, created_at, updated_at
+        ) VALUES ('step-paused-autonomous', 'plan-paused-autonomous', ?, 0,
+          'reconnaissance', 'Inspect authorized service', 'Collect one observation',
+          'ready', 'ReconScout', ?, ?)
+      `).run(runId, now, now);
+      database.prepare(`
+        INSERT INTO assignments (
+          id, run_id, step_id, agent_id, status, created_at, updated_at
+        ) VALUES ('assignment-paused-autonomous', ?, 'step-paused-autonomous',
+          'ReconScout', 'queued', ?, ?)
+      `).run(runId, now, now);
+      database.prepare(`
+        UPDATE runs SET status = 'running', current_plan_id = 'plan-paused-autonomous',
+          current_step_id = 'step-paused-autonomous', current_owner_id = 'ReconScout',
+          started_at = COALESCE(started_at, ?), updated_at = ?
+        WHERE id = ?
+      `).run(now, now, runId);
+
+      runtime.pauseRun(runId, "operator-test", "Inspect exact plan boundary");
+      const boundary = exactResumeBoundary(runtime, runId);
+      expect(() => runtime.resumeRun(
+        runId,
+        "operator-test",
+        "Continue the exact plan only",
+        boundary,
+      )).toThrow("Paused Autonomous plan continuation is not cryptographically bound");
+      expect(plannerCalls).toBe(0);
+      expect(runtime.repository.getRunProjection(runId)).toMatchObject({
+        status: "blocked",
+        currentPlanId: "plan-paused-autonomous",
+        currentStepId: "step-paused-autonomous",
+        version: boundary.expectedRunVersion,
+      });
+      expect(runtime.continuations.listForRun(runId)).toEqual([]);
+    } finally {
+      await runtime.stop();
+      database.close();
+    }
+  });
+
   test("a paused Autonomous source run cannot resume after an explicit successor branch exists", async () => {
     const { database, runtime, runId, missionId } = setup("autonomous");
     try {
       const now = "2026-07-15T00:00:01.000Z";
       const contract = database.prepare("SELECT contract_id FROM runs WHERE id = ?")
         .get(runId) as { contract_id: string };
-      database.prepare(`
-        UPDATE runs SET status = 'blocked', status_reason = 'Paused by operator: branch',
-          updated_at = ?, version = version + 1 WHERE id = ?
-      `).run(now, runId);
+      runtime.pauseRun(runId, "operator-test", "Create the exact branch boundary");
+      const boundary = exactResumeBoundary(runtime, runId);
       database.prepare(`
         INSERT INTO runs (
           id, mission_id, journey, status, contract_id, budget_json,
@@ -398,7 +807,7 @@ describe("MissionRuntimeEngine", () => {
 
       let rejection: unknown;
       try {
-        runtime.resumeRun(runId, "operator-test", "Resume the superseded source");
+        runtime.resumeRun(runId, "operator-test", "Resume the superseded source", boundary);
       } catch (error) {
         rejection = error;
       }
@@ -1015,6 +1424,87 @@ describe("MissionRuntimeEngine", () => {
     }
   }, 120_000);
 
+  test("slow cancellation keeps durable and control-plane authority alive until cleanup is confirmed", async () => {
+    const { database, runtime, port, runId } = setup(
+      "autonomous",
+      planner,
+      evaluator,
+      undefined,
+      1_000,
+    );
+    let releaseCleanup!: () => void;
+    port.cancelGate = new Promise<void>((resolve) => { releaseCleanup = resolve; });
+    try {
+      await runtime.processRunNow(runId);
+      const cancellation = runtime.cancelRun(runId, "operator-test", "Stop after slow cleanup");
+      await Bun.sleep(1_500);
+      releaseCleanup();
+      await cancellation;
+
+      expect(runtime.repository.getRunProjection(runId).status).toBe("cancelled");
+      expect(database.prepare(`
+        SELECT status, lease_owner, lease_expires_at FROM runs WHERE id = ?
+      `).get(runId)).toEqual({ status: "cancelled", lease_owner: null, lease_expires_at: null });
+      expect(database.prepare(`
+        SELECT status FROM runtime_continuations
+        WHERE run_id = ? AND kind = 'cancellation_finalize_pending'
+      `).get(runId)).toEqual({ status: "completed" });
+    } finally {
+      releaseCleanup?.();
+      await runtime.stop();
+      database.close();
+    }
+  }, 10_000);
+
+  test("cancellation and Guided stop records fail closed when ownership transfers during external cleanup", async () => {
+    let databaseForHook: SqliteDatabase | undefined;
+    const configured = setup("guided", planner, evaluator, (point, context) => {
+      if (point !== "cancellation_cleanup_before_finalize") return;
+      databaseForHook?.prepare("UPDATE runs SET control_plane = 'legacy' WHERE id = ?")
+        .run(context.runId);
+    });
+    const { database, runtime, port, runId, missionId } = configured;
+    databaseForHook = database;
+    try {
+      await runtime.processRunNow(runId);
+      const decision = runtime.repository.listDecisions({ runId, status: "pending" })[0]!;
+
+      await expect(runtime.cancelRun(
+        runId,
+        "operator-test",
+        "Stop only this exact represented Guided mission",
+        {
+          kind: "guided_stop",
+          decisionId: decision.id,
+          missionId,
+          stepId: decision.stepId,
+          actionFingerprint: decision.actionFingerprint,
+          parameterHash: hashJson(decision.requestedParameters),
+        },
+      )).rejects.toMatchObject({ code: "control_plane_mismatch" });
+
+      expect(port.cancelled).toEqual([runId]);
+      expect(database.prepare("SELECT status FROM runs WHERE id = ?").get(runId))
+        .toEqual({ status: "waiting_guided_decision" });
+      expect(database.prepare("SELECT status FROM missions WHERE id = ?").get(missionId))
+        .toEqual({ status: "active" });
+      expect(database.prepare("SELECT status FROM guided_decisions WHERE id = ?").get(decision.id))
+        .toEqual({ status: "pending" });
+      expect(database.prepare(`
+        SELECT COUNT(*) AS count FROM events
+        WHERE run_id = ? AND event_type IN ('run.cancelled', 'guided.mission_stopped')
+      `).get(runId)).toEqual({ count: 0 });
+      expect(database.prepare(`
+        SELECT COUNT(*) AS count FROM audit_records
+        WHERE run_id = ? AND action IN ('run.cancelled', 'guided.mission_stopped')
+      `).get(runId)).toEqual({ count: 0 });
+    } finally {
+      database.prepare("UPDATE runs SET control_plane = 'command_os_v2' WHERE id = ?").run(runId);
+      await runtime.stop();
+      database.close();
+    }
+  }, 120_000);
+
   test("cancelling a waiting Guided run closes queued assignments and its exact decision", async () => {
     const { database, runtime, port, runId } = setup("guided");
     try {
@@ -1294,6 +1784,9 @@ describe("MissionRuntimeEngine", () => {
         description: "Bounded test specialist",
         mcpServer: "sechub-reconnaissance",
         toolNames: ["quick_scan"],
+        toolInputSchemas: {
+          quick_scan: { type: "object", additionalProperties: true },
+        },
         safetyBoundaries: ["fixture target only"],
       }],
       callGrok: async () => { throw new Error("The MCP execution regression must not call a provider"); },
@@ -2033,7 +2526,11 @@ describe("MissionRuntimeEngine", () => {
       expect(recoveryDecision.actionFingerprint).not.toBe(initialDecision!.actionFingerprint);
       expect(recoveryDecision.requestedParameters).toMatchObject({
         actionType: "alternate-reconnaissance",
-        arguments: { service: "http", fallbackAfter: "https-timeout" },
+        arguments: {
+          mcpServer: "sechub-reconnaissance",
+          toolName: "quick_scan",
+          arguments: { service: "http", fallbackAfter: "https-timeout" },
+        },
       });
       expect(port.dispatched).toHaveLength(1);
 
@@ -2077,7 +2574,11 @@ describe("MissionRuntimeEngine", () => {
       expect(port.dispatched).toHaveLength(2);
       expect(port.dispatched[1]).toMatchObject({
         actionType: "alternate-reconnaissance",
-        arguments: { service: "http", fallbackAfter: "https-timeout" },
+        arguments: {
+          mcpServer: "sechub-reconnaissance",
+          toolName: "quick_scan",
+          arguments: { service: "http", fallbackAfter: "https-timeout" },
+        },
         guidedDecisionId: recoveryDecision.id,
       });
     } finally {
@@ -2135,6 +2636,38 @@ describe("MissionRuntimeEngine", () => {
           AND summary LIKE '%same reconnaissance action and parameters%'
       `).get(runId)).toEqual({ count: 1 });
       expect(port.dispatched).toHaveLength(1);
+    } finally {
+      await runtime.stop();
+      database.close();
+    }
+  }, 120_000);
+
+  test("persists a terminal structured diagnosis for schema-invalid MCP input", async () => {
+    const { database, runtime, port, runId } = setup("autonomous");
+    try {
+      await runtime.processRunNow(runId);
+      await port.fail(0, "invalid_input");
+
+      expect(runtime.repository.getRunProjection(runId).status).toBe("failed");
+      expect(database.prepare(`
+        SELECT category, code, originating_component, retryable, state,
+          json_extract(automatic_recovery_json, '$.directive') AS directive
+        FROM failure_diagnoses WHERE run_id = ? AND action_id = ?
+      `).get(runId, port.dispatched[0]!.id)).toEqual({
+        category: "deterministic_tool_error",
+        code: "mcp_tool_input_placeholder",
+        originating_component: "command-runtime.mcp-boundary",
+        retryable: 0,
+        state: "terminal",
+        directive: "failed",
+      });
+      expect(database.prepare(`
+        SELECT COUNT(*) AS count FROM failure_diagnoses WHERE run_id = ?
+      `).get(runId)).toEqual({ count: 1 });
+      expect(database.prepare(`
+        SELECT json_extract(details_json, '$.category') AS category
+        FROM audit_records WHERE run_id = ? AND action = 'failure_diagnosis.created'
+      `).get(runId)).toEqual({ category: "deterministic_tool_error" });
     } finally {
       await runtime.stop();
       database.close();
@@ -2275,6 +2808,65 @@ describe("MissionRuntimeEngine", () => {
     }
   }, 120_000);
 
+  test("restart executes one exact bounded Autonomous replan committed with new evidence", async () => {
+    const configured = setup("autonomous", autonomousReplanPlanner, evaluator, (point) => {
+      if (point === "resume_recovery_pending") throw new Error("simulated process exit");
+    });
+    const { database, runtime, port, runId } = configured;
+    const replacementPort = new CallbackPort();
+    let replacement: ReturnType<typeof createMissionRuntime> | undefined;
+    try {
+      await runtime.processRunNow(runId);
+      const failedAction = port.dispatched[0]!;
+      await expect(port.sink!.acceptExecutionResult({
+        actionId: failedAction.id,
+        runId,
+        actionFingerprint: failedAction.fingerprint,
+        success: false,
+        summary: "The service returned a different verified banner before the deterministic tool failure",
+        progress: { evidenceIds: ["evidence-new-replan-fact"] },
+        failure: {
+          source: "mcp",
+          code: "fixture_deterministic_tool_error",
+          message: "The original service probe cannot parse the newly observed banner",
+        },
+        failureCategory: "deterministic_tool_error",
+      })).rejects.toThrow("Injected process crash");
+      expect(runtime.repository.getRunProjection(runId).status).toBe("recovering");
+      expect(database.prepare(`
+        SELECT status, source_id FROM runtime_continuations
+        WHERE run_id = ? AND kind = 'resume_recovery_pending'
+      `).get(runId)).toEqual({ status: "pending", source_id: failedAction.id });
+      await runtime.stop();
+
+      replacement = restartedRuntime(
+        database,
+        replacementPort,
+        autonomousReplanPlanner,
+        evaluator,
+        "restart-replan-worker",
+      );
+      await replacement.start();
+
+      expect(database.prepare(`
+        SELECT status, last_error FROM runtime_continuations
+        WHERE run_id = ? AND kind = 'resume_recovery_pending'
+      `).get(runId)).toEqual({ status: "completed", last_error: null });
+      expect(replacement.repository.getRunProjection(runId)).toMatchObject({
+        status: "running",
+      });
+      expect(database.prepare("SELECT COUNT(*) AS count FROM plans WHERE run_id = ?").get(runId))
+        .toEqual({ count: 2 });
+      expect(replacementPort.dispatched).toHaveLength(1);
+      expect(replacementPort.dispatched[0]!.intentSummary)
+        .toBe("Inspect the alternate approved service path");
+    } finally {
+      await replacement?.stop();
+      await runtime.stop();
+      database.close();
+    }
+  }, 120_000);
+
   test("restart advances a committed Guided manual result without redispatch or duplicate evidence", async () => {
     const configured = setup("guided", manualPlanner, evaluator, (point) => {
       if (point === "manual_result_to_advance") throw new Error("simulated process exit");
@@ -2399,12 +2991,17 @@ describe("MissionRuntimeEngine", () => {
     });
     const { database, runtime, port, runId } = configured;
     const replacementPort = new CallbackPort();
+    let releaseReplacementCleanup!: () => void;
+    replacementPort.cancelGate = new Promise<void>((resolve) => {
+      releaseReplacementCleanup = resolve;
+    });
     const replacement = restartedRuntime(
       database,
       replacementPort,
       planner,
       evaluator,
       "runtime-recovery-worker",
+      1_000,
     );
     try {
       await runtime.processRunNow(runId);
@@ -2437,7 +3034,10 @@ describe("MissionRuntimeEngine", () => {
         UPDATE runs SET lease_expires_at = '2000-01-01T00:00:00.000Z' WHERE id = ?
       `).run(runId);
 
-      await replacement.start();
+      const restart = replacement.start();
+      await Bun.sleep(1_500);
+      releaseReplacementCleanup();
+      await restart;
       expect(replacement.repository.getRunProjection(runId).status).toBe("cancelled");
       expect(replacementPort.cancelled).toEqual([runId]);
       for (const table of ["actions", "plan_steps", "assignments"] as const) {
@@ -2462,6 +3062,7 @@ describe("MissionRuntimeEngine", () => {
       `).get(runId)).toEqual({ count: 1 });
       expect(replacement.coordinator.getLatestCheckpoint(runId)?.state.inFlightActions).toEqual([]);
     } finally {
+      releaseReplacementCleanup?.();
       await replacement.stop();
       database.close();
     }
@@ -2485,7 +3086,8 @@ describe("MissionRuntimeEngine", () => {
       `).get(runId)).toEqual({ count: 1 });
 
       crashPoint = "resume_projection_committed";
-      expect(() => runtime.resumeRun(runId, "operator-test", "Continue exact Guided decision"))
+      const boundary = exactResumeBoundary(runtime, runId);
+      expect(() => runtime.resumeRun(runId, "operator-test", "Continue exact Guided decision", boundary))
         .toThrow("Injected process crash");
       expect(runtime.repository.getRunProjection(runId).status).toBe("waiting_guided_decision");
       expect(database.prepare("SELECT status FROM missions WHERE id = ?").get(missionId))

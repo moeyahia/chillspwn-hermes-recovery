@@ -2,6 +2,10 @@ import { expect, test, type Locator, type Page, type Response, type TestInfo } f
 import { readFileSync } from "node:fs";
 import { validateInteractionManifest } from "../interaction-manifest/schema";
 import { BrowserAudit } from "./support/browserAudit";
+import {
+  createMissionIntakeDynamicFixture,
+  type MissionIntakeDynamicFixture,
+} from "./support/missionIntakeDynamicFixture";
 
 const TEST_ID = "e2e.mission-intake";
 const VISUAL_PROJECT = "chromium-1440";
@@ -47,9 +51,15 @@ async function expectApprovedVisual(locator: Locator, testInfo: TestInfo): Promi
 }
 
 async function normalizeAutonomousReviewVisual(card: Locator): Promise<void> {
-  const commandTrigger = card.page().locator(".os-command-trigger");
-  if (await commandTrigger.count() === 1) {
-    await commandTrigger.evaluate((node) => { (node as HTMLElement).style.visibility = "hidden"; });
+  // Locator screenshots taller than the viewport are captured in tiles. The
+  // sticky shell header can otherwise be painted over a different tile seam
+  // depending on the page's prior scroll position, obscuring the fieldset
+  // legend or one readiness row without any product-state change.
+  for (const selector of [".os-topbar", ".os-refresh-note"]) {
+    const shellOverlay = card.page().locator(selector);
+    if (await shellOverlay.count() === 1) {
+      await shellOverlay.evaluate((node) => { (node as HTMLElement).style.display = "none"; });
+    }
   }
   await card.locator(".os-review-grid > div").evaluateAll((rows) => {
     const replacements: Record<string, string> = {
@@ -57,11 +67,21 @@ async function normalizeAutonomousReviewVisual(card: Locator): Promise<void> {
       Objective: "Map the authorized disposable lab target and retain attributable evidence without changing target state.",
       Targets: "lab:autonomous-intake-approved-visual",
       "Contract SHA-256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "Compatible providers": "1",
     };
     for (const row of rows) {
       const label = row.querySelector("dt")?.textContent?.trim();
       const value = row.querySelector("dd");
       if (label && value && replacements[label]) value.textContent = replacements[label];
+    }
+  });
+  await card.locator(".os-review-list > li").evaluateAll((rows) => {
+    for (const row of rows) {
+      if (row.querySelector("strong")?.textContent?.trim() !== "Inspected enforcing provider paths") continue;
+      const detail = row.querySelector("small");
+      if (detail) {
+        detail.textContent = "1 projected authenticated provider path is compatible with the Autonomous boundary; live readiness is also rechecked at launch.";
+      }
     }
   });
 }
@@ -253,11 +273,71 @@ async function exerciseContract(page: Page, journey: IntakeJourney): Promise<voi
   await expect(stops.locator(".os-mandatory-stop")).toHaveCount(8);
 }
 
-test.describe(`${TEST_ID} registry-driven four-step journeys`, () => {
+async function exerciseAutonomousTeam(page: Page, fixture: MissionIntakeDynamicFixture): Promise<void> {
+  await expect(page.getByText("Specialist team and execution readiness", { exact: true })).toBeVisible();
+  const recommended = page.getByRole("button", { name: "Use recommended team", exact: true });
+  await expect(recommended).toBeVisible();
+  const team = group(page, "Specialist team and execution readiness");
+  const candidate = team.getByRole("checkbox", { name: new RegExp(fixture.agentName, "u") });
+  await expect(candidate).toBeEnabled();
+  const initial = await candidate.isChecked();
+  await candidate.click();
+  await expect(candidate).toBeChecked({ checked: !initial });
+  await candidate.click();
+  await expect(candidate).toBeChecked({ checked: initial });
+  await recommended.click();
+  await expect(candidate).toBeChecked();
+  const selectedSummary = team.locator(":scope > .os-inline-actions > span");
+  const recommendedCount = await team.locator('input[type="checkbox"]:checked').count();
+  expect(recommendedCount, "The live recommended team must contain at least the attested fixture specialist").toBeGreaterThan(0);
+  await expect(selectedSummary).toHaveText(`${recommendedCount} selected`);
+
+  // Other suites legitimately add specialists to the same canonical browser
+  // database. Exercise the live recommendation as returned, then create one
+  // explicit, deterministic operator selection for this mission instead of
+  // allowing unrelated fixture agents to change the signed contract visual.
+  // This proves both the dynamic count and the exact selected-team boundary.
+  const specialistRows = team.locator("label.os-check-field");
+  for (let index = 0; index < await specialistRows.count(); index += 1) {
+    const row = specialistRows.nth(index);
+    const checkbox = row.getByRole("checkbox");
+    const isFixtureSpecialist = (await row.textContent())?.includes(fixture.agentName) === true;
+    if (await checkbox.isDisabled()) {
+      await expect(checkbox).not.toBeChecked();
+    } else if (isFixtureSpecialist) {
+      await checkbox.check();
+    } else {
+      await checkbox.uncheck();
+    }
+  }
+  await expect(team.locator('input[type="checkbox"]:checked')).toHaveCount(1);
+  await expect(selectedSummary).toHaveText("1 selected");
+  await expect(page.getByText("Provider enforcement paths", { exact: true })).toBeVisible();
+}
+
+async function exerciseAutonomousContext(page: Page, fixture: MissionIntakeDynamicFixture): Promise<void> {
+  const context = group(page, "Second Brain context");
+  await expect(context).toContainText("smallest useful set");
+  const scopes = group(page, "Memory scopes allowed for this mission");
+  await expect(scopes.getByRole("checkbox", { name: /Confirmed operator preferences/u })).toBeChecked();
+  await expect(scopes.getByRole("checkbox", { name: /Verified operational lessons/u })).toBeChecked();
+  await expect(scopes.getByRole("checkbox", { name: /Engagement-isolated knowledge/u })).toBeDisabled();
+  const candidate = context.getByRole("checkbox", { name: new RegExp(fixture.memoryTitle, "u") });
+  await expect(candidate).not.toBeChecked();
+  await candidate.check();
+  await expect(candidate).toBeChecked();
+  await context.getByRole("button", { name: "Use no retained context", exact: true }).click();
+  await expect(candidate).not.toBeChecked();
+  await expect(scopes.getByRole("checkbox", { name: /Confirmed operator preferences/u })).toBeChecked();
+  await expect(context).toContainText(/never expand authorization/u);
+}
+
+test.describe(`${TEST_ID} registry-driven journey-specific intake`, () => {
   test.setTimeout(120_000);
 
   test("e2e.mission-intake.autonomous-minimal resolves defaults and remains fail-closed", async ({ page }, testInfo) => {
     const audit = new BrowserAudit(page, { allowEventStreamNavigationAbort: true });
+    const dynamicFixture = createMissionIntakeDynamicFixture(testInfo.testId);
     const target = "lab:autonomous-intake-approved-visual";
     await exerciseMinimalScope(page, "autonomous", target);
     await clickContinue(page, "Outcome and collaboration");
@@ -270,6 +350,10 @@ test.describe(`${TEST_ID} registry-driven four-step journeys`, () => {
     await clickContinue(page, "Outcome and collaboration");
     await clickContinue(page, "Autonomous operating contract");
     await exerciseContract(page, "autonomous");
+    await clickContinue(page, "Specialist team and execution readiness", { autonomousPreflight: true });
+    await exerciseAutonomousTeam(page, dynamicFixture);
+    await clickContinue(page, "Second Brain context", { autonomousPreflight: true });
+    await exerciseAutonomousContext(page, dynamicFixture);
     await clickContinue(page, "Review the resolved mission", { autonomousPreflight: true });
 
     const review = group(page, "Review the resolved mission");
@@ -281,6 +365,7 @@ test.describe(`${TEST_ID} registry-driven four-step journeys`, () => {
     const readiness = review.locator(".os-readiness-summary");
     await expect(readiness).toContainText("blocked");
     await expect(readiness).toContainText("launch blockers");
+    await expect(review.getByText("Signed specialists", { exact: true }).locator("xpath=..").locator("dd")).toHaveText("1");
     const launch = page.getByRole("button", { name: "Launch Autonomous Mission", exact: true });
     await expect(launch).toBeDisabled();
     const visual = page.locator(".os-contract-form > .os-card");

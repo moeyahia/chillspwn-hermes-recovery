@@ -3,10 +3,38 @@ import type { MemoryEdgeSummary, MemoryNodeSummary } from "../../domain/types/br
 import type { BrainGraphLabelDensity, PinnedGraphPositions } from "./brainGraphState";
 import { collapseGraphClusters, compactGraphLayout, graphZoomPercent, layoutGraph, relatedNodeIds, relaxGraphLayout, shortestMemoryPath, type GraphCluster, type GraphPoint } from "./graphUtils";
 
-const CLUSTER_COLORS: Record<string, string> = {
-  operator: "#b8f341", mission: "#61a5ff", attack: "#f3b64b", tool: "#a891ff",
-  evidence: "#67d6c2", agent: "#f0f4f1", failure: "#ff667a", lesson: "#9ed972", other: "#8a9690",
+const CLUSTER_COLOR_TOKENS: Record<string, string> = {
+  operator: "--os-graph-node-operator",
+  mission: "--os-graph-node-mission",
+  attack: "--os-graph-node-attack",
+  tool: "--os-graph-node-tool",
+  evidence: "--os-graph-node-evidence",
+  agent: "--os-graph-node-agent",
+  failure: "--os-graph-node-failure",
+  lesson: "--os-graph-node-lesson",
+  other: "--os-graph-node-other",
 };
+
+function canvasTheme(element: HTMLCanvasElement) {
+  const styles = getComputedStyle(element);
+  const color = (token: string, fallback: string) => styles.getPropertyValue(token).trim() || fallback;
+  return {
+    canvas: color("--os-graph-canvas", "#f8faf9"),
+    grid: color("--os-graph-grid", "rgba(48, 79, 70, 0.08)"),
+    gridStrong: color("--os-graph-grid-strong", "rgba(48, 79, 70, 0.13)"),
+    edge: color("--os-graph-edge", "rgba(34, 63, 55, 0.18)"),
+    edgeConnected: color("--os-graph-edge-connected", "rgba(34, 63, 55, 0.52)"),
+    selection: color("--os-graph-selection", "#173d53"),
+    label: color("--os-graph-label", "#243b35"),
+    nodeBorder: color("--os-graph-node-border", "rgba(255, 255, 255, 0.96)"),
+    accent: color("--os-accent", "#526f00"),
+    danger: color("--os-danger", "#b4233d"),
+    clusters: Object.fromEntries(Object.entries(CLUSTER_COLOR_TOKENS).map(([cluster, token]) => [
+      cluster,
+      color(token, "#71827c"),
+    ])),
+  };
+}
 
 interface Camera { x: number; y: number; zoom: number }
 
@@ -136,10 +164,27 @@ export function MemoryGraphCanvas({
     element.style.height = `${size.height}px`;
     const context = element.getContext("2d");
     if (!context) return;
+    const theme = canvasTheme(element);
     context.setTransform(ratio, 0, 0, ratio, 0, 0);
     context.clearRect(0, 0, size.width, size.height);
-    context.fillStyle = "#090d0f";
+    context.fillStyle = theme.canvas;
     context.fillRect(0, 0, size.width, size.height);
+    for (let x = 0; x <= size.width; x += 32) {
+      context.beginPath();
+      context.moveTo(x + 0.5, 0);
+      context.lineTo(x + 0.5, size.height);
+      context.strokeStyle = x % 128 === 0 ? theme.gridStrong : theme.grid;
+      context.lineWidth = 1;
+      context.stroke();
+    }
+    for (let y = 0; y <= size.height; y += 32) {
+      context.beginPath();
+      context.moveTo(0, y + 0.5);
+      context.lineTo(size.width, y + 0.5);
+      context.strokeStyle = y % 128 === 0 ? theme.gridStrong : theme.grid;
+      context.lineWidth = 1;
+      context.stroke();
+    }
     context.save();
     context.translate(camera.x, camera.y);
     context.scale(camera.zoom, camera.zoom);
@@ -154,8 +199,8 @@ export function MemoryGraphCanvas({
       context.beginPath();
       context.moveTo(source.x, source.y);
       context.lineTo(target.x, target.y);
-      context.lineWidth = (inPath ? 2 : connected ? 1.3 : 0.65) / camera.zoom;
-      context.strokeStyle = inPath ? "rgba(184,243,65,.95)" : connected ? "rgba(240,244,241,.44)" : "rgba(240,244,241,.10)";
+      context.lineWidth = (inPath ? 2.2 : connected ? 1.5 : 1) / camera.zoom;
+      context.strokeStyle = inPath ? theme.accent : connected ? theme.edgeConnected : theme.edge;
       context.stroke();
     });
 
@@ -164,7 +209,7 @@ export function MemoryGraphCanvas({
       if (!node) return;
       const selected = point.id === selectedId;
       const dimmed = selectedId && !related.has(point.id);
-      const color = CLUSTER_COLORS[point.cluster] ?? CLUSTER_COLORS.other;
+      const color = theme.clusters[point.cluster] ?? theme.clusters.other!;
       context.globalAlpha = dimmed ? 0.18 : 1;
       context.beginPath();
       if (["evidence", "failure"].includes(point.cluster)) {
@@ -181,12 +226,12 @@ export function MemoryGraphCanvas({
       context.fillStyle = color;
       context.fill();
       context.lineWidth = (selected ? 3 : node.lifecycleStatus === "disputed" ? 2 : 1) / camera.zoom;
-      context.strokeStyle = selected ? "#ffffff" : node.lifecycleStatus === "disputed" ? "#ff667a" : "rgba(8,11,13,.8)";
+      context.strokeStyle = selected ? theme.selection : node.lifecycleStatus === "disputed" ? theme.danger : theme.nodeBorder;
       context.stroke();
       if (node.pinned || pinnedPositions[point.id]) {
         context.beginPath();
         context.arc(point.x, point.y, point.radius + 4 / camera.zoom, 0, Math.PI * 2);
-        context.strokeStyle = "rgba(184,243,65,.7)";
+        context.strokeStyle = theme.accent;
         context.lineWidth = 1 / camera.zoom;
         context.stroke();
       }
@@ -198,7 +243,7 @@ export function MemoryGraphCanvas({
         context.font = `${selected ? 600 : 500} ${Math.max(9, 11 / camera.zoom)}px Inter, system-ui, sans-serif`;
         context.textAlign = "center";
         context.textBaseline = "top";
-        context.fillStyle = selected ? "#f0f4f1" : "rgba(240,244,241,.74)";
+        context.fillStyle = selected ? theme.selection : theme.label;
         const label = node.title.length > 30 ? `${node.title.slice(0, 29)}…` : node.title;
         context.fillText(label, point.x, point.y + point.radius + 7 / camera.zoom);
       }

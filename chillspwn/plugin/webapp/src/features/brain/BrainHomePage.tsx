@@ -46,6 +46,7 @@ export default function BrainHomePage() {
         <>
           <section className="brain-pulse" aria-label="Memory health">
             <div><span>Confirmed</span><strong>{summary.data.counts.confirmed}</strong></div>
+            <div><span>Verified</span><strong>{summary.data.counts.verified}</strong></div>
             <div><span>Candidates</span><strong>{summary.data.counts.candidates}</strong></div>
             <div><span>Stale</span><strong>{summary.data.counts.stale}</strong></div>
             <div><span>Disputed</span><strong>{summary.data.counts.disputed}</strong></div>

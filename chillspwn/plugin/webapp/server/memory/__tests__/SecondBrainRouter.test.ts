@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import express from "express";
+import { createHash } from "node:crypto";
 import type { Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { existsSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
@@ -28,6 +29,11 @@ function provenance(id: string): MemoryProvenance {
       acquiredAt: "2026-07-15T10:00:00.000Z",
     }],
   };
+}
+
+function projectionHash(nodeIds: readonly string[]): string {
+  const canonical = `[${nodeIds.map((nodeId) => JSON.stringify(nodeId)).join(",")}]`;
+  return createHash("sha256").update(canonical, "utf8").digest("hex");
 }
 
 function insertMission(
@@ -193,12 +199,27 @@ describe("Second Brain HTTP boundary", () => {
   });
 
   test("summary, search, graph, and detail never leak another engagement", async () => {
-    const { database, url } = await application();
+    const { database, repository, url } = await application();
     try {
+      repository.createNode({
+        id: "node-verified",
+        nodeType: "artifact",
+        title: "Verified imported artifact",
+        summary: "Evidence-backed operational fact",
+        body: "Verified content remains distinct from operator-confirmed preference memory.",
+        scope: { kind: "engagement", engagementId: "eng-a" },
+        sensitivity: "private",
+        confidence: 1,
+        lifecycleStatus: "verified",
+        confirmationState: "not_required",
+        provenance: provenance("source-node-verified"),
+        authorType: "import",
+        authorId: "import:test",
+      });
       const summary = await json(await fetch(`${url}/api/v2/brain/summary`));
       expect(summary).toMatchObject({
         schemaVersion: "2.4",
-        counts: { confirmed: 3, candidates: 1, edges: 1 },
+        counts: { confirmed: 3, verified: 1, candidates: 1, edges: 1 },
         health: { database: "healthy", fts: "healthy" },
       });
 
@@ -207,6 +228,7 @@ describe("Second Brain HTTP boundary", () => {
       expect(JSON.stringify(nodes)).not.toContain("Engagement B");
 
       const graph = await json(await fetch(`${url}/api/v2/brain/graph?view=global&limit=50`));
+      expect(graph.availableNodeCount).toBe(4);
       expect(graph.nodes.map((item: { id: string }) => item.id)).toContain("node-a");
       expect(graph.nodes.map((item: { id: string }) => item.id)).not.toContain("node-b");
       expect(graph.edges).toHaveLength(1);
@@ -231,18 +253,44 @@ describe("Second Brain HTTP boundary", () => {
   test("graph metadata filters execute inside the bounded access-controlled query", async () => {
     const { database, repository, url } = await application();
     try {
+      repository.createEdge({
+        sourceNodeId: "node-global",
+        targetNodeId: "node-b",
+        edgeType: "similar_to",
+        title: "Cross-engagement access-policy fixture",
+        summary: "The inaccessible endpoint must never affect the visible local count.",
+        scope: { kind: "engagement", engagementId: "eng-b" },
+        sensitivity: "private",
+        confidence: 0.7,
+        lifecycleStatus: "confirmed",
+        provenance: provenance("edge-hidden-local"),
+        explanation: "Exercises access-controlled local-neighborhood counting.",
+        authorType: "operator",
+      });
+      const local = await json(await fetch(`${url}/api/v2/brain/graph?view=local&nodeId=node-global&depth=1&limit=1`));
+      expect(local).toMatchObject({ availableNodeCount: 2, truncated: true });
+      expect(local.nodes.map((item: { id: string }) => item.id)).toEqual(["node-global"]);
+      const localAll = await json(await fetch(`${url}/api/v2/brain/graph?view=local&nodeId=node-global&depth=1&limit=50`, {
+        headers: { "X-Test-Access": "all" },
+      }));
+      expect(localAll.availableNodeCount).toBe(3);
+
       const relationship = await json(await fetch(`${url}/api/v2/brain/graph?view=global&edgeType=applies_to&limit=50`));
+      expect(relationship.availableNodeCount).toBe(2);
       expect(relationship.nodes.map((item: { id: string }) => item.id).sort()).toEqual(["node-a", "node-global"]);
       expect(relationship.edges.map((item: { edgeType: string }) => item.edgeType)).toEqual(["applies_to"]);
 
       const scoped = await json(await fetch(`${url}/api/v2/brain/graph?view=global&scope=engagement&engagementId=eng-a&status=confirmed&minConfidence=0.75&limit=50`));
+      expect(scoped.availableNodeCount).toBe(1);
       expect(scoped.nodes.map((item: { id: string }) => item.id)).toEqual(["node-a"]);
       expect(JSON.stringify(scoped)).not.toContain("Engagement B");
 
       const future = await json(await fetch(`${url}/api/v2/brain/graph?view=global&updatedAfter=2099-01-01T00%3A00%3A00.000Z&limit=50`));
+      expect(future.availableNodeCount).toBe(0);
       expect(future.nodes).toEqual([]);
       node(repository, "lesson-a", { kind: "engagement", engagementId: "eng-a" }, "Engagement A recovery lesson", "lesson");
       const preset = await json(await fetch(`${url}/api/v2/brain/graph?view=global&preset=lessons_failures&limit=50`));
+      expect(preset.availableNodeCount).toBe(1);
       expect(preset.nodes.map((item: { id: string }) => item.id)).toEqual(["lesson-a"]);
       expect(preset.edges).toEqual([]);
 
@@ -823,6 +871,160 @@ describe("Second Brain HTTP boundary", () => {
       });
       expect([400, 403]).toContain(traversal.status);
       expect(JSON.stringify(await traversal.json())).not.toContain(directory.replaceAll("\\", "/"));
+    } finally {
+      database.close();
+    }
+  });
+
+  test("generic Vault export cannot bypass the exact approved legacy projection", async () => {
+    const { database, url } = await application();
+    try {
+      database.exec(`
+        CREATE TABLE legacy_migration_runs (
+          id TEXT PRIMARY KEY,
+          status TEXT NOT NULL,
+          source_roots_json TEXT NOT NULL,
+          database_path TEXT NOT NULL,
+          output_directory TEXT NOT NULL,
+          started_at TEXT NOT NULL,
+          completed_at TEXT
+        ) STRICT;
+        CREATE TABLE legacy_migration_reconciliation (
+          migration_id TEXT PRIMARY KEY,
+          report_json TEXT NOT NULL,
+          report_hash TEXT NOT NULL,
+          created_at TEXT NOT NULL
+        ) STRICT;
+        CREATE TABLE legacy_engagement_brain_nodes (
+          migration_id TEXT NOT NULL,
+          manifest_id TEXT NOT NULL,
+          node_id TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          PRIMARY KEY (migration_id, node_id)
+        ) STRICT;
+        CREATE TABLE legacy_vault_projection_approvals (
+          id TEXT PRIMARY KEY,
+          migration_id TEXT NOT NULL,
+          reconciliation_hash TEXT NOT NULL,
+          projection_hash TEXT NOT NULL,
+          connection_id TEXT NOT NULL,
+          approved_by TEXT NOT NULL,
+          status TEXT NOT NULL,
+          projected_node_ids_json TEXT NOT NULL,
+          result_json TEXT,
+          approved_at TEXT NOT NULL,
+          completed_at TEXT
+        ) STRICT;
+      `);
+      const migrationId = "migration-vault-export-gate";
+      const reconciliationHash = "a".repeat(64);
+      const now = "2026-07-17T16:00:00.000Z";
+      database.prepare(`
+        INSERT INTO legacy_migration_runs (
+          id, status, source_roots_json, database_path, output_directory,
+          started_at, completed_at
+        ) VALUES (?, 'completed', '[]', '/redacted/database', '/redacted/output', ?, ?)
+      `).run(migrationId, now, now);
+      database.prepare(`
+        INSERT INTO legacy_migration_reconciliation (
+          migration_id, report_json, report_hash, created_at
+        ) VALUES (?, '{}', ?, ?)
+      `).run(migrationId, reconciliationHash, now);
+      database.prepare(`
+        INSERT INTO legacy_engagement_brain_nodes (
+          migration_id, manifest_id, node_id, created_at
+        ) VALUES (?, 'manifest-vault-export-gate', 'node-a', ?)
+      `).run(migrationId, now);
+
+      const connectedResponse = await fetch(`${url}/api/v2/brain/vault/connect`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Idempotency-Key": "connect-legacy-export-gate-0001",
+        },
+        body: JSON.stringify({
+          vaultPath: "Legacy-Export-Gate",
+          displayName: "Legacy Export Gate",
+          permissionGranted: true,
+        }),
+      });
+      expect(connectedResponse.status).toBe(201);
+      const connected = await json(connectedResponse);
+      const connectionId = String(connected.connection.id);
+
+      const unapprovedTarget = await fetch(`${url}/api/v2/brain/vault/export`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Idempotency-Key": "legacy-target-export-unapproved-0001",
+        },
+        body: JSON.stringify({ connectionId, nodeId: "node-a" }),
+      });
+      const unapprovedBulk = await fetch(`${url}/api/v2/brain/vault/export`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Idempotency-Key": "legacy-bulk-export-unapproved-0001",
+        },
+        body: JSON.stringify({ connectionId }),
+      });
+      expect(unapprovedTarget.status).toBe(409);
+      expect(unapprovedBulk.status).toBe(409);
+      expect(await unapprovedTarget.json()).toMatchObject({
+        error: {
+          code: "legacy_vault_projection_approval_required",
+          remediation: expect.stringContaining("projection preview"),
+        },
+      });
+      expect(database.prepare(`
+        SELECT COUNT(*) AS count FROM vault_sync_state
+        WHERE connection_id = ? AND node_id = 'node-a'
+      `).get(connectionId)).toEqual({ count: 0 });
+
+      const expectedProjectionHash = projectionHash(["node-a"]);
+      database.prepare(`
+        INSERT INTO legacy_vault_projection_approvals (
+          id, migration_id, reconciliation_hash, projection_hash, connection_id,
+          approved_by, status, projected_node_ids_json, result_json,
+          approved_at, completed_at
+        ) VALUES (
+          'approval-vault-export-gate', ?, ?, ?, ?, 'operator-route-test',
+          'completed', '["node-a"]', '{}', ?, ?
+        )
+      `).run(migrationId, reconciliationHash, "b".repeat(64), connectionId, now, now);
+      const wrongProjectionHash = await fetch(`${url}/api/v2/brain/vault/export`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Idempotency-Key": "legacy-target-export-wrong-hash-0001",
+        },
+        body: JSON.stringify({ connectionId, nodeId: "node-a" }),
+      });
+      expect(wrongProjectionHash.status).toBe(409);
+
+      database.prepare(`
+        UPDATE legacy_vault_projection_approvals SET projection_hash = ?
+        WHERE id = 'approval-vault-export-gate'
+      `).run(expectedProjectionHash);
+      const approvedRequest = {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Idempotency-Key": "legacy-target-export-approved-0001",
+        },
+        body: JSON.stringify({ connectionId, nodeId: "node-a" }),
+      } as const;
+      const approved = await fetch(`${url}/api/v2/brain/vault/export`, approvedRequest);
+      expect(approved.status).toBe(200);
+
+      database.prepare(`
+        UPDATE legacy_migration_reconciliation SET report_hash = ? WHERE migration_id = ?
+      `).run("c".repeat(64), migrationId);
+      const staleReplay = await fetch(`${url}/api/v2/brain/vault/export`, approvedRequest);
+      expect(staleReplay.status).toBe(409);
+      expect(await staleReplay.json()).toMatchObject({
+        error: { code: "legacy_vault_projection_approval_required" },
+      });
     } finally {
       database.close();
     }

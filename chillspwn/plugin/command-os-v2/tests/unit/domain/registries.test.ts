@@ -114,7 +114,7 @@ describe("action policy registry", () => {
     expect(assertAutonomousRegistryLaunchReady(registry)).toBe(registry);
   });
 
-  test("blocks pre-authorized Autonomous work without an enforced executor", () => {
+  test("blocks explicitly pre-authorized Autonomous work without an enforced executor", () => {
     const projection = buildRuntimeCapabilityProjection(
       completeRuntimeManifests({ enforcement: "observe_only_executor" }),
     );
@@ -124,10 +124,13 @@ describe("action policy registry", () => {
       destructivePolicy: "prohibited",
       projection,
       authorizedTargetIds: ["target-1"],
+      overrides: { passive_intelligence_osint: "pre_authorized" },
     });
 
     expect(registry.autonomousLaunchReady).toBe(false);
-    expect(registry.launchBlockingReasons.join(" ")).toContain("enforced compatible executor");
+    expect(registry.launchBlockingReasons.join(" ")).toContain("no locally enforced executor");
+    expect(registry.launchBlockingReasons.join(" ")).toContain("Passive intelligence and OSINT");
+    expect(registry.launchBlockingReasons.join(" ")).not.toContain("passive_intelligence_osint");
     expect(() => assertAutonomousRegistryLaunchReady(registry)).toThrow("not executable");
   });
 

@@ -796,7 +796,23 @@ describe("enforced recovery mutations", () => {
         leaseTtlMs: 10_000,
         scanIntervalMs: 60_000,
       });
-      runtime.resumeRun("run-recovery", "operator:test", "Resume the exact reassigned provider retry");
+      const resumableRun = runtime.repository.getRunProjection("run-recovery");
+      const resumableCheckpoint = runtime.coordinator.getLatestCheckpoint("run-recovery");
+      if (!resumableCheckpoint || resumableRun.status !== "blocked") {
+        throw new Error("Recovery fixture has no exact blocked checkpoint");
+      }
+      runtime.resumeRun(
+        "run-recovery",
+        "operator:test",
+        "Resume the exact reassigned provider retry",
+        {
+          expectedRunVersion: resumableRun.version,
+          expectedRunStatus: "blocked",
+          expectedCheckpointId: resumableCheckpoint.id,
+          expectedCheckpointStateHash: resumableCheckpoint.stateHash,
+          expectedCheckpointEventSequence: resumableCheckpoint.eventSequence,
+        },
+      );
       await waitFor(() => alternateCalls === 1, "selected provider dispatch");
       await waitFor(() => Boolean(database.prepare(`
         SELECT 1 FROM actions WHERE parent_action_id = 'action-failed' AND status = 'succeeded'

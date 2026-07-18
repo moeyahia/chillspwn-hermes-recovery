@@ -27,6 +27,7 @@ import { canonicalFixtureNamespace } from "./support/fixtureNamespace";
 
 const TEST_IDS = {
   globalEmptyInbox: "e2e.brain-graph.global-empty-inbox",
+  disconnectedTruth: "e2e.brain-graph.disconnected-truth",
   errorEmptyRetry: "e2e.brain-graph.error-empty-retry",
   controlsFiltersViews: "e2e.brain-graph.controls-filters-views",
   canvasTableInspector: "e2e.brain-graph.canvas-table-inspector",
@@ -198,6 +199,7 @@ test(`${TEST_IDS.globalEmptyInbox} renders the canonical empty graph and opens t
     view: "global",
     nodes: [],
     edges: [],
+    availableNodeCount: 0,
     truncated: false,
   } satisfies MemoryGraph;
   const emptyGraphFixture = async (route: Route): Promise<void> => {
@@ -221,6 +223,36 @@ test(`${TEST_IDS.globalEmptyInbox} renders the canonical empty graph and opens t
     await strictAudit(audit, testInfo);
   } finally {
     await page.unroute("**/api/v2/brain/graph?*", emptyGraphFixture);
+  }
+});
+
+test(`${TEST_IDS.disconnectedTruth} explains isolated canonical nodes instead of implying a rendered relationship`, async ({ page }, testInfo) => {
+  const disconnectedFixture = async (route: Route): Promise<void> => {
+    const response = await route.fetch();
+    const payload = await response.json() as MemoryGraph | { readonly data: MemoryGraph };
+    const graph = "data" in payload ? payload.data : payload;
+    const disconnected = { ...graph, edges: [] } satisfies MemoryGraph;
+    await route.fulfill({
+      response,
+      contentType: "application/json; charset=utf-8",
+      body: JSON.stringify("data" in payload ? { ...payload, data: disconnected } : disconnected),
+    });
+  };
+  await page.route("**/api/v2/brain/graph?*", disconnectedFixture);
+  try {
+    const graphRead = graphResponse(page, (url) => url.searchParams.get("engagementId") === fixture.engagementId
+      && url.searchParams.get("limit") === "500");
+    await page.goto(graphRoute({ limit: "500" }), { waitUntil: "domcontentloaded" });
+    const graph = await graphPayload(await graphRead);
+    expect(graph.nodes.length).toBeGreaterThan(1);
+    expect(graph.edges).toEqual([]);
+    await expect(page.getByText("0 visible relationships", { exact: true })).toBeVisible();
+    await expect(page.getByRole("status").filter({ hasText: "These memories are currently isolated" })).toContainText(
+      "Command OS will keep them separate until an import, mission event, or operator-reviewed link provides real provenance.",
+    );
+    await strictAudit(new BrowserAudit(page, { allowEventStreamNavigationAbort: true }), testInfo);
+  } finally {
+    await page.unroute("**/api/v2/brain/graph?*", disconnectedFixture);
   }
 });
 
@@ -255,7 +287,7 @@ test(`${TEST_IDS.errorEmptyRetry} explains a failed canonical read, retries it, 
   const recoveredPayload = await graphPayload(await recovered);
   expect(recoveredPayload.nodes).toHaveLength(BRAIN_GRAPH_FIXTURE_INITIAL_LIMIT);
   expect(recoveredPayload.truncated).toBe(true);
-  await expect(page.getByText(`${BRAIN_GRAPH_FIXTURE_INITIAL_LIMIT} visible of ${BRAIN_GRAPH_FIXTURE_INITIAL_LIMIT} loaded nodes`, { exact: true })).toBeVisible();
+  await expect(page.getByText(`${BRAIN_GRAPH_FIXTURE_INITIAL_LIMIT} visible of ${BRAIN_GRAPH_FIXTURE_INITIAL_LIMIT} loaded · ${fixture.nodeCount} accessible in this view`, { exact: true })).toBeVisible();
 
   const audit = new BrowserAudit(page, { allowEventStreamNavigationAbort: true });
   const advanced = await openAdvanced(page);
@@ -305,7 +337,7 @@ test(`${TEST_IDS.controlsFiltersViews} exercises progressive loading, every grap
 
   await activate(page.getByRole("button", { name: "Global", exact: true }), "pointer");
   await expect(page.getByRole("button", { name: "Global", exact: true })).toHaveClass(/is-active/u);
-  await expect(page.getByText(`${fixture.nodeCount} visible of ${fixture.nodeCount} loaded nodes`, { exact: true })).toBeVisible();
+  await expect(page.getByText(`${fixture.nodeCount} visible of ${fixture.nodeCount} loaded · ${fixture.nodeCount} accessible in this view`, { exact: true })).toBeVisible();
 
   const operatorRead = graphResponse(page, (url) => url.searchParams.get("view") === "operator");
   await activate(page.getByRole("button", { name: "Operator profile", exact: true }), "keyboard");
@@ -326,13 +358,13 @@ test(`${TEST_IDS.controlsFiltersViews} exercises progressive loading, every grap
 
   await activate(page.getByRole("button", { name: "Global", exact: true }), "pointer");
   await expect.poll(() => new URL(page.url()).searchParams.get("preset")).toBeNull();
-  await expect(page.getByText(`${fixture.nodeCount} visible of ${fixture.nodeCount} loaded nodes`, { exact: true })).toBeVisible();
+  await expect(page.getByText(`${fixture.nodeCount} visible of ${fixture.nodeCount} loaded · ${fixture.nodeCount} accessible in this view`, { exact: true })).toBeVisible();
 
   const search = page.getByLabel("Search visible graph", { exact: true });
   await search.fill(fixture.operatorTitle);
-  await expect(page.getByText(`1 visible of ${fixture.nodeCount} loaded nodes`, { exact: true })).toBeVisible();
+  await expect(page.getByText(`1 visible of ${fixture.nodeCount} loaded · ${fixture.nodeCount} accessible in this view`, { exact: true })).toBeVisible();
   await search.fill("");
-  await expect(page.getByText(`${fixture.nodeCount} visible of ${fixture.nodeCount} loaded nodes`, { exact: true })).toBeVisible();
+  await expect(page.getByText(`${fixture.nodeCount} visible of ${fixture.nodeCount} loaded · ${fixture.nodeCount} accessible in this view`, { exact: true })).toBeVisible();
 
   expect(await optionValues(page.getByRole("combobox", { name: "Edge type", exact: true }))).toEqual(["", ...MEMORY_EDGE_TYPES]);
   await selectAndAssertGraphFilter(
@@ -389,7 +421,7 @@ test(`${TEST_IDS.controlsFiltersViews} exercises progressive loading, every grap
   await graphPayload(await clearFrom);
   await advanced.getByLabel("Updated through", { exact: true }).fill("");
   await expect(advanced.getByLabel("Updated through", { exact: true })).toHaveValue("");
-  await expect(page.getByText(`${fixture.nodeCount} visible of ${fixture.nodeCount} loaded nodes`, { exact: true })).toBeVisible();
+  await expect(page.getByText(`${fixture.nodeCount} visible of ${fixture.nodeCount} loaded · ${fixture.nodeCount} accessible in this view`, { exact: true })).toBeVisible();
 
   const engagementInput = advanced.getByLabel("Engagement ID", { exact: true });
   const missingEngagement = `${fixture.engagementId}-missing`;
@@ -397,7 +429,7 @@ test(`${TEST_IDS.controlsFiltersViews} exercises progressive loading, every grap
   await engagementInput.fill(missingEngagement);
   expect((await graphPayload(await missingRead)).nodes).toEqual([]);
   await engagementInput.fill(fixture.engagementId);
-  await expect(page.getByText(`${fixture.nodeCount} visible of ${fixture.nodeCount} loaded nodes`, { exact: true })).toBeVisible();
+  await expect(page.getByText(`${fixture.nodeCount} visible of ${fixture.nodeCount} loaded · ${fixture.nodeCount} accessible in this view`, { exact: true })).toBeVisible();
 
   const labels = advanced.getByRole("combobox", { name: "Label density", exact: true });
   await labels.selectOption("minimal");
@@ -470,6 +502,10 @@ test(`${TEST_IDS.controlsFiltersViews} exercises progressive loading, every grap
   await audit.withExpectedDocumentNavigationTeardown(page, () => page.reload({ waitUntil: "domcontentloaded" }));
   await graphPayload(await reloadRead);
   await expect(page.getByRole("button", { name, exact: true })).toBeVisible();
+  // The graph worker and its route chunk are part of the required surface.
+  // Wait for the post-reload canvas before ending the audit so a fast test
+  // teardown cannot abort still-loading Vite modules and hide a real failure.
+  await waitForCanvas(page);
   await activate(page.getByRole("button", { name: `Delete saved view ${name}`, exact: true }), "keyboard");
   await expect(page.getByRole("button", { name, exact: true })).toHaveCount(0);
   await expect(page.locator(".brain-graph-notice")).toContainText(`Removed “${name}” from this browser.`);
@@ -635,7 +671,7 @@ test(`${TEST_IDS.canvasTableInspector} exercises pointer and keyboard canvas inp
   await activate(page.locator(".brain-active-filter").filter({ hasText: "Local neighborhood" })
     .getByRole("button", { name: "Clear", exact: true }), "keyboard");
   await expect.poll(() => new URL(page.url()).searchParams.get("view")).toBeNull();
-  await expect(page.getByText(`${fixture.nodeCount} visible of ${fixture.nodeCount} loaded nodes`, { exact: true })).toBeVisible();
+  await expect(page.getByText(`${fixture.nodeCount} visible of ${fixture.nodeCount} loaded · ${fixture.nodeCount} accessible in this view`, { exact: true })).toBeVisible();
   await strictAudit(audit, testInfo);
 });
 
@@ -770,7 +806,8 @@ test(`${TEST_IDS.deepLinksHistory} preserves graph state through node, Context P
   await activate(page.getByRole("button", { name: "Show in graph", exact: true }), "keyboard");
   await expect(page).toHaveURL((url) => url.pathname === "/brain/graph"
     && url.searchParams.get("view") === "local"
-    && url.searchParams.get("root") === fixture.preferenceNodeId);
+    && url.searchParams.get("root") === fixture.preferenceNodeId
+    && url.searchParams.get("selected") === fixture.preferenceNodeId);
   await expect(page.locator(".brain-active-filter").filter({ hasText: "Local neighborhood" })).toContainText(fixture.preferenceNodeId);
 
   const reviewCandidates = page.getByRole("link", { name: "Review candidates", exact: true });
@@ -802,10 +839,14 @@ test(`${TEST_IDS.deepLinksHistory} preserves graph state through node, Context P
     .getByRole("link", { name: "Graph", exact: true });
   await expect(graphNav).toHaveAttribute("href", "/brain/graph");
   await expect(graphNav).toHaveAttribute("aria-current", "page");
+  await page.evaluate((staleRoot) => {
+    sessionStorage.setItem("chillspwn.command-os-v2.brain.graph-root", staleRoot);
+  }, fixture.secondaryNodeId);
   const graphHomeRead = graphResponse(page, (url) => url.searchParams.get("view") === "global"
     && !url.searchParams.has("nodeId"));
   await activate(graphNav, "keyboard");
   await graphPayload(await graphHomeRead);
   await expect(page).toHaveURL("/brain/graph");
+  await expect(page.locator(".brain-active-filter").filter({ hasText: "Local neighborhood" })).toHaveCount(0);
   await strictAudit(audit, testInfo);
 });

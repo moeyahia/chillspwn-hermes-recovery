@@ -12,6 +12,7 @@ interface GraphPayload {
   readonly rootNodeId?: string;
   readonly nodes: ReadonlyArray<{ readonly id: string }>;
   readonly edges: ReadonlyArray<{ readonly id: string }>;
+  readonly availableNodeCount: number;
   readonly truncated: boolean;
 }
 
@@ -115,6 +116,7 @@ test.describe("E2E-only Second Brain 50,000-node profile", () => {
       truncated: true,
     });
     expect(globalGraph.body.nodes).toHaveLength(250);
+    expect(globalGraph.body.availableNodeCount).toBe(BRAIN_SCALE_NODE_COUNT);
     expect(globalGraph.body.nodes.some((node) => node.id === BRAIN_SCALE_SENTINEL_ID)).toBe(false);
     expect(globalGraph.bytes).toBeLessThan(1_000_000);
 
@@ -123,7 +125,7 @@ test.describe("E2E-only Second Brain 50,000-node profile", () => {
     await expect(page.getByRole("heading", { level: 1, name: "Memory Graph" })).toBeVisible();
     await waitForGraphLayout(page, 250);
     timings.initialGraphInteractiveMs = elapsed(initialStartedAt);
-    await expect(page.locator(".brain-graph-meta")).toContainText("250 visible of 250 loaded nodes");
+    await expect(page.locator(".brain-graph-meta")).toContainText("250 visible of 250 loaded · 50,000 accessible in this view");
     await expect(page.getByText("Bounded view", { exact: true })).toBeVisible();
 
     const progressiveStartedAt = performance.now();
@@ -136,11 +138,12 @@ test.describe("E2E-only Second Brain 50,000-node profile", () => {
     expect(progressiveResponse.ok()).toBe(true);
     const progressivePayload = await progressiveResponse.json() as GraphPayload;
     expect(progressivePayload.nodes).toHaveLength(500);
+    expect(progressivePayload.availableNodeCount).toBe(BRAIN_SCALE_NODE_COUNT);
     expect(progressivePayload.truncated).toBe(true);
     await waitForGraphLayout(page, 500);
     timings.progressiveGraphInteractiveMs = elapsed(progressiveStartedAt);
     await expect(page).toHaveURL(/limit=500/u);
-    await expect(page.locator(".brain-graph-meta")).toContainText("500 visible of 500 loaded nodes");
+    await expect(page.locator(".brain-graph-meta")).toContainText("500 visible of 500 loaded · 50,000 accessible in this view");
 
     const boundedDom = await page.evaluate(() => ({
       allElements: document.querySelectorAll("*").length,
@@ -175,6 +178,7 @@ test.describe("E2E-only Second Brain 50,000-node profile", () => {
     });
     expect(localGraph.body.nodes).toHaveLength(5);
     expect(localGraph.body.edges).toHaveLength(4);
+    expect(localGraph.body.availableNodeCount).toBe(5);
 
     const localStartedAt = performance.now();
     await page.goto(
@@ -183,7 +187,7 @@ test.describe("E2E-only Second Brain 50,000-node profile", () => {
     );
     await waitForGraphLayout(page, 5);
     timings.localGraphInteractiveMs = elapsed(localStartedAt);
-    await expect(page.locator(".brain-graph-meta")).toContainText("5 visible of 5 loaded nodes");
+    await expect(page.locator(".brain-graph-meta")).toContainText("5 visible of 5 loaded · 5 accessible in this view");
     await expect(page.getByRole("heading", { name: `Scale search ${BRAIN_SCALE_SENTINEL_TERM}` })).toBeVisible();
 
     const interactionStartedAt = performance.now();
@@ -208,7 +212,7 @@ test.describe("E2E-only Second Brain 50,000-node profile", () => {
     await expect(table.getByRole("row")).toHaveCount(6);
     await expect(table).toContainText(`Scale search ${BRAIN_SCALE_SENTINEL_TERM}`);
     await page.getByLabel("Search visible graph").fill(BRAIN_SCALE_SENTINEL_TERM);
-    await expect(page.locator(".brain-graph-meta")).toContainText("1 visible of 5 loaded nodes");
+    await expect(page.locator(".brain-graph-meta")).toContainText("1 visible of 5 loaded · 5 accessible in this view");
     await expect(table.getByRole("row")).toHaveCount(2);
     timings.viewportAndTableMs = elapsed(interactionStartedAt);
 

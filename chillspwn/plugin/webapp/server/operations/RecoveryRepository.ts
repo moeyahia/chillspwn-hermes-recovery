@@ -59,6 +59,7 @@ function recoveryActions(input: {
   canManageRecovery: boolean;
   reassignmentCandidates: number;
   providerCandidates: number;
+  startNewRunRequired: boolean;
 }): RecoveryActionAvailability[] {
   const stopped = input.status === "blocked" || input.status === "waiting_guided_decision";
   const resumeAvailable = input.ownedByV2 && input.canManageRecovery && input.status === "blocked"
@@ -82,6 +83,8 @@ function recoveryActions(input: {
           : !input.hasCheckpoint ? "No validated durable checkpoint is available for resume."
             : !input.safeCheckpointForResume
               ? "The latest checkpoint is stale, has in-flight work, or lacks a safe in-flight classification."
+              : input.startNewRunRequired
+                ? "This Autonomous attempt stopped before a plan existed. Preserve it and start a new run after the provider recovers; in-place resume is not permitted."
               : "The blocked state is not an operator pause or a diagnosed resumable recovery.",
       command: resumeAvailable ? "resume" : null,
     },
@@ -191,7 +194,7 @@ export class RecoveryRepository {
     }));
 
     const eventRows = this.database.prepare(`
-      SELECT id, event_type, summary, occurred_at, sequence
+      SELECT id, event_type, summary, payload_json, occurred_at, sequence
       FROM events
       WHERE run_id = ? AND (
         event_type IN (
@@ -246,6 +249,13 @@ export class RecoveryRepository {
           coalesce((SELECT max(sequence) FROM events WHERE run_id = ?), 0)
         ) AS latest_sequence
       `).get(runId, runId) as { latest_sequence: number };
+      const trailingEvents = this.database.prepare(`
+        SELECT event_type FROM events
+        WHERE run_id = ? AND sequence > ?
+        ORDER BY sequence
+      `).all(runId, checkpointRow.event_sequence) as Array<{ event_type: string }>;
+      const diagnosticTailOnly = trailingEvents.length > 0 && trailingEvents.every((event) =>
+        event.event_type === "run.autonomous_safe_stopped" || event.event_type === "run.guided_blocked");
       checkpointStateIsCurrent =
         stateRun.id === runId &&
         stateRun.missionId === run.mission_id &&
@@ -253,7 +263,9 @@ export class RecoveryRepository {
         stateRun.state === run.status &&
         stateRun.stateVersion === run.version &&
         state.lastEventSequence === checkpointRow.event_sequence &&
-        latestSequence.latest_sequence === checkpointRow.event_sequence &&
+        (latestSequence.latest_sequence === checkpointRow.event_sequence || (
+          checkpointRow.in_flight_classification === null && inFlight.length === 0 && diagnosticTailOnly
+        )) &&
         (run.current_plan_id === null
           ? checkpointRow.plan_version === null
           : currentPlan?.version === checkpointRow.plan_version);
@@ -294,7 +306,25 @@ export class RecoveryRepository {
       WHERE run_id = ? AND status = 'pending' AND expires_at > ?
       ORDER BY created_at DESC, id DESC LIMIT 1
     `).get(runId, this.clock().toISOString()) as Row | undefined;
-    const category = failedActions.find((item) => item.errorCategory)?.errorCategory ?? null;
+    const latestDiagnosis = this.database.prepare(`
+      SELECT category, retryable, originating_component, automatic_recovery_json
+      FROM failure_diagnoses
+      WHERE run_id = ? AND state IN ('active', 'terminal')
+      ORDER BY created_at DESC, id DESC LIMIT 1
+    `).get(runId) as {
+      category: string;
+      retryable: number;
+      originating_component: string;
+      automatic_recovery_json: string;
+    } | undefined;
+    const eventCategory = eventRows.flatMap((event) => {
+      const category = record(parseJson(String(event.payload_json ?? "{}"))).category;
+      return typeof category === "string" && category.trim() ? [category] : [];
+    })[0];
+    const category = latestDiagnosis?.category
+      ?? failedActions.find((item) => item.errorCategory)?.errorCategory
+      ?? eventCategory
+      ?? null;
     const status = String(run.status);
     const statusReason = run.status_reason === null ? null : text(run.status_reason);
     const operatorPaused = status === "blocked" && /paused by operator/iu.test(statusReason ?? "");
@@ -310,6 +340,13 @@ export class RecoveryRepository {
     const recoveryEvent = eventEvidence.some((item) => item.eventType.startsWith("run.recovery") || item.eventType === "run.replan_started");
     const recoveryRequired = ["blocked", "recovering", "failed"].includes(status)
       || (run.journey === "guided" && status === "waiting_guided_decision" && (failedActions.length > 0 || recoveryEvent));
+    const prePlanAutonomousSafeStop = run.journey === "autonomous"
+      && status === "blocked"
+      && run.current_plan_id === null
+      && run.current_step_id === null
+      && autonomousSafeStopRecorded
+      && (latestDiagnosis?.originating_component === "command-runtime.planning-provider"
+        || eventRows.some((event) => event.event_type === "run.autonomous_safe_stopped"));
 
     const noExecutionImpact = status === "blocked" || isTerminal(status);
     const impact = {
@@ -347,6 +384,13 @@ export class RecoveryRepository {
       proposedRecovery = {
         kind: "operator_resume",
         summary: "Resume from the last durable checkpoint when the recorded pause condition is resolved.",
+        basis: reason,
+        impact,
+      };
+    } else if (prePlanAutonomousSafeStop) {
+      proposedRecovery = {
+        kind: "safe_stop",
+        summary: "This attempt stopped before a plan was created. Test the provider, then start a new run; this preserved run cannot be resumed in place.",
         basis: reason,
         impact,
       };
@@ -580,7 +624,8 @@ export class RecoveryRepository {
     `).get(runId, boundary.stepId));
     const acceptableInFlightClassification = checkpoint?.inFlightClassification === "safe_no_in_flight_action"
       || checkpoint?.inFlightClassification === "resume_idempotently"
-      || (operatorPaused && checkpoint?.inFlightClassification === null);
+      || (checkpoint?.inFlightClassification === null
+        && checkpoint.inFlightActions.length === 0 && !inFlight);
     const safeCheckpointForResume = Boolean(
       checkpoint && checkpointStateIsCurrent && checkpoint.inFlightActions.length === 0 && !inFlight
       && acceptableInFlightClassification,
@@ -648,6 +693,7 @@ export class RecoveryRepository {
         canManageRecovery: access.canManageRecovery === true,
         reassignmentCandidates: reassignmentCandidates.length,
         providerCandidates: providerCandidates.length,
+        startNewRunRequired: prePlanAutonomousSafeStop,
       }),
     };
   }

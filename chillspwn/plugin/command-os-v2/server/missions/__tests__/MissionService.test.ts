@@ -42,6 +42,7 @@ function autonomousRequest(overrides: Partial<AutonomousMissionRequest> = {}): A
       destructivePolicy: "prohibited",
       evidenceRequirements: ["Hash every retained artifact"],
       timeBudgetMinutes: 60,
+      toolCallBudget: 100,
       tokenBudget: 50_000,
       costBudget: 10,
       retryBudget: 2,
@@ -302,7 +303,8 @@ describe("Command OS mission vertical slice", () => {
       expect(count(database, "mission_constraints")).toBe(5);
       const persisted = database.prepare(`
         SELECT m.retention_policy_json, m.memory_policy_json,
-          mc.contract_hash, mc.action_policy_json, mc.budgets_json
+          mc.contract_hash, mc.action_policy_json, mc.budgets_json,
+          r.budget_json AS run_budget_json
         FROM missions m JOIN runs r ON r.mission_id = m.id
         JOIN mission_contracts mc ON mc.id = r.contract_id WHERE r.id = ?
       `).get(created.run.id) as Record<string, string>;
@@ -319,9 +321,11 @@ describe("Command OS mission vertical slice", () => {
         specialistAgentIds: ["agent-recon"],
       });
       expect(JSON.parse(persisted.budgets_json)).toMatchObject({
+        toolCalls: 100,
         evidenceBytes: 64 * 1024 * 1024,
         artifactBytes: 256 * 1024 * 1024,
       });
+      expect(JSON.parse(persisted.run_budget_json)).toMatchObject({ toolCalls: 100 });
       expect(persisted.contract_hash).toMatch(/^[a-f0-9]{64}$/u);
       expect(count(database, "events")).toBe(2);
       expect(count(database, "event_outbox")).toBe(2);

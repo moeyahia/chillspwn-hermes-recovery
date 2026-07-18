@@ -9,6 +9,7 @@ release so a service user cannot replace the commander's delegation surface.
 import json
 import os
 import time
+import urllib.error
 import urllib.request
 
 from mcp.server.fastmcp import FastMCP
@@ -51,6 +52,20 @@ def _http(method, path, body=None, timeout=15):
         with urllib.request.urlopen(request, timeout=timeout) as response:
             raw = response.read().decode("utf-8", "replace")
             return json.loads(raw) if raw.strip() else {}
+    except urllib.error.HTTPError as error:
+        raw = error.read().decode("utf-8", "replace")
+        try:
+            parsed = json.loads(raw) if raw.strip() else {}
+        except (TypeError, ValueError):
+            parsed = {}
+        reason = parsed.get("error") if isinstance(parsed, dict) else None
+        if not reason:
+            reason = raw.strip() or str(error.reason or "request rejected")
+        return {
+            "error": f"HTTP {error.code}: {reason}",
+            "status": error.code,
+            "retryable": error.code >= 500,
+        }
     except Exception as error:  # MCP result must remain structured for recovery.
         return {"error": f"{type(error).__name__}: {error}"}
 

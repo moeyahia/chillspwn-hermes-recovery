@@ -50,14 +50,14 @@ describe("Command OS database foundation", () => {
       const second = migrateDatabase(database);
       const health = getDatabaseHealth(database);
 
-      expect(first.applied.map((migration) => migration.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]);
+      expect(first.applied.map((migration) => migration.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]);
       expect(second.applied).toEqual([]);
-      expect(listAppliedMigrations(database)).toHaveLength(13);
+      expect(listAppliedMigrations(database)).toHaveLength(14);
       expect(health.healthy).toBe(true);
       expect(health.journalMode).toBe("wal");
       expect(health.foreignKeys).toBe(true);
       expect(health.busyTimeoutMs).toBe(5_000);
-      expect(health.currentMigration).toBe(13);
+      expect(health.currentMigration).toBe(14);
       expect(existsSync(databasePath)).toBe(true);
     } finally {
       database.close();
@@ -105,8 +105,11 @@ describe("Command OS database foundation", () => {
       `).run(importedRunId, "f".repeat(64), now, now, "2026-07-17T10:00:00.000Z");
 
       expect(migrateDatabase(database)).toMatchObject({
-        applied: [{ version: 13, name: "imported_legacy_control_plane" }],
-        currentVersion: 13,
+        applied: [
+          { version: 13, name: "imported_legacy_control_plane" },
+          { version: 14, name: "runtime_mutation_receipts" },
+        ],
+        currentVersion: 14,
       });
       expect(database.prepare(`
         SELECT id, control_plane FROM missions ORDER BY id
@@ -202,12 +205,13 @@ describe("Command OS database foundation", () => {
           { version: 11, name: "memory_edge_scope_identity" },
           { version: 12, name: "planning_retry_continuation" },
           { version: 13, name: "imported_legacy_control_plane" },
+          { version: 14, name: "runtime_mutation_receipts" },
         ],
-        currentVersion: 13,
+        currentVersion: 14,
       });
       expect(getDatabaseHealth(database)).toMatchObject({
         healthy: true,
-        currentMigration: 13,
+        currentMigration: 14,
       });
     } finally {
       database.close();
@@ -246,8 +250,9 @@ describe("Command OS database foundation", () => {
         applied: [
           { version: 12, name: "planning_retry_continuation" },
           { version: 13, name: "imported_legacy_control_plane" },
+          { version: 14, name: "runtime_mutation_receipts" },
         ],
-        currentVersion: 13,
+        currentVersion: 14,
       });
       expect(database.prepare(`
         SELECT kind, source_id, payload_json, status, attempt_count,
@@ -359,8 +364,9 @@ describe("Command OS database foundation", () => {
           { version: 11, name: "memory_edge_scope_identity" },
           { version: 12, name: "planning_retry_continuation" },
           { version: 13, name: "imported_legacy_control_plane" },
+          { version: 14, name: "runtime_mutation_receipts" },
         ],
-        currentVersion: 13,
+        currentVersion: 14,
       });
       expect(database.prepare(`
         SELECT DISTINCT status, decision_actor, decision_reason
@@ -505,6 +511,7 @@ describe("Command OS database foundation", () => {
         "research_campaigns",
         "experiments",
         "integrity_receipts",
+        "runtime_mutation_receipts",
         "audit_records",
       ]) {
         expect(names.has(expected)).toBe(true);
@@ -639,7 +646,7 @@ describe("Command OS database foundation", () => {
       `).run(now);
 
       const result = migrateDatabase(database);
-      expect(result.applied.map((migration) => migration.version)).toEqual([6, 7, 8, 9, 10, 11, 12, 13]);
+      expect(result.applied.map((migration) => migration.version)).toEqual([6, 7, 8, 9, 10, 11, 12, 13, 14]);
       expect(database.prepare(`
         SELECT comparison_status, reason, prior_run_id, metrics_json
         FROM run_evaluation_comparisons WHERE evaluation_id = 'evaluation-legacy'
@@ -693,7 +700,7 @@ describe("Command OS database foundation", () => {
       `).run("b".repeat(64), now);
 
       const result = migrateDatabase(database);
-      expect(result.applied.map((migration) => migration.version)).toEqual([7, 8, 9, 10, 11, 12, 13]);
+      expect(result.applied.map((migration) => migration.version)).toEqual([7, 8, 9, 10, 11, 12, 13, 14]);
       expect(database.prepare(
         "SELECT journey, record_hash FROM audit_records WHERE id = 'audit-legacy'",
       ).get()).toEqual({ journey: "guided", record_hash: "legacy-record-hash" });

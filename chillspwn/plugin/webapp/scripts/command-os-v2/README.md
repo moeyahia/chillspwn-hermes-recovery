@@ -1,5 +1,29 @@
 # Command OS V2 operational scripts
 
+## Kernel-offline VulnIntel CVE implementation canary
+
+`audit:v2-tool-coverage:vulnintel-local` exercises the ten exact configured
+`vulnintel-cve-mcp` FastMCP bindings with deterministic fixtures inside a
+read-only, unprivileged Bubblewrap sandbox with a separate network namespace.
+It makes no public request and contacts no engagement target or public LLM.
+
+```bash
+bun run audit:v2-tool-coverage:vulnintel-local \
+  --receipt=/absolute/test-evidence/vulnintel-cve-canary.json
+```
+
+The command intentionally exits non-zero while any binding loses a
+deterministic failure or applicable 429 category. See
+`docs/command-os-v2/vulnintel-cve-tool-canary.md` for the exact 8/10 result and
+the two retained implementation blockers.
+
+`test:v2-tool-coverage` is the complete executable release gate. It combines
+the kernel-offline VulnIntel fixture, the disposable loopback-only Pentest
+Recon canary against the root-provisioned V2-only tool bundle, and the two
+read-only public NVD bindings. It never accepts an engagement target. The
+inventory-only/report commands remain separate so routine diagnostics do not
+silently make public requests.
+
 ## Immutable live schema-7 to candidate schema-9 rehearsal
 
 The release rehearsal reads the `/opt/chillspwn/plugin` symlink and its exact

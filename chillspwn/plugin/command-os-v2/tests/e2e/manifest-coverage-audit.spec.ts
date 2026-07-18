@@ -205,6 +205,12 @@ async function renderedIntakeControls(page: Page, route: string, audit: BrowserA
   await page.getByRole("group", { name: "Named disposable lab targets", exact: true }).getByRole("checkbox").check();
   await openVisibleDetails(page);
   controls.push(...await controlsOnCurrentPage(page, route));
+  if (journey === "Autonomous") {
+    await advanceIntake(page, "Specialist team and execution readiness");
+    controls.push(...await controlsOnCurrentPage(page, route));
+    await advanceIntake(page, "Second Brain context");
+    controls.push(...await controlsOnCurrentPage(page, route));
+  }
   await advanceIntake(page, "Review the resolved mission");
   controls.push(...await controlsOnCurrentPage(page, route));
   return controls;

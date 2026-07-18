@@ -23,9 +23,15 @@ describe("MissionIntakeService", () => {
     expect(resolved.request.contract.deliverables.length).toBeGreaterThan(0);
     expect(resolved.request.contract.evidenceRequirements.length).toBeGreaterThan(0);
     expect(resolved.request.contract.safeStopConditions).toContain("budget_reached");
+    expect(resolved.request.contract.toolCallBudget).toBe(resolved.budget.toolCallBudget);
     expect(resolved.request.contract.destructivePolicy).toBe("prohibited");
+    expect(resolved.request.contract.memoryScopes).toEqual([
+      "confirmed_preferences",
+      "verified_lessons",
+    ]);
     expect(resolved.mandatorySafeStopIds).toContain("target_outside_authorized_scope");
     expect(resolved.inferredFields).toContain("title");
+    expect(resolved.inferredFields).toContain("memoryScopes");
     expect(resolved.normalizedTargets[0]?.type).toBe("cidr");
   });
 
@@ -43,6 +49,23 @@ describe("MissionIntakeService", () => {
     expect(resolved.request.title).toContain("External Web Assessment");
     expect(resolved.request.explanationDepth).toBe("balanced");
     expect(resolved.request.executionPreference).toBe("manual");
+    expect(resolved.inferredFields).not.toContain("memoryScopes");
+  });
+
+  test("adds engagement-isolated memory only when an explicit engagement is supplied", () => {
+    const resolved = service.resolve({
+      journey: "autonomous",
+      authorizationAcknowledged: true,
+      targets: [{ value: "10.10.10.0/24" }],
+      engagementId: "eng-authorized-lab",
+    });
+
+    if (resolved.request.journey !== "autonomous") throw new Error("Expected Autonomous request");
+    expect(resolved.request.contract.memoryScopes).toEqual([
+      "confirmed_preferences",
+      "verified_lessons",
+      "engagement_memory",
+    ]);
   });
 
   test("templates preserve exact supplied target scope", () => {
@@ -87,6 +110,11 @@ describe("MissionIntakeService", () => {
       targets: [{ value: "lab:authorized" }],
     });
     expect(resolved.limitations.join(" ")).toContain("No attested runtime capability manifest");
+    expect(resolved.limitations).toHaveLength(1);
+    expect(resolved.policyMatrix.autonomousLaunchReady).toBe(false);
+    expect(Object.values(resolved.policyMatrix.classes).every(
+      ({ policyState }) => policyState !== "pre_authorized",
+    )).toBe(true);
   });
 
   test("allows bounded destructive policy only for an exact normalized disposable lab target", () => {

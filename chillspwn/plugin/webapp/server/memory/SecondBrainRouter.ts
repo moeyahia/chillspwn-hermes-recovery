@@ -641,6 +641,112 @@ function accessibleConnectionNodeIds(
   return rows.map((row) => row.id);
 }
 
+interface LegacyVaultProjectionApprovalRow {
+  readonly migration_id: string;
+  readonly reconciliation_hash: string;
+  readonly projection_hash: string;
+  readonly projected_node_ids_json: string;
+  readonly migration_status: string | null;
+  readonly current_reconciliation_hash: string | null;
+}
+
+/**
+ * Historical engagement import and Vault publication are deliberately two
+ * separate operations. A generic export must never become a second,
+ * unreviewed publication path for imported nodes: each imported node needs a
+ * completed approval whose reconciliation and exact projected-node selection
+ * still match their immutable hashes.
+ */
+function assertLegacyVaultProjectionApproved(
+  database: SqliteDatabase,
+  connectionId: string,
+  nodeIds: readonly string[],
+): void {
+  if (nodeIds.length === 0) return;
+  const mappingTable = database.prepare(`
+    SELECT 1 AS present FROM sqlite_master
+    WHERE type = 'table' AND name = 'legacy_engagement_brain_nodes'
+  `).get() as { present: number } | undefined;
+  if (!mappingTable) return;
+
+  const importedMappings: Array<{ migration_id: string; node_id: string }> = [];
+  for (let offset = 0; offset < nodeIds.length; offset += 400) {
+    const batch = nodeIds.slice(offset, offset + 400);
+    importedMappings.push(...database.prepare(`
+      SELECT migration_id, node_id FROM legacy_engagement_brain_nodes
+      WHERE node_id IN (${batch.map(() => "?").join(",")})
+      ORDER BY migration_id, node_id
+    `).all(...batch) as Array<{ migration_id: string; node_id: string }>);
+  }
+  if (importedMappings.length === 0) return;
+
+  const approvalColumns = database.prepare(
+    "PRAGMA table_info(legacy_vault_projection_approvals)",
+  ).all() as Array<{ name: string }>;
+  if (!approvalColumns.some((column) => column.name === "projection_hash")) {
+    throw new BrainApiError(
+      409,
+      "legacy_vault_projection_approval_required",
+      "Imported engagement memories require an exact approved Vault projection before export",
+      "policy_denied",
+      "Run the legacy Vault projection preview, review its reconciliation and projection hashes, then approve that exact projection.",
+    );
+  }
+
+  const migrationIds = [...new Set(importedMappings.map((item) => item.migration_id))];
+  const approvals: LegacyVaultProjectionApprovalRow[] = [];
+  for (let offset = 0; offset < migrationIds.length; offset += 300) {
+    const batch = migrationIds.slice(offset, offset + 300);
+    approvals.push(...database.prepare(`
+      SELECT a.migration_id, a.reconciliation_hash, a.projection_hash,
+        a.projected_node_ids_json, r.status AS migration_status,
+        q.report_hash AS current_reconciliation_hash
+      FROM legacy_vault_projection_approvals a
+      LEFT JOIN legacy_migration_runs r ON r.id = a.migration_id
+      LEFT JOIN legacy_migration_reconciliation q ON q.migration_id = a.migration_id
+      WHERE a.connection_id = ? AND a.status = 'completed'
+        AND a.completed_at IS NOT NULL
+        AND a.migration_id IN (${batch.map(() => "?").join(",")})
+    `).all(connectionId, ...batch) as LegacyVaultProjectionApprovalRow[]);
+  }
+
+  const approvedByMigration = new Map<string, Set<string>>();
+  for (const approval of approvals) {
+    if (
+      approval.migration_status !== "completed"
+      || approval.current_reconciliation_hash !== approval.reconciliation_hash
+      || !/^[a-f0-9]{64}$/u.test(approval.reconciliation_hash)
+      || !/^[a-f0-9]{64}$/u.test(approval.projection_hash)
+    ) continue;
+    let projectedNodeIds: unknown;
+    try {
+      projectedNodeIds = JSON.parse(approval.projected_node_ids_json);
+    } catch {
+      continue;
+    }
+    if (
+      !Array.isArray(projectedNodeIds)
+      || projectedNodeIds.some((nodeId) => typeof nodeId !== "string")
+      || new Set(projectedNodeIds).size !== projectedNodeIds.length
+      || sha256(canonical(projectedNodeIds)) !== approval.projection_hash
+    ) continue;
+    approvedByMigration.set(approval.migration_id, new Set(projectedNodeIds as string[]));
+  }
+
+  const unapproved = importedMappings.some((mapping) => (
+    !approvedByMigration.get(mapping.migration_id)?.has(mapping.node_id)
+  ));
+  if (unapproved) {
+    throw new BrainApiError(
+      409,
+      "legacy_vault_projection_approval_required",
+      "Imported engagement memories require an exact approved Vault projection before export",
+      "policy_denied",
+      "Run the legacy Vault projection preview, review its reconciliation and projection hashes, then approve that exact projection.",
+    );
+  }
+}
+
 function vaultAuthorizationFingerprint(
   vault: ObsidianVaultBridge,
   connectionId: string,
@@ -1046,17 +1152,84 @@ function appendGraphNodeFilters(
   }
 }
 
-function graphNodeMatches(node: MemoryNode, filters: GraphFilters): boolean {
-  if (filters.preset && !GRAPH_PRESETS[filters.preset].nodeTypes.includes(node.nodeType)) return false;
-  if (filters.nodeType && node.nodeType !== filters.nodeType) return false;
-  if (filters.scope && node.scope.kind !== filters.scope) return false;
-  if (filters.engagementId && node.scope.engagementId !== filters.engagementId) return false;
-  if (filters.lifecycle && node.lifecycleStatus !== filters.lifecycle) return false;
-  if (filters.sensitivity && node.sensitivity !== filters.sensitivity) return false;
-  if (filters.minConfidence !== undefined && node.confidence < filters.minConfidence) return false;
-  if (filters.updatedAfter && node.updatedAt < filters.updatedAfter) return false;
-  if (filters.updatedBefore && node.updatedAt > filters.updatedBefore) return false;
-  return true;
+function accessibleGraphNodeIds(
+  database: SqliteDatabase,
+  candidateIds: readonly string[],
+  access: MemoryAccessPolicy,
+  filters: GraphFilters,
+  now: string,
+): readonly string[] {
+  if (candidateIds.length === 0) return [];
+  const accessible = new Set<string>();
+  for (let offset = 0; offset < candidateIds.length; offset += 400) {
+    const batch = candidateIds.slice(offset, offset + 400);
+    const accessClause = accessSql("mn", access);
+    const clauses = [
+      `mn.id IN (${batch.map(() => "?").join(",")})`,
+      accessClause.sql,
+      ...(filters.lifecycle ? [] : ["mn.lifecycle_status IN ('confirmed', 'verified', 'disputed', 'stale')"]),
+      "(mn.expires_at IS NULL OR mn.expires_at > ? OR mn.lifecycle_status = 'stale')",
+    ];
+    const params: unknown[] = [...batch, ...accessClause.params, now];
+    appendGraphNodeFilters(clauses, params, filters, "mn");
+    const rows = database.prepare(`
+      SELECT mn.id FROM memory_nodes mn
+      WHERE ${clauses.join(" AND ")}
+    `).all(...params) as Array<{ id: string }>;
+    rows.forEach((row) => accessible.add(row.id));
+  }
+  // Preserve discovery order so increasing the render limit adds nodes to the
+  // existing local segment instead of reshuffling it.
+  return candidateIds.filter((id) => accessible.has(id));
+}
+
+function localGraphNodeIds(
+  database: SqliteDatabase,
+  rootNodeId: string,
+  access: MemoryAccessPolicy,
+  filters: GraphFilters,
+  depth: number,
+  now: string,
+): readonly string[] {
+  const discovered = [rootNodeId];
+  const seen = new Set(discovered);
+  let frontier = [rootNodeId];
+  for (let level = 1; level <= depth && frontier.length > 0; level += 1) {
+    const candidates: string[] = [];
+    const candidateSet = new Set<string>();
+    for (let offset = 0; offset < frontier.length; offset += 300) {
+      const batch = frontier.slice(offset, offset + 300);
+      const placeholders = batch.map(() => "?").join(",");
+      const edgeTypeClause = filters.edgeTypes?.length
+        ? `AND edge_type IN (${filters.edgeTypes.map(() => "?").join(",")})`
+        : "";
+      const rows = database.prepare(`
+        SELECT source_node_id, target_node_id FROM memory_edges
+        WHERE lifecycle_status IN ('confirmed', 'verified')
+          AND (expires_at IS NULL OR expires_at > ?)
+          ${edgeTypeClause}
+          AND (source_node_id IN (${placeholders}) OR target_node_id IN (${placeholders}))
+        ORDER BY confidence DESC, updated_at DESC, id ASC
+      `).all(now, ...(filters.edgeTypes ?? []), ...batch, ...batch) as Array<{
+        source_node_id: string;
+        target_node_id: string;
+      }>;
+      for (const row of rows) {
+        for (const id of [row.source_node_id, row.target_node_id]) {
+          if (!seen.has(id) && !candidateSet.has(id)) {
+            candidateSet.add(id);
+            candidates.push(id);
+          }
+        }
+      }
+    }
+    frontier = [...accessibleGraphNodeIds(database, candidates, access, filters, now)];
+    for (const id of frontier) {
+      seen.add(id);
+      discovered.push(id);
+    }
+  }
+  return discovered;
 }
 
 function graph(
@@ -1074,43 +1247,18 @@ function graph(
   const depth = integer(query.depth, 1, 0, 2, "graph depth");
   const filters = graphFilters(query, access);
   const selected = new Set<string>();
+  const now = new Date().toISOString();
   let rootNodeId: string | undefined;
+  let availableNodeCount = 0;
   let truncated = false;
-  const addIfAccessible = (id: string): boolean => {
-    const node = repository.getNode(id);
-    if (!node || !canAccess(node, access) || !graphNodeMatches(node, filters) || selected.has(id)) return false;
-    if (selected.size >= limit) {
-      truncated = true;
-      return false;
-    }
-    selected.add(id);
-    return true;
-  };
 
   if (view === "local") {
     rootNodeId = requiredText(query.nodeId, "local graph node ID", 256);
     requireAccessibleNode(repository, rootNodeId, access);
-    selected.add(rootNodeId);
-    let frontier = [rootNodeId];
-    for (let level = 1; level <= depth && frontier.length > 0; level += 1) {
-      const placeholders = frontier.map(() => "?").join(",");
-      const edgeTypeClause = filters.edgeTypes?.length ? `AND edge_type IN (${filters.edgeTypes.map(() => "?").join(",")})` : "";
-      const rows = database.prepare(`
-        SELECT source_node_id, target_node_id FROM memory_edges
-        WHERE lifecycle_status IN ('confirmed', 'verified')
-          AND (expires_at IS NULL OR expires_at > ?)
-          ${edgeTypeClause}
-          AND (source_node_id IN (${placeholders}) OR target_node_id IN (${placeholders}))
-        ORDER BY confidence DESC, updated_at DESC LIMIT 1000
-      `).all(new Date().toISOString(), ...(filters.edgeTypes ?? []), ...frontier, ...frontier) as Array<{ source_node_id: string; target_node_id: string }>;
-      const next: string[] = [];
-      for (const row of rows) {
-        for (const id of [row.source_node_id, row.target_node_id]) {
-          if (addIfAccessible(id)) next.push(id);
-        }
-      }
-      frontier = next;
-    }
+    const availableIds = localGraphNodeIds(database, rootNodeId, access, filters, depth, now);
+    availableNodeCount = availableIds.length;
+    availableIds.slice(0, limit).forEach((id) => selected.add(id));
+    truncated = availableNodeCount > selected.size;
   } else {
     const accessClause = accessSql("mn", access);
     const clauses = [
@@ -1119,7 +1267,7 @@ function graph(
       "(mn.expires_at IS NULL OR mn.expires_at > ? OR mn.lifecycle_status = 'stale')",
     ];
     const params: unknown[] = [...accessClause.params];
-    params.push(new Date().toISOString());
+    params.push(now);
     appendGraphNodeFilters(clauses, params, filters, "mn");
     if (view === "mission") {
       const missionId = requiredText(query.missionId, "mission graph ID", 256);
@@ -1140,14 +1288,16 @@ function graph(
           SELECT target_node_id AS node_id FROM live_edges
         ) GROUP BY node_id
       )
-      SELECT mn.id, COALESCE(edge_degree.degree, 0) AS degree
+      SELECT mn.id, COALESCE(edge_degree.degree, 0) AS degree,
+        COUNT(*) OVER () AS available_node_count
       FROM memory_nodes mn
       LEFT JOIN edge_degree ON edge_degree.node_id = mn.id
       WHERE ${clauses.join(" AND ")}
       ORDER BY mn.pinned DESC, degree DESC, mn.updated_at DESC LIMIT ?
-    `).all(new Date().toISOString(), ...params, limit + 1) as Array<{ id: string; degree: number }>;
-    if (rows.length > limit) truncated = true;
-    rows.slice(0, limit).forEach((row) => selected.add(row.id));
+    `).all(now, ...params, limit) as Array<{ id: string; degree: number; available_node_count: number }>;
+    availableNodeCount = Number(rows[0]?.available_node_count ?? 0);
+    truncated = availableNodeCount > rows.length;
+    rows.forEach((row) => selected.add(row.id));
   }
 
   const summaries = [...selected].flatMap((id) => {
@@ -1167,7 +1317,7 @@ function graph(
         AND lifecycle_status != 'forgotten' AND (expires_at IS NULL OR expires_at > ?)
         ${edgeTypeClause}
       ORDER BY confidence DESC, updated_at DESC LIMIT 1000
-    `).all(...ids, ...ids, new Date().toISOString(), ...(filters.edgeTypes ?? [])) as Array<{
+    `).all(...ids, ...ids, now, ...(filters.edgeTypes ?? [])) as Array<{
       id: string;
       source_node_id: string;
       target_node_id: string;
@@ -1199,6 +1349,7 @@ function graph(
     ...(rootNodeId ? { rootNodeId } : {}),
     nodes: summaries,
     edges,
+    availableNodeCount,
     truncated,
   };
 }
@@ -1300,6 +1451,7 @@ function brainSummary(database: SqliteDatabase, access: MemoryAccessPolicy) {
     schemaVersion: SCHEMA_VERSION,
     counts: {
       confirmed: counts.get("confirmed") ?? 0,
+      verified: counts.get("verified") ?? 0,
       candidates,
       stale: counts.get("stale") ?? 0,
       disputed: counts.get("disputed") ?? 0,
@@ -2271,6 +2423,7 @@ export function createSecondBrainRouter(dependencies: SecondBrainRouterDependenc
       if (nodeId) {
         requireAccessibleNode(repository, nodeId, access);
         vault.assertConnectionNodeAllowed(connectionId, nodeId);
+        assertLegacyVaultProjectionApproved(dependencies.database, connectionId, [nodeId]);
         const exported = vault.exportNode(connectionId, nodeId, allowedTargetIds);
         repository.recordNodeExportAudit({ nodeId, actor, connectionId, status: exported.status });
         const result = {
@@ -2281,6 +2434,7 @@ export function createSecondBrainRouter(dependencies: SecondBrainRouterDependenc
       }
       const nodeIds = connectionNodeIds;
       const bounded = nodeIds.slice(0, 250);
+      assertLegacyVaultProjectionApproved(dependencies.database, connectionId, bounded);
       const results = bounded.map((id) => {
         const result = vault.exportNode(connectionId, id, allowedTargetIds);
         repository.recordNodeExportAudit({
@@ -2316,6 +2470,23 @@ export function createSecondBrainRouter(dependencies: SecondBrainRouterDependenc
       if (nodeId) {
         requireAccessibleNode(repository, nodeId, access);
         vault.assertConnectionNodeAllowed(cachedResponse.result.connectionId, nodeId);
+        assertLegacyVaultProjectionApproved(
+          dependencies.database,
+          cachedResponse.result.connectionId,
+          [nodeId],
+        );
+      } else {
+        const currentNodeIds = accessibleConnectionNodeIds(
+          dependencies.database,
+          vault,
+          cachedResponse.result.connectionId,
+          access,
+        );
+        assertLegacyVaultProjectionApproved(
+          dependencies.database,
+          cachedResponse.result.connectionId,
+          currentNodeIds.slice(0, 250),
+        );
       }
     });
   });

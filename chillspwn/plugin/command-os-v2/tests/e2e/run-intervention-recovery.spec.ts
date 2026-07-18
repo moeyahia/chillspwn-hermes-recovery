@@ -193,35 +193,46 @@ async function mutationResponse(
   return pending;
 }
 
-async function replayCapturedMutation(page: Page, request: Request): Promise<{
+async function replayCapturedMutation(
+  page: Page,
+  audit: BrowserAudit,
+  request: Request,
+  expectedResponseId?: string,
+): Promise<{
   readonly status: number;
   readonly body: unknown;
 }> {
-  const pathname = pathOf(request);
-  const idempotencyKey = request.headers()["idempotency-key"];
+  const capturedUrl = new URL(request.url());
+  const requestPath = `${capturedUrl.pathname}${capturedUrl.search}`;
+  const headers = request.headers();
+  const idempotencyKey = headers["idempotency-key"];
+  const capturedCsrf = headers["x-command-os-v2-csrf"];
+  const contentType = headers["content-type"];
   const body = request.postData();
   expect(idempotencyKey).toBeTruthy();
+  expect(capturedCsrf).toBeTruthy();
+  expect(contentType).toContain("application/json");
   expect(body).toBeTruthy();
-  return page.evaluate(async ({ pathname: path, idempotencyKey: key, body: payload }) => {
-    const rawCsrf = document.cookie
-      .split(";")
-      .map((part) => part.trim())
-      .find((part) => part.startsWith("chillspwn_command_os_v2_csrf="))
-      ?.slice("chillspwn_command_os_v2_csrf=".length);
-    if (!rawCsrf) throw new Error("The authenticated E2E context has no V2 CSRF cookie");
-    const response = await fetch(path, {
-      method: "POST",
-      credentials: "same-origin",
+  const csrf = (await page.context().cookies(request.url()))
+    .find((cookie) => cookie.name === "chillspwn_command_os_v2_csrf");
+  if (!csrf || csrf.value !== capturedCsrf) {
+    throw new Error("The captured V2 mutation is not bound to the exact authenticated origin CSRF cookie");
+  }
+  const response = await audit.request(page.request, {
+    method: "POST",
+    url: requestPath,
+    ...(expectedResponseId ? { expectedResponseId } : {}),
+    options: {
+      data: body,
       headers: {
-        Accept: "application/json",
-        "Content-Type": "application/json",
-        "Idempotency-Key": key,
-        "X-Command-OS-V2-CSRF": decodeURIComponent(rawCsrf),
+        Accept: headers.accept ?? "application/json",
+        "Content-Type": contentType!,
+        "Idempotency-Key": idempotencyKey!,
+        "X-Command-OS-V2-CSRF": capturedCsrf!,
       },
-      body: payload,
-    });
-    return { status: response.status, body: await response.json() as unknown };
-  }, { pathname, idempotencyKey, body });
+    },
+  });
+  return { status: response.status(), body: await response.json() as unknown };
 }
 
 test(`${TEST_CONTROL_PLANE} refuses a legacy-owned run without creating V2 lease, event, checkpoint, or audit state`, async ({ page }, testInfo) => {
@@ -312,7 +323,8 @@ test(`${TEST_PAUSE_RESUME} pauses and resumes from the exact durable checkpoint 
   expect(afterPause.checkpoints.at(-1)?.inFlightCount).toBe(0);
   expect(afterPause.runtimeIdempotencyCount).toBe(1);
 
-  const replay = await replayCapturedMutation(page, pausedResponse.request());
+  await audit.waitForPageApiSettlement(page);
+  const replay = await replayCapturedMutation(page, audit, pausedResponse.request());
   expect(replay).toEqual({ status: 200, body: pausedBody });
   expect(readRunInterventionRecoverySnapshot(pauseFixture)).toEqual(afterPause);
 
@@ -344,7 +356,8 @@ test(`${TEST_PAUSE_RESUME} pauses and resumes from the exact durable checkpoint 
   expect(resumedBody).toMatchObject({
     run: { id: pauseFixture.runId, status: "waiting_guided_decision", currentStepId: pauseFixture.stepId },
   });
-  const resumedReplay = await replayCapturedMutation(page, resumedResponse.request());
+  await audit.waitForPageApiSettlement(page);
+  const resumedReplay = await replayCapturedMutation(page, audit, resumedResponse.request());
   expect(resumedReplay).toEqual({ status: 200, body: resumedBody });
   // Resume invalidates the mounted run, plan, observability, and notification
   // projections. Prove those authoritative reads finish before deliberately
@@ -427,7 +440,8 @@ test(`${TEST_CANCEL} cancels all durable child work, checkpoints zero in-flight 
   expect(afterCancel.checkpoints.at(-1)?.inFlightCount).toBe(0);
   expect(afterCancel.runtimeIdempotencyCount).toBe(1);
 
-  const replay = await replayCapturedMutation(page, cancelledResponse.request());
+  await audit.waitForPageApiSettlement(page);
+  const replay = await replayCapturedMutation(page, audit, cancelledResponse.request());
   expect(replay).toEqual({ status: 200, body: cancelledBody });
   expect(readRunInterventionRecoverySnapshot(cancelFixture)).toEqual(afterCancel);
   await audit.withExpectedDocumentNavigationTeardown(page, () => page.reload({ waitUntil: "domcontentloaded" }));
@@ -440,16 +454,28 @@ test(`${TEST_CANCEL} cancels all durable child work, checkpoints zero in-flight 
 test(`${TEST_REPLAN} rejects a stale boundary, persists one bounded replan, then rejects replay after fail-closed progression`, async ({ page }, testInfo) => {
   const audit = new BrowserAudit(page, {
     allowEventStreamNavigationAbort: true,
-    expectedHttpResponses: [{
-      id: "run-recovery.replan-conflicts",
-      transport: "browser",
-      method: "POST",
-      pathname: recoveryMutationPath(replanFixture, "replan"),
-      query: {},
-      status: 409,
-      occurrences: 2,
-      reason: "Prove both a stale exact boundary and an obsolete post-progression idempotent replay fail closed.",
-    }],
+    expectedHttpResponses: [
+      {
+        id: "run-recovery.replan-stale-boundary",
+        transport: "browser",
+        method: "POST",
+        pathname: recoveryMutationPath(replanFixture, "replan"),
+        query: {},
+        status: 409,
+        occurrences: 1,
+        reason: "Prove a stale exact recovery boundary fails closed in the represented browser interaction.",
+      },
+      {
+        id: "run-recovery.replan-progressed-replay",
+        transport: "api-request",
+        method: "POST",
+        pathname: recoveryMutationPath(replanFixture, "replan"),
+        query: {},
+        status: 409,
+        occurrences: 1,
+        reason: "Prove the exact idempotency key cannot replay after fail-closed runtime progression.",
+      },
+    ],
   });
   await page.goto(liveRoute(replanFixture), { waitUntil: "domcontentloaded" });
   const recovery = recoveryControls(page);
@@ -548,7 +574,13 @@ test(`${TEST_REPLAN} rejects a stale boundary, persists one bounded replan, then
     inFlightCount: 0,
   }));
   expect(afterUnavailablePlanner.recoveryIdempotencyCount).toBe(1);
-  const progressedReplay = await replayCapturedMutation(page, acceptedResponse.request());
+  await audit.waitForPageApiSettlement(page);
+  const progressedReplay = await replayCapturedMutation(
+    page,
+    audit,
+    acceptedResponse.request(),
+    "run-recovery.replan-progressed-replay",
+  );
   expect(progressedReplay).toMatchObject({
     status: 409,
     body: { error: { code: "recovery_idempotent_replay_stale", retryable: false } },
@@ -622,11 +654,13 @@ test(`${TEST_REASSIGN_TERMINATE} reassigns only the exact stopped assignment, de
   });
   expect(afterReassign.checkpoints.at(-1)).toMatchObject({ planVersion: 1, stateHashVerified: true, inFlightCount: 0 });
   expect(afterReassign.recoveryIdempotencyCount).toBe(1);
-  const replay = await replayCapturedMutation(page, reassignedResponse.request());
+  await audit.waitForPageApiSettlement(page);
+  const replay = await replayCapturedMutation(page, audit, reassignedResponse.request());
   expect(replay).toEqual({ status: 200, body: reassignedBody });
   expect(readRunInterventionRecoverySnapshot(reassignFixture)).toEqual(afterReassign);
 
   await audit.withExpectedDocumentNavigationTeardown(page, () => page.reload({ waitUntil: "domcontentloaded" }));
+  await audit.waitForPageApiSettlement(page);
   const terminateRecovery = recoveryControls(page);
   await terminateRecovery.getByRole("textbox", { name: "Operator reason (audited)", exact: true })
     .fill("No further in-scope recovery remains; close the disposable run cleanly.");
@@ -651,6 +685,7 @@ test(`${TEST_REASSIGN_TERMINATE} reassigns only the exact stopped assignment, de
     action: "run.cancelled",
     reason: "No further in-scope recovery remains; close the disposable run cleanly.",
   });
+  await audit.waitForPageApiSettlement(page);
   await audit.withExpectedDocumentNavigationTeardown(page, () => page.reload({ waitUntil: "domcontentloaded" }));
   await expect(page.getByLabel("Selected run status")).toContainText("cancelled");
   expect(readRunInterventionRecoverySnapshot(reassignFixture).activeChildCount).toBe(0);

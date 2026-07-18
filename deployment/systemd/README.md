@@ -1,105 +1,155 @@
-# Hardened systemd deployment
+# Command OS V2 preview systemd deployment
 
-These units describe the Command OS V2.1 host contract. They contain paths and
-safe defaults only; credentials are injected from root-owned mode-`0600`
-environment files outside the repository.
+This directory's preview procedure is intentionally limited to the isolated
+Command OS V2 service on port 3132. It does not promote, restart, reconfigure,
+or otherwise operate the legacy application.
 
-## Active unit set
+## Absolute preview boundary
 
-- `chillspwn.service` runs the dashboard and runtime as `chillspwn`.
-- `hermes-gateway.service` runs Hermes adapters and scheduling as `chillspwn`.
-- `var-lib-chillspwn-workspaces-htb-boxes.mount` bind-mounts the existing HTB
-  workspace into the service namespace.
-- `var-lib-chillspwn-workspaces-engagements.mount` does the same for engagement
-  workspaces.
+Use only:
 
-The pre-V2 memory broker is retained only under `deployment/legacy/` and is not
-part of the V2.1 unit dependency graph. Command OS memory is canonical in
-`/var/lib/chillspwn/command-os-v2.sqlite`; Obsidian-compatible projections live
-under `/var/lib/chillspwn/brain-vaults`.
+- service: `chillspwn-command-os-v2-preview.service`;
+- active code symlink: `/opt/chillspwn/plugin-command-os-v2`;
+- retained prior symlink: `/opt/chillspwn/plugin.previous-command-os-v2`;
+- database: `/var/lib/chillspwn/command-os-v2.sqlite`;
+- preview state: `/var/lib/chillspwn/state-v2-preview`;
+- V2 Vault root: `/var/lib/chillspwn/brain-vaults`;
+- preview log: `/var/log/chillspwn/command-os-v2-preview.log`;
+- default preview listener: port 3132.
 
-## Filesystem contract
+During preview, **never modify `/opt/chillspwn/plugin` and never stop, restart,
+reload, enable, disable, or deploy through `chillspwn.service`**. Those names
+belong to the legacy production application on port 3131. Generic plugin
+promotion, generic restore helpers, and any command that changes the legacy
+symlink are outside this runbook.
 
-Root-controlled, non-service-writable paths:
+The preview unit starts
+`server/command-os-v2-preview-entry.ts`. That entry evaluates the kill switch
+before importing the hybrid application, so a killed preview does not open the
+database, initialize workers/providers/MCP/Vault services, or load legacy
+runtime modules.
 
-- `/opt/chillspwn/releases/<release-id>` and the atomic
-  `/opt/chillspwn/plugin` symlink;
-- `/opt/chillspwn-runtime/bin/bun`;
-- `/opt/chillspwn-runtime/hermes-venv`;
-- `/opt/chillspwn/report-template`;
-- `/opt/chillspwn/bin/grok`;
-- `/etc/systemd/system/*.service` and `*.mount`.
+## Unit contract
 
-Service-owned mode-`0700` state roots:
-
-- `/var/lib/chillspwn/state`;
-- `/var/lib/chillspwn/hermes`;
-- `/var/lib/chillspwn/claude`;
-- `/var/lib/chillspwn/codex`;
-- `/var/lib/chillspwn/grok-home`;
-- `/var/lib/chillspwn/grok-auth`;
-- `/var/lib/chillspwn/brain-vaults`;
-- `/var/lib/chillspwn/workspaces`.
-
-The canonical SQLite file and refreshable OAuth files are service-owned mode
-`0600`. Logs are under service-owned `/var/log/chillspwn` with restrictive
-permissions. API secrets remain in `/etc/chillspwn/chillspwn.env` and
-`/etc/hermes-gateway.env`, owned by root and mode `0600`; do not put live values
-in a unit or repository file.
-
-## Release staging
-
-Never copy the plugin with an ad hoc `rsync -aL`. The plugin contains reviewed
-repository-relative aliases to shared Hermes skills, and release materialization
-must not follow mutable user-home or runtime paths. Use the fail-closed stager
-from a root-owned checkout:
+Install and verify only the preview unit:
 
 ```bash
-install -d -o root -g root -m 0755 /opt/chillspwn/releases/<release-id>
-./scripts/stage-chillspwn-release.sh \
-  --destination /opt/chillspwn/releases/<release-id>/plugin \
-  --dry-run
-./scripts/stage-chillspwn-release.sh \
-  --destination /opt/chillspwn/releases/<release-id>/plugin \
-  --build
+install -o root -g root -m 0644 \
+  deployment/systemd/chillspwn-command-os-v2-preview.service \
+  /etc/systemd/system/chillspwn-command-os-v2-preview.service
+systemd-analyze verify \
+  /etc/systemd/system/chillspwn-command-os-v2-preview.service
+systemctl daemon-reload
 ```
 
-The destination must not already exist. `--build` is deliberate: only that
-option installs the locked Bun dependencies and creates the client build inside
-the isolated staging directory. The stager rejects unknown or external
-symlinks, unsafe filenames, mutable state, oversized files, writable output,
-and a changed logo before atomically moving the completed tree into place.
-Recheck a staged tree without changing it with:
+The unit runs as the unprivileged `chillspwn` account, clears supplementary
+groups/capabilities, enables `NoNewPrivileges`, applies separate CPU/IO/memory
+weights, and uses V2-namespaced state and database paths. Docker MCP execution
+is disabled. Do not weaken those boundaries to make a tool pass.
+
+## Trusted recon tools
+
+The V2-only trusted directory is
+`/usr/local/libexec/chillspwn-command-os-v2/bin`. It contains exactly the
+capability-free, hash-pinned Nmap copy and the reviewed `httpx-toolkit` wrapper
+that forces update checks off. It is absent from legacy and preview-global
+PATHs; only the exact reviewed Pentest Recon child can receive it.
+
+After staging reviewed source, install or verify it as root from the staged
+V2 webapp:
 
 ```bash
+./scripts/command-os-v2/manage-trusted-tool-shims.sh install
+./scripts/command-os-v2/manage-trusted-tool-shims.sh check
+```
+
+The current isolated Pentest canary passes all 8/8 exposed bindings.
+`runHashcat`, `subfinderEnum`, `httpxProbe`, and `nucleiScan` remain suppressed;
+the wrapper is not an egress sandbox. Removing the private bundle uses
+`manage-trusted-tool-shims.sh remove` and does not change global binaries.
+
+## Stage an immutable preview release
+
+Stage from a root-owned checkout into a new release directory. The destination
+must not exist:
+
+```bash
+RELEASE_ID=<utc-timestamp>-command-os-v2-<exact-revision>
+RELEASE_ROOT=/opt/chillspwn/releases/$RELEASE_ID
+
+install -d -o root -g root -m 0755 "$RELEASE_ROOT"
 ./scripts/stage-chillspwn-release.sh \
-  --destination /opt/chillspwn/releases/<release-id>/plugin \
+  --destination "$RELEASE_ROOT/plugin" \
+  --dry-run
+./scripts/stage-chillspwn-release.sh \
+  --destination "$RELEASE_ROOT/plugin" \
+  --build
+./scripts/stage-chillspwn-release.sh \
+  --destination "$RELEASE_ROOT/plugin" \
   --verify-only
 ```
 
-Promotion of `/opt/chillspwn/plugin` remains a separate, explicit operation
-after validation; the staging script never changes the active symlink or a
-service.
+The stager never changes an active symlink or service. Validate the staged
+schema, logo hash, build, unit, and V2-only trusted-tool check before promotion.
 
-## Installation order
+## Promote only the preview
 
-1. Create the source and target workspace directories. The mount unit names are
-   derived from their `Where=` paths and must not be renamed.
-2. Install and enable the two `.mount` units before either application service.
-3. Install the two service units and validate all four units with
-   `systemd-analyze verify`.
-4. Confirm `id chillspwn` lists only its primary group and that passwordless
-   `sudo` is unavailable.
-5. Start `hermes-gateway.service`, then `chillspwn.service`.
-6. Verify both health endpoints, provider readiness, database integrity, vault
-   scope, mount identity, and the no-hands action boundary.
+Before promotion, record the legacy service PID, start timestamp, and restart
+counter for a post-operation noninterference check. Do not issue any command to
+that service.
 
-The shipped service units explicitly clear supplementary groups, capabilities,
-and ambient capabilities. Docker MCP execution is disabled because membership
-in the Docker group or access to its socket is root-equivalent. Enable no
-additional group, device, socket, or write path without a separate threat-model
-review.
+Stop only the preview service, create and verify a timestamped V2 database
+backup, then atomically switch only the V2 symlinks. The previous target must
+remain retained for static rollback. Use a same-directory temporary symlink and
+`mv -T` so readers never observe a partial pointer.
 
-See the [deployment gate](../../chillspwn/plugin/webapp/docs/command-os-v2/deployment.md)
-and [rollback runbook](../../chillspwn/plugin/webapp/docs/command-os-v2/rollback.md)
-before promotion.
+```bash
+systemctl stop chillspwn-command-os-v2-preview.service
+
+# Run db:backup and db:verify from the staged V2 webapp while the preview is
+# quiescent. Record the backup path and SHA-256 before changing the pointer.
+
+NEW_TARGET="$RELEASE_ROOT/plugin"
+OLD_TARGET=$(readlink -f /opt/chillspwn/plugin-command-os-v2)
+
+ln -sfn "$OLD_TARGET" /opt/chillspwn/.previous-command-os-v2.next
+mv -Tf /opt/chillspwn/.previous-command-os-v2.next \
+  /opt/chillspwn/plugin.previous-command-os-v2
+ln -sfn "$NEW_TARGET" /opt/chillspwn/.plugin-command-os-v2.next
+mv -Tf /opt/chillspwn/.plugin-command-os-v2.next \
+  /opt/chillspwn/plugin-command-os-v2
+
+systemctl start chillspwn-command-os-v2-preview.service
+```
+
+Poll the JSON V2 readiness endpoint on port 3132 until it is healthy, then
+require consecutive healthy samples. Verify the preview PID/restart counter,
+database/schema, event stream, Vault health, and tool disposition. Finally,
+verify the recorded legacy PID, start timestamp, and restart counter are
+unchanged and its critical workflow still works.
+
+If preview startup or readiness fails, stop only the preview, point
+`/opt/chillspwn/plugin-command-os-v2` back to the retained previous target,
+and start only the preview. Do not restore the database merely for a code/static
+rollback; database restoration requires a stopped preview, an explicit
+compatibility decision, and a checksum-verified backup.
+
+## Kill switch
+
+Set `COMMAND_OS_V2_KILL_SWITCH=true` for the preview environment and restart
+only:
+
+```bash
+systemctl restart chillspwn-command-os-v2-preview.service
+```
+
+The preview entry returns a structured 503 for all requests without
+initializing V2 dependencies. Confirm the legacy application remains unchanged.
+Clear the flag and restart the same preview service to re-enable V2.
+
+## Cutover status
+
+This procedure is preview promotion only. It does not change the default route
+and is not formal cutover evidence. The full browser matrix, migration and
+restore rehearsal, 72-hour soak, preview acceptance window, rollback rehearsal,
+zero-defect review, and explicit human sign-off remain required.

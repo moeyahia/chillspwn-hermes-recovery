@@ -53,7 +53,10 @@ interface RemoteQueryExpectation {
   readonly pathname: string;
   readonly limit: number;
   readonly itemId: string;
+  readonly optionNameFromItem?: (item: Readonly<Record<string, unknown>>) => RegExp;
 }
+
+const AGENT_PALETTE_STATUSES = ["available", "busy", "degraded", "offline", "quarantined"] as const;
 
 function escapeRegex(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
@@ -108,6 +111,7 @@ async function chooseResult(input: {
   expectedPath: string;
   keyboard?: boolean;
   remote?: RemoteQueryExpectation;
+  assertDestination?: (page: Page) => Promise<void>;
 }): Promise<void> {
   await input.audit.withExpectedDocumentNavigationTeardown(input.page, () =>
     input.page.goto("/manual", { waitUntil: "domcontentloaded" }));
@@ -126,14 +130,17 @@ async function chooseResult(input: {
       })
     : undefined;
   await search.fill(input.query);
+  let optionName = input.name;
   if (remoteResponse && input.remote) {
     const response = await remoteResponse;
     expect(response.status()).toBe(200);
-    const payload = await response.json() as { items?: Array<{ id?: unknown }> };
-    expect(payload.items?.some((item) => item.id === input.remote!.itemId)).toBe(true);
+    const payload = await response.json() as { items?: Array<Record<string, unknown>> };
+    const item = payload.items?.find((candidate) => candidate.id === input.remote!.itemId);
+    expect(item, `Remote ${input.remote.pathname} must return the exact requested record`).toBeDefined();
+    if (item && input.remote.optionNameFromItem) optionName = input.remote.optionNameFromItem(item);
   }
   await waitForPaletteSearch(dialog);
-  const option = dialog.getByRole("option", { name: input.name }).first();
+  const option = dialog.getByRole("option", { name: optionName }).first();
   await expect(option).toBeVisible();
   if (input.keyboard) {
     for (let index = 0; index < 20 && await option.getAttribute("aria-selected") !== "true"; index += 1) {
@@ -149,6 +156,26 @@ async function chooseResult(input: {
   const routeSurface = input.page.locator("main#command-os-content");
   await expect(routeSurface).toBeVisible();
   await expect(routeSurface.locator("h1, [role='status']").first()).toBeVisible();
+  // A route heading can render after its first canonical read while nested
+  // mission surfaces are still starting their own required queries. Keep the
+  // command activation boundary open until every same-page V2 read has a
+  // normal completion receipt; the next palette navigation must never make
+  // legitimate plan, evidence, or topology reads look like teardown noise.
+  await input.audit.waitForPageApiSettlement(input.page);
+  await input.assertDestination?.(input.page);
+}
+
+async function assertGuidedSearchDestination(page: Page): Promise<void> {
+  await expect(page.getByRole("heading", { name: fixture.missionLabel, exact: true })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Exact step decision", exact: true })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Commander conversation", exact: true })).toBeVisible();
+  await expect(page.getByLabel("Current Guided step").getByRole("heading", {
+    name: "Collect bounded observation",
+    exact: true,
+  })).toBeVisible();
+  await expect(page.getByLabel("Selected run status")).toContainText("waiting guided decision");
+  await expect(page.getByRole("region", { name: "Recon digital twin", exact: true })).toBeVisible();
+  await expect(page.locator("main#command-os-content .os-state-panel")).toHaveCount(0);
 }
 
 function mutationResponse(page: Page, path: string, action: () => Promise<void>) {
@@ -278,6 +305,7 @@ test(`${TEST_SEARCH} searches real permitted records and activates every result 
     name: new RegExp(`^${escapeRegex(fixture.missionLabel)}.*Guided mission.*waiting guided decision$`, "u"),
     expectedPath: `/guided/${fixture.search.missionId}`,
     remote: { pathname: "/api/v2/missions", limit: 100, itemId: fixture.search.missionId },
+    assertDestination: assertGuidedSearchDestination,
   });
   await chooseResult({
     page,
@@ -287,6 +315,7 @@ test(`${TEST_SEARCH} searches real permitted records and activates every result 
     expectedPath: `/guided/${fixture.search.missionId}`,
     keyboard: true,
     remote: { pathname: "/api/v2/runs", limit: 100, itemId: fixture.search.runId },
+    assertDestination: assertGuidedSearchDestination,
   });
   await chooseResult({
     page,
@@ -303,7 +332,31 @@ test(`${TEST_SEARCH} searches real permitted records and activates every result 
     query: fixture.agentToken,
     name: new RegExp(`^${escapeRegex(fixture.agentLabel)}.*recon-specialist.*available`, "u"),
     expectedPath: `/agents/${fixture.search.agentId}`,
-    remote: { pathname: "/api/v2/agents", limit: 100, itemId: fixture.search.agentId },
+    remote: {
+      pathname: "/api/v2/agents",
+      limit: 100,
+      itemId: fixture.search.agentId,
+      optionNameFromItem: (item) => {
+        if (item.displayName !== fixture.agentLabel || item.role !== "recon-specialist") {
+          throw new Error("The canonical agent search returned an unexpected identity or specialist role");
+        }
+        if (typeof item.status !== "string" ||
+          !AGENT_PALETTE_STATUSES.includes(item.status as typeof AGENT_PALETTE_STATUSES[number])) {
+          throw new Error(`The canonical agent search returned unsupported status ${String(item.status)}`);
+        }
+        const assignmentHealth = item.assignmentHealth;
+        if (!assignmentHealth || typeof assignmentHealth !== "object" ||
+          !("queueDepth" in assignmentHealth) ||
+          !Number.isSafeInteger(assignmentHealth.queueDepth) ||
+          Number(assignmentHealth.queueDepth) < 0) {
+          throw new Error("The canonical agent search returned an invalid queue depth");
+        }
+        return new RegExp(
+          `^${escapeRegex(fixture.agentLabel)}.*recon-specialist.*${escapeRegex(item.status)}.*queue ${String(assignmentHealth.queueDepth)}$`,
+          "u",
+        );
+      },
+    },
   });
   await chooseResult({
     page,

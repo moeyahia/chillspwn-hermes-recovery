@@ -43,6 +43,13 @@ describe("E2E live-attestation fixture boundary", () => {
       name: "sechub-reconnaissance",
       verified: true,
       tools: ["quick_scan"],
+      toolSchemas: {
+        quick_scan: {
+          type: "object",
+          properties: {},
+          additionalProperties: false,
+        },
+      },
       assignedAgentIds: ["ReconScout"],
       attestedAt: "2026-07-15T12:00:00.000Z",
       expiresAt: "2026-07-15T12:02:00.000Z",

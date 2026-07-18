@@ -1,143 +1,118 @@
 # Command OS V2 rollback and coexistence
 
-Status: preview isolation, database backup/restore primitives, and an immutable
-V2 static-artifact pointer rollback are proven on disposable stores and
-processes. Default-route cutover and one-command full production rollback are
-not authorized or rehearsed yet.
+Status: **V2 preview containment is implemented; default-route cutover and full
+production rollback remain unauthorized and unrehearsed**.
 
-## Preview rollback
+## Noninterference boundary
 
-1. Set `COMMAND_OS_V2_KILL_SWITCH=true` and restart only the V2 service.
-2. Confirm `/api/v2/*` returns the explicit V2-disabled response.
-3. Verify the legacy process, routes, database/files, storage keys, and primary
-   browser workflow remain unchanged.
-4. Preserve the V2 database, artifacts, event history, and audit records for
-   diagnosis; do not rewrite them into legacy stores.
-5. Restore a V2 database only while the V2 service is stopped and only from a
-   checksum-verified backup.
+Preview rollback may operate only on:
 
-The wired commands are `db:verify`, `db:backup`, and `db:restore`. A disposable
-backup/restore/quick-check cycle has passed. This is not yet a production data
-rollback rehearsal.
+- `chillspwn-command-os-v2-preview.service`;
+- `/opt/chillspwn/plugin-command-os-v2`;
+- `/opt/chillspwn/plugin.previous-command-os-v2`;
+- `/var/lib/chillspwn/command-os-v2.sqlite` and its verified V2 backups; and
+- V2-namespaced state, artifacts, logs, and Vault projections.
 
-## Immutable V2 static-artifact handoff
+It must never modify `/opt/chillspwn/plugin` or stop, restart, reload, enable,
+disable, or deploy through `chillspwn.service`. Those are the legacy production
+application boundary. Record the legacy PID, process start timestamp, and
+systemd restart counter before a preview operation and prove they are unchanged
+afterward.
 
-The isolated V2 application now has a versioned static-release store and CLI:
+## Immediate containment: V2 kill switch
 
-- [StaticArtifactReleaseStore.ts](../../chillspwn/plugin/command-os-v2/server/static-release/StaticArtifactReleaseStore.ts)
-- [cli.ts](../../chillspwn/plugin/command-os-v2/server/static-release/cli.ts)
+The preview unit starts
+`server/command-os-v2-preview-entry.ts`. When
+`COMMAND_OS_V2_KILL_SWITCH=true`, that entry returns a structured 503 without
+importing the hybrid application. SQLite, workers, providers, MCP processes,
+Vault watchers, and legacy runtime modules are therefore not initialized.
 
-Use absolute paths carrying a `command-os-v2` namespace. The release root and
-built `dist` source must be disjoint and must not traverse legacy, `webapp`, or
-symlinked paths. A bounded handoff is:
+Put the flag in a drop-in for the preview unit only, reload systemd, and restart
+only V2:
 
-```bash
-export COMMAND_OS_V2_STATIC_RELEASE_ROOT=/srv/chillspwn/command-os-v2-static-releases
-export COMMAND_OS_V2_STATIC_RELEASE_ID=20260717T0514Z-<exact-build-id>
-
-bun run release:static:stage \
-  --root "$COMMAND_OS_V2_STATIC_RELEASE_ROOT" \
-  --release-id "$COMMAND_OS_V2_STATIC_RELEASE_ID" \
-  --dist /absolute/path/to/command-os-v2/dist
-
-bun run release:static:verify \
-  --root "$COMMAND_OS_V2_STATIC_RELEASE_ROOT" \
-  --release-id "$COMMAND_OS_V2_STATIC_RELEASE_ID"
-
-bun run release:static:activate \
-  --root "$COMMAND_OS_V2_STATIC_RELEASE_ROOT" \
-  --release-id "$COMMAND_OS_V2_STATIC_RELEASE_ID"
-
-bun run release:static:pin \
-  --root "$COMMAND_OS_V2_STATIC_RELEASE_ROOT"
+```ini
+# /etc/systemd/system/chillspwn-command-os-v2-preview.service.d/kill-switch.conf
+[Service]
+Environment=COMMAND_OS_V2_KILL_SWITCH=true
 ```
 
-Staging copies only regular files into a same-filesystem temporary directory,
-writes a sorted per-file SHA-256 manifest and aggregate digest, verifies the
-complete copy, makes the release tree read-only, and atomically renames it to
-`releases/<release-id>`. Symlinks, special files, unsafe relative paths,
-unmanifested files, partial copies, changed source files, reused release IDs,
-and legacy-owned roots fail closed. Activation verifies the selected manifest
-before atomically replacing `state/active.json`; the exact previous release ID
-and manifest digest remain in that pointer and the prior version directory is
-retained.
-
-When `COMMAND_OS_V2_SERVE_STATIC=true` and
-`COMMAND_OS_V2_STATIC_RELEASE_ROOT` is configured, `server/index.ts` reads the
-pointer once during startup and pins the exact verified version directory.
-`express.static` and the SPA fallback use that immutable directory—not the
-mutable pointer or a shared serving directory. Changing the pointer while the
-process runs cannot change its files. A deliberate V2 process restart is
-required to pin a newly activated release. Missing, malformed, partial, extra,
-or hash-mismatched active content refuses startup before the listener opens.
-
-### Pointer-only rollback
-
-The one-command static rollback is:
-
 ```bash
-bun run release:static:rollback \
-  --root "$COMMAND_OS_V2_STATIC_RELEASE_ROOT"
+systemctl daemon-reload
+systemctl restart chillspwn-command-os-v2-preview.service
 ```
 
-Rollback first verifies the currently active manifest and the exact prior
-manifest digest recorded in the pointer. It then atomically swaps only the V2
-static pointer and preserves both version directories. A running process stays
-pinned to its existing directory; restart only the isolated V2 process when it
-is appropriate to adopt the rolled-back pointer.
+Confirm port 3132 returns `command_os_v2_killed`, no V2 workers or database
+handles remain, and the legacy PID/restart counter and critical workflow are
+unchanged. To re-enable the preview, remove only that drop-in, reload systemd,
+and restart only `chillspwn-command-os-v2-preview.service`.
 
-This command does **not** change the legacy route, reverse proxy, API/backend,
-database, migrations, workers, queues, provider/MCP state, control-plane
-ownership, active runs, or service lifecycle. It is not the full cutover
-rollback described below and must never be presented as one.
+## Preview code-pointer rollback
 
-### Focused evidence
+The active preview pointer is `/opt/chillspwn/plugin-command-os-v2`; the exact
+prior target is retained at `/opt/chillspwn/plugin.previous-command-os-v2`.
+Pointer rollback is permitted only after the prior artifact and its database
+schema compatibility are verified.
 
-- [StaticArtifactReleaseStore.test.ts](../../chillspwn/plugin/command-os-v2/server/static-release/__tests__/StaticArtifactReleaseStore.test.ts):
-  `7` tests passed with `47` assertions. This covers atomic version staging,
-  complete manifest verification, exact process pins, prior retention,
-  verified rollback, tamper/partial/extra-file refusal, unsafe filesystem
-  entries, and the CLI's static-only scope warning.
-- [StaticServerHandoff.integration.test.ts](../../chillspwn/plugin/command-os-v2/server/static-release/__tests__/StaticServerHandoff.integration.test.ts):
-  `1` real-process integration test passed with `12` assertions in `878 ms`.
-  The standalone V2 server served release A, continued serving A after the
-  pointer activated B, pinned and served B after graceful restart, and exited
-  nonzero before listening after active B was tampered.
-- `bun run typecheck` passed both TypeScript configurations after the focused
-  process test.
+Migration `014_runtime_mutation_receipts` is additive and the migration runner
+rejects an unknown future schema. A schema-13 binary must therefore not be
+blindly restarted against a schema-14 database. When compatibility is not
+proven, keep the kill switch active and make an explicit code/data recovery
+decision instead of looping restarts.
 
-## Cutover prerequisites
+For a compatible prior release:
 
-Before the default route may change:
+1. stop only `chillspwn-command-os-v2-preview.service`;
+2. verify the current database and capture its checksum-protected backup;
+3. verify the retained prior release manifest and schema compatibility;
+4. atomically repoint only `/opt/chillspwn/plugin-command-os-v2` to the retained
+   prior target;
+5. start only the preview service;
+6. require consecutive healthy JSON readiness samples on port 3132; and
+7. verify the legacy process identity and workflow did not change.
 
-- freeze and back up legacy and V2 stores;
-- complete source-hash reconciliation and quarantine review;
-- prove no run has concurrent control-plane ownership;
-- drain active work or checkpoint it into an explicitly classified state;
-- run the no-retry full browser matrix, legacy compatibility, migration,
-  restart, backup, restore, visual, accessibility, performance, and soak gates;
-- record human release approval and the rollback owner/window.
+Do not use generic `/opt/chillspwn/plugin`, restore, or service commands for
+this operation.
 
-## One-command rollback design
+## Database recovery
 
-The production deployment command must atomically restore the legacy entry
-route/origin, stop or kill-switch V2 mutations, preserve post-cutover V2 data,
-and emit an audit record. It must not reverse-import V2 state into fragile
-legacy files. Runs created under V2 remain V2-owned and visible read-only while
-their recovery is decided explicitly.
+The wired V2 commands are `db:verify`, `db:backup`, and `db:restore`.
+Restoration is allowed only while the preview is stopped, from a
+checksum-verified and integrity-checked backup, after explicitly deciding how
+post-backup V2 events will be preserved or reconciled. A code/static failure
+alone is not authority to discard newer canonical V2 state.
 
-After rollback:
+Migration 014 retains completed mutation responses for deterministic replay and
+imports interrupted settings-backed reservations as expired/ambiguous. On
+restart, those records require canonical receipt reconciliation; they must not
+be converted into fabricated success or blindly repeated.
 
-- verify legacy health and critical journeys;
-- verify V2 has no active workers, leases, subscribers, or orphan processes;
-- reconcile every run and terminal event;
-- retain both code and data through the documented rollback window;
-- investigate before any new cutover attempt.
+A disposable backup/restore/quick-check cycle has passed. A production-sized
+restore and post-restore mission reconciliation are still release blockers.
 
-## Current blockers
+## Separate static-store primitive
 
-The deployment switch, signed rollback artifact, full service/data rollback,
-ownership-transfer rehearsal, post-cutover reconciliation, and human sign-off
-do not yet exist. Therefore the legacy application remains the only default and
-no cutover claim is valid. The verified static pointer is a necessary bounded
-primitive, not closure of these blockers.
+The standalone V2 package also contains a content-addressed static-release
+store with stage, verify, activate, pin, and pointer-only rollback commands.
+Focused tests proved immutable manifests and process pinning on disposable
+processes. The currently deployed hybrid preview does not use that standalone
+static pointer as its service promotion mechanism. This historical bounded
+proof must not be represented as the live preview rollback or a full system
+rollback.
+
+## Cutover rollback remains pending
+
+Before changing the default route, the program still requires:
+
+- frozen, reconciled legacy and V2 backups;
+- proven single control-plane ownership for every run;
+- a no-retry browser and legacy-compatibility matrix;
+- migration, restart, backup, restore, visual, accessibility, performance, and
+  soak gates;
+- a signed deployment/rollback artifact and named rollback owner/window; and
+- explicit human release approval.
+
+A future production rollback must atomically restore the legacy entry route,
+disable V2 mutation, preserve post-cutover V2 data, emit an audit record, and
+reconcile every run. It must never reverse-import V2 state into fragile legacy
+files. Until that procedure is implemented and rehearsed, the legacy
+application remains the default and no cutover claim is valid.

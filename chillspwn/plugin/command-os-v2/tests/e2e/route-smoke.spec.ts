@@ -133,18 +133,20 @@ test.describe(`${TEST_ID} static route, console, network, and layout contract`, 
   for (const route of STATIC_ROUTE_CASES) {
     test(`${route.id} renders at ${route.path}`, async ({ page }, testInfo) => {
       const audit = new BrowserAudit(page, { allowEventStreamNavigationAbort: true });
+      const requiredApi = new RequiredApiTracker(page);
+      const generation = requiredApi.beginNavigation();
       const response = await page.goto(route.path, { waitUntil: "domcontentloaded" });
       expect(response?.status(), "The document request itself must resolve").toBe(200);
       await expect(page.locator("main#command-os-content")).toBeVisible();
       await expect(page.locator("main#command-os-content h1").first()).toBeVisible();
       await expect(page.getByText("Command surface not found", { exact: true })).toHaveCount(0);
       if (route.expectedPath) await expect.poll(() => new URL(page.url()).pathname).toBe(route.expectedPath);
+      await requiredApi.settle(route.path, generation);
       const overflow = await page.evaluate(() => ({
         clientWidth: document.documentElement.clientWidth,
         scrollWidth: document.documentElement.scrollWidth,
       }));
       expect(overflow.scrollWidth, `Unexpected horizontal overflow on ${route.path}`).toBeLessThanOrEqual(overflow.clientWidth + 1);
-      await page.waitForTimeout(200);
       await audit.assertClean(testInfo);
     });
   }

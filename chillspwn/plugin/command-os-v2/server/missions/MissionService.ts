@@ -68,6 +68,22 @@ export class MissionService {
     const context = this.missions.autonomousContextPreview(request);
     const execution = this.missions.autonomousExecutionPreview(request);
     const checks = [...base.checks];
+    checks.push(request.contract.allowedActionClasses.length > 0
+      ? {
+          id: "contract_action_boundary",
+          label: "Executable action boundary",
+          status: "pass",
+          journeys: ["autonomous"],
+          impact: `${request.contract.allowedActionClasses.length} exact action class${request.contract.allowedActionClasses.length === 1 ? " is" : "es are"} permitted by this reviewed contract.`,
+        }
+      : {
+          id: "contract_action_boundary",
+          label: "Executable action boundary",
+          status: "fail",
+          journeys: ["autonomous"],
+          impact: "Recommended defaults could not find a supported, locally enforced action class, so Autonomous has no executable boundary.",
+          remediation: "Connect and validate a compatible specialist/tool path, or explicitly choose a supported action class, then rerun preflight.",
+        });
     checks.push(context.invalidSelectedNodeIds.length > 0
       ? {
           id: "contract_memory_selection",

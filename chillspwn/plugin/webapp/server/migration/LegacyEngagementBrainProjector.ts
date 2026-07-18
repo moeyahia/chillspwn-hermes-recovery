@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import type { SqliteDatabase } from "../db";
 import { MemoryRepository, type MemoryEdgeType, type MemoryLifecycle, type MemoryNodeType } from "../memory";
 import type { LegacyEngagementManifest, LegacyEngagementFileKind } from "./LegacyEngagementDiscovery";
+import { parseLegacyReconSemantics, type LegacyReconHostObservation } from "./LegacyReconSemanticParser";
 
 export interface LegacyEngagementProjectionArtifact {
   readonly artifactId: string;
@@ -82,6 +83,13 @@ export class LegacyEngagementBrainProjector {
       sourceType?: string;
       sourceId?: string;
       sourceHash?: string;
+      sources?: readonly {
+        sourceType: string;
+        sourceId: string;
+        sourceHash?: string;
+        acquiredAt: string;
+      }[];
+      provenanceExplanation?: string;
     }): string => {
       const existing = this.#memory.getNode(values.id, true);
       if (!existing) {
@@ -98,8 +106,8 @@ export class LegacyEngagementBrainProjector {
           confirmationState: values.lifecycle === "candidate" ? "pending" : "not_required",
           provenance: {
             method: "imported",
-            explanation: "Projected from a hash-verified historical engagement manifest; authorization and claim verification remain separate.",
-            sources: [{
+            explanation: values.provenanceExplanation ?? "Projected from a hash-verified historical engagement manifest; authorization and claim verification remain separate.",
+            sources: values.sources ?? [{
               sourceType: values.sourceType ?? source.sourceType,
               sourceId: values.sourceId ?? source.sourceId,
               sourceHash: values.sourceHash ?? source.sourceHash,
@@ -127,6 +135,13 @@ export class LegacyEngagementBrainProjector {
       summary: string;
       lifecycle?: Exclude<MemoryLifecycle, "forgotten">;
       confidence?: number;
+      sources?: readonly {
+        sourceType: string;
+        sourceId: string;
+        sourceHash?: string;
+        acquiredAt: string;
+      }[];
+      provenanceExplanation?: string;
     }): string => {
       const id = stableId("medge_legacy", values.sourceNodeId, values.edgeType, values.targetNodeId);
       const existing = this.database.prepare("SELECT id FROM memory_edges WHERE id = ?").get(id);
@@ -144,8 +159,8 @@ export class LegacyEngagementBrainProjector {
           lifecycleStatus: values.lifecycle ?? "verified",
           provenance: {
             method: "imported",
-            explanation: "The relationship was deterministically reconstructed from canonical imported records.",
-            sources: [source],
+            explanation: values.provenanceExplanation ?? "The relationship was deterministically reconstructed from canonical imported records.",
+            sources: values.sources ?? [source],
           },
           explanation: values.summary,
           authorType: "import",
@@ -189,6 +204,7 @@ export class LegacyEngagementBrainProjector {
       },
       ...input.artifacts,
     ];
+    const artifactNodesByRelativePath = new Map<string, { artifact: LegacyEngagementProjectionArtifact; nodeId: string }>();
     for (const artifact of allArtifacts) {
       const artifactNode = ensureNode({
         id: stableId("mem_legacy_artifact", artifact.artifactId),
@@ -200,6 +216,7 @@ export class LegacyEngagementBrainProjector {
         sourceId: artifact.artifactId,
         sourceHash: artifact.contentHash,
       });
+      artifactNodesByRelativePath.set(artifact.relativePath, { artifact, nodeId: artifactNode });
       ensureEdge({ sourceNodeId: runNode, targetNodeId: artifactNode, edgeType: "produced", title: "Run produced artifact", summary: "The historical engagement inventory associates this artifact with the imported run." });
       if (artifact.evidenceCandidateId) {
         const evidenceNode = ensureNode({
@@ -215,6 +232,153 @@ export class LegacyEngagementBrainProjector {
           sourceHash: artifact.contentHash,
         });
         ensureEdge({ sourceNodeId: evidenceNode, targetNodeId: artifactNode, edgeType: "derived_from", title: "Candidate derived from artifact", summary: "The reviewable evidence candidate was derived from this immutable artifact metadata.", lifecycle: "candidate", confidence: 0.4 });
+      }
+    }
+
+    const recon = parseLegacyReconSemantics(input.manifest);
+    const groupedHosts = new Map<string, {
+      address: string;
+      hostnames: Set<string>;
+      statuses: Set<string>;
+      osHints: Set<string>;
+      observations: LegacyReconHostObservation[];
+      services: Map<string, {
+        port: number;
+        transport: "tcp" | "udp" | "sctp";
+        states: Set<string>;
+        names: Set<string>;
+        products: Set<string>;
+        observations: LegacyReconHostObservation[];
+      }>;
+    }>();
+    for (const observation of recon.hosts) {
+      const key = observation.address.toLocaleLowerCase();
+      const host: NonNullable<ReturnType<typeof groupedHosts.get>> = groupedHosts.get(key) ?? {
+        address: observation.address,
+        hostnames: new Set<string>(),
+        statuses: new Set<string>(),
+        osHints: new Set<string>(),
+        observations: [],
+        services: new Map(),
+      };
+      if (observation.hostname) host.hostnames.add(observation.hostname);
+      host.statuses.add(observation.hostStatus);
+      observation.osHints.forEach((hint) => host.osHints.add(hint));
+      host.observations.push(observation);
+      for (const service of observation.services) {
+        const serviceKey = `${service.port}/${service.transport}`;
+        const grouped: NonNullable<ReturnType<typeof host.services.get>> = host.services.get(serviceKey) ?? {
+          port: service.port,
+          transport: service.transport,
+          states: new Set<string>(),
+          names: new Set<string>(),
+          products: new Set<string>(),
+          observations: [],
+        };
+        grouped.states.add(service.state);
+        if (service.serviceName) grouped.names.add(service.serviceName);
+        if (service.productVersion) grouped.products.add(service.productVersion);
+        grouped.observations.push(observation);
+        host.services.set(serviceKey, grouped);
+      }
+      groupedHosts.set(key, host);
+    }
+    const sourcesFor = (observations: readonly LegacyReconHostObservation[]) => [...new Map(observations.flatMap((observation) => {
+      const linked = artifactNodesByRelativePath.get(observation.sourceRelativePath);
+      if (!linked) return [];
+      const value = {
+        sourceType: "artifact",
+        sourceId: linked.artifact.artifactId,
+        sourceHash: observation.sourceHash,
+        acquiredAt: observation.observedAt,
+      };
+      return [[`${value.sourceId}:${value.sourceHash}`, value] as const];
+    })).values()].sort((left, right) => left.sourceId.localeCompare(right.sourceId));
+    const historicalProvenance = "A bounded deterministic parser extracted this observation from hash-verified historical Nmap output. It proves what the artifact reported, not that the asset or service is reachable now.";
+    for (const host of [...groupedHosts.values()].sort((left, right) => left.address.localeCompare(right.address))) {
+      const hostSources = sourcesFor(host.observations);
+      if (hostSources.length === 0) continue;
+      const hostnames = [...host.hostnames].sort();
+      const osHints = [...host.osHints].sort();
+      const assetNode = ensureNode({
+        id: stableId("mem_legacy_asset_observation", input.missionId, host.address.toLocaleLowerCase()),
+        nodeType: "asset",
+        title: `Historical asset observation — ${host.address}`,
+        summary: `Hash-verified historical recon reported ${host.address}${hostnames.length ? ` as ${hostnames.join(", ")}` : ""}; current reachability is unverified.`,
+        body: [
+          `Reported address: ${host.address}.`,
+          hostnames.length ? `Reported hostnames: ${hostnames.join(", ")}.` : "No hostname was reported.",
+          `Historical host state: ${[...host.statuses].sort().join(", ")}.`,
+          osHints.length ? `Historical OS hints: ${osHints.join("; ")}.` : "No OS hint was retained.",
+          "Treat this as historical context until a current authorized run corroborates it.",
+        ].join(" "),
+        sources: hostSources,
+        provenanceExplanation: historicalProvenance,
+      });
+      ensureEdge({
+        sourceNodeId: assetNode,
+        targetNodeId: missionNode,
+        edgeType: "mentioned_in",
+        title: "Asset reported in historical mission",
+        summary: "Hash-verified recon associated this historical asset observation with the imported mission; current authorization and reachability are not inferred.",
+        sources: hostSources,
+        provenanceExplanation: historicalProvenance,
+      });
+      for (const observation of host.observations) {
+        const linked = artifactNodesByRelativePath.get(observation.sourceRelativePath);
+        if (!linked) continue;
+        const observationSources = sourcesFor([observation]);
+        ensureEdge({
+          sourceNodeId: assetNode,
+          targetNodeId: linked.nodeId,
+          edgeType: "derived_from",
+          title: "Asset observation derived from recon artifact",
+          summary: "This historical asset observation was extracted from the linked immutable recon artifact.",
+          sources: observationSources,
+          provenanceExplanation: historicalProvenance,
+        });
+      }
+      for (const service of [...host.services.values()].sort((left, right) => left.port - right.port || left.transport.localeCompare(right.transport))) {
+        const serviceSources = sourcesFor(service.observations);
+        const names = [...service.names].sort();
+        const products = [...service.products].sort();
+        const serviceNode = ensureNode({
+          id: stableId("mem_legacy_service_observation", input.missionId, host.address.toLocaleLowerCase(), String(service.port), service.transport),
+          nodeType: "entity",
+          title: `Historical service observation — ${host.address}:${service.port}/${service.transport}`,
+          summary: `Historical recon reported ${names[0] ?? "a service"} on ${host.address}:${service.port}/${service.transport}; current availability is unverified.`,
+          body: [
+            `Reported states: ${[...service.states].sort().join(", ")}.`,
+            names.length ? `Reported service names: ${names.join(", ")}.` : "No service name was retained.",
+            products.length ? `Reported product/version text: ${products.join("; ")}.` : "No product/version text was retained.",
+            "Treat this as a historical observation until current evidence corroborates it.",
+          ].join(" "),
+          sources: serviceSources,
+          provenanceExplanation: historicalProvenance,
+        });
+        ensureEdge({
+          sourceNodeId: serviceNode,
+          targetNodeId: assetNode,
+          edgeType: "belongs_to",
+          title: "Service reported on asset",
+          summary: "The historical recon output reported this service on the linked asset observation.",
+          sources: serviceSources,
+          provenanceExplanation: historicalProvenance,
+        });
+        for (const observation of service.observations) {
+          const linked = artifactNodesByRelativePath.get(observation.sourceRelativePath);
+          if (!linked) continue;
+          const observationSources = sourcesFor([observation]);
+          ensureEdge({
+            sourceNodeId: serviceNode,
+            targetNodeId: linked.nodeId,
+            edgeType: "derived_from",
+            title: "Service observation derived from recon artifact",
+            summary: "This historical service observation was extracted from the linked immutable recon artifact.",
+            sources: observationSources,
+            provenanceExplanation: historicalProvenance,
+          });
+        }
       }
     }
     return { nodeIds: [...new Set(nodeIds)], edgeIds: [...new Set(edgeIds)] };

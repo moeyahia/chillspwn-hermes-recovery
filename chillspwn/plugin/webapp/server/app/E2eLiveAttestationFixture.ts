@@ -48,6 +48,13 @@ export function createE2eLiveAttestationFixture(
       name: "sechub-reconnaissance",
       verified: true,
       tools: ["quick_scan"],
+      toolSchemas: {
+        quick_scan: {
+          type: "object",
+          properties: {},
+          additionalProperties: false,
+        },
+      },
       assignedAgentIds: ["ReconScout"],
       attestedAt,
       expiresAt: routeExpiresAt,

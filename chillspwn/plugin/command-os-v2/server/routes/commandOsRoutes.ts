@@ -32,6 +32,7 @@ import {
   ReadinessService,
   validateIdempotencyKey,
   validateMissionCreateRequest,
+  validateMissionPreflightRequest,
   type Journey,
   type MissionPortfolioFilterState,
   type ReadinessCheckProvider,
@@ -551,7 +552,7 @@ export function createCommandOsRouter(
           remediation: "Sign in again and rerun contract preflight.",
         });
       }
-      const missionRequest = validateMissionCreateRequest(request.body);
+      const missionRequest = validateMissionPreflightRequest(request.body);
       if (missionRequest.journey !== "autonomous") {
         throw new MissionApiError(400, "autonomous_contract_required", "Autonomous contract required", {
           humanMessage: "This preflight endpoint accepts Autonomous contracts only.",

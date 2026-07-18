@@ -154,43 +154,33 @@ test.describe("Command OS populated canonical browser journeys", () => {
     await expect.poll(readUnreadCount).toBe(0);
   });
 
-  test("Autonomous composer inspects providers and specialists then signs exact memory and team selections", async ({ page }) => {
+  test("Autonomous composer resolves registry-backed policy checklists and signs the ready contract", async ({ page }) => {
     await page.goto("/missions/new/autonomous");
-    await page.getByLabel("Mission title").fill("[E2E] Reviewed Autonomous contract");
-    await page.getByLabel("Authorized objective").fill("Review a bounded fixture observation under the exact signed policy");
-    await page.getByLabel("Measurable success criteria").fill("One evidence-backed fixture observation is retained");
-    await page.getByLabel("Required final deliverables").fill("Command OS JSON completion bundle");
+    await page.getByLabel("Authorized targets or environment references", { exact: false }).fill("fixture.local");
+    await page.getByRole("checkbox", { name: /I confirm these targets and the selected action policy are authorized/u }).check();
     await page.getByRole("button", { name: "Continue" }).click();
 
-    await page.getByLabel("Engagement ID").fill("eng-e2e");
-    await page.getByLabel("Allowed targets and boundaries").fill("fixture.local");
-    await page.getByLabel("I confirm this mission is authorized").check();
+    await page.getByLabel("Mission title", { exact: false }).fill("[E2E] Reviewed Autonomous contract");
+    await page.getByLabel("Authorized objective", { exact: false }).fill("Review a bounded fixture observation under the exact signed policy");
     await page.getByRole("button", { name: "Continue" }).click();
 
-    await page.getByLabel("Pre-authorized action classes").fill("analysis");
-    await page.getByLabel("Safe-stop conditions").fill("Any action outside the exact signed target or specialist pool");
+    const actionMatrix = page.locator("summary").filter({ hasText: "Action-class policy matrix" });
+    await actionMatrix.click();
+    await expect(actionMatrix.locator("xpath=..").getByRole("combobox", { name: / policy$/u }).first()).toBeVisible();
+    const evidence = page.locator("summary").filter({ hasText: "Evidence requirements" });
+    await evidence.click();
+    await expect(evidence.locator("xpath=..").getByRole("checkbox").first()).toBeVisible();
+    const safeStops = page.locator("summary").filter({ hasText: "Safe-stop behavior" });
+    await safeStops.click();
+    await expect(safeStops.locator("xpath=..").locator(".os-mandatory-stop")).toHaveCount(8);
     await page.getByRole("button", { name: "Continue" }).click();
 
-    await expect(page.getByRole("heading", { name: "Inspected enforcing provider paths" })).toBeVisible();
-    await expect(page.getByRole("list", { name: "Autonomous enforcing provider paths" })).toContainText("grok-acp");
-    const specialistList = page.getByRole("list", { name: "Compatible Autonomous specialists" });
-    const staleFixtureSpecialist = page.getByRole("checkbox", { name: /Fixture Recon Specialist/u });
-    await expect(staleFixtureSpecialist).toBeDisabled();
-    await expect(specialistList).toContainText("Specialist status is offline");
-    const compatibleSpecialist = specialistList.locator('input[type="checkbox"]:not(:disabled)').first();
-    await expect(compatibleSpecialist).toBeChecked();
-    await expect(specialistList).toContainText("Provider policy");
-    await page.getByRole("button", { name: "Continue" }).click();
-
-    const memory = page.getByRole("checkbox", { name: /Explain before acting/u });
-    await expect(memory).toBeVisible();
-    await memory.check();
-    await page.getByRole("button", { name: "Continue" }).click();
-
-    await expect(page.getByText("Contract version")).toBeVisible();
-    await expect(page.getByText("Selected memory nodes").locator("..")).toContainText("1; Context Pack created at planning");
-    await expect(page.locator(".os-review-grid code")).toHaveText(/^[a-f0-9]{64}$/u);
-    await expect(page.getByText("Contract is ready to launch")).toBeVisible();
+    const review = page.getByRole("group", { name: "Review the resolved mission" });
+    await expect(review).toContainText("Contract version");
+    await expect(review).toContainText("Compatible providers");
+    await expect(review).toContainText("Signed specialists");
+    await expect(review.locator(".os-mono")).toHaveText(/^[a-f0-9]{64}$/u);
+    await expect(review.locator(".os-readiness-summary")).toContainText("ready");
     await expect(page.getByRole("button", { name: "Launch Autonomous Mission" })).toBeEnabled();
   });
 
@@ -700,7 +690,7 @@ test.describe("Command OS populated canonical browser journeys", () => {
 
     await page.goto("/brain/graph");
     await expect(page.getByRole("heading", { level: 1, name: "Memory Graph" })).toBeVisible();
-    await expect(page.getByText(/(?:8 visible of 8|9 visible of 9) loaded nodes/u)).toBeVisible();
+    await expect(page.getByText(/(?:8 visible of 8|9 visible of 9) loaded · (?:8|9) accessible in this view/u)).toBeVisible();
     await expect(page.getByRole("application", { name: /Memory graph with (?:8|9) nodes and 5 relationships/u })).toBeVisible();
     const physics = page.getByRole("button", { name: "Physics: fixed clusters" });
     await physics.click();

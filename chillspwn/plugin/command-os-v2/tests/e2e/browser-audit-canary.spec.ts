@@ -1,7 +1,10 @@
 import { expect, test } from "./support/playwright";
 import {
+  crossDocumentStaleEventSourceCloseCanary,
   hungRequestFinalizationCanary,
   inFlightRequestSealCanary,
+  pageWorldUnavailableAuditCanary,
+  rapidExplicitEventSourceCloseCanary,
   undeclaredDownloadCanary,
   unwrappedEventSourceNavigationCanary,
   unsolicitedPopupCanary,
@@ -103,6 +106,39 @@ test("e2e.audit-boundary.event-source-explicit-close correlates the exact reques
   // Firefox console echo correlate to this exact close receipt.
 });
 
+test("e2e.audit-boundary.page-world-unavailable keeps receipt reconciliation and teardown out of the page", async ({
+  baseURL,
+  browser,
+}) => {
+  if (!baseURL) throw new Error("The browser-audit canary requires the configured V2 base URL");
+  await expect(pageWorldUnavailableAuditCanary(browser, baseURL)).resolves.toEqual({
+    evaluateCalls: 0,
+    pageClosed: true,
+  });
+});
+
+test("e2e.audit-boundary.event-source-rapid-explicit-close joins the exact established request and lifecycle pair", async ({
+  baseURL,
+  browser,
+  context,
+}) => {
+  if (!baseURL) throw new Error("The browser-audit canary requires the configured V2 base URL");
+  const result = await rapidExplicitEventSourceCloseCanary(browser, baseURL, await context.storageState());
+  const expectedFailure = {
+    chromium: "net::ERR_ABORTED",
+    firefox: "NS_ERROR_ABORT",
+    webkit: "Load request cancelled",
+  }[browser.browserType().name()];
+  expect(result).toEqual({
+    requestUrl: new URL(
+      "/api/v2/events/stream?runId=audit-canary-rapid-close&afterSequence=0",
+      baseURL,
+    ).href,
+    failureText: expectedFailure,
+    pageClosed: true,
+  });
+});
+
 test("e2e.audit-boundary.unwrapped-event-source-navigation-negative-canary rejects an unreceipted exact stream abort", async ({
   baseURL,
   browser,
@@ -118,6 +154,24 @@ test("e2e.audit-boundary.unwrapped-event-source-navigation-negative-canary rejec
   expect(messages).toContainEqual(expect.stringContaining(
     "tracked EventSource request had no correlated close, navigation, or page-close receipt",
   ));
+});
+
+test("e2e.audit-boundary.cross-document-event-source-close-negative-canary rejects a stale exact-URL ordinal receipt", async ({
+  baseURL,
+  browser,
+  context,
+}, testInfo) => {
+  if (!baseURL) throw new Error("The browser-audit canary requires the configured V2 base URL");
+  const messages = await crossDocumentStaleEventSourceCloseCanary(
+    browser,
+    baseURL,
+    await context.storageState(),
+    testInfo,
+  );
+  expect(messages).toHaveLength(1);
+  expect(messages.filter((message) => message.includes(
+    "tracked EventSource request had no correlated close, navigation, or page-close receipt",
+  ))).toHaveLength(1);
 });
 
 test("e2e.audit-boundary.unsolicited-popup-negative-canary rejects a popup without prospective opener authority", async ({

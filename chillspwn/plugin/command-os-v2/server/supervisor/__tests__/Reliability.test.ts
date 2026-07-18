@@ -77,14 +77,28 @@ describe("error taxonomy and retry policy", () => {
     }
   });
 
-  test("exponential backoff honors retry-after, jitter bounds, and maximum delay", () => {
+  test("exponential backoff honors retry-after without shortening it to the local jitter cap", () => {
     expect(computeBackoffMs({ retriesUsed: 0, random: () => 0.5 })).toBe(500);
     expect(computeBackoffMs({ retriesUsed: 1, retryAfterMs: 10_000, random: () => 0.5 })).toBe(10_000);
-    expect(computeBackoffMs({ retriesUsed: 99, retryAfterMs: 90_000, random: () => 1 })).toBe(30_000);
+    expect(computeBackoffMs({ retriesUsed: 99, retryAfterMs: 90_000, random: () => 1 })).toBe(90_000);
+    expect(computeBackoffMs({ retriesUsed: 1, retryAfterMs: 120_000, random: () => 0 })).toBe(120_000);
     const low = computeBackoffMs({ retriesUsed: 1, random: () => 0 });
     const high = computeBackoffMs({ retriesUsed: 1, random: () => 1 });
     expect(low).toBe(800);
     expect(high).toBe(1_200);
+  });
+
+  test("safe-stops instead of retrying before an excessive provider boundary", () => {
+    expect(decideRetry({
+      category: "rate_limit",
+      retriesUsed: 0,
+      retryAfterMs: 30 * 60_000 + 1,
+      random: () => 0.5,
+    })).toEqual({ retry: false, reason: "provider_retry_after_exceeds_bound" });
+    expect(() => computeBackoffMs({
+      retriesUsed: 0,
+      retryAfterMs: 30 * 60_000 + 1,
+    })).toThrow(/Retry-After exceeds/u);
   });
 
   test("rejects unsafe retry configuration", () => {
@@ -92,6 +106,9 @@ describe("error taxonomy and retry policy", () => {
       /Invalid retry policy/,
     );
     expect(() => decideRetry({ category: "timeout", retriesUsed: 0, config: { maxAutomaticRetries: 1.5 } })).toThrow(
+      /Invalid retry policy/,
+    );
+    expect(() => decideRetry({ category: "timeout", retriesUsed: 0, config: { maxProviderRetryAfterMs: -1 } })).toThrow(
       /Invalid retry policy/,
     );
   });

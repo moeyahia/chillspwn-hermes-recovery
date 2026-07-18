@@ -201,7 +201,8 @@ export function parseBrainSummary(payload: unknown): BrainSummary {
   return {
     schemaVersion: schemaVersion(value.schemaVersion),
     counts: {
-      confirmed: count(counts.confirmed, "confirmed count"), candidates: count(counts.candidates, "candidate count"),
+      confirmed: count(counts.confirmed, "confirmed count"), verified: count(counts.verified, "verified count"),
+      candidates: count(counts.candidates, "candidate count"),
       stale: count(counts.stale, "stale count"), disputed: count(counts.disputed, "disputed count"),
       forgotten: count(counts.forgotten, "forgotten count"), edges: count(counts.edges, "edge count"),
       contextPacks: count(counts.contextPacks, "context pack count"),
@@ -228,13 +229,19 @@ export function parseMemoryNodePage(payload: unknown): MemoryNodePage {
 
 export function parseMemoryGraph(payload: unknown): MemoryGraph {
   const value = record(unwrap(payload), "memory graph");
+  const nodes = list(value.nodes, "graph nodes").map((item) => parseMemoryNodeSummary(item));
+  const availableNodeCount = count(value.availableNodeCount, "available graph node count");
+  const truncated = value.truncated === true;
+  if (availableNodeCount < nodes.length) throw new RangeError("available graph node count cannot be smaller than the loaded node count");
+  if (truncated !== (availableNodeCount > nodes.length)) throw new RangeError("graph truncation must match the available and loaded node counts");
   return {
     schemaVersion: schemaVersion(value.schemaVersion),
     view: enumValue(value.view, ["global", "local", "mission", "operator"] as const, "graph view") as MemoryGraphView,
     ...(optionalText(value.rootNodeId) ? { rootNodeId: optionalText(value.rootNodeId) } : {}),
-    nodes: list(value.nodes, "graph nodes").map((item) => parseMemoryNodeSummary(item)),
+    nodes,
     edges: list(value.edges, "graph edges").map(parseMemoryEdge),
-    truncated: value.truncated === true,
+    availableNodeCount,
+    truncated,
   };
 }
 

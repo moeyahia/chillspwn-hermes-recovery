@@ -182,6 +182,79 @@ export class FailureDiagnosisService {
     return this.repository.listForRun(identifier(runId, "runId"), states, limit);
   }
 
+  /**
+   * Close only an active planning-provider diagnosis after the exact provider
+   * turn that produced an active plan has committed. This is an internal
+   * lifecycle transition, not an operator recovery action and never changes
+   * run state or execution authority.
+   */
+  supersedePlanningFailureAfterPlanActivation(input: {
+    readonly runId: string;
+    readonly planId: string;
+    readonly providerTurnId: string;
+    readonly actor: OperationalActor;
+  }): readonly FailureDiagnosis[] {
+    const runId = identifier(input.runId, "runId");
+    const planId = identifier(input.planId, "planId");
+    const providerTurnId = identifier(input.providerTurnId, "providerTurnId");
+    const supersededBy = actor(input.actor);
+    const now = this.repository.now();
+    return this.repository.transaction(() => {
+      const boundary = this.repository.database.prepare(`
+        SELECT r.mission_id, r.control_plane, r.current_plan_id,
+          p.status AS plan_status, pt.status AS provider_turn_status,
+          pt.ended_at AS provider_turn_ended_at
+        FROM runs r
+        JOIN plans p ON p.id = ? AND p.run_id = r.id
+        JOIN provider_turns pt ON pt.id = ? AND pt.run_id = r.id
+        WHERE r.id = ?
+      `).get(planId, providerTurnId, runId) as {
+        mission_id: string;
+        control_plane: string;
+        current_plan_id: string | null;
+        plan_status: string;
+        provider_turn_status: string;
+        provider_turn_ended_at: string | null;
+      } | undefined;
+      if (
+        !boundary || boundary.control_plane !== "command_os_v2" ||
+        boundary.current_plan_id !== planId || boundary.plan_status !== "active" ||
+        boundary.provider_turn_status !== "completed" || !boundary.provider_turn_ended_at
+      ) {
+        throw stateConflict(
+          "Planning diagnosis cannot be superseded without an exact active plan and completed provider turn",
+          "Keep the diagnosis active until the provider turn and active plan are both committed for this V2 run.",
+        );
+      }
+      const diagnoses = this.repository.listForRun(runId, ["active"], 200).filter((diagnosis) =>
+        diagnosis.originatingComponent === "command-runtime.planning-provider" &&
+        Date.parse(diagnosis.createdAt) <= Date.parse(boundary.provider_turn_ended_at!),
+      );
+      return diagnoses.map((diagnosis) => {
+        const superseded = this.repository.supersede(diagnosis.id, now);
+        this.repository.audit.append({
+          missionId: boundary.mission_id,
+          runId,
+          actor: supersededBy,
+          action: "failure_diagnosis.superseded",
+          resourceType: "failure_diagnosis",
+          resourceId: diagnosis.id,
+          reason: "A completed planning provider turn produced the exact active plan for this run.",
+          details: {
+            from: diagnosis.state,
+            to: superseded.state,
+            originatingComponent: diagnosis.originatingComponent,
+            providerTurnId,
+            planId,
+            rawProviderPayloadPersisted: false,
+          },
+          occurredAt: now,
+        });
+        return superseded;
+      });
+    });
+  }
+
   resolve(input: ResolveFailureDiagnosisInput): FailureDiagnosis {
     const diagnosisId = identifier(input.diagnosisId, "diagnosisId");
     const resolvedBy = actor(input.actor);

@@ -35,11 +35,12 @@ interface NodeListResponse {
 }
 
 interface GraphResponse {
-  readonly schemaVersion: "2.1";
+  readonly schemaVersion: "2.4";
   readonly view: "global" | "local";
   readonly rootNodeId?: string;
   readonly nodes: readonly { readonly id: string }[];
   readonly edges: readonly { readonly sourceNodeId: string; readonly targetNodeId: string }[];
+  readonly availableNodeCount: number;
   readonly truncated: boolean;
 }
 
@@ -174,12 +175,14 @@ describe("Second Brain 50,000-node scale contract", () => {
         neighborhoodSamples.push(result.durationMs);
         expect(result.body.rootNodeId).toBe("mem-scale-00000");
         expect(result.body.nodes).toHaveLength(250);
+        expect(result.body.availableNodeCount).toBe(ROOT_EDGE_COUNT + 1);
         expect(result.body.truncated).toBe(true);
         expect(result.body.edges.length).toBeGreaterThan(0);
       }
 
       const global = await measuredJson<GraphResponse>(globalUrl);
       expect(global.body.nodes).toHaveLength(250);
+      expect(global.body.availableNodeCount).toBe(NODE_COUNT);
       expect(global.body.truncated).toBe(true);
       expect(global.durationMs).toBeLessThan(GRAPH_SHELL_BUDGET_MS);
 

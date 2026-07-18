@@ -29,6 +29,7 @@ export { autonomousContractHash, hashCanonical, canonicalJson } from "./canonica
 export {
   validateIdempotencyKey,
   validateMissionCreateRequest,
+  validateMissionPreflightRequest,
 } from "./validation";
 export type {
   AgentSummary,

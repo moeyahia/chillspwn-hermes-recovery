@@ -20,6 +20,19 @@ import {
   type McpApprovalAttestation,
   type McpApprovalAttestationVerifier,
 } from "./McpApprovalAttestation";
+import {
+  isMcpToolExposable,
+  resolvedMcpToolExecutionDecision,
+  reviewedMcpServerSurface,
+  reviewedMcpToolDisposition,
+} from "./McpToolDispositionRegistry";
+import { adaptVulnIntelCveMcpContent } from "./VulnIntelCveResultAdapter";
+import { adaptPentestReconMcpContent } from "./PentestReconResultAdapter";
+import {
+  isExactFullTcpNmapSelection,
+  validatePentestReconToolPolicy,
+} from "./PentestReconToolPolicy";
+import { attestMcpServerImplementation } from "./McpServerImplementationAttestation";
 
 export interface BridgeConfig {
   configPath: string;
@@ -39,6 +52,10 @@ export interface BridgeConfig {
   verifyAndConsumeApprovalAttestation?: McpApprovalAttestationVerifier;
   /** Test-only clock injection. */
   now?: () => Date;
+  /** Test-only trusted-tool readiness injection; production always omits it. */
+  trustedNmapReady?: boolean;
+  /** Test-only implementation attestation injection; production always omits it. */
+  attestImplementation?: typeof attestMcpServerImplementation;
 }
 
 export interface McpBridgeExecuteInput {
@@ -91,7 +108,17 @@ export class McpArsenalBridge {
     for (const s of servers) {
       const h = this.registry.health(s.name, { allowDocker: this.cfg.allowDocker });
       // tools this specialist is allowed AND this server exposes
-      const tools = s.toolNames.filter((t) => map.allowedTools.includes(t));
+      const tools = s.toolNames.filter((toolName) => {
+        if (!map.allowedTools.includes(toolName)) return false;
+        const review = reviewedMcpServerSurface(s.name);
+        if (!review) return true;
+        const disposition = reviewedMcpToolDisposition(s.name, toolName);
+        return Boolean(
+          disposition
+          && isMcpToolExposable(disposition.disposition)
+          && disposition.mappedAgentIds.includes(agent.agentId),
+        );
+      });
       view.servers.push({ name: s.name, state: h.state, tools, deniedTools: map.deniedTools, approvalRequiredTools: map.approvalRequiredTools.filter((t) => s.toolNames.includes(t)), reasons: h.reasons });
       const runnable = h.state === "healthy" || h.state === "configured";
       for (const t of tools) {
@@ -114,9 +141,9 @@ export class McpArsenalBridge {
     if (this.cfg.mode === "disabled") return fin({ error: "MCP arsenal is disabled (MCP_ARSENAL_MODE=disabled)" });
 
     // Defense-in-depth binding checks (the endpoint already enforced policy/routing/gate).
-    const decision = specialistToolDecision(input.specialistAgentId, input.toolName);
-    if (decision === "unknown_agent") return fin({ error: `unknown specialist '${input.specialistAgentId}'` });
-    if (decision === "deny") return fin({ error: `'${input.toolName}' is outside ${input.specialistAgentId}'s allowlist` });
+    const rosterDecision = specialistToolDecision(input.specialistAgentId, input.toolName);
+    if (rosterDecision === "unknown_agent") return fin({ error: `unknown specialist '${input.specialistAgentId}'` });
+    if (rosterDecision === "deny") return fin({ error: `'${input.toolName}' is outside ${input.specialistAgentId}'s allowlist` });
     const specialist = getAgent(input.specialistAgentId);
     if (!specialist?.allowedMcpServers.includes(input.mcpServer)) {
       return fin({ error: `MCP server '${input.mcpServer}' is outside ${input.specialistAgentId}'s server allowlist` });
@@ -125,19 +152,76 @@ export class McpArsenalBridge {
     if (!spec) return fin({ error: `MCP server '${input.mcpServer}' not in arsenal config` });
     if (!spec.assignedAgents.map((a) => a.toLowerCase()).includes(input.specialistAgentId.toLowerCase())) return fin({ error: `server '${input.mcpServer}' is not assigned to ${input.specialistAgentId}` });
     if (!spec.toolNames.includes(input.toolName)) return fin({ error: `'${input.toolName}' is not a declared tool of '${input.mcpServer}'` });
+    const reviewedServer = reviewedMcpServerSurface(input.mcpServer);
+    const reviewedTool = reviewedMcpToolDisposition(input.mcpServer, input.toolName);
+    if (reviewedServer && (!reviewedTool || !isMcpToolExposable(reviewedTool.disposition))) {
+      return fin({ error: `'${input.toolName}' is suppressed by the reviewed MCP tool disposition registry` });
+    }
+    if (reviewedTool && !reviewedTool.mappedAgentIds.includes(input.specialistAgentId)) {
+      return fin({ error: `'${input.toolName}' is not mapped to ${input.specialistAgentId} in the reviewed MCP tool disposition registry` });
+    }
+    const decision = resolvedMcpToolExecutionDecision(
+      input.mcpServer,
+      input.toolName,
+      input.specialistAgentId,
+      rosterDecision,
+    );
+    if (decision === "deny") return fin({ error: `'${input.toolName}' is denied for this reviewed MCP server binding` });
+    const policyOptions = {
+      currentYear: (this.cfg.now ?? (() => new Date()))().getUTCFullYear(),
+      ...(this.cfg.trustedNmapReady === undefined
+        ? {}
+        : { trustedNmapReady: this.cfg.trustedNmapReady }),
+    };
+    const inputPolicyError = validatePentestReconToolPolicy(
+      input.mcpServer,
+      input.toolName,
+      input.arguments ?? {},
+      policyOptions,
+    );
+    const contractBoundFullTcp = Boolean(
+      inputPolicyError
+      && this.isEnabled()
+      && input.mcpServer === "pentest-mcp-recon"
+      && input.toolName === "nmapScan"
+      && input.approvalAttestation?.kind === "autonomous_full_tcp"
+      && isExactFullTcpNmapSelection(input.arguments ?? {}),
+    );
+    if (inputPolicyError && !contractBoundFullTcp) {
+      return fin({ error: `invalid input: ${inputPolicyError}` });
+    }
+    if (contractBoundFullTcp) {
+      const fullTcpPolicyError = validatePentestReconToolPolicy(
+        input.mcpServer,
+        input.toolName,
+        input.arguments ?? {},
+        { ...policyOptions, allowAttestedExactFullTcp: true },
+      );
+      if (fullTcpPolicyError) return fin({ error: `invalid input: ${fullTcpPolicyError}` });
+    }
+    const dispositionRequiresApproval = reviewedTool?.disposition === "guided_only";
 
     // DRY-RUN: record what WOULD happen, execute nothing.
     if (this.isDryRun()) {
-      return fin({ success: true, dryRun: true, outputPreview: `[dry-run] would call ${input.mcpServer}.${input.toolName}(${redactSecrets(JSON.stringify(input.arguments ?? {})).slice(0, 400)})${decision === "require_approval" ? " [approval-required]" : ""}` });
+      return fin({ success: true, dryRun: true, outputPreview: `[dry-run] would call ${input.mcpServer}.${input.toolName}(${redactSecrets(JSON.stringify(input.arguments ?? {})).slice(0, 400)})${decision === "require_approval" || dispositionRequiresApproval ? " [approval-required]" : ""}` });
     }
 
     // ENABLED: actually call the MCP server.
     if (!this.cfg.startServers) return fin({ error: "MCP_ARSENAL_START_SERVERS=false — server start not permitted" });
+    const implementation = (this.cfg.attestImplementation ?? attestMcpServerImplementation)(spec);
+    if (!implementation.accepted) {
+      return fin({ error: `server '${input.mcpServer}' implementation attestation failed: ${implementation.reason}` });
+    }
     const h = this.registry.health(input.mcpServer, { allowDocker: this.cfg.allowDocker });
     if (h.state === "missing_dependency" || h.state === "missing_secret" || h.state === "failed" || h.state === "disabled") {
       return fin({ error: `server '${input.mcpServer}' not runnable (${h.state}): ${h.reasons.join("; ")}` });
     }
-    if (decision === "require_approval" || input.approvalAttestation) {
+    if (
+      decision === "require_approval"
+      || dispositionRequiresApproval
+      || input.approvalAttestation
+      || contractBoundFullTcp
+    ) {
       if (!input.runId || !input.stepId) {
         return fin({ error: "approval-required MCP execution must be bound to a run and step" });
       }
@@ -172,6 +256,18 @@ export class McpArsenalBridge {
         this.#claimsInFlight.delete(attestation.claimId);
       }
     }
+    if (contractBoundFullTcp) {
+      // Re-run the structured policy after the canonical verifier atomically
+      // consumes the issued claim. Until this point the ordinary 1,024-port
+      // boundary remains authoritative and no full-TCP dispatch may occur.
+      const fullTcpPolicyError = validatePentestReconToolPolicy(
+        input.mcpServer,
+        input.toolName,
+        input.arguments ?? {},
+        { ...policyOptions, allowAttestedExactFullTcp: true },
+      );
+      if (fullTcpPolicyError) return fin({ error: `invalid input: ${fullTcpPolicyError}` });
+    }
     const opts: ExecOptions = {
       timeoutMs: this.cfg.defaultTimeoutMs,
       allowDocker: this.cfg.allowDocker,
@@ -180,7 +276,16 @@ export class McpArsenalBridge {
     const raw = await callServerTool(spec, input.toolName, input.arguments ?? {}, opts);
     const dur = 0; // real ms is stamped by the caller (registry avoids Date.now)
     if (!raw.ok) return fin({ error: raw.error ?? "MCP call failed", durationMs: dur });
-    const { text, isError } = flattenMcpContent(raw.result);
+    const vulnIntelContent = adaptVulnIntelCveMcpContent(
+      input.mcpServer,
+      input.toolName,
+      flattenMcpContent(raw.result),
+    );
+    const { text, isError } = adaptPentestReconMcpContent(
+      input.mcpServer,
+      input.toolName,
+      vulnIntelContent,
+    );
     const redacted = redactSecrets(text);
     const fullBytes = Buffer.byteLength(redacted, "utf-8");
     const preview = fullBytes > this.cfg.maxOutputBytes ? redacted.slice(0, this.cfg.maxOutputBytes) + `\n…[truncated ${fullBytes - this.cfg.maxOutputBytes} bytes → artifact]` : redacted;
@@ -222,17 +327,56 @@ export class McpArsenalBridge {
   }
 
   /** Live tools/list health probe (only in enabled mode + startServers). Safe: no target args. */
-  async probeTools(name: string, signal?: AbortSignal): Promise<{ ok: boolean; tools?: string[]; error?: string }> {
+  async probeTools(name: string, signal?: AbortSignal): Promise<{
+    ok: boolean;
+    tools?: string[];
+    toolSchemas?: Readonly<Record<string, Readonly<Record<string, unknown>>>>;
+    error?: string;
+  }> {
     if (!this.isEnabled() || !this.cfg.startServers) return { ok: false, error: "probe requires enabled mode + start permission" };
     const spec = this.registry.get(name);
     if (!spec) return { ok: false, error: "unknown server" };
+    const implementation = attestMcpServerImplementation(spec);
+    if (!implementation.accepted) {
+      return { ok: false, error: `MCP implementation attestation failed: ${implementation.reason}` };
+    }
     const raw = await listServerTools(spec, {
       timeoutMs: this.cfg.defaultTimeoutMs,
       allowDocker: this.cfg.allowDocker,
       signal,
     });
     if (!raw.ok) return { ok: false, error: raw.error };
-    const tools = Array.isArray(raw.result?.tools) ? raw.result.tools.map((t: any) => t.name).filter(Boolean) : [];
-    return { ok: true, tools };
+    if (!Array.isArray(raw.result?.tools) || raw.result.tools.length > 256) {
+      return { ok: false, error: "MCP tools/list returned an invalid or oversized tool collection" };
+    }
+    const tools: string[] = [];
+    const toolSchemas: Record<string, Readonly<Record<string, unknown>>> = Object.create(null) as Record<
+      string,
+      Readonly<Record<string, unknown>>
+    >;
+    for (const item of raw.result.tools as unknown[]) {
+      if (!item || typeof item !== "object" || Array.isArray(item)) {
+        return { ok: false, error: "MCP tools/list returned an invalid tool descriptor" };
+      }
+      const descriptor = item as Record<string, unknown>;
+      const toolName = typeof descriptor.name === "string" ? descriptor.name.trim() : "";
+      const inputSchema = descriptor.inputSchema;
+      if (
+        !/^[A-Za-z0-9._:-]{1,160}$/u.test(toolName)
+        || !inputSchema || typeof inputSchema !== "object" || Array.isArray(inputSchema)
+      ) {
+        return { ok: false, error: "MCP tools/list omitted a usable tool name or input schema" };
+      }
+      let serialized: string;
+      try { serialized = JSON.stringify(inputSchema); }
+      catch { return { ok: false, error: "MCP tools/list returned a non-serializable input schema" }; }
+      if (Buffer.byteLength(serialized, "utf8") > 128 * 1024) {
+        return { ok: false, error: "MCP tool input schema exceeds the reviewed attestation bound" };
+      }
+      if (tools.includes(toolName)) return { ok: false, error: "MCP tools/list returned duplicate tool names" };
+      tools.push(toolName);
+      toolSchemas[toolName] = JSON.parse(serialized) as Readonly<Record<string, unknown>>;
+    }
+    return { ok: true, tools, toolSchemas };
   }
 }

@@ -134,6 +134,14 @@ export class RuntimeContinuationRepository {
   }): RuntimeContinuation {
     const runId = requireText(input.runId, "runId");
     const sourceId = requireText(input.sourceId, "sourceId");
+    const owned = this.database.prepare(`
+      SELECT 1 AS present FROM runs r
+      JOIN missions m ON m.id = r.mission_id
+      WHERE r.id = ?
+        AND r.control_plane = 'command_os_v2'
+        AND m.control_plane = 'command_os_v2'
+    `).get(runId) as { present: number } | undefined;
+    if (!owned) throw new Error(`Runtime continuation requires Command OS V2 ownership: ${runId}`);
     const id = `continuation_${randomUUID()}`;
     this.database.prepare(`
       INSERT INTO runtime_continuations (
@@ -180,12 +188,18 @@ export class RuntimeContinuationRepository {
 
   readyRunIds(now: string, limit = 50): string[] {
     return (this.database.prepare(`
-      SELECT run_id, MIN(created_at) AS first_created
-      FROM runtime_continuations
-      WHERE (status = 'pending' AND available_at <= ?)
-         OR (status = 'processing' AND lease_expires_at <= ?)
-      GROUP BY run_id
-      ORDER BY first_created, run_id
+      SELECT continuation.run_id, MIN(continuation.created_at) AS first_created
+      FROM runtime_continuations continuation
+      JOIN runs r ON r.id = continuation.run_id
+      JOIN missions m ON m.id = r.mission_id
+      WHERE r.control_plane = 'command_os_v2'
+        AND m.control_plane = 'command_os_v2'
+        AND (
+          (continuation.status = 'pending' AND continuation.available_at <= ?)
+          OR (continuation.status = 'processing' AND continuation.lease_expires_at <= ?)
+        )
+      GROUP BY continuation.run_id
+      ORDER BY first_created, continuation.run_id
       LIMIT ?
     `).all(now, now, limit) as Array<{ run_id: string }>).map((row) => row.run_id);
   }
@@ -211,7 +225,10 @@ export class RuntimeContinuationRepository {
         SELECT e.id AS event_id, e.run_id
         FROM events e
         JOIN runs r ON r.id = e.run_id
+        JOIN missions m ON m.id = r.mission_id
         WHERE e.event_type = 'run.cancellation_requested'
+          AND r.control_plane = 'command_os_v2'
+          AND m.control_plane = 'command_os_v2'
           AND r.status NOT IN ('completed', 'failed', 'cancelled')
           AND NOT EXISTS (
             SELECT 1 FROM events terminal
@@ -232,9 +249,12 @@ export class RuntimeContinuationRepository {
       const readyAutonomous = this.database.prepare(`
         SELECT r.id AS run_id, r.current_plan_id AS plan_id, ps.id AS step_id
         FROM runs r
+        JOIN missions m ON m.id = r.mission_id
         JOIN plans p ON p.id = r.current_plan_id AND p.status = 'active'
         JOIN plan_steps ps ON ps.id = r.current_step_id AND ps.plan_id = p.id
         WHERE r.journey = 'autonomous' AND r.status = 'running'
+          AND r.control_plane = 'command_os_v2'
+          AND m.control_plane = 'command_os_v2'
           AND ps.status = 'ready'
           AND NOT EXISTS (
             SELECT 1 FROM actions a
@@ -255,7 +275,10 @@ export class RuntimeContinuationRepository {
         SELECT gd.run_id, gd.id AS decision_id, gd.step_id
         FROM guided_decisions gd
         JOIN runs r ON r.id = gd.run_id
+        JOIN missions m ON m.id = r.mission_id
         WHERE r.journey = 'guided'
+          AND r.control_plane = 'command_os_v2'
+          AND m.control_plane = 'command_os_v2'
           AND r.status IN ('waiting_guided_decision', 'running')
           AND gd.status = 'approved'
           AND NOT EXISTS (
@@ -276,8 +299,11 @@ export class RuntimeContinuationRepository {
         SELECT a.run_id, a.id AS action_id, a.step_id
         FROM actions a
         JOIN runs r ON r.id = a.run_id
+        JOIN missions m ON m.id = r.mission_id
         JOIN plan_steps ps ON ps.id = a.step_id
         WHERE r.status = 'running' AND a.status = 'succeeded'
+          AND r.control_plane = 'command_os_v2'
+          AND m.control_plane = 'command_os_v2'
           AND ps.status NOT IN ('completed', 'skipped', 'cancelled')
       `).all() as Array<{ run_id: string; action_id: string; step_id: string }>;
       for (const row of succeeded) {
@@ -294,7 +320,10 @@ export class RuntimeContinuationRepository {
         SELECT a.run_id, a.id AS action_id, a.step_id
         FROM actions a
         JOIN runs r ON r.id = a.run_id
+        JOIN missions m ON m.id = r.mission_id
         WHERE r.journey = 'guided' AND r.status = 'recovering'
+          AND r.control_plane = 'command_os_v2'
+          AND m.control_plane = 'command_os_v2'
           AND a.status IN ('failed', 'timed_out', 'denied')
           AND a.ended_at = (
             SELECT MAX(latest.ended_at) FROM actions latest
@@ -315,8 +344,11 @@ export class RuntimeContinuationRepository {
       const evaluations = this.database.prepare(`
         SELECT r.id AS run_id, p.id AS plan_id
         FROM runs r
+        JOIN missions m ON m.id = r.mission_id
         JOIN plans p ON p.id = r.current_plan_id
         WHERE r.status = 'running' AND p.status = 'completed'
+          AND r.control_plane = 'command_os_v2'
+          AND m.control_plane = 'command_os_v2'
           AND NOT EXISTS (SELECT 1 FROM run_evaluations re WHERE re.run_id = r.id)
       `).all() as Array<{ run_id: string; plan_id: string }>;
       for (const row of evaluations) {
@@ -328,28 +360,10 @@ export class RuntimeContinuationRepository {
         });
       }
 
-      const resumed = this.database.prepare(`
-        SELECT r.id AS run_id, CAST(r.version AS TEXT) AS source_id
-        FROM runs r
-        WHERE r.status = 'recovering'
-          AND NOT EXISTS (
-            SELECT 1 FROM actions a
-            WHERE a.run_id = r.id AND a.status IN ('queued', 'running')
-          )
-          AND NOT EXISTS (
-            SELECT 1 FROM actions failed
-            WHERE failed.run_id = r.id
-              AND failed.status IN ('failed', 'timed_out', 'denied')
-          )
-      `).all() as Array<{ run_id: string; source_id: string }>;
-      for (const row of resumed) {
-        enqueue({
-          runId: row.run_id,
-          kind: "resume_recovery_pending",
-          sourceId: row.source_id,
-          now,
-        });
-      }
+      // Do not synthesize a generic recovery continuation from status alone.
+      // Every resumable recovery is written atomically by the exact operator,
+      // action-failure, retry, or replan transition that owns it. Reconstructing
+      // authority here could turn stale `recovering` state into a fresh plan.
       return repaired;
     });
   }
@@ -371,14 +385,19 @@ export class RuntimeContinuationRepository {
         : "";
       const parameters: unknown[] = [input.runId, input.now, input.now, ...(input.kinds ?? [])];
       const candidate = this.database.prepare(`
-        SELECT id, attempt_count FROM runtime_continuations
-        WHERE run_id = ?
+        SELECT continuation.id, continuation.attempt_count
+        FROM runtime_continuations continuation
+        JOIN runs r ON r.id = continuation.run_id
+        JOIN missions m ON m.id = r.mission_id
+        WHERE continuation.run_id = ?
+          AND r.control_plane = 'command_os_v2'
+          AND m.control_plane = 'command_os_v2'
           AND (
-            (status = 'pending' AND available_at <= ?)
-            OR (status = 'processing' AND lease_expires_at <= ?)
+            (continuation.status = 'pending' AND continuation.available_at <= ?)
+            OR (continuation.status = 'processing' AND continuation.lease_expires_at <= ?)
           )
           ${kindFilter}
-        ORDER BY created_at, id LIMIT 1
+        ORDER BY continuation.created_at, continuation.id LIMIT 1
       `).get(...parameters) as { id: string; attempt_count: number } | undefined;
       if (!candidate) return null;
       const attempt = candidate.attempt_count + 1;
@@ -388,7 +407,13 @@ export class RuntimeContinuationRepository {
         UPDATE runtime_continuations
         SET status = 'processing', attempt_count = ?, lease_owner = ?,
           lease_expires_at = ?, updated_at = ?, last_error = NULL
-        WHERE id = ? AND (
+        WHERE id = ?
+          AND EXISTS (
+            SELECT 1 FROM runs r JOIN missions m ON m.id = r.mission_id
+            WHERE r.id = runtime_continuations.run_id
+              AND r.control_plane = 'command_os_v2'
+              AND m.control_plane = 'command_os_v2'
+          ) AND (
           (status = 'pending' AND available_at <= ?)
           OR (status = 'processing' AND lease_expires_at <= ?)
         )
@@ -409,6 +434,14 @@ export class RuntimeContinuationRepository {
     const workerId = requireText(input.workerId, "workerId");
     return inImmediateTransaction(this.database, () => {
       const candidate = this.get(input.id);
+      const owned = this.database.prepare(`
+        SELECT 1 AS present
+        FROM runs r JOIN missions m ON m.id = r.mission_id
+        WHERE r.id = ?
+          AND r.control_plane = 'command_os_v2'
+          AND m.control_plane = 'command_os_v2'
+      `).get(candidate.runId) as { present: number } | undefined;
+      if (!owned) throw new Error(`Runtime continuation requires Command OS V2 ownership: ${candidate.runId}`);
       if (
         !(
           (candidate.status === "pending" && candidate.availableAt <= input.now) ||
@@ -441,6 +474,13 @@ export class RuntimeContinuationRepository {
         completed_at = ?, updated_at = ?, last_error = NULL
       WHERE id = ? AND status = 'processing' AND lease_owner = ?
         AND lease_expires_at > ?
+        AND EXISTS (
+          SELECT 1 FROM runs r
+          JOIN missions m ON m.id = r.mission_id
+          WHERE r.id = runtime_continuations.run_id
+            AND r.control_plane = 'command_os_v2'
+            AND m.control_plane = 'command_os_v2'
+        )
     `).run(now, now, id, ownerToken, now);
     if (completed.changes !== 1) {
       throw new Error(`Runtime continuation completion fence lost: ${id}`);
@@ -463,6 +503,13 @@ export class RuntimeContinuationRepository {
       SET lease_expires_at = ?, updated_at = ?
       WHERE id = ? AND status = 'processing' AND lease_owner = ?
         AND lease_expires_at > ?
+        AND EXISTS (
+          SELECT 1 FROM runs r
+          JOIN missions m ON m.id = r.mission_id
+          WHERE r.id = runtime_continuations.run_id
+            AND r.control_plane = 'command_os_v2'
+            AND m.control_plane = 'command_os_v2'
+        )
     `).run(expiresAt, now, id, ownerToken, now);
     if (renewed.changes !== 1) {
       throw new Error(`Runtime continuation heartbeat fence lost: ${id}`);
@@ -484,6 +531,13 @@ export class RuntimeContinuationRepository {
         available_at = ?, updated_at = ?, last_error = ?
       WHERE id = ? AND status = 'processing' AND lease_owner = ?
         AND lease_expires_at > ?
+        AND EXISTS (
+          SELECT 1 FROM runs r
+          JOIN missions m ON m.id = r.mission_id
+          WHERE r.id = runtime_continuations.run_id
+            AND r.control_plane = 'command_os_v2'
+            AND m.control_plane = 'command_os_v2'
+        )
     `).run(input.availableAt, input.now, message, input.id, input.ownerToken, input.now);
     if (released.changes !== 1) {
       throw new Error(`Runtime continuation retry fence lost: ${input.id}`);
@@ -504,6 +558,13 @@ export class RuntimeContinuationRepository {
         updated_at = ?, last_error = ?
       WHERE id = ? AND status = 'processing' AND lease_owner = ?
         AND lease_expires_at > ?
+        AND EXISTS (
+          SELECT 1 FROM runs r
+          JOIN missions m ON m.id = r.mission_id
+          WHERE r.id = runtime_continuations.run_id
+            AND r.control_plane = 'command_os_v2'
+            AND m.control_plane = 'command_os_v2'
+        )
     `).run(input.now, message, input.id, input.ownerToken, input.now);
     if (failed.changes !== 1) {
       throw new Error(`Runtime continuation failure fence lost: ${input.id}`);
@@ -517,6 +578,13 @@ export class RuntimeContinuationRepository {
       SET status = 'cancelled', lease_owner = NULL, lease_expires_at = NULL,
         updated_at = ?, last_error = ?
       WHERE run_id = ? AND status IN ('pending', 'processing')
+        AND EXISTS (
+          SELECT 1 FROM runs r
+          JOIN missions m ON m.id = r.mission_id
+          WHERE r.id = runtime_continuations.run_id
+            AND r.control_plane = 'command_os_v2'
+            AND m.control_plane = 'command_os_v2'
+        )
     `).run(now, safeError(reason, "Run reached a terminal state"), runId).changes;
   }
 }

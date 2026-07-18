@@ -643,6 +643,20 @@ class CronStateTests(unittest.TestCase):
         spec.loader.exec_module(module)
         return module
 
+    def test_full_context_reviewer_is_contained_before_dispatch(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            hermes_home = root / "hermes-home"
+            sessions_dir = root / "sessions"
+            (hermes_home / "conversations").mkdir(parents=True)
+            sessions_dir.mkdir(parents=True)
+            cron = self._load_cron(hermes_home, sessions_dir)
+            output = io.StringIO()
+            with mock.patch.object(cron.subprocess, "Popen") as popen, redirect_stdout(output):
+                cron.main()
+            popen.assert_not_called()
+            self.assertIn("legacy full-context public-model reviewer is disabled", output.getvalue())
+
     def test_offset_advances_only_after_valid_success_marker(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -677,7 +691,9 @@ class CronStateTests(unittest.TestCase):
             self.assertEqual(cron.LEARN_LOG.parent, hermes_home / "logs")
             now = time.time()
             os.utime(transcript, (now - cron.SETTLE_SECONDS - 10,) * 2)
-            with mock.patch.object(cron.time, "time", return_value=now), mock.patch.object(
+            with mock.patch.object(
+                cron, "LEGACY_FULL_CONTEXT_PUBLIC_REVIEW_DISABLED", False
+            ), mock.patch.object(cron.time, "time", return_value=now), mock.patch.object(
                 cron.subprocess,
                 "Popen",
             ) as popen, redirect_stdout(io.StringIO()):
@@ -691,7 +707,9 @@ class CronStateTests(unittest.TestCase):
             marker = cron.success_marker_for(name)
             marker.parent.mkdir(parents=True, exist_ok=True)
             marker.write_text(json.dumps({"ok": True}))
-            with mock.patch.object(cron.time, "time", return_value=now + 1), redirect_stdout(
+            with mock.patch.object(
+                cron, "LEGACY_FULL_CONTEXT_PUBLIC_REVIEW_DISABLED", False
+            ), mock.patch.object(cron.time, "time", return_value=now + 1), redirect_stdout(
                 io.StringIO()
             ):
                 cron.main()

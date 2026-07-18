@@ -31,9 +31,9 @@ column drift, graph-control occlusion, safe-area errors, and layout shift.
 
 ## Current deterministic baseline registry
 
-`tests/interaction-manifest/visual-baselines.json` currently maps **18 of 489
-manifest groups** to **12 checked-in Chromium-1440/Linux baselines**. The other
-**471 groups remain explicitly unmapped**, cross-browser baseline coverage is
+`tests/interaction-manifest/visual-baselines.json` currently maps **30 of 489
+manifest groups** to **13 checked-in Chromium-1440/Linux baselines**. The other
+**459 groups remain explicitly unmapped**, cross-browser baseline coverage is
 incomplete, and the registry retains `humanReleaseApproval: false`.
 
 The six original connected-Vault baselines cover:
@@ -45,21 +45,25 @@ The six original connected-Vault baselines cover:
 5. reindex receipt;
 6. degraded-to-connected recovery.
 
-Six additional material screenshots now cover:
+Seven additional material screenshots now cover:
 
 1. minimal Autonomous intake review with resolved defaults and fail-closed
    runtime readiness;
-2. structured blocked recovery diagnosis and bounded proposal;
-3. resumed Guided waiting-for-decision status;
-4. deterministic Second Brain graph canvas;
-5. the same Brain projection in its accessible table mode;
-6. a targeted memory export after browser reload with its selected verified
+2. the complete independent evidence-verification gate, including canonical
+   sources, provenance, custody, additional requirements, human attestation,
+   and the enabled verification action before mutation;
+3. structured blocked recovery diagnosis and bounded proposal;
+4. resumed Guided waiting-for-decision status;
+5. deterministic Second Brain graph canvas;
+6. the same Brain projection in its accessible table mode;
+7. a targeted memory export after browser reload with its selected verified
    Vault and sanitized native Obsidian deep link visible together.
 
 The baseline PNGs live beside their owning specs under:
 
 - `tests/e2e/brain-vault.spec.ts-snapshots/`;
 - `tests/e2e/mission-intake.spec.ts-snapshots/`;
+- `tests/e2e/operational-truth.spec.ts-snapshots/`;
 - `tests/e2e/run-intervention-recovery.spec.ts-snapshots/`;
 - `tests/e2e/brain-graph.spec.ts-snapshots/`;
 - `tests/e2e/brain-node-vault.spec.ts-snapshots/`.
@@ -67,7 +71,9 @@ The baseline PNGs live beside their owning specs under:
 The registry records each baseline's interaction IDs, owning test ID, project,
 viewport, platform, pixel dimensions, byte size, normalization fields, and
 SHA-256 hash. Reverse mapping, file integrity, dimensions, hashes, and explicit
-unmapped accounting passed **21/21 tests with 3,486 assertions**.
+unmapped accounting for the current 13-baseline registry passed **21/21 tests
+with 3,554 assertions**. The earlier archived registry receipt recorded 3,486
+assertions before the evidence-verification baseline was added.
 
 The targeted node-level Vault baseline then passed a strict no-update
 Chromium-1440 replay **1/1**. JSON:
@@ -77,6 +83,17 @@ HTML:
 `test-results/html/brain-node-vault-visual-verify-20260717/index.html`
 (SHA-256
 `7fc71c6fb2a475a14cae2a4e8aa9c8e8e1724e2ec4ca82edd60534fa7fd70a0a`).
+
+The independent evidence-verification baseline also passed a strict no-update
+Chromium-1440 replay **1/1** in **9,818.544 ms**, with zero skipped, unexpected,
+or flaky results. JSON:
+`test-results/results/visual-operational-truth-evidence-verification-verify-20260717.json`
+(SHA-256
+`60a474e18b001b4bd06fcac7e84c1f048a6575712841e6890fda0e0a35626d65`).
+HTML:
+`test-results/html/visual-operational-truth-evidence-verification-verify-20260717/index.html`
+(SHA-256
+`0412a3b9a826114b6e500abba562626a128913ee00b1f8331c207a0a5da4713b`).
 
 The earlier five-screenshot focused Chromium replay passed **3/3 tests** in
 **27,940.205 ms** with zero failures or skips and exercised those five material
@@ -97,8 +114,8 @@ remaining routes, states, browsers, viewports, or copy/alignment review.
 
 ## Current gaps
 
-- **471 of 489** manifest groups have no checked-in visual mapping;
-- all 12 baselines are Chromium-1440/Linux only;
+- **459 of 489** manifest groups have no checked-in visual mapping;
+- all 13 baselines are Chromium-1440/Linux only;
 - screenshot, trace, and video capture outside these assertions remains
   failure-oriented, so diagnostic images are not success-path approvals;
 - the 720×450/DPR-2 project models reflow but does not prove native browser
